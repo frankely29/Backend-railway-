@@ -1,14 +1,26 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import JSONResponse, FileResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pathlib import Path
 import traceback
 
-from build_hotspots import (
+# ✅ IMPORTANT: your file is build_hotspot.py (no "s")
+from build_hotspot import (
     ensure_zones_geojson,
     build_hotspots_json,
 )
 
 app = FastAPI()
+
+# ✅ CORS so GitHub Pages can fetch Railway
+# (You can tighten this later. For now, this makes it work.)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Railway volume mount (persistent)
 DATA_DIR = Path("/data")
@@ -43,10 +55,6 @@ def status():
 async def upload_parquet(file: UploadFile = File(...)):
     """
     Upload parquet files into the Railway volume (/data).
-    Do this for:
-      fhvhv_tripdata_2025-09.parquet
-      fhvhv_tripdata_2025-10.parquet
-      fhvhv_tripdata_2025-11.parquet
     """
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -78,40 +86,50 @@ def setup_zones():
         return JSONResponse({"error": str(e), "trace": traceback.format_exc()}, status_code=500)
 
 
+def _generate_impl(bin_minutes: int = 20, min_trips_per_window: int = 10):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Ensure zones exist (auto-download if missing)
+    ensure_zones_geojson(DATA_DIR, force=False)
+
+    parquets = sorted(DATA_DIR.glob("fhvhv_tripdata_*.parquet"))
+    if not parquets:
+        return JSONResponse(
+            {"error": "No parquet files found in /data. Upload first via /upload_parquet."},
+            status_code=400,
+        )
+
+    build_hotspots_json(
+        parquet_files=parquets,
+        zones_geojson_path=ZONES_GEOJSON,
+        out_path=OUT_PATH,
+        bin_minutes=bin_minutes,
+        min_trips_per_window=min_trips_per_window,
+    )
+
+    return {
+        "ok": True,
+        "output": OUT_PATH.name,
+        "size_mb": round(OUT_PATH.stat().st_size / 1024 / 1024, 2),
+    }
+
+
 @app.post("/generate")
-def generate(
-    bin_minutes: int = 20,
-    min_trips_per_window: int = 10,
-):
+def generate(bin_minutes: int = 20, min_trips_per_window: int = 10):
     """
     Builds /data/hotspots_20min.json (persistent) from parquet(s) in /data.
     """
     try:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        return _generate_impl(bin_minutes=bin_minutes, min_trips_per_window=min_trips_per_window)
+    except Exception as e:
+        return JSONResponse({"error": str(e), "trace": traceback.format_exc()}, status_code=500)
 
-        # Ensure zones exist (auto-download if missing)
-        ensure_zones_geojson(DATA_DIR, force=False)
 
-        parquets = sorted(DATA_DIR.glob("fhvhv_tripdata_*.parquet"))
-        if not parquets:
-            return JSONResponse(
-                {"error": "No parquet files found in /data. Upload first via /upload_parquet."},
-                status_code=400,
-            )
-
-        build_hotspots_json(
-            parquet_files=parquets,
-            zones_geojson_path=ZONES_GEOJSON,
-            out_path=OUT_PATH,
-            bin_minutes=bin_minutes,
-            min_trips_per_window=min_trips_per_window,
-        )
-
-        return {
-            "ok": True,
-            "output": OUT_PATH.name,
-            "size_mb": round(OUT_PATH.stat().st_size / 1024 / 1024, 2),
-        }
+# ✅ Convenience: allow GET too (avoids “Method Not Allowed” if you open it in browser)
+@app.get("/generate")
+def generate_get(bin_minutes: int = 20, min_trips_per_window: int = 10):
+    try:
+        return _generate_impl(bin_minutes=bin_minutes, min_trips_per_window=min_trips_per_window)
     except Exception as e:
         return JSONResponse({"error": str(e), "trace": traceback.format_exc()}, status_code=500)
 
@@ -120,7 +138,7 @@ def generate(
 def get_hotspots():
     if not OUT_PATH.exists():
         return JSONResponse(
-            {"error": "hotspots_20min.json not generated yet. Call POST /generate first."},
+            {"error": "hotspots_20min.json not generated yet. Call /generate first."},
             status_code=404,
         )
     return FileResponse(str(OUT_PATH), media_type="application/json", filename="hotspots_20min.json")
