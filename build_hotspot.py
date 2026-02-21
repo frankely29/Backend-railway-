@@ -4,23 +4,30 @@ from pathlib import Path
 from typing import List, Dict, Any, Tuple
 from datetime import datetime, timedelta
 import json
-
 import duckdb
 
 
 def ensure_zones_geojson(data_dir: Path, force: bool = False) -> Path:
     """
-    We DO NOT download/convert shapefiles on Railway (geo deps break deploy).
-    Instead: you upload /data/taxi_zones.geojson one time.
+    Railway-safe approach:
+    - You upload /data/taxi_zones.geojson once (stored in the Railway volume).
+    - No geopandas/fiona/pyproj needed.
     """
     data_dir.mkdir(parents=True, exist_ok=True)
     geojson_path = data_dir / "taxi_zones.geojson"
     if geojson_path.exists() and geojson_path.stat().st_size > 0 and not force:
         return geojson_path
-    raise RuntimeError("Missing /data/taxi_zones.geojson. Upload it first via POST /upload_zones_geojson.")
+    raise RuntimeError("Missing /data/taxi_zones.geojson. Upload it via POST /upload_zones_geojson.")
 
 
 def color_bucket_from_rating(rating: int) -> str:
+    """
+    STRICT mandatory rules:
+      Green = Best
+      Blue = Medium
+      Sky  = Normal
+      Red  = Avoid
+    """
     r = int(rating)
     if r >= 80:
         return "#00b050"  # Green
@@ -38,7 +45,7 @@ def build_hotspots_json(
     bin_minutes: int = 20,
     min_trips_per_window: int = 10,
 ) -> None:
-    # Load zone geometry
+    # Load zone geometry (LocationID -> geometry)
     zones = json.loads(zones_geojson_path.read_text(encoding="utf-8"))
     geom_by_id: Dict[int, Any] = {}
 
@@ -54,14 +61,14 @@ def build_hotspots_json(
         geom_by_id[zid_int] = f.get("geometry")
 
     if not geom_by_id:
-        raise RuntimeError("taxi_zones.geojson did not contain usable LocationID geometry.")
+        raise RuntimeError("taxi_zones.geojson missing usable LocationID geometry.")
 
     con = duckdb.connect(database=":memory:")
 
     parquet_list = [str(p) for p in parquet_files]
     parquet_sql = ", ".join("'" + p.replace("'", "''") + "'" for p in parquet_list)
 
-    # All normalization + rating happens in DuckDB (no pandas)
+    # DuckDB does everything: aggregate + normalize + rating (1..100)
     sql = f"""
     WITH base AS (
       SELECT
@@ -108,10 +115,8 @@ def build_hotspots_json(
         *,
         MIN(pickups) OVER (PARTITION BY dow_m, bin_start_min) AS min_pickups,
         MAX(pickups) OVER (PARTITION BY dow_m, bin_start_min) AS max_pickups,
-
         MIN(avg_driver_pay) OVER (PARTITION BY dow_m, bin_start_min) AS min_pay,
         MAX(avg_driver_pay) OVER (PARTITION BY dow_m, bin_start_min) AS max_pay,
-
         MIN(avg_tips) OVER (PARTITION BY dow_m, bin_start_min) AS min_tips,
         MAX(avg_tips) OVER (PARTITION BY dow_m, bin_start_min) AS max_tips
       FROM agg
@@ -156,23 +161,23 @@ def build_hotspots_json(
     if not rows:
         raise RuntimeError("No data after filtering. Lower min_trips_per_window.")
 
-    # Column order matches SELECT above
-    # (PULocationID, dow_m, bin_start_min, pickups, avg_driver_pay, avg_tips, rating)
+    # Group rows by (dow_m, bin_start_min)
     by_window: Dict[Tuple[int, int], list] = {}
     for r in rows:
         zid = int(r[0])
         dow_m = int(r[1])
         bin_start_min = int(r[2])
         pickups = int(r[3])
-        avg_pay = r[4]  # can be None
-        avg_tips = r[5] # can be None
+        avg_pay = r[4]   # can be None
+        avg_tip = r[5]   # can be None
         rating = int(r[6])
 
         by_window.setdefault((dow_m, bin_start_min), []).append(
-            (zid, pickups, avg_pay, avg_tips, rating)
+            (zid, pickups, avg_pay, avg_tip, rating)
         )
 
-    week_start = datetime(2025, 1, 6, 0, 0, 0)  # Monday baseline
+    # Baseline week (typical week pattern). Frontend matches by day/time-of-week.
+    week_start = datetime(2025, 1, 6, 0, 0, 0)  # Monday
     timeline: List[str] = []
     frames: List[Dict[str, Any]] = []
 
@@ -201,10 +206,12 @@ def build_hotspots_json(
                     "avg_driver_pay": None if avg_pay is None else float(avg_pay),
                     "avg_tips": None if avg_tip is None else float(avg_tip),
                     "style": {
+                        # ✅ no outlines + stronger fill so colors look correct on phone
                         "color": fill,
+                        "opacity": 0,
                         "weight": 0,
                         "fillColor": fill,
-                        "fillOpacity": 0.55
+                        "fillOpacity": 0.82
                     }
                 }
             })
