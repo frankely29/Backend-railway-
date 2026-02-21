@@ -52,7 +52,7 @@ def build_hotspots_frames(
     if not geom_by_id:
         raise RuntimeError("taxi_zones.geojson missing usable LocationID geometry.")
 
-    # ✅ DuckDB spill-to-disk on Railway volume (no f-string escaping)
+    # DuckDB spill-to-disk
     tmp_dir = out_dir.parent / "duckdb_tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
@@ -144,17 +144,15 @@ def build_hotspots_frames(
     ORDER BY dow_m, bin_start_min, PULocationID;
     """
 
-    rows = con.execute(sql).fetchall()
-    if not rows:
-        raise RuntimeError("No data after filtering. Lower min_trips_per_window.")
+    # ✅ STREAM rows in batches (NO fetchall)
+    cur = con.execute(sql)
 
-    # Write frames to disk
     week_start = datetime(2025, 1, 6, 0, 0, 0)  # Monday baseline
-    timeline = []
+    timeline: List[str] = []
     frame_count = 0
 
     current_key: Tuple[int, int] | None = None
-    current_features = []
+    current_features: List[Dict[str, Any]] = []
     current_time_iso: str | None = None
 
     def flush_frame():
@@ -172,50 +170,62 @@ def build_hotspots_frames(
         current_features = []
         current_time_iso = None
 
-    for (zid, dow_m, bin_start_min, pickups, avg_pay, rating) in rows:
-        key = (int(dow_m), int(bin_start_min))
+    total_rows = 0
+    any_rows = False
 
-        if current_key is None:
-            current_key = key
-        if key != current_key:
-            flush_frame()
-            current_key = key
+    while True:
+        batch = cur.fetchmany(5000)
+        if not batch:
+            break
 
-        hour = int(bin_start_min // 60)
-        minute = int(bin_start_min % 60)
-        ts = week_start + timedelta(days=int(dow_m), hours=hour, minutes=minute)
-        current_time_iso = ts.strftime("%Y-%m-%dT%H:%M:%S")
+        any_rows = True
+        for (zid, dow_m, bin_start_min, pickups, avg_pay, rating) in batch:
+            total_rows += 1
+            key = (int(dow_m), int(bin_start_min))
 
-        geom = geom_by_id.get(int(zid))
-        if not geom:
-            continue
+            if current_key is None:
+                current_key = key
+            if key != current_key:
+                flush_frame()
+                current_key = key
 
-        fill = color_bucket_from_rating(int(rating))
-        current_features.append({
-            "type": "Feature",
-            "geometry": geom,
-            "properties": {
-                "LocationID": int(zid),
-                "rating": int(rating),
-                "pickups": int(pickups),
-                "avg_driver_pay": None if avg_pay is None else float(avg_pay),
-                "avg_tips": None,
-                "style": {
-                    "color": fill,
-                    "opacity": 0,
-                    "weight": 0,
-                    "fillColor": fill,
-                    "fillOpacity": 0.82
+            hour = int(bin_start_min // 60)
+            minute = int(bin_start_min % 60)
+            ts = week_start + timedelta(days=int(dow_m), hours=hour, minutes=minute)
+            current_time_iso = ts.strftime("%Y-%m-%dT%H:%M:%S")
+
+            geom = geom_by_id.get(int(zid))
+            if not geom:
+                continue
+
+            fill = color_bucket_from_rating(int(rating))
+            current_features.append({
+                "type": "Feature",
+                "geometry": geom,
+                "properties": {
+                    "LocationID": int(zid),
+                    "rating": int(rating),
+                    "pickups": int(pickups),
+                    "avg_driver_pay": None if avg_pay is None else float(avg_pay),
+                    "avg_tips": None,
+                    "style": {
+                        "color": fill,
+                        "opacity": 0,
+                        "weight": 0,
+                        "fillColor": fill,
+                        "fillOpacity": 0.82
+                    }
                 }
-            }
-        })
+            })
+
+    if not any_rows:
+        raise RuntimeError("No data after filtering. Lower min_trips_per_window.")
 
     flush_frame()
 
-    # Write timeline index
     (out_dir / "timeline.json").write_text(
         json.dumps({"timeline": timeline, "count": len(timeline)}, separators=(",", ":")),
         encoding="utf-8"
     )
 
-    return {"ok": True, "count": len(timeline), "frames_dir": str(out_dir)}
+    return {"ok": True, "count": len(timeline), "frames_dir": str(out_dir), "rows": total_rows}
