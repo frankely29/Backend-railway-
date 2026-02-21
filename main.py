@@ -3,6 +3,8 @@ from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pathlib import Path
 import traceback
+import json
+from typing import Any, Dict, Optional, Tuple
 
 from build_hotspot import (
     ensure_zones_geojson,
@@ -11,19 +13,37 @@ from build_hotspot import (
 
 app = FastAPI()
 
-# CORS so GitHub Pages (different domain) can fetch Railway endpoints
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # tighten later if you want
+    allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Railway persistent volume mount
 DATA_DIR = Path("/data")
 ZONES_GEOJSON = DATA_DIR / "taxi_zones.geojson"
 OUT_PATH = DATA_DIR / "hotspots_20min.json"
+
+# ----------------------------
+# Simple cache for hotspots_20min.json
+# ----------------------------
+_cache_mtime: Optional[float] = None
+_cache_payload: Optional[Dict[str, Any]] = None
+
+
+def _load_hotspots_cached() -> Dict[str, Any]:
+    global _cache_mtime, _cache_payload
+
+    if not OUT_PATH.exists():
+        raise FileNotFoundError("hotspots_20min.json not generated yet")
+
+    mtime = OUT_PATH.stat().st_mtime
+    if _cache_payload is None or _cache_mtime != mtime:
+        _cache_payload = json.loads(OUT_PATH.read_text(encoding="utf-8"))
+        _cache_mtime = mtime
+
+    return _cache_payload
 
 
 @app.get("/")
@@ -51,13 +71,6 @@ def status():
 
 @app.post("/upload_parquet")
 async def upload_parquet(file: UploadFile = File(...)):
-    """
-    Upload parquet files into the Railway volume (/data).
-    Example filenames:
-      fhvhv_tripdata_2025-09.parquet
-      fhvhv_tripdata_2025-10.parquet
-      fhvhv_tripdata_2025-11.parquet
-    """
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         out_path = DATA_DIR / file.filename
@@ -70,13 +83,6 @@ async def upload_parquet(file: UploadFile = File(...)):
 
 @app.post("/upload_zones_geojson")
 async def upload_zones_geojson(file: UploadFile = File(...)):
-    """
-    ONE-TIME SETUP (recommended):
-    Upload taxi_zones.geojson into /data so Railway doesn't need geopandas/fiona/pyproj.
-
-    IMPORTANT:
-    - The file you upload will be saved as /data/taxi_zones.geojson
-    """
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         content = await file.read()
@@ -90,7 +96,7 @@ async def upload_zones_geojson(file: UploadFile = File(...)):
 def _generate_impl(bin_minutes: int = 20, min_trips_per_window: int = 10):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Zones must already exist (uploaded once)
+    # zones must exist (uploaded once)
     ensure_zones_geojson(DATA_DIR, force=False)
 
     parquets = sorted(DATA_DIR.glob("fhvhv_tripdata_*.parquet"))
@@ -117,9 +123,6 @@ def _generate_impl(bin_minutes: int = 20, min_trips_per_window: int = 10):
 
 @app.post("/generate")
 def generate(bin_minutes: int = 20, min_trips_per_window: int = 10):
-    """
-    Builds /data/hotspots_20min.json from parquet(s) in /data.
-    """
     try:
         return _generate_impl(bin_minutes=bin_minutes, min_trips_per_window=min_trips_per_window)
     except Exception as e:
@@ -128,15 +131,43 @@ def generate(bin_minutes: int = 20, min_trips_per_window: int = 10):
 
 @app.get("/generate")
 def generate_get(bin_minutes: int = 20, min_trips_per_window: int = 10):
-    """
-    Same as POST /generate, but GET-friendly for quick testing in a browser.
-    """
     try:
         return _generate_impl(bin_minutes=bin_minutes, min_trips_per_window=min_trips_per_window)
     except Exception as e:
         return JSONResponse({"error": str(e), "trace": traceback.format_exc()}, status_code=500)
 
 
+# ----------------------------
+# Railway-only data endpoints for the frontend
+# ----------------------------
+
+@app.get("/timeline")
+def timeline():
+    try:
+        payload = _load_hotspots_cached()
+        tl = payload.get("timeline") or []
+        return {"timeline": tl, "count": len(tl)}
+    except FileNotFoundError:
+        return JSONResponse({"error": "timeline not ready. Call /generate first."}, status_code=404)
+    except Exception as e:
+        return JSONResponse({"error": str(e), "trace": traceback.format_exc()}, status_code=500)
+
+
+@app.get("/frame/{idx}")
+def frame(idx: int):
+    try:
+        payload = _load_hotspots_cached()
+        frames = payload.get("frames") or []
+        if idx < 0 or idx >= len(frames):
+            return JSONResponse({"error": "idx out of range", "idx": idx, "count": len(frames)}, status_code=400)
+        return frames[idx]
+    except FileNotFoundError:
+        return JSONResponse({"error": "timeline not ready. Call /generate first."}, status_code=404)
+    except Exception as e:
+        return JSONResponse({"error": str(e), "trace": traceback.format_exc()}, status_code=500)
+
+
+# Keep this for compatibility (optional)
 @app.get("/hotspots_20min.json")
 def get_hotspots():
     if not OUT_PATH.exists():
@@ -144,8 +175,4 @@ def get_hotspots():
             {"error": "hotspots_20min.json not generated yet. Call /generate first."},
             status_code=404,
         )
-    return FileResponse(
-        str(OUT_PATH),
-        media_type="application/json",
-        filename="hotspots_20min.json",
-    )
+    return FileResponse(str(OUT_PATH), media_type="application/json", filename="hotspots_20min.json")
