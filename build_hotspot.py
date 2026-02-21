@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 from datetime import datetime, timedelta
 import json
 import duckdb
@@ -16,15 +16,14 @@ def ensure_zones_geojson(data_dir: Path, force: bool = False) -> Path:
 
 
 def color_bucket_from_rating(rating: int) -> str:
-    # STRICT buckets
     r = int(rating)
     if r >= 80:
-        return "#00b050"  # Green = Best
+        return "#00b050"  # Green
     if r >= 60:
-        return "#0066ff"  # Blue = Medium
+        return "#0066ff"  # Blue
     if r >= 40:
-        return "#66ccff"  # Sky = Normal
-    return "#e60000"      # Red = Avoid
+        return "#66ccff"  # Sky
+    return "#e60000"      # Red
 
 
 def build_hotspots_frames(
@@ -34,18 +33,9 @@ def build_hotspots_frames(
     bin_minutes: int = 20,
     min_trips_per_window: int = 10,
 ) -> Dict[str, Any]:
-    """
-    Writes:
-      /data/frames/timeline.json
-      /data/frames/frame_000000.json
-      /data/frames/frame_000001.json
-      ...
-    This avoids a huge single JSON and keeps iPhone fast.
-    Scoring: 80% busy + 20% driver_pay (tips ignored).
-    """
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load zone geometry (LocationID -> geometry)
+    # Load zone geometry
     zones = json.loads(zones_geojson_path.read_text(encoding="utf-8"))
     geom_by_id: Dict[int, Any] = {}
     for f in zones.get("features", []):
@@ -62,20 +52,17 @@ def build_hotspots_frames(
     if not geom_by_id:
         raise RuntimeError("taxi_zones.geojson missing usable LocationID geometry.")
 
-    # DuckDB setup: allow spill to disk on Railway volume
+    # ✅ DuckDB spill-to-disk on Railway volume (no f-string escaping)
     tmp_dir = out_dir.parent / "duckdb_tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
     con = duckdb.connect(database=":memory:")
-    con.execute(f"PRAGMA temp_directory='{str(tmp_dir).replace(\"'\", \"''\")}'")
     con.execute("PRAGMA enable_progress_bar=false")
-    # Threads: DuckDB picks a default; you can hard-set if you want:
-    # con.execute("PRAGMA threads=4")
+    con.execute(f"PRAGMA temp_directory='{tmp_dir.as_posix()}'")
 
     parquet_list = [str(p) for p in parquet_files]
     parquet_sql = ", ".join("'" + p.replace("'", "''") + "'" for p in parquet_list)
 
-    # We produce one row per (window, zone) with rating + geometry fields.
     sql = f"""
     WITH base AS (
       SELECT
@@ -151,8 +138,7 @@ def build_hotspots_frames(
             GREATEST((0.80*vol_n + 0.20*pay_n), 0.0),
             1.0
           )
-        )
-        AS INTEGER
+        ) AS INTEGER
       ) AS rating
     FROM scored
     ORDER BY dow_m, bin_start_min, PULocationID;
@@ -162,14 +148,14 @@ def build_hotspots_frames(
     if not rows:
         raise RuntimeError("No data after filtering. Lower min_trips_per_window.")
 
-    # Build windows in chronological order; write each frame as its own file.
+    # Write frames to disk
     week_start = datetime(2025, 1, 6, 0, 0, 0)  # Monday baseline
     timeline = []
     frame_count = 0
 
-    current_key = None
+    current_key: Tuple[int, int] | None = None
     current_features = []
-    current_time_iso = None
+    current_time_iso: str | None = None
 
     def flush_frame():
         nonlocal frame_count, current_features, current_time_iso
@@ -188,9 +174,9 @@ def build_hotspots_frames(
 
     for (zid, dow_m, bin_start_min, pickups, avg_pay, rating) in rows:
         key = (int(dow_m), int(bin_start_min))
+
         if current_key is None:
             current_key = key
-
         if key != current_key:
             flush_frame()
             current_key = key
@@ -232,4 +218,4 @@ def build_hotspots_frames(
         encoding="utf-8"
     )
 
-    return {"ok": True, "frames_dir": str(out_dir), "count": len(timeline)}
+    return {"ok": True, "count": len(timeline), "frames_dir": str(out_dir)}
