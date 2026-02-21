@@ -1,89 +1,131 @@
+from __future__ import annotations
+
 from pathlib import Path
-from typing import List
+from typing import List, Dict, Any
 from datetime import datetime, timedelta
+import zipfile
+import json
 
 import duckdb
 import pandas as pd
-import json
+import geopandas as gpd
+import requests
 
 
-def clamp01(x: float) -> float:
-    return max(0.0, min(1.0, float(x)))
+# Official NYC TLC taxi zones (same dataset you were using before)
+TAXI_ZONES_ZIP_URL = "https://d37ci6vzurychx.cloudfront.net/misc/taxi_zones.zip"
 
 
-def lerp(a: float, b: float, t: float) -> float:
-    return a + (b - a) * t
-
-
-def score_to_color_bucket(rating: int) -> str:
+def ensure_zones_geojson(data_dir: Path, force: bool = False) -> Path:
     """
-    Your strict rules:
-    Green = Best
-    Blue = Medium
-    Sky = Normal
-    Red = Avoid
+    Downloads taxi_zones.zip and converts it to /data/taxi_zones.geojson
+    Runs once and then stays persistent in the Railway Volume.
+    """
+    data_dir.mkdir(parents=True, exist_ok=True)
+    geojson_path = data_dir / "taxi_zones.geojson"
+    if geojson_path.exists() and geojson_path.stat().st_size > 0 and not force:
+        return geojson_path
+
+    zip_path = data_dir / "taxi_zones.zip"
+    if (not zip_path.exists()) or zip_path.stat().st_size == 0 or force:
+        r = requests.get(TAXI_ZONES_ZIP_URL, timeout=120)
+        r.raise_for_status()
+        zip_path.write_bytes(r.content)
+
+    extract_dir = data_dir / "taxi_zones_extracted"
+    extract_dir.mkdir(parents=True, exist_ok=True)
+
+    # Extract zip
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        zf.extractall(extract_dir)
+
+    shp_files = list(extract_dir.rglob("*.shp"))
+    if not shp_files:
+        raise RuntimeError("Could not find .shp after extracting taxi_zones.zip")
+
+    # Read shapefile, convert to WGS84, write GeoJSON
+    gdf = gpd.read_file(shp_files[0])
+    if "LocationID" not in gdf.columns:
+        # some versions have different casing
+        low = {c.lower(): c for c in gdf.columns}
+        if "locationid" in low:
+            gdf = gdf.rename(columns={low["locationid"]: "LocationID"})
+        else:
+            raise RuntimeError(f"Shapefile missing LocationID column. Columns: {list(gdf.columns)}")
+
+    if gdf.crs is None:
+        gdf = gdf.set_crs("EPSG:4326", allow_override=True)
+    gdf = gdf.to_crs(epsg=4326)
+
+    geojson_path.write_text(gdf.to_json(), encoding="utf-8")
+    return geojson_path
+
+
+def color_bucket_from_rating(rating: int) -> str:
+    """
+    STRICT mandatory rules:
+      Green = Best
+      Blue = Medium
+      Sky = Normal
+      Red = Avoid
     """
     r = int(rating)
-    if r >= 75:
-        return "#00b050"  # green
-    if r >= 55:
-        return "#0066ff"  # blue
-    if r >= 35:
-        return "#66ccff"  # sky
-    return "#e60000"      # red
+    if r >= 80:
+        return "#00b050"  # Green
+    if r >= 60:
+        return "#0066ff"  # Blue
+    if r >= 40:
+        return "#66ccff"  # Sky
+    return "#e60000"      # Red
 
 
 def build_hotspots_json(
     parquet_files: List[Path],
+    zones_geojson_path: Path,
     out_path: Path,
     bin_minutes: int = 20,
     min_trips_per_window: int = 10,
 ) -> None:
     """
-    Output JSON schema:
-      {
-        "timeline": [...iso...],
-        "frames": [
-          {
-            "time": "...iso...",
-            "polygons": { "type":"FeatureCollection", "features":[...] }
-          }
-        ]
-      }
+    Output schema (stable):
+    {
+      "timeline": ["YYYY-MM-DDTHH:MM:SS", ...],
+      "frames": [
+        {
+          "time": "...",
+          "polygons": { "type":"FeatureCollection", "features":[...Feature...] }
+        }
+      ]
+    }
 
-    Requires zone geometry in: /data/taxi_zones.geojson
-    Each feature in taxi_zones.geojson must include:
-      properties.LocationID (or location_id) matching PULocationID.
+    Each Feature has:
+      properties: { LocationID, rating (1–100), pickups, avg_driver_pay, avg_tips, style{fillColor...} }
     """
 
-    data_dir = out_path.parent
-    zones_path = data_dir / "taxi_zones.geojson"
-    if not zones_path.exists():
-        raise RuntimeError("Missing /data/taxi_zones.geojson (needed to draw zone polygons).")
+    # Load zone geometry
+    zones = json.loads(zones_geojson_path.read_text(encoding="utf-8"))
+    geom_by_id: Dict[int, Any] = {}
 
-    zones_geo = json.loads(zones_path.read_text(encoding="utf-8"))
-
-    # Map LocationID -> geometry
-    geom_by_id = {}
-    for f in zones_geo.get("features", []):
-        props = f.get("properties", {}) or {}
-        zid = props.get("LocationID", props.get("location_id", props.get("locationid")))
+    for f in zones.get("features", []):
+        props = f.get("properties") or {}
+        zid = props.get("LocationID")
         if zid is None:
             continue
         try:
-            zid = int(zid)
+            zid_int = int(zid)
         except Exception:
             continue
-        geom_by_id[zid] = f.get("geometry")
+        geom_by_id[zid_int] = f.get("geometry")
 
     if not geom_by_id:
-        raise RuntimeError("taxi_zones.geojson has no usable LocationID keys.")
+        raise RuntimeError("taxi_zones.geojson did not contain usable LocationID geometry.")
 
     con = duckdb.connect(database=":memory:")
+
     parquet_list = [str(p) for p in parquet_files]
     parquet_sql = ", ".join("'" + p.replace("'", "''") + "'" for p in parquet_list)
 
-    # Aggregate by DOW + 20-min bin + PULocationID
+    # Aggregate pickups/pay/tips per (dow, 20-min bin, zone)
     sql = f"""
     WITH base AS (
       SELECT
@@ -97,7 +139,7 @@ def build_hotspots_json(
     t AS (
       SELECT
         PULocationID,
-        EXTRACT('dow' FROM pickup_datetime) AS dow_i,
+        EXTRACT('dow' FROM pickup_datetime) AS dow_i,      -- 0=Sun..6=Sat
         EXTRACT('hour' FROM pickup_datetime) AS hour_i,
         EXTRACT('minute' FROM pickup_datetime) AS minute_i,
         driver_pay,
@@ -127,13 +169,13 @@ def build_hotspots_json(
 
     df = con.execute(sql).df()
     if df.empty:
-        raise RuntimeError("No rows after filtering. Try lower min_trips_per_window.")
+        raise RuntimeError("No data after filtering. Lower min_trips_per_window.")
 
-    # Normalize DOW: Mon=0..Sun=6 (convert from DuckDB: Sun=0..Sat=6)
+    # Convert dow to Monday=0..Sunday=6
     df["dow_i"] = df["dow_i"].astype(int)
     df["dow_m"] = df["dow_i"].apply(lambda d: 6 if d == 0 else d - 1)
 
-    # Score per window
+    # Score per window using minmax normalization across zones in same window
     def minmax(series: pd.Series) -> pd.Series:
         s = pd.to_numeric(series, errors="coerce")
         mn = s.min(skipna=True)
@@ -146,13 +188,13 @@ def build_hotspots_json(
     df["pay_n"] = df.groupby(["dow_m", "bin_start_min"])["avg_driver_pay"].transform(minmax)
     df["tip_n"] = df.groupby(["dow_m", "bin_start_min"])["avg_tips"].transform(minmax)
 
-    df["score01"] = 0.60 * df["vol_n"] + 0.30 * df["pay_n"] + 0.10 * df["tip_n"]
+    df["score01"] = (0.60 * df["vol_n"]) + (0.30 * df["pay_n"]) + (0.10 * df["tip_n"])
     df["rating"] = (1 + (99 * df["score01"].clip(0, 1))).round().astype(int)
 
-    # Build timeline frames
-    week_start = datetime(2025, 1, 6, 0, 0, 0)  # Monday
-    frames = []
-    timeline = []
+    # Build frames
+    week_start = datetime(2025, 1, 6, 0, 0, 0)  # Monday baseline
+    timeline: List[str] = []
+    frames: List[Dict[str, Any]] = []
 
     for (dow_m, bin_start_min), g in df.groupby(["dow_m", "bin_start_min"]):
         hour = int(bin_start_min // 60)
@@ -161,7 +203,7 @@ def build_hotspots_json(
         ts = week_start + timedelta(days=int(dow_m), hours=hour, minutes=minute)
         ts_iso = ts.strftime("%Y-%m-%dT%H:%M:%S")
 
-        features = []
+        feats = []
         for _, r in g.iterrows():
             zid = int(r["PULocationID"])
             geom = geom_by_id.get(zid)
@@ -169,9 +211,9 @@ def build_hotspots_json(
                 continue
 
             rating = int(r["rating"])
-            fill = score_to_color_bucket(rating)
+            fill = color_bucket_from_rating(rating)
 
-            features.append({
+            feats.append({
                 "type": "Feature",
                 "geometry": geom,
                 "properties": {
@@ -182,16 +224,18 @@ def build_hotspots_json(
                     "avg_tips": None if pd.isna(r["avg_tips"]) else float(r["avg_tips"]),
                     "style": {
                         "color": fill,
-                        "weight": 0,          # no outlines
+                        "weight": 0,           # NO OUTLINE (you said you don’t want it)
                         "fillColor": fill,
                         "fillOpacity": 0.55
                     }
                 }
             })
 
-        fc = {"type": "FeatureCollection", "features": features}
-        frames.append({"time": ts_iso, "polygons": fc})
         timeline.append(ts_iso)
+        frames.append({
+            "time": ts_iso,
+            "polygons": {"type": "FeatureCollection", "features": feats}
+        })
 
     out = {"timeline": timeline, "frames": frames}
     out_path.write_text(json.dumps(out, separators=(",", ":")), encoding="utf-8")
