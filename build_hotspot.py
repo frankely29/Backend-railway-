@@ -9,8 +9,8 @@ import duckdb
 
 def ensure_zones_geojson(data_dir: Path, force: bool = False) -> Path:
     """
-    Railway-safe approach:
-    - You upload /data/taxi_zones.geojson once (stored in the Railway volume).
+    Railway-safe:
+    - You upload /data/taxi_zones.geojson once into the Railway volume.
     - No geopandas/fiona/pyproj needed.
     """
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -45,7 +45,28 @@ def build_hotspots_json(
     bin_minutes: int = 20,
     min_trips_per_window: int = 10,
 ) -> None:
-    # Load zone geometry (LocationID -> geometry)
+    """
+    Output schema:
+    {
+      "timeline": ["YYYY-MM-DDTHH:MM:SS", ...],
+      "frames": [
+        {
+          "time": "...",
+          "polygons": { "type":"FeatureCollection", "features":[...Feature...] }
+        }
+      ]
+    }
+
+    Each Feature properties:
+      LocationID, rating (1-100), pickups, avg_driver_pay, style{...}
+
+    Scoring:
+      - 80% Busy (pickups)
+      - 20% Driver Pay (avg_driver_pay)
+      - Tips NOT used
+    """
+
+    # Load zone geometry
     zones = json.loads(zones_geojson_path.read_text(encoding="utf-8"))
     geom_by_id: Dict[int, Any] = {}
 
@@ -68,14 +89,14 @@ def build_hotspots_json(
     parquet_list = [str(p) for p in parquet_files]
     parquet_sql = ", ".join("'" + p.replace("'", "''") + "'" for p in parquet_list)
 
-    # DuckDB does everything: aggregate + normalize + rating (1..100)
+    # DuckDB: aggregate + normalize + rating (1..100)
+    # Tips removed entirely from scoring.
     sql = f"""
     WITH base AS (
       SELECT
         CAST(PULocationID AS INTEGER) AS PULocationID,
         pickup_datetime,
-        TRY_CAST(driver_pay AS DOUBLE) AS driver_pay,
-        TRY_CAST(tips AS DOUBLE) AS tips
+        TRY_CAST(driver_pay AS DOUBLE) AS driver_pay
       FROM read_parquet([{parquet_sql}])
       WHERE PULocationID IS NOT NULL AND pickup_datetime IS NOT NULL
     ),
@@ -85,8 +106,7 @@ def build_hotspots_json(
         CAST(EXTRACT('dow' FROM pickup_datetime) AS INTEGER) AS dow_i,  -- 0=Sun..6=Sat
         CAST(EXTRACT('hour' FROM pickup_datetime) AS INTEGER) AS hour_i,
         CAST(EXTRACT('minute' FROM pickup_datetime) AS INTEGER) AS minute_i,
-        driver_pay,
-        tips
+        driver_pay
       FROM base
     ),
     binned AS (
@@ -94,8 +114,7 @@ def build_hotspots_json(
         PULocationID,
         CASE WHEN dow_i = 0 THEN 6 ELSE dow_i - 1 END AS dow_m,  -- Mon=0..Sun=6
         CAST(FLOOR((hour_i*60 + minute_i) / {int(bin_minutes)}) * {int(bin_minutes)} AS INTEGER) AS bin_start_min,
-        driver_pay,
-        tips
+        driver_pay
       FROM t
     ),
     agg AS (
@@ -104,8 +123,7 @@ def build_hotspots_json(
         dow_m,
         bin_start_min,
         COUNT(*) AS pickups,
-        AVG(driver_pay) AS avg_driver_pay,
-        AVG(tips) AS avg_tips
+        AVG(driver_pay) AS avg_driver_pay
       FROM binned
       GROUP BY 1,2,3
       HAVING COUNT(*) >= {int(min_trips_per_window)}
@@ -116,9 +134,7 @@ def build_hotspots_json(
         MIN(pickups) OVER (PARTITION BY dow_m, bin_start_min) AS min_pickups,
         MAX(pickups) OVER (PARTITION BY dow_m, bin_start_min) AS max_pickups,
         MIN(avg_driver_pay) OVER (PARTITION BY dow_m, bin_start_min) AS min_pay,
-        MAX(avg_driver_pay) OVER (PARTITION BY dow_m, bin_start_min) AS max_pay,
-        MIN(avg_tips) OVER (PARTITION BY dow_m, bin_start_min) AS min_tips,
-        MAX(avg_tips) OVER (PARTITION BY dow_m, bin_start_min) AS max_tips
+        MAX(avg_driver_pay) OVER (PARTITION BY dow_m, bin_start_min) AS max_pay
       FROM agg
     ),
     scored AS (
@@ -128,7 +144,6 @@ def build_hotspots_json(
         bin_start_min,
         pickups,
         avg_driver_pay,
-        avg_tips,
 
         CASE
           WHEN max_pickups IS NULL OR min_pickups IS NULL OR max_pickups = min_pickups THEN 0.0
@@ -138,12 +153,7 @@ def build_hotspots_json(
         CASE
           WHEN max_pay IS NULL OR min_pay IS NULL OR max_pay = min_pay THEN 0.0
           ELSE (avg_driver_pay - min_pay) * 1.0 / (max_pay - min_pay)
-        END AS pay_n,
-
-        CASE
-          WHEN max_tips IS NULL OR min_tips IS NULL OR max_tips = min_tips THEN 0.0
-          ELSE (avg_tips - min_tips) * 1.0 / (max_tips - min_tips)
-        END AS tip_n
+        END AS pay_n
       FROM mm
     )
     SELECT
@@ -152,8 +162,15 @@ def build_hotspots_json(
       bin_start_min,
       pickups,
       avg_driver_pay,
-      avg_tips,
-      CAST(ROUND(1 + 99 * LEAST(GREATEST((0.60*vol_n + 0.30*pay_n + 0.10*tip_n), 0.0), 1.0)) AS INTEGER) AS rating
+      CAST(
+        ROUND(
+          1 + 99 * LEAST(
+            GREATEST((0.80*vol_n + 0.20*pay_n), 0.0),
+            1.0
+          )
+        )
+        AS INTEGER
+      ) AS rating
     FROM scored;
     """
 
@@ -161,7 +178,7 @@ def build_hotspots_json(
     if not rows:
         raise RuntimeError("No data after filtering. Lower min_trips_per_window.")
 
-    # Group rows by (dow_m, bin_start_min)
+    # rows: (PULocationID, dow_m, bin_start_min, pickups, avg_driver_pay, rating)
     by_window: Dict[Tuple[int, int], list] = {}
     for r in rows:
         zid = int(r[0])
@@ -169,14 +186,13 @@ def build_hotspots_json(
         bin_start_min = int(r[2])
         pickups = int(r[3])
         avg_pay = r[4]   # can be None
-        avg_tip = r[5]   # can be None
-        rating = int(r[6])
+        rating = int(r[5])
 
         by_window.setdefault((dow_m, bin_start_min), []).append(
-            (zid, pickups, avg_pay, avg_tip, rating)
+            (zid, pickups, avg_pay, rating)
         )
 
-    # Baseline week (typical week pattern). Frontend matches by day/time-of-week.
+    # Baseline week (typical week pattern)
     week_start = datetime(2025, 1, 6, 0, 0, 0)  # Monday
     timeline: List[str] = []
     frames: List[Dict[str, Any]] = []
@@ -189,7 +205,7 @@ def build_hotspots_json(
         ts_iso = ts.strftime("%Y-%m-%dT%H:%M:%S")
 
         feats = []
-        for (zid, pickups, avg_pay, avg_tip, rating) in by_window[(dow_m, bin_start_min)]:
+        for (zid, pickups, avg_pay, rating) in by_window[(dow_m, bin_start_min)]:
             geom = geom_by_id.get(zid)
             if not geom:
                 continue
@@ -204,9 +220,9 @@ def build_hotspots_json(
                     "rating": int(rating),
                     "pickups": int(pickups),
                     "avg_driver_pay": None if avg_pay is None else float(avg_pay),
-                    "avg_tips": None if avg_tip is None else float(avg_tip),
+                    "avg_tips": None,  # kept for popup compatibility (tips not used)
                     "style": {
-                        # ✅ no outlines + stronger fill so colors look correct on phone
+                        # No outlines + strong fill for iPhone visibility
                         "color": fill,
                         "opacity": 0,
                         "weight": 0,
