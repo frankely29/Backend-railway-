@@ -15,15 +15,30 @@ def ensure_zones_geojson(data_dir: Path, force: bool = False) -> Path:
     raise RuntimeError("Missing /data/taxi_zones.geojson. Upload it via POST /upload_zones_geojson.")
 
 
-def color_bucket_from_rating(rating: int) -> str:
+def bucket_name_from_rating(rating: int) -> str:
     r = int(rating)
     if r >= 80:
-        return "#00b050"  # Green
+        return "green"   # Best
     if r >= 60:
-        return "#0066ff"  # Blue
+        return "blue"    # Medium
     if r >= 40:
-        return "#66ccff"  # Sky
-    return "#e60000"      # Red
+        return "sky"     # Normal
+    if r >= 30:
+        return "yellow"  # Below Normal
+    return "red"         # Avoid
+
+
+def color_from_bucket(bucket: str) -> str:
+    # Fixed hex colors
+    if bucket == "green":
+        return "#00b050"
+    if bucket == "blue":
+        return "#0066ff"
+    if bucket == "sky":
+        return "#66ccff"
+    if bucket == "yellow":
+        return "#ffd400"
+    return "#e60000"
 
 
 def build_hotspots_frames(
@@ -33,6 +48,16 @@ def build_hotspots_frames(
     bin_minutes: int = 20,
     min_trips_per_window: int = 25,
 ) -> Dict[str, Any]:
+    """
+    Writes frames to disk:
+      /data/frames/timeline.json
+      /data/frames/frame_000000.json ... etc
+
+    Adds:
+      - Yellow bucket (Below Normal)
+      - eta_minutes per zone/window (activity interval proxy)
+      - summary counts per frame (green/blue/sky/yellow/red)
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Load zone geometry (LocationID -> geometry)
@@ -50,7 +75,7 @@ def build_hotspots_frames(
         geom_by_id[zid_int] = f.get("geometry")
 
     if not geom_by_id:
-        raise RuntimeError("taxi_zones.geojson missing usable LocationID geometry.")
+        raise RuntimeError("taxi_zones.geojson missing usable properties.LocationID geometry.")
 
     # DuckDB spill-to-disk on Railway volume
     tmp_dir = out_dir.parent / "duckdb_tmp"
@@ -63,10 +88,10 @@ def build_hotspots_frames(
     parquet_list = [str(p) for p in parquet_files]
     parquet_sql = ", ".join("'" + p.replace("'", "''") + "'" for p in parquet_list)
 
-    # ✅ More realistic, still factual:
+    # ✅ Realistic scoring (still factual):
     # - log1p pickups to reduce domination
-    # - baseline per-zone score (so "bad zones can have good moments" if real)
-    # - confidence scaling (prevents noise spikes from turning green)
+    # - baseline per-zone score
+    # - confidence scaling (reduces noise spikes)
     sql = f"""
     WITH base AS (
       SELECT
@@ -199,7 +224,6 @@ def build_hotspots_frames(
     ORDER BY dow_m, bin_start_min, PULocationID;
     """
 
-    # Stream rows in batches (prevents RAM spikes)
     cur = con.execute(sql)
 
     week_start = datetime(2025, 1, 6, 0, 0, 0)  # Monday baseline
@@ -209,21 +233,27 @@ def build_hotspots_frames(
     current_key: Tuple[int, int] | None = None
     current_features: List[Dict[str, Any]] = []
     current_time_iso: str | None = None
+    current_summary = {"green": 0, "blue": 0, "sky": 0, "yellow": 0, "red": 0}
 
     def flush_frame():
-        nonlocal frame_count, current_features, current_time_iso
+        nonlocal frame_count, current_features, current_time_iso, current_summary
         if current_time_iso is None:
             return
+
         timeline.append(current_time_iso)
+
         frame_path = out_dir / f"frame_{frame_count:06d}.json"
         payload = {
             "time": current_time_iso,
+            "summary": current_summary,  # ✅ counts per color bucket for this frame
             "polygons": {"type": "FeatureCollection", "features": current_features},
         }
         frame_path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+
         frame_count += 1
         current_features = []
         current_time_iso = None
+        current_summary = {"green": 0, "blue": 0, "sky": 0, "yellow": 0, "red": 0}
 
     total_rows = 0
     any_rows = False
@@ -253,14 +283,24 @@ def build_hotspots_frames(
             if not geom:
                 continue
 
-            fill = color_bucket_from_rating(int(rating))
+            r = int(rating)
+            bucket = bucket_name_from_rating(r)
+            fill = color_from_bucket(bucket)
+            current_summary[bucket] += 1
+
+            p = int(pickups)
+            # ETA proxy: average minutes between pickups in this zone+window
+            eta_min = int(max(1, min(60, round(bin_minutes / max(1, p)))))
+
             current_features.append({
                 "type": "Feature",
                 "geometry": geom,
                 "properties": {
                     "LocationID": int(zid),
-                    "rating": int(rating),
-                    "pickups": int(pickups),
+                    "rating": r,
+                    "bucket": bucket,
+                    "pickups": p,
+                    "eta_minutes": eta_min,
                     "avg_driver_pay": None if avg_pay is None else float(avg_pay),
                     "avg_tips": None,
                     "style": {
