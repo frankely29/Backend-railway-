@@ -3,72 +3,27 @@ from __future__ import annotations
 from pathlib import Path
 from typing import List, Dict, Any
 from datetime import datetime, timedelta
-import zipfile
 import json
 
 import duckdb
 import pandas as pd
-import geopandas as gpd
-import requests
-
-
-# Official NYC TLC taxi zones (same dataset you were using before)
-TAXI_ZONES_ZIP_URL = "https://d37ci6vzurychx.cloudfront.net/misc/taxi_zones.zip"
 
 
 def ensure_zones_geojson(data_dir: Path, force: bool = False) -> Path:
     """
-    Downloads taxi_zones.zip and converts it to /data/taxi_zones.geojson
-    Runs once and then stays persistent in the Railway Volume.
+    We DO NOT download/convert shapefiles on Railway (geo deps break deploy).
+    Instead: you upload /data/taxi_zones.geojson one time.
     """
     data_dir.mkdir(parents=True, exist_ok=True)
     geojson_path = data_dir / "taxi_zones.geojson"
     if geojson_path.exists() and geojson_path.stat().st_size > 0 and not force:
         return geojson_path
-
-    zip_path = data_dir / "taxi_zones.zip"
-    if (not zip_path.exists()) or zip_path.stat().st_size == 0 or force:
-        r = requests.get(TAXI_ZONES_ZIP_URL, timeout=120)
-        r.raise_for_status()
-        zip_path.write_bytes(r.content)
-
-    extract_dir = data_dir / "taxi_zones_extracted"
-    extract_dir.mkdir(parents=True, exist_ok=True)
-
-    # Extract zip
-    with zipfile.ZipFile(zip_path, "r") as zf:
-        zf.extractall(extract_dir)
-
-    shp_files = list(extract_dir.rglob("*.shp"))
-    if not shp_files:
-        raise RuntimeError("Could not find .shp after extracting taxi_zones.zip")
-
-    # Read shapefile, convert to WGS84, write GeoJSON
-    gdf = gpd.read_file(shp_files[0])
-    if "LocationID" not in gdf.columns:
-        # some versions have different casing
-        low = {c.lower(): c for c in gdf.columns}
-        if "locationid" in low:
-            gdf = gdf.rename(columns={low["locationid"]: "LocationID"})
-        else:
-            raise RuntimeError(f"Shapefile missing LocationID column. Columns: {list(gdf.columns)}")
-
-    if gdf.crs is None:
-        gdf = gdf.set_crs("EPSG:4326", allow_override=True)
-    gdf = gdf.to_crs(epsg=4326)
-
-    geojson_path.write_text(gdf.to_json(), encoding="utf-8")
-    return geojson_path
+    raise RuntimeError(
+        "Missing /data/taxi_zones.geojson. Upload it first via POST /upload_zones_geojson."
+    )
 
 
 def color_bucket_from_rating(rating: int) -> str:
-    """
-    STRICT mandatory rules:
-      Green = Best
-      Blue = Medium
-      Sky = Normal
-      Red = Avoid
-    """
     r = int(rating)
     if r >= 80:
         return "#00b050"  # Green
@@ -86,23 +41,7 @@ def build_hotspots_json(
     bin_minutes: int = 20,
     min_trips_per_window: int = 10,
 ) -> None:
-    """
-    Output schema (stable):
-    {
-      "timeline": ["YYYY-MM-DDTHH:MM:SS", ...],
-      "frames": [
-        {
-          "time": "...",
-          "polygons": { "type":"FeatureCollection", "features":[...Feature...] }
-        }
-      ]
-    }
-
-    Each Feature has:
-      properties: { LocationID, rating (1–100), pickups, avg_driver_pay, avg_tips, style{fillColor...} }
-    """
-
-    # Load zone geometry
+    # Load zone geometry from geojson
     zones = json.loads(zones_geojson_path.read_text(encoding="utf-8"))
     geom_by_id: Dict[int, Any] = {}
 
@@ -125,7 +64,6 @@ def build_hotspots_json(
     parquet_list = [str(p) for p in parquet_files]
     parquet_sql = ", ".join("'" + p.replace("'", "''") + "'" for p in parquet_list)
 
-    # Aggregate pickups/pay/tips per (dow, 20-min bin, zone)
     sql = f"""
     WITH base AS (
       SELECT
@@ -171,11 +109,9 @@ def build_hotspots_json(
     if df.empty:
         raise RuntimeError("No data after filtering. Lower min_trips_per_window.")
 
-    # Convert dow to Monday=0..Sunday=6
     df["dow_i"] = df["dow_i"].astype(int)
-    df["dow_m"] = df["dow_i"].apply(lambda d: 6 if d == 0 else d - 1)
+    df["dow_m"] = df["dow_i"].apply(lambda d: 6 if d == 0 else d - 1)  # Mon=0..Sun=6
 
-    # Score per window using minmax normalization across zones in same window
     def minmax(series: pd.Series) -> pd.Series:
         s = pd.to_numeric(series, errors="coerce")
         mn = s.min(skipna=True)
@@ -191,7 +127,6 @@ def build_hotspots_json(
     df["score01"] = (0.60 * df["vol_n"]) + (0.30 * df["pay_n"]) + (0.10 * df["tip_n"])
     df["rating"] = (1 + (99 * df["score01"].clip(0, 1))).round().astype(int)
 
-    # Build frames
     week_start = datetime(2025, 1, 6, 0, 0, 0)  # Monday baseline
     timeline: List[str] = []
     frames: List[Dict[str, Any]] = []
@@ -224,7 +159,7 @@ def build_hotspots_json(
                     "avg_tips": None if pd.isna(r["avg_tips"]) else float(r["avg_tips"]),
                     "style": {
                         "color": fill,
-                        "weight": 0,           # NO OUTLINE (you said you don’t want it)
+                        "weight": 0,
                         "fillColor": fill,
                         "fillOpacity": 0.55
                     }
