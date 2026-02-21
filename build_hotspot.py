@@ -1,207 +1,197 @@
-import os
-import json
-from datetime import datetime, timezone
+from pathlib import Path
+from typing import List
+from datetime import datetime, timedelta
 
 import duckdb
+import pandas as pd
+import json
 
-# Strict bucket colors (MANDATORY)
-COLOR_GREEN = "#00b050"   # Best
-COLOR_BLUE  = "#1f5cff"   # Medium
-COLOR_SKY   = "#66ccff"   # Normal
-COLOR_RED   = "#e60000"   # Avoid
 
-def ensure_taxi_zones_geojson(data_dir: str):
-    # We do not auto-download here; you upload once to /data
-    # Expected path:
-    # /data/taxi_zones.geojson
-    return
+def clamp01(x: float) -> float:
+    return max(0.0, min(1.0, float(x)))
 
-def _read_taxi_zones_geojson(path: str):
-    with open(path, "r", encoding="utf-8") as f:
-        gj = json.load(f)
 
-    feats = gj.get("features", [])
-    if not feats:
-        raise RuntimeError("taxi_zones.geojson has no features")
+def lerp(a: float, b: float, t: float) -> float:
+    return a + (b - a) * t
 
-    zone_by_id = {}
-    for ft in feats:
-        props = ft.get("properties") or {}
-        loc = (
-            props.get("LocationID")
-            or props.get("location_id")
-            or props.get("locationid")
-            or props.get("OBJECTID")
-            or props.get("objectid")
-        )
-        if loc is None:
-            continue
-        try:
-            loc = int(loc)
-        except:
-            continue
-        zone_by_id[loc] = ft
 
-    if not zone_by_id:
-        raise RuntimeError("Could not find LocationID in taxi_zones.geojson properties")
+def score_to_color_bucket(rating: int) -> str:
+    """
+    Your strict rules:
+    Green = Best
+    Blue = Medium
+    Sky = Normal
+    Red = Avoid
+    """
+    r = int(rating)
+    if r >= 75:
+        return "#00b050"  # green
+    if r >= 55:
+        return "#0066ff"  # blue
+    if r >= 35:
+        return "#66ccff"  # sky
+    return "#e60000"      # red
 
-    return gj, zone_by_id
 
-def _bucket_color(rating: int, normal_lo: int, medium_lo: int, best_lo: int) -> str:
-    if rating < normal_lo:
-        return COLOR_RED
-    if rating < medium_lo:
-        return COLOR_SKY
-    if rating < best_lo:
-        return COLOR_BLUE
-    return COLOR_GREEN
-
-def build_hotspots(
-    data_dir: str,
-    taxi_zones_geojson_path: str,
-    output_path: str,
+def build_hotspots_json(
+    parquet_files: List[Path],
+    out_path: Path,
     bin_minutes: int = 20,
     min_trips_per_window: int = 10,
-    normal_lo: int = 40,
-    medium_lo: int = 60,
-    best_lo: int = 80,
-):
-    # Load taxi zone geometry
-    _, zone_by_id = _read_taxi_zones_geojson(taxi_zones_geojson_path)
+) -> None:
+    """
+    Output JSON schema:
+      {
+        "timeline": [...iso...],
+        "frames": [
+          {
+            "time": "...iso...",
+            "polygons": { "type":"FeatureCollection", "features":[...] }
+          }
+        ]
+      }
 
-    # IMPORTANT: Match YOUR parquet naming
-    pattern = os.path.join(data_dir, "fhvhv_tripdata_*.parquet")
+    Requires zone geometry in: /data/taxi_zones.geojson
+    Each feature in taxi_zones.geojson must include:
+      properties.LocationID (or location_id) matching PULocationID.
+    """
+
+    data_dir = out_path.parent
+    zones_path = data_dir / "taxi_zones.geojson"
+    if not zones_path.exists():
+        raise RuntimeError("Missing /data/taxi_zones.geojson (needed to draw zone polygons).")
+
+    zones_geo = json.loads(zones_path.read_text(encoding="utf-8"))
+
+    # Map LocationID -> geometry
+    geom_by_id = {}
+    for f in zones_geo.get("features", []):
+        props = f.get("properties", {}) or {}
+        zid = props.get("LocationID", props.get("location_id", props.get("locationid")))
+        if zid is None:
+            continue
+        try:
+            zid = int(zid)
+        except Exception:
+            continue
+        geom_by_id[zid] = f.get("geometry")
+
+    if not geom_by_id:
+        raise RuntimeError("taxi_zones.geojson has no usable LocationID keys.")
 
     con = duckdb.connect(database=":memory:")
-    con.execute("PRAGMA threads=4;")
+    parquet_list = [str(p) for p in parquet_files]
+    parquet_sql = ", ".join("'" + p.replace("'", "''") + "'" for p in parquet_list)
 
-    # Assumes columns:
-    # pickup_datetime and PULocationID (standard for fhvhv_tripdata)
-    query = f"""
+    # Aggregate by DOW + 20-min bin + PULocationID
+    sql = f"""
     WITH base AS (
       SELECT
-        TRY_CAST(pickup_datetime AS TIMESTAMP) AS pickup_ts,
-        TRY_CAST(PULocationID AS INTEGER) AS pu
-      FROM read_parquet('{pattern}')
-      WHERE pickup_datetime IS NOT NULL AND PULocationID IS NOT NULL
+        CAST(PULocationID AS INTEGER) AS PULocationID,
+        pickup_datetime,
+        TRY_CAST(driver_pay AS DOUBLE) AS driver_pay,
+        TRY_CAST(tips AS DOUBLE) AS tips
+      FROM read_parquet([{parquet_sql}])
+      WHERE PULocationID IS NOT NULL AND pickup_datetime IS NOT NULL
+    ),
+    t AS (
+      SELECT
+        PULocationID,
+        EXTRACT('dow' FROM pickup_datetime) AS dow_i,
+        EXTRACT('hour' FROM pickup_datetime) AS hour_i,
+        EXTRACT('minute' FROM pickup_datetime) AS minute_i,
+        driver_pay,
+        tips
+      FROM base
     ),
     binned AS (
       SELECT
-        pu,
-        date_trunc('minute', pickup_ts)
-          - (EXTRACT(MINUTE FROM pickup_ts)::INTEGER % {int(bin_minutes)}) * INTERVAL 1 MINUTE AS bin_start,
-        COUNT(*) AS trips
-      FROM base
-      GROUP BY pu, bin_start
+        PULocationID,
+        CAST(dow_i AS INTEGER) AS dow_i,
+        CAST(FLOOR((hour_i*60 + minute_i) / {int(bin_minutes)}) * {int(bin_minutes)} AS INTEGER) AS bin_start_min,
+        driver_pay,
+        tips
+      FROM t
     )
-    SELECT bin_start, pu, trips
+    SELECT
+      PULocationID,
+      dow_i,
+      bin_start_min,
+      COUNT(*) AS pickups,
+      AVG(driver_pay) AS avg_driver_pay,
+      AVG(tips) AS avg_tips
     FROM binned
-    ORDER BY bin_start, pu
+    GROUP BY 1,2,3
+    HAVING COUNT(*) >= {int(min_trips_per_window)};
     """
-    rows = con.execute(query).fetchall()
 
-    windows = {}
-    for bin_start, pu, trips in rows:
-        if bin_start is None or pu is None:
-            continue
-        key = bin_start.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
-        windows.setdefault(key, []).append((int(pu), int(trips)))
+    df = con.execute(sql).df()
+    if df.empty:
+        raise RuntimeError("No rows after filtering. Try lower min_trips_per_window.")
 
-    timeline = sorted(windows.keys())
+    # Normalize DOW: Mon=0..Sun=6 (convert from DuckDB: Sun=0..Sat=6)
+    df["dow_i"] = df["dow_i"].astype(int)
+    df["dow_m"] = df["dow_i"].apply(lambda d: 6 if d == 0 else d - 1)
+
+    # Score per window
+    def minmax(series: pd.Series) -> pd.Series:
+        s = pd.to_numeric(series, errors="coerce")
+        mn = s.min(skipna=True)
+        mx = s.max(skipna=True)
+        if pd.isna(mn) or pd.isna(mx) or mx == mn:
+            return pd.Series([0.0] * len(s), index=s.index)
+        return (s - mn) / (mx - mn)
+
+    df["vol_n"] = df.groupby(["dow_m", "bin_start_min"])["pickups"].transform(minmax)
+    df["pay_n"] = df.groupby(["dow_m", "bin_start_min"])["avg_driver_pay"].transform(minmax)
+    df["tip_n"] = df.groupby(["dow_m", "bin_start_min"])["avg_tips"].transform(minmax)
+
+    df["score01"] = 0.60 * df["vol_n"] + 0.30 * df["pay_n"] + 0.10 * df["tip_n"]
+    df["rating"] = (1 + (99 * df["score01"].clip(0, 1))).round().astype(int)
+
+    # Build timeline frames
+    week_start = datetime(2025, 1, 6, 0, 0, 0)  # Monday
     frames = []
+    timeline = []
 
-    for t in timeline:
-        zone_trips = windows[t]  # [(zone_id, trips)]
+    for (dow_m, bin_start_min), g in df.groupby(["dow_m", "bin_start_min"]):
+        hour = int(bin_start_min // 60)
+        minute = int(bin_start_min % 60)
 
-        filtered = [(z, c) for (z, c) in zone_trips if c >= min_trips_per_window]
-        if not filtered:
-            min_c, max_c = 0, 0
-        else:
-            counts = [c for _, c in filtered]
-            min_c, max_c = min(counts), max(counts)
+        ts = week_start + timedelta(days=int(dow_m), hours=hour, minutes=minute)
+        ts_iso = ts.strftime("%Y-%m-%dT%H:%M:%S")
 
-        def to_rating(count: int) -> int:
-            # If zone has too few trips, treat it as lowest bucket
-            if count < min_trips_per_window:
-                return 1
-            if max_c <= min_c:
-                return 50
-            x = (count - min_c) / (max_c - min_c)
-            r = int(round(1 + x * 99))
-            return max(1, min(100, r))
+        features = []
+        for _, r in g.iterrows():
+            zid = int(r["PULocationID"])
+            geom = geom_by_id.get(zid)
+            if not geom:
+                continue
 
-        # Build the polygons for THIS time window
-        out_features = []
-        for zone_id, ft in zone_by_id.items():
-            count = 0
-            for z, c in zone_trips:
-                if z == zone_id:
-                    count = c
-                    break
+            rating = int(r["rating"])
+            fill = score_to_color_bucket(rating)
 
-            rating = to_rating(count)
-            fill = _bucket_color(rating, normal_lo, medium_lo, best_lo)
-
-            props = dict(ft.get("properties") or {})
-            props["zone_id"] = zone_id
-            props["trips"] = count
-            props["rating"] = rating
-            props["bucket"] = (
-                "Best" if fill == COLOR_GREEN else
-                "Medium" if fill == COLOR_BLUE else
-                "Normal" if fill == COLOR_SKY else
-                "Avoid"
-            )
-
-            # No confusing outlines: border == fill color
-            props["style"] = {
-                "color": fill,
-                "weight": 1,
-                "opacity": 0.9,
-                "fillColor": fill,
-                "fillOpacity": 0.45,
-            }
-
-            zone_name = props.get("zone") or props.get("Zone") or props.get("ZONE") or "Zone"
-            borough = props.get("borough") or props.get("Borough") or ""
-            props["popup"] = (
-                f"<b>{zone_name}</b><br>"
-                f"{borough}<br>"
-                f"<b>Trips:</b> {count}<br>"
-                f"<b>Rating:</b> {rating}/100<br>"
-                f"<b>Level:</b> {props['bucket']}"
-            )
-
-            out_features.append({
+            features.append({
                 "type": "Feature",
-                "geometry": ft.get("geometry"),
-                "properties": props
+                "geometry": geom,
+                "properties": {
+                    "LocationID": zid,
+                    "rating": rating,
+                    "pickups": int(r["pickups"]),
+                    "avg_driver_pay": None if pd.isna(r["avg_driver_pay"]) else float(r["avg_driver_pay"]),
+                    "avg_tips": None if pd.isna(r["avg_tips"]) else float(r["avg_tips"]),
+                    "style": {
+                        "color": fill,
+                        "weight": 0,          # no outlines
+                        "fillColor": fill,
+                        "fillOpacity": 0.55
+                    }
+                }
             })
 
-        frames.append({
-            "time": t,
-            "polygons": {"type": "FeatureCollection", "features": out_features}
-        })
+        fc = {"type": "FeatureCollection", "features": features}
+        frames.append({"time": ts_iso, "polygons": fc})
+        timeline.append(ts_iso)
 
-    payload = {
-        "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        "bin_minutes": bin_minutes,
-        "min_trips_per_window": min_trips_per_window,
-        "thresholds": {
-            "normal_lo": normal_lo,
-            "medium_lo": medium_lo,
-            "best_lo": best_lo
-        },
-        "timeline": timeline,
-        "frames": frames
-    }
-
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f)
-
-    return {
-        "timeline_steps": len(timeline),
-        "frames": len(frames),
-        "generated_at": payload["generated_at"],
-        "pattern": pattern
-    }
+    out = {"timeline": timeline, "frames": frames}
+    out_path.write_text(json.dumps(out, separators=(",", ":")), encoding="utf-8")
