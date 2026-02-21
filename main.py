@@ -4,15 +4,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from pathlib import Path
 import traceback
 import json
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
-from build_hotspot import (
-    ensure_zones_geojson,
-    build_hotspots_json,
-)
+from build_hotspot import ensure_zones_geojson, build_hotspots_json
 
 app = FastAPI()
 
+# CORS so GitHub Pages + iPhone Safari can call Railway
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -25,24 +23,18 @@ DATA_DIR = Path("/data")
 ZONES_GEOJSON = DATA_DIR / "taxi_zones.geojson"
 OUT_PATH = DATA_DIR / "hotspots_20min.json"
 
-# ----------------------------
-# Simple cache for hotspots_20min.json
-# ----------------------------
 _cache_mtime: Optional[float] = None
 _cache_payload: Optional[Dict[str, Any]] = None
 
 
 def _load_hotspots_cached() -> Dict[str, Any]:
     global _cache_mtime, _cache_payload
-
     if not OUT_PATH.exists():
         raise FileNotFoundError("hotspots_20min.json not generated yet")
-
     mtime = OUT_PATH.stat().st_mtime
     if _cache_payload is None or _cache_mtime != mtime:
         _cache_payload = json.loads(OUT_PATH.read_text(encoding="utf-8"))
         _cache_mtime = mtime
-
     return _cache_payload
 
 
@@ -96,7 +88,7 @@ async def upload_zones_geojson(file: UploadFile = File(...)):
 def _generate_impl(bin_minutes: int = 20, min_trips_per_window: int = 10):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    # zones must exist (uploaded once)
+    # zones must exist in volume
     ensure_zones_geojson(DATA_DIR, force=False)
 
     parquets = sorted(DATA_DIR.glob("fhvhv_tripdata_*.parquet"))
@@ -114,11 +106,7 @@ def _generate_impl(bin_minutes: int = 20, min_trips_per_window: int = 10):
         min_trips_per_window=min_trips_per_window,
     )
 
-    return {
-        "ok": True,
-        "output": OUT_PATH.name,
-        "size_mb": round(OUT_PATH.stat().st_size / 1024 / 1024, 2),
-    }
+    return {"ok": True, "output": OUT_PATH.name, "size_mb": round(OUT_PATH.stat().st_size / 1024 / 1024, 2)}
 
 
 @app.post("/generate")
@@ -137,10 +125,7 @@ def generate_get(bin_minutes: int = 20, min_trips_per_window: int = 10):
         return JSONResponse({"error": str(e), "trace": traceback.format_exc()}, status_code=500)
 
 
-# ----------------------------
-# Railway-only data endpoints for the frontend
-# ----------------------------
-
+# ✅ Railway-only endpoints used by the frontend
 @app.get("/timeline")
 def timeline():
     try:
@@ -167,12 +152,9 @@ def frame(idx: int):
         return JSONResponse({"error": str(e), "trace": traceback.format_exc()}, status_code=500)
 
 
-# Keep this for compatibility (optional)
+# optional compatibility endpoint
 @app.get("/hotspots_20min.json")
 def get_hotspots():
     if not OUT_PATH.exists():
-        return JSONResponse(
-            {"error": "hotspots_20min.json not generated yet. Call /generate first."},
-            status_code=404,
-        )
+        return JSONResponse({"error": "hotspots_20min.json not generated yet. Call /generate first."}, status_code=404)
     return FileResponse(str(OUT_PATH), media_type="application/json", filename="hotspots_20min.json")
