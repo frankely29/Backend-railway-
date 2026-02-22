@@ -18,16 +18,16 @@ def ensure_zones_geojson(data_dir: Path, force: bool = False) -> Path:
 def bucket_and_color_from_rating(rating: int) -> tuple[str, str]:
     """
     STRICT bucket order requested:
-      Green = Highest
+      Green  = Highest
       Purple = High
-      Blue = Medium
-      Sky = Normal
+      Blue   = Medium
+      Sky    = Normal
       Yellow = Below Normal
-      Red = Very Low / Avoid
+      Red    = Very Low / Avoid
     """
     r = int(rating)
 
-    # You can change thresholds later, but these are stable and easy to reason about.
+    # Stable fixed thresholds. You can tune later.
     if r >= 90:
         return "green", "#00b050"
     if r >= 80:
@@ -51,18 +51,25 @@ def build_hotspots_frames(
     """
     Writes:
       /data/frames/timeline.json
-      /data/frames/frame_000000.json ... frame_000503.json
+      /data/frames/frame_000000.json ... etc
 
     Each frame contains:
-      - time (bucket label)
+      - time
       - polygons FeatureCollection
-      - each feature has: LocationID, rating, bucket, pickups, avg_driver_pay, style(fillColor)
+      - each feature has:
+          LocationID, zone_name, borough, rating, bucket, pickups, avg_driver_pay, style(fillColor)
     """
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load zone geometry (LocationID -> geometry)
+    # ----------------------------
+    # Load zone geometry + names
+    # ----------------------------
     zones = json.loads(zones_geojson_path.read_text(encoding="utf-8"))
+
     geom_by_id: Dict[int, Any] = {}
+    name_by_id: Dict[int, str] = {}
+    borough_by_id: Dict[int, str] = {}
+
     for f in zones.get("features", []):
         props = f.get("properties") or {}
         zid = props.get("LocationID")
@@ -72,12 +79,24 @@ def build_hotspots_frames(
             zid_int = int(zid)
         except Exception:
             continue
-        geom_by_id[zid_int] = f.get("geometry")
+
+        geom = f.get("geometry")
+        if geom:
+            geom_by_id[zid_int] = geom
+
+        # Common TLC fields: zone + borough (sometimes different casing)
+        zone_name = props.get("zone") or props.get("Zone") or props.get("name") or props.get("Name") or ""
+        borough = props.get("borough") or props.get("Borough") or props.get("boro") or props.get("Boro") or ""
+
+        name_by_id[zid_int] = str(zone_name) if zone_name is not None else ""
+        borough_by_id[zid_int] = str(borough) if borough is not None else ""
 
     if not geom_by_id:
         raise RuntimeError("taxi_zones.geojson missing usable properties.LocationID geometry.")
 
-    # DuckDB spill-to-disk on Railway volume
+    # ----------------------------
+    # DuckDB (spill to volume)
+    # ----------------------------
     tmp_dir = out_dir.parent / "duckdb_tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
@@ -89,11 +108,10 @@ def build_hotspots_frames(
     parquet_sql = ", ".join("'" + p.replace("'", "''") + "'" for p in parquet_list)
 
     # Rating logic:
-    # - Demand weight is mostly pickups (busy)
-    # - Smaller weight driver_pay
+    # - mostly "busy" (pickups), smaller "driver_pay" weight
     # - log1p pickups to reduce domination
-    # - baseline per-zone score to keep "bad zones can have good moments" realistically
-    # - confidence scaling by pickups
+    # - baseline per-zone score so “bad” areas can still pop during certain windows
+    # - confidence scaling by pickup count
     sql = f"""
     WITH base AS (
       SELECT
@@ -228,7 +246,8 @@ def build_hotspots_frames(
 
     cur = con.execute(sql)
 
-    week_start = datetime(2025, 1, 6, 0, 0, 0)  # Monday baseline
+    # timeline labels (Mon-based week anchor)
+    week_start = datetime(2025, 1, 6, 0, 0, 0)  # Monday
     timeline: List[str] = []
     frame_count = 0
 
@@ -242,7 +261,6 @@ def build_hotspots_frames(
             return
 
         timeline.append(current_time_iso)
-
         frame_path = out_dir / f"frame_{frame_count:06d}.json"
         payload = {
             "time": current_time_iso,
@@ -278,7 +296,8 @@ def build_hotspots_frames(
             ts = week_start + timedelta(days=int(dow_m), hours=hour, minutes=minute)
             current_time_iso = ts.strftime("%Y-%m-%dT%H:%M:%S")
 
-            geom = geom_by_id.get(int(zid))
+            zid_i = int(zid)
+            geom = geom_by_id.get(zid_i)
             if not geom:
                 continue
 
@@ -289,7 +308,9 @@ def build_hotspots_frames(
                 "type": "Feature",
                 "geometry": geom,
                 "properties": {
-                    "LocationID": int(zid),
+                    "LocationID": zid_i,
+                    "zone_name": name_by_id.get(zid_i, ""),
+                    "borough": borough_by_id.get(zid_i, ""),
                     "rating": r,
                     "bucket": bucket,
                     "pickups": int(pickups),
