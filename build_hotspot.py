@@ -27,7 +27,6 @@ def bucket_and_color_from_rating(rating: int) -> tuple[str, str]:
     """
     r = int(rating)
 
-    # Stable fixed thresholds. You can tune later.
     if r >= 90:
         return "green", "#00b050"
     if r >= 80:
@@ -58,6 +57,10 @@ def build_hotspots_frames(
       - polygons FeatureCollection
       - each feature has:
           LocationID, zone_name, borough, rating, bucket, pickups, avg_driver_pay, style(fillColor)
+
+    IMPORTANT FIX:
+      Normalization is percentile-rank based per time window (NOT min/max),
+      so JFK/LGA won't flatten the rest of the city.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -84,7 +87,6 @@ def build_hotspots_frames(
         if geom:
             geom_by_id[zid_int] = geom
 
-        # Common TLC fields: zone + borough (sometimes different casing)
         zone_name = props.get("zone") or props.get("Zone") or props.get("name") or props.get("Name") or ""
         borough = props.get("borough") or props.get("Borough") or props.get("boro") or props.get("Boro") or ""
 
@@ -107,11 +109,13 @@ def build_hotspots_frames(
     parquet_list = [str(p) for p in parquet_files]
     parquet_sql = ", ".join("'" + p.replace("'", "''") + "'" for p in parquet_list)
 
-    # Rating logic:
-    # - mostly "busy" (pickups), smaller "driver_pay" weight
-    # - log1p pickups to reduce domination
-    # - baseline per-zone score so “bad” areas can still pop during certain windows
-    # - confidence scaling by pickup count
+    # ----------------------------
+    # SQL build
+    #
+    # - "busy" drives score (pickups) more than pay, as you requested.
+    # - Uses percentile rank per window instead of min/max so airports don't dominate.
+    # - Baseline per zone mixed in so "bad areas can have good moments" realistically.
+    # ----------------------------
     sql = f"""
     WITH base AS (
       SELECT
@@ -150,32 +154,31 @@ def build_hotspots_frames(
       HAVING COUNT(*) >= {int(min_trips_per_window)}
     ),
 
+    -- Percentile-rank normalization per window (avoids JFK/LGA outlier domination)
     win AS (
       SELECT
         *,
         LN(1 + pickups) AS log_pickups,
-        MIN(LN(1 + pickups)) OVER (PARTITION BY dow_m, bin_start_min) AS min_log_pickups,
-        MAX(LN(1 + pickups)) OVER (PARTITION BY dow_m, bin_start_min) AS max_log_pickups,
-        MIN(avg_driver_pay) OVER (PARTITION BY dow_m, bin_start_min) AS min_pay,
-        MAX(avg_driver_pay) OVER (PARTITION BY dow_m, bin_start_min) AS max_pay
+        ROW_NUMBER() OVER (PARTITION BY dow_m, bin_start_min ORDER BY LN(1 + pickups)) AS rn_pickups,
+        ROW_NUMBER() OVER (PARTITION BY dow_m, bin_start_min ORDER BY avg_driver_pay) AS rn_pay,
+        COUNT(*) OVER (PARTITION BY dow_m, bin_start_min) AS n_in_window
       FROM agg
     ),
     win_scored AS (
       SELECT
         PULocationID, dow_m, bin_start_min, pickups, avg_driver_pay,
-
         CASE
-          WHEN max_log_pickups IS NULL OR min_log_pickups IS NULL OR max_log_pickups = min_log_pickups THEN 0.0
-          ELSE (log_pickups - min_log_pickups) * 1.0 / (max_log_pickups - min_log_pickups)
+          WHEN n_in_window <= 1 THEN 0.0
+          ELSE (rn_pickups - 1) * 1.0 / (n_in_window - 1)
         END AS vol_n,
-
         CASE
-          WHEN max_pay IS NULL OR min_pay IS NULL OR max_pay = min_pay THEN 0.0
-          ELSE (avg_driver_pay - min_pay) * 1.0 / (max_pay - min_pay)
+          WHEN n_in_window <= 1 THEN 0.0
+          ELSE (rn_pay - 1) * 1.0 / (n_in_window - 1)
         END AS pay_n
       FROM win
     ),
 
+    -- Baseline per-zone score (historical average across all windows)
     zone_base AS (
       SELECT
         PULocationID,
@@ -215,9 +218,11 @@ def build_hotspots_frames(
         w.pickups,
         w.avg_driver_pay,
 
+        -- Your rule: mostly busy, some driver pay
         (0.85*w.vol_n + 0.15*w.pay_n) AS moment_score,
         (0.85*z.base_vol_n + 0.15*z.base_pay_n) AS base_score,
 
+        -- confidence: more pickups -> more trust in moment_score
         LEAST(1.0, w.pickups / 50.0) AS conf
       FROM win_scored w
       JOIN zone_norm z USING (PULocationID)
@@ -247,7 +252,7 @@ def build_hotspots_frames(
     cur = con.execute(sql)
 
     # timeline labels (Mon-based week anchor)
-    week_start = datetime(2025, 1, 6, 0, 0, 0)  # Monday
+    week_start = datetime(2025, 1, 6, 0, 0, 0)  # Monday anchor
     timeline: List[str] = []
     frame_count = 0
 
