@@ -58,9 +58,10 @@ def build_hotspots_frames(
       - each feature has:
           LocationID, zone_name, borough, rating, bucket, pickups, avg_driver_pay, style(fillColor)
 
-    IMPORTANT FIX:
-      Normalization is percentile-rank based per time window (NOT min/max),
-      so JFK/LGA won't flatten the rest of the city.
+    FACTS + REALISM GUARANTEE:
+      - Per-window normalization is percentile-rank based (NOT min/max), so airports cannot flatten the city.
+      - Baseline per-zone normalization is ALSO percentile-rank based (NOT global min/max),
+        so airports cannot compress baseline scores either.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -113,8 +114,10 @@ def build_hotspots_frames(
     # SQL build
     #
     # - "busy" drives score (pickups) more than pay, as you requested.
-    # - Uses percentile rank per window instead of min/max so airports don't dominate.
-    # - Baseline per zone mixed in so "bad areas can have good moments" realistically.
+    # - Per-window normalization uses percentile rank (no max/min) so airports don't dominate.
+    # - Baseline per-zone normalization ALSO uses percentile rank (no global min/max),
+    #   so airports cannot compress base_score either.
+    # - Confidence scales down low-sample windows (still data-driven).
     # ----------------------------
     sql = f"""
     WITH base AS (
@@ -154,7 +157,9 @@ def build_hotspots_frames(
       HAVING COUNT(*) >= {int(min_trips_per_window)}
     ),
 
-    -- Percentile-rank normalization per window (avoids JFK/LGA outlier domination)
+    -- ----------------------------
+    -- Per-window percentile-rank normalization (robust to airport outliers)
+    -- ----------------------------
     win AS (
       SELECT
         *,
@@ -178,7 +183,11 @@ def build_hotspots_frames(
       FROM win
     ),
 
-    -- Baseline per-zone score (historical average across all windows)
+    -- ----------------------------
+    -- Baseline per-zone (historical typical level)
+    -- IMPORTANT CHANGE: baseline normalization uses percentile ranks (NOT min/max)
+    -- so airports cannot compress baseline for all other zones.
+    -- ----------------------------
     zone_base AS (
       SELECT
         PULocationID,
@@ -187,27 +196,26 @@ def build_hotspots_frames(
       FROM agg
       GROUP BY 1
     ),
-    zone_mm AS (
+    zone_ranked AS (
       SELECT
         *,
-        MIN(base_log_pickups) OVER () AS min_base_log_pickups,
-        MAX(base_log_pickups) OVER () AS max_base_log_pickups,
-        MIN(base_pay) OVER () AS min_base_pay,
-        MAX(base_pay) OVER () AS max_base_pay
+        ROW_NUMBER() OVER (ORDER BY base_log_pickups) AS rn_base_pickups,
+        ROW_NUMBER() OVER (ORDER BY base_pay) AS rn_base_pay,
+        COUNT(*) OVER () AS n_zones
       FROM zone_base
     ),
     zone_norm AS (
       SELECT
         PULocationID,
         CASE
-          WHEN max_base_log_pickups IS NULL OR min_base_log_pickups IS NULL OR max_base_log_pickups = min_base_log_pickups THEN 0.0
-          ELSE (base_log_pickups - min_base_log_pickups) * 1.0 / (max_base_log_pickups - min_base_log_pickups)
+          WHEN n_zones <= 1 THEN 0.0
+          ELSE (rn_base_pickups - 1) * 1.0 / (n_zones - 1)
         END AS base_vol_n,
         CASE
-          WHEN max_base_pay IS NULL OR min_base_pay IS NULL OR max_base_pay = min_base_pay THEN 0.0
-          ELSE (base_pay - min_base_pay) * 1.0 / (max_base_pay - min_base_pay)
+          WHEN n_zones <= 1 THEN 0.0
+          ELSE (rn_base_pay - 1) * 1.0 / (n_zones - 1)
         END AS base_pay_n
-      FROM zone_mm
+      FROM zone_ranked
     ),
 
     final AS (
