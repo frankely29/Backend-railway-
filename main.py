@@ -5,11 +5,13 @@ import json
 import time
 import threading
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+
+import httpx
 
 from build_hotspot import ensure_zones_geojson, build_hotspots_frames
 
@@ -42,6 +44,29 @@ _generate_state: Dict[str, Any] = {
 }
 
 # ----------------------------
+# Context overlay cache (places/events) — separate from TLC data
+# ----------------------------
+_CONTEXT_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}  # key -> (expires_unix, payload)
+_CONTEXT_TTL_SEC = int(os.environ.get("CONTEXT_TTL_SEC", "600"))  # 10 minutes default
+
+
+def _cache_get(key: str) -> Optional[Dict[str, Any]]:
+    now = time.time()
+    hit = _CONTEXT_CACHE.get(key)
+    if not hit:
+        return None
+    exp, payload = hit
+    if now > exp:
+        _CONTEXT_CACHE.pop(key, None)
+        return None
+    return payload
+
+
+def _cache_set(key: str, payload: Dict[str, Any], ttl_sec: int = _CONTEXT_TTL_SEC) -> None:
+    _CONTEXT_CACHE[key] = (time.time() + ttl_sec, payload)
+
+
+# ----------------------------
 # App
 # ----------------------------
 app = FastAPI(title="NYC TLC Hotspot Backend", version="1.0")
@@ -64,18 +89,22 @@ def _list_parquets() -> List[Path]:
     # match your filenames like fhvhv_tripdata_2025-11.parquet
     return sorted([p for p in DATA_DIR.glob("*.parquet") if p.is_file()])
 
+
 def _has_frames() -> bool:
     try:
         return TIMELINE_PATH.exists() and TIMELINE_PATH.stat().st_size > 0
     except Exception:
         return False
 
+
 def _read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
+
 
 def _write_lock() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     LOCK_PATH.write_text(str(int(time.time())), encoding="utf-8")
+
 
 def _clear_lock() -> None:
     try:
@@ -84,16 +113,20 @@ def _clear_lock() -> None:
     except Exception:
         pass
 
+
 def _lock_is_present() -> bool:
     return LOCK_PATH.exists()
+
 
 def _set_state(**kwargs):
     with _state_lock:
         _generate_state.update(kwargs)
 
+
 def _get_state() -> Dict[str, Any]:
     with _state_lock:
         return dict(_generate_state)
+
 
 def _generate_worker(bin_minutes: int, min_trips_per_window: int) -> None:
     start = time.time()
@@ -151,6 +184,7 @@ def _generate_worker(bin_minutes: int, min_trips_per_window: int) -> None:
     finally:
         _clear_lock()
 
+
 def start_generate(bin_minutes: int, min_trips_per_window: int) -> Dict[str, Any]:
     # Avoid double runs
     st = _get_state()
@@ -171,6 +205,7 @@ def start_generate(bin_minutes: int, min_trips_per_window: int) -> Dict[str, Any
 
     return {"ok": True, "state": "started", "bin_minutes": bin_minutes, "min_trips_per_window": min_trips_per_window}
 
+
 # ----------------------------
 # Option A: Auto-generate ONCE if missing
 # ----------------------------
@@ -186,11 +221,13 @@ def auto_generate_if_missing():
         FRAMES_DIR.mkdir(parents=True, exist_ok=True)
 
         if _has_frames():
-            _set_state(state="done", result={"ok": True, "count": _read_json(TIMELINE_PATH).get("count")})
+            try:
+                tl = _read_json(TIMELINE_PATH)
+                _set_state(state="done", result={"ok": True, "count": tl.get("count")})
+            except Exception:
+                _set_state(state="done", result={"ok": True})
             return
 
-        # Only auto-run if we have the required inputs
-        # (zones + at least one parquet). If missing, stay idle and let user upload.
         zones_ok = (DATA_DIR / "taxi_zones.geojson").exists()
         parquets_ok = len(_list_parquets()) > 0
 
@@ -200,8 +237,136 @@ def auto_generate_if_missing():
             _set_state(state="idle")
 
     except Exception:
-        # Don't crash app on startup issues
         _set_state(state="idle")
+
+
+# ----------------------------
+# Context overlay fetchers (separate layer)
+# ----------------------------
+def _parse_bbox(bbox: str) -> Tuple[float, float, float, float]:
+    parts = [p.strip() for p in bbox.split(",")]
+    if len(parts) != 4:
+        raise ValueError("Expected bbox=minLng,minLat,maxLng,maxLat")
+    min_lng, min_lat, max_lng, max_lat = [float(x) for x in parts]
+    return (min_lng, min_lat, max_lng, max_lat)
+
+
+def _bbox_cache_key(min_lng: float, min_lat: float, max_lng: float, max_lat: float, types: str) -> str:
+    # Round to stabilize caching keys
+    return f"{round(min_lng,3)},{round(min_lat,3)},{round(max_lng,3)},{round(max_lat,3)}|{types}"
+
+
+async def fetch_ticketmaster_concerts(bbox_t: Tuple[float, float, float, float], limit: int = 80) -> List[Dict[str, Any]]:
+    api_key = os.getenv("TICKETMASTER_API_KEY", "").strip()
+    if not api_key:
+        return []
+
+    min_lng, min_lat, max_lng, max_lat = bbox_t
+    lat = (min_lat + max_lat) / 2.0
+    lng = (min_lng + max_lng) / 2.0
+
+    url = "https://app.ticketmaster.com/discovery/v2/events.json"
+    params = {
+        "apikey": api_key,
+        "latlong": f"{lat},{lng}",
+        "radius": "10",
+        "unit": "miles",
+        "size": str(limit),
+        "sort": "date,asc",
+        "classificationName": "music",
+    }
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.get(url, params=params)
+        if r.status_code != 200:
+            return []
+        data = r.json()
+
+    events = ((data.get("_embedded") or {}).get("events") or [])
+    items: List[Dict[str, Any]] = []
+
+    for ev in events:
+        name = ev.get("name") or ""
+        dates = ev.get("dates") or {}
+        start_dt = ((dates.get("start") or {}).get("dateTime"))  # UTC ISO string (if provided)
+
+        venues = (((ev.get("_embedded") or {}).get("venues")) or [])
+        venue = venues[0] if venues else {}
+        vname = venue.get("name") or ""
+        loc = (venue.get("location") or {})
+
+        try:
+            vlat = float(loc.get("latitude"))
+            vlng = float(loc.get("longitude"))
+        except Exception:
+            continue
+
+        items.append({
+            "type": "concert",
+            "name": name,
+            "venue": vname,
+            "lat": vlat,
+            "lng": vlng,
+            "start": start_dt,
+            "source": "ticketmaster",
+        })
+
+    return items
+
+
+async def fetch_foursquare_places(
+    bbox_t: Tuple[float, float, float, float],
+    kind: str,
+    limit: int = 80
+) -> List[Dict[str, Any]]:
+    api_key = os.getenv("FOURSQUARE_API_KEY", "").strip()
+    if not api_key:
+        return []
+
+    min_lng, min_lat, max_lng, max_lat = bbox_t
+
+    # Use bounding box search
+    url = "https://api.foursquare.com/v3/places/search"
+    headers = {"Authorization": api_key, "Accept": "application/json"}
+
+    # Simple query text (beginner friendly)
+    q = "nightclub" if kind == "nightlife" else "restaurant"
+
+    params = {
+        "query": q,
+        "sw": f"{min_lat},{min_lng}",
+        "ne": f"{max_lat},{max_lng}",
+        "limit": str(limit),
+    }
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.get(url, params=params, headers=headers)
+        if r.status_code != 200:
+            return []
+        data = r.json()
+
+    results = data.get("results") or []
+    items: List[Dict[str, Any]] = []
+
+    for p in results:
+        name = p.get("name") or ""
+        geocodes = p.get("geocodes") or {}
+        main = geocodes.get("main") or {}
+        lat = main.get("latitude")
+        lng = main.get("longitude")
+        if lat is None or lng is None:
+            continue
+
+        items.append({
+            "type": kind,  # "nightlife" or "restaurants"
+            "name": name,
+            "lat": float(lat),
+            "lng": float(lng),
+            "source": "foursquare",
+        })
+
+    return items
+
 
 # ----------------------------
 # API Endpoints
@@ -221,20 +386,24 @@ def status():
         "generate_state": _get_state(),
     }
 
+
 @app.get("/generate")
 def generate_get(bin_minutes: int = DEFAULT_BIN_MINUTES, min_trips_per_window: int = DEFAULT_MIN_TRIPS_PER_WINDOW):
     # Starts generation async
     return start_generate(bin_minutes, min_trips_per_window)
 
+
 @app.get("/generate_status")
 def generate_status():
     return _get_state()
+
 
 @app.get("/timeline")
 def timeline():
     if not _has_frames():
         raise HTTPException(status_code=409, detail="timeline not ready. Call /generate first.")
     return _read_json(TIMELINE_PATH)
+
 
 @app.get("/frame/{idx}")
 def frame(idx: int):
@@ -244,6 +413,55 @@ def frame(idx: int):
     if not p.exists():
         raise HTTPException(status_code=404, detail=f"frame not found: {idx}")
     return _read_json(p)
+
+
+@app.get("/context")
+async def context(
+    bbox: str = Query(..., description="minLng,minLat,maxLng,maxLat"),
+    types: str = Query("concerts,nightlife,restaurants", description="comma-separated: concerts,nightlife,restaurants"),
+):
+    """
+    Separate overlay layer (NOT used in TLC rating).
+    Returns markers for concerts/nightlife/restaurants for the current map view.
+    """
+    try:
+        min_lng, min_lat, max_lng, max_lat = _parse_bbox(bbox)
+        bbox_t = (min_lng, min_lat, max_lng, max_lat)
+    except Exception as e:
+        return JSONResponse({"error": f"Invalid bbox: {e}"}, status_code=400)
+
+    requested = [t.strip().lower() for t in types.split(",") if t.strip()]
+    allowed = {"concerts", "nightlife", "restaurants"}
+    req = [t for t in requested if t in allowed]
+    if not req:
+        return {"items": [], "generated_at_unix": int(time.time()), "note": "No valid types requested."}
+
+    cache_key = _bbox_cache_key(min_lng, min_lat, max_lng, max_lat, ",".join(sorted(req)))
+    cached = _cache_get(cache_key)
+    if cached:
+        return cached
+
+    items: List[Dict[str, Any]] = []
+
+    # Fetch in sequence (simple + reliable). Can parallelize later if you want.
+    if "concerts" in req:
+        items.extend(await fetch_ticketmaster_concerts(bbox_t))
+
+    if "nightlife" in req:
+        items.extend(await fetch_foursquare_places(bbox_t, kind="nightlife"))
+
+    if "restaurants" in req:
+        items.extend(await fetch_foursquare_places(bbox_t, kind="restaurants"))
+
+    payload = {
+        "items": items,
+        "generated_at_unix": int(time.time()),
+        "types": req,
+        "cached_ttl_sec": _CONTEXT_TTL_SEC,
+    }
+    _cache_set(cache_key, payload)
+    return payload
+
 
 @app.post("/upload_zones_geojson")
 async def upload_zones_geojson(file: UploadFile = File(...)):
@@ -268,6 +486,7 @@ async def upload_zones_geojson(file: UploadFile = File(...)):
 
     target.write_bytes(content)
     return {"saved": str(target), "size_mb": round(target.stat().st_size / (1024 * 1024), 2)}
+
 
 @app.post("/upload_parquet")
 async def upload_parquet(file: UploadFile = File(...)):
