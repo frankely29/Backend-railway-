@@ -71,7 +71,6 @@ def _cache_set(key: str, payload: Dict[str, Any], ttl_sec: int = _CONTEXT_TTL_SE
 # ----------------------------
 app = FastAPI(title="NYC TLC Hotspot Backend", version="1.0")
 
-# Allow GitHub Pages frontend to call Railway backend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # lock down later if you want
@@ -209,10 +208,6 @@ def start_generate(bin_minutes: int, min_trips_per_window: int) -> Dict[str, Any
 # ----------------------------
 @app.on_event("startup")
 def auto_generate_if_missing():
-    """
-    - If /data/frames/timeline.json exists -> do nothing
-    - Else -> start generation in background using defaults
-    """
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         FRAMES_DIR.mkdir(parents=True, exist_ok=True)
@@ -323,11 +318,11 @@ async def fetch_ticketmaster_concerts(bbox_t: Tuple[float, float, float, float],
 async def fetch_foursquare_places(
     bbox_t: Tuple[float, float, float, float],
     kind: str,
-    limit: int = 60
+    limit: int = 25
 ) -> List[Dict[str, Any]]:
     """
-    Uses ll + radius (more reliable than bbox for many accounts).
-    kind: "nightlife" or "restaurants"
+    Reliable Foursquare search using ll + radius.
+    If Foursquare rejects the request, returns a single "error" item so you can see why.
     """
     api_key = os.getenv("FOURSQUARE_API_KEY", "").strip()
     if not api_key:
@@ -338,26 +333,46 @@ async def fetch_foursquare_places(
     lng = (min_lng + max_lng) / 2.0
 
     url = "https://api.foursquare.com/v3/places/search"
-    headers = {"Authorization": api_key, "Accept": "application/json"}
+    headers = {
+        "Authorization": api_key,
+        "Accept": "application/json",
+        "Accept-Language": "en",
+    }
 
     q = "nightclub" if kind == "nightlife" else "restaurant"
     params = {
         "query": q,
         "ll": f"{lat},{lng}",
-        "radius": "6000",       # meters
+        "radius": "8000",  # meters (8km)
         "limit": str(limit),
         "sort": "POPULARITY",
+        "fields": "fsq_id,name,geocodes,location,categories",
     }
 
-    async with httpx.AsyncClient(timeout=15) as client:
+    async with httpx.AsyncClient(timeout=20) as client:
         r = await client.get(url, params=params, headers=headers)
-        if r.status_code != 200:
-            # return empty rather than crashing the whole map
-            return []
-        data = r.json()
+
+    if r.status_code != 200:
+        msg = ""
+        try:
+            j = r.json()
+            msg = (j or {}).get("message") or r.text[:200]
+        except Exception:
+            msg = r.text[:200]
+
+        return [{
+            "type": "error",
+            "name": f"Foursquare error {r.status_code}: {msg}",
+            "lat": lat,
+            "lng": lng,
+            "source": "foursquare",
+        }]
+
+    data = r.json()
+    results = data.get("results") or []
 
     items: List[Dict[str, Any]] = []
-    for p in (data.get("results") or []):
+    for p in results:
         name = p.get("name") or ""
         main = ((p.get("geocodes") or {}).get("main") or {})
         plat = main.get("latitude")
@@ -447,6 +462,7 @@ def context_debug():
 async def context(
     bbox: str = Query(..., description="minLng,minLat,maxLng,maxLat"),
     types: str = Query("concerts,nightlife,restaurants", description="comma-separated: concerts,nightlife,restaurants"),
+    nocache: int = Query(0, description="Set to 1 to bypass server cache"),
 ):
     """
     Separate overlay layer (NOT used in TLC rating).
@@ -464,9 +480,10 @@ async def context(
         return {"items": [], "generated_at_unix": int(time.time()), "types": [], "cached_ttl_sec": _CONTEXT_TTL_SEC}
 
     cache_key = _bbox_cache_key(min_lng, min_lat, max_lng, max_lat, ",".join(sorted(req)))
-    cached = _cache_get(cache_key)
-    if cached:
-        return cached
+    if not nocache:
+        cached = _cache_get(cache_key)
+        if cached:
+            return cached
 
     items: List[Dict[str, Any]] = []
 
@@ -485,7 +502,10 @@ async def context(
         "types": req,
         "cached_ttl_sec": _CONTEXT_TTL_SEC,
     }
-    _cache_set(cache_key, payload)
+
+    if not nocache:
+        _cache_set(cache_key, payload)
+
     return payload
 
 
