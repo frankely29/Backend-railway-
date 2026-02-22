@@ -40,23 +40,6 @@ def color_from_bucket(bucket: str) -> str:
     return "#e60000"
 
 
-def _median_int(vals: List[int]) -> int | None:
-    if not vals:
-        return None
-    vals_sorted = sorted(vals)
-    n = len(vals_sorted)
-    mid = n // 2
-    if n % 2 == 1:
-        return int(vals_sorted[mid])
-    return int(round((vals_sorted[mid - 1] + vals_sorted[mid]) / 2))
-
-
-def _avg_int(vals: List[int]) -> int | None:
-    if not vals:
-        return None
-    return int(round(sum(vals) / len(vals)))
-
-
 def build_hotspots_frames(
     parquet_files: List[Path],
     zones_geojson_path: Path,
@@ -64,8 +47,19 @@ def build_hotspots_frames(
     bin_minutes: int = 20,
     min_trips_per_window: int = 25,
 ) -> Dict[str, Any]:
+    """
+    Writes frames to disk:
+      /data/frames/timeline.json
+      /data/frames/frame_000000.json ... etc
+
+    Output includes:
+      - bucket + rating per zone
+      - strict colors (Green/Blue/Sky/Yellow/Red)
+      - per-frame counts summary (no ETA)
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Load zone geometry (LocationID -> geometry)
     zones = json.loads(zones_geojson_path.read_text(encoding="utf-8"))
     geom_by_id: Dict[int, Any] = {}
     for f in zones.get("features", []):
@@ -82,6 +76,7 @@ def build_hotspots_frames(
     if not geom_by_id:
         raise RuntimeError("taxi_zones.geojson missing usable properties.LocationID geometry.")
 
+    # DuckDB spill-to-disk on Railway volume
     tmp_dir = out_dir.parent / "duckdb_tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
@@ -92,6 +87,10 @@ def build_hotspots_frames(
     parquet_list = [str(p) for p in parquet_files]
     parquet_sql = ", ".join("'" + p.replace("'", "''") + "'" for p in parquet_list)
 
+    # Realistic scoring (still factual):
+    # - log1p pickups to reduce domination
+    # - baseline per-zone score
+    # - confidence scaling (reduces noise spikes)
     sql = f"""
     WITH base AS (
       SELECT
@@ -104,7 +103,7 @@ def build_hotspots_frames(
     t AS (
       SELECT
         PULocationID,
-        CAST(EXTRACT('dow' FROM pickup_datetime) AS INTEGER) AS dow_i,
+        CAST(EXTRACT('dow' FROM pickup_datetime) AS INTEGER) AS dow_i,  -- 0=Sun..6=Sat
         CAST(EXTRACT('hour' FROM pickup_datetime) AS INTEGER) AS hour_i,
         CAST(EXTRACT('minute' FROM pickup_datetime) AS INTEGER) AS minute_i,
         driver_pay
@@ -113,7 +112,7 @@ def build_hotspots_frames(
     binned AS (
       SELECT
         PULocationID,
-        CASE WHEN dow_i = 0 THEN 6 ELSE dow_i - 1 END AS dow_m,
+        CASE WHEN dow_i = 0 THEN 6 ELSE dow_i - 1 END AS dow_m,  -- Mon=0..Sun=6
         CAST(FLOOR((hour_i*60 + minute_i) / {int(bin_minutes)}) * {int(bin_minutes)} AS INTEGER) AS bin_start_min,
         driver_pay
       FROM t
@@ -143,10 +142,12 @@ def build_hotspots_frames(
     win_scored AS (
       SELECT
         PULocationID, dow_m, bin_start_min, pickups, avg_driver_pay,
+
         CASE
           WHEN max_log_pickups IS NULL OR min_log_pickups IS NULL OR max_log_pickups = min_log_pickups THEN 0.0
           ELSE (log_pickups - min_log_pickups) * 1.0 / (max_log_pickups - min_log_pickups)
         END AS vol_n,
+
         CASE
           WHEN max_pay IS NULL OR min_pay IS NULL OR max_pay = min_pay THEN 0.0
           ELSE (avg_driver_pay - min_pay) * 1.0 / (max_pay - min_pay)
@@ -192,8 +193,10 @@ def build_hotspots_frames(
         w.bin_start_min,
         w.pickups,
         w.avg_driver_pay,
+
         (0.80*w.vol_n + 0.20*w.pay_n) AS moment_score,
         (0.80*z.base_vol_n + 0.20*z.base_pay_n) AS base_score,
+
         LEAST(1.0, w.pickups / 50.0) AS conf
       FROM win_scored w
       JOIN zone_norm z USING (PULocationID)
@@ -208,7 +211,10 @@ def build_hotspots_frames(
       CAST(
         ROUND(
           1 + 99 * LEAST(
-            GREATEST(((0.70*moment_score + 0.30*base_score) * (0.50 + 0.50*conf)), 0.0),
+            GREATEST(
+              ((0.70*moment_score + 0.30*base_score) * (0.50 + 0.50*conf)),
+              0.0
+            ),
             1.0
           )
         ) AS INTEGER
@@ -219,37 +225,25 @@ def build_hotspots_frames(
 
     cur = con.execute(sql)
 
-    week_start = datetime(2025, 1, 6, 0, 0, 0)
+    week_start = datetime(2025, 1, 6, 0, 0, 0)  # Monday baseline
     timeline: List[str] = []
     frame_count = 0
 
     current_key: Tuple[int, int] | None = None
     current_features: List[Dict[str, Any]] = []
     current_time_iso: str | None = None
-
-    counts = {"green": 0, "blue": 0, "sky": 0, "yellow": 0, "red": 0}
-    etas: Dict[str, List[int]] = {"green": [], "blue": [], "sky": [], "yellow": [], "red": []}
+    current_counts = {"green": 0, "blue": 0, "sky": 0, "yellow": 0, "red": 0}
 
     def flush_frame():
-        nonlocal frame_count, current_features, current_time_iso, counts, etas
+        nonlocal frame_count, current_features, current_time_iso, current_counts
         if current_time_iso is None:
             return
-
-        eta_summary = {}
-        for k in ["green", "blue", "sky", "yellow", "red"]:
-            eta_summary[k] = {
-                "median": _median_int(etas[k]),
-                "avg": _avg_int(etas[k]),
-            }
 
         timeline.append(current_time_iso)
         frame_path = out_dir / f"frame_{frame_count:06d}.json"
         payload = {
             "time": current_time_iso,
-            "summary": {
-                **counts,
-                "eta": eta_summary
-            },
+            "summary": current_counts,
             "polygons": {"type": "FeatureCollection", "features": current_features},
         }
         frame_path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
@@ -257,8 +251,7 @@ def build_hotspots_frames(
         frame_count += 1
         current_features = []
         current_time_iso = None
-        counts = {"green": 0, "blue": 0, "sky": 0, "yellow": 0, "red": 0}
-        etas = {"green": [], "blue": [], "sky": [], "yellow": [], "red": []}
+        current_counts = {"green": 0, "blue": 0, "sky": 0, "yellow": 0, "red": 0}
 
     total_rows = 0
     any_rows = False
@@ -291,11 +284,7 @@ def build_hotspots_frames(
             r = int(rating)
             bucket = bucket_name_from_rating(r)
             fill = color_from_bucket(bucket)
-            counts[bucket] += 1
-
-            p = int(pickups)
-            eta_min = int(max(1, min(60, round(bin_minutes / max(1, p)))))
-            etas[bucket].append(eta_min)
+            current_counts[bucket] += 1
 
             current_features.append({
                 "type": "Feature",
@@ -304,8 +293,7 @@ def build_hotspots_frames(
                     "LocationID": int(zid),
                     "rating": r,
                     "bucket": bucket,
-                    "pickups": p,
-                    "eta_minutes": eta_min,
+                    "pickups": int(pickups),
                     "avg_driver_pay": None if avg_pay is None else float(avg_pay),
                     "avg_tips": None,
                     "style": {
