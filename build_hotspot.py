@@ -15,29 +15,30 @@ def ensure_zones_geojson(data_dir: Path, force: bool = False) -> Path:
     raise RuntimeError("Missing /data/taxi_zones.geojson. Upload it via POST /upload_zones_geojson.")
 
 
-def bucket_name_from_rating(rating: int) -> str:
+def bucket_and_color_from_rating(rating: int) -> tuple[str, str]:
+    """
+    STRICT bucket order requested:
+      Green = Highest
+      Purple = High
+      Blue = Medium
+      Sky = Normal
+      Yellow = Below Normal
+      Red = Very Low / Avoid
+    """
     r = int(rating)
+
+    # You can change thresholds later, but these are stable and easy to reason about.
+    if r >= 90:
+        return "green", "#00b050"
     if r >= 80:
-        return "green"   # Best
-    if r >= 60:
-        return "blue"    # Medium
-    if r >= 40:
-        return "sky"     # Normal
-    if r >= 30:
-        return "yellow"  # Below Normal
-    return "red"         # Avoid
-
-
-def color_from_bucket(bucket: str) -> str:
-    if bucket == "green":
-        return "#00b050"
-    if bucket == "blue":
-        return "#0066ff"
-    if bucket == "sky":
-        return "#66ccff"
-    if bucket == "yellow":
-        return "#ffd400"
-    return "#e60000"
+        return "purple", "#8000ff"
+    if r >= 65:
+        return "blue", "#0066ff"
+    if r >= 45:
+        return "sky", "#66ccff"
+    if r >= 25:
+        return "yellow", "#ffd400"
+    return "red", "#e60000"
 
 
 def build_hotspots_frames(
@@ -48,14 +49,14 @@ def build_hotspots_frames(
     min_trips_per_window: int = 25,
 ) -> Dict[str, Any]:
     """
-    Writes frames to disk:
+    Writes:
       /data/frames/timeline.json
-      /data/frames/frame_000000.json ... etc
+      /data/frames/frame_000000.json ... frame_000503.json
 
-    Output includes:
-      - bucket + rating per zone
-      - strict colors (Green/Blue/Sky/Yellow/Red)
-      - per-frame counts summary (no ETA)
+    Each frame contains:
+      - time (bucket label)
+      - polygons FeatureCollection
+      - each feature has: LocationID, rating, bucket, pickups, avg_driver_pay, style(fillColor)
     """
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -87,10 +88,12 @@ def build_hotspots_frames(
     parquet_list = [str(p) for p in parquet_files]
     parquet_sql = ", ".join("'" + p.replace("'", "''") + "'" for p in parquet_list)
 
-    # Realistic scoring (still factual):
+    # Rating logic:
+    # - Demand weight is mostly pickups (busy)
+    # - Smaller weight driver_pay
     # - log1p pickups to reduce domination
-    # - baseline per-zone score
-    # - confidence scaling (reduces noise spikes)
+    # - baseline per-zone score to keep "bad zones can have good moments" realistically
+    # - confidence scaling by pickups
     sql = f"""
     WITH base AS (
       SELECT
@@ -194,8 +197,8 @@ def build_hotspots_frames(
         w.pickups,
         w.avg_driver_pay,
 
-        (0.80*w.vol_n + 0.20*w.pay_n) AS moment_score,
-        (0.80*z.base_vol_n + 0.20*z.base_pay_n) AS base_score,
+        (0.85*w.vol_n + 0.15*w.pay_n) AS moment_score,
+        (0.85*z.base_vol_n + 0.15*z.base_pay_n) AS base_score,
 
         LEAST(1.0, w.pickups / 50.0) AS conf
       FROM win_scored w
@@ -232,18 +235,17 @@ def build_hotspots_frames(
     current_key: Tuple[int, int] | None = None
     current_features: List[Dict[str, Any]] = []
     current_time_iso: str | None = None
-    current_counts = {"green": 0, "blue": 0, "sky": 0, "yellow": 0, "red": 0}
 
     def flush_frame():
-        nonlocal frame_count, current_features, current_time_iso, current_counts
+        nonlocal frame_count, current_features, current_time_iso
         if current_time_iso is None:
             return
 
         timeline.append(current_time_iso)
+
         frame_path = out_dir / f"frame_{frame_count:06d}.json"
         payload = {
             "time": current_time_iso,
-            "summary": current_counts,
             "polygons": {"type": "FeatureCollection", "features": current_features},
         }
         frame_path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
@@ -251,7 +253,6 @@ def build_hotspots_frames(
         frame_count += 1
         current_features = []
         current_time_iso = None
-        current_counts = {"green": 0, "blue": 0, "sky": 0, "yellow": 0, "red": 0}
 
     total_rows = 0
     any_rows = False
@@ -282,9 +283,7 @@ def build_hotspots_frames(
                 continue
 
             r = int(rating)
-            bucket = bucket_name_from_rating(r)
-            fill = color_from_bucket(bucket)
-            current_counts[bucket] += 1
+            bucket, fill = bucket_and_color_from_rating(r)
 
             current_features.append({
                 "type": "Feature",
