@@ -5,9 +5,10 @@ import json
 import time
 import threading
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from build_hotspot import ensure_zones_geojson, build_hotspots_frames
@@ -41,17 +42,11 @@ _generate_state: Dict[str, Any] = {
 }
 
 # ----------------------------
-# Friends / Presence (in-memory)
-# NOTE: resets if Railway restarts (OK for now).
-# ----------------------------
-_presence_lock = threading.Lock()
-_presence: Dict[str, Dict[str, Any]] = {}
-
-# ----------------------------
 # App
 # ----------------------------
 app = FastAPI(title="NYC TLC Hotspot Backend", version="1.0")
 
+# Allow GitHub Pages frontend to call Railway backend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # lock down later if you want
@@ -125,12 +120,15 @@ def _generate_worker(bin_minutes: int, min_trips_per_window: int) -> None:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         FRAMES_DIR.mkdir(parents=True, exist_ok=True)
 
+        # ensure zones exist
         zones_path = ensure_zones_geojson(DATA_DIR, force=False)
 
+        # ensure at least one parquet exists
         parquets = _list_parquets()
         if not parquets:
             raise RuntimeError("No .parquet files found in /data. Upload via POST /upload_parquet.")
 
+        # build frames
         result = build_hotspots_frames(
             parquet_files=parquets,
             zones_geojson_path=zones_path,
@@ -162,6 +160,7 @@ def _generate_worker(bin_minutes: int, min_trips_per_window: int) -> None:
 
 
 def start_generate(bin_minutes: int, min_trips_per_window: int) -> Dict[str, Any]:
+    # Avoid double runs
     st = _get_state()
     if st["state"] in ("started", "running"):
         return {
@@ -171,6 +170,7 @@ def start_generate(bin_minutes: int, min_trips_per_window: int) -> Dict[str, Any
             "min_trips_per_window": st["min_trips_per_window"],
         }
 
+    # File lock guard (best-effort across restarts)
     if _lock_is_present():
         _set_state(state="running", bin_minutes=bin_minutes, min_trips_per_window=min_trips_per_window)
         return {"ok": True, "state": "running", "bin_minutes": bin_minutes, "min_trips_per_window": min_trips_per_window}
@@ -184,13 +184,21 @@ def start_generate(bin_minutes: int, min_trips_per_window: int) -> Dict[str, Any
     return {"ok": True, "state": "started", "bin_minutes": bin_minutes, "min_trips_per_window": min_trips_per_window}
 
 
+# ----------------------------
+# Option A: Auto-generate ONCE if missing
+# ----------------------------
 @app.on_event("startup")
 def auto_generate_if_missing():
+    """
+    - If /data/frames/timeline.json exists -> do nothing
+    - Else -> start generation in background using defaults (if inputs exist)
+    """
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         FRAMES_DIR.mkdir(parents=True, exist_ok=True)
 
         if _has_frames():
+            # Fill state with defaults for nicer status output
             try:
                 tl = _read_json(TIMELINE_PATH)
                 _set_state(
@@ -220,15 +228,15 @@ def auto_generate_if_missing():
         _set_state(state="idle")
 
 
+# ----------------------------
+# Routes
+# ----------------------------
 @app.get("/")
 def root():
     return {
         "ok": True,
         "service": "NYC TLC Hotspot Backend",
-        "endpoints": [
-            "/status", "/generate", "/generate_status", "/timeline", "/frame/{idx}",
-            "/presence/upsert", "/presence/list", "/presence/signout"
-        ],
+        "endpoints": ["/status", "/generate", "/generate_status", "/timeline", "/frame/{idx}"],
     }
 
 
@@ -250,6 +258,7 @@ def status():
 
 @app.get("/generate")
 def generate_get(bin_minutes: int = DEFAULT_BIN_MINUTES, min_trips_per_window: int = DEFAULT_MIN_TRIPS_PER_WINDOW):
+    # Starts generation async
     return start_generate(bin_minutes, min_trips_per_window)
 
 
@@ -277,6 +286,10 @@ def frame(idx: int):
 
 @app.post("/upload_zones_geojson")
 async def upload_zones_geojson(file: UploadFile = File(...)):
+    """
+    Upload the TLC taxi zones geojson file.
+    Must be valid GeoJSON content.
+    """
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     target = DATA_DIR / "taxi_zones.geojson"
 
@@ -284,6 +297,7 @@ async def upload_zones_geojson(file: UploadFile = File(...)):
     if not content:
         raise HTTPException(status_code=400, detail="Empty upload.")
 
+    # Basic validation: should parse as JSON
     try:
         obj = json.loads(content.decode("utf-8", errors="strict"))
         if obj.get("type") not in ("FeatureCollection", "Feature"):
@@ -297,6 +311,9 @@ async def upload_zones_geojson(file: UploadFile = File(...)):
 
 @app.post("/upload_parquet")
 async def upload_parquet(file: UploadFile = File(...)):
+    """
+    Upload a parquet month file into /data.
+    """
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     filename = (file.filename or "upload.parquet").replace("\\", "/").split("/")[-1]
@@ -310,86 +327,3 @@ async def upload_parquet(file: UploadFile = File(...)):
 
     target.write_bytes(content)
     return {"saved": str(target), "size_mb": round(target.stat().st_size / (1024 * 1024), 2)}
-
-
-# ----------------------------
-# Friends / Presence API
-# ----------------------------
-def _now_unix() -> float:
-    return time.time()
-
-
-def _cleanup_presence(max_age_sec: float) -> None:
-    now = _now_unix()
-    dead = []
-    for cid, row in _presence.items():
-        ts = float(row.get("ts") or 0)
-        if (now - ts) > max_age_sec:
-            dead.append(cid)
-    for cid in dead:
-        _presence.pop(cid, None)
-
-
-@app.post("/presence/upsert")
-async def presence_upsert(payload: Dict[str, Any]):
-    cid = (payload.get("client_id") or "").strip()
-    if not cid:
-        raise HTTPException(status_code=400, detail="client_id required")
-
-    username = (payload.get("username") or "").strip()[:48]
-    lat = payload.get("lat")
-    lng = payload.get("lng")
-    heading = payload.get("heading")
-
-    def _safe_float(x) -> Optional[float]:
-        try:
-            if x is None:
-                return None
-            f = float(x)
-            if not (f == f):
-                return None
-            return f
-        except Exception:
-            return None
-
-    row = {
-        "client_id": cid,
-        "username": username,
-        "lat": _safe_float(lat),
-        "lng": _safe_float(lng),
-        "heading": _safe_float(heading),
-        "ts": _now_unix(),
-    }
-
-    with _presence_lock:
-        if cid in _presence and not row["username"]:
-            row["username"] = _presence[cid].get("username") or row["username"]
-        _presence[cid] = row
-        _cleanup_presence(max_age_sec=60 * 60)
-
-    return {"ok": True}
-
-
-@app.get("/presence/list")
-def presence_list(max_age_min: int = 30):
-    max_age_min = max(1, min(240, int(max_age_min)))
-    max_age_sec = max_age_min * 60
-
-    with _presence_lock:
-        _cleanup_presence(max_age_sec=max_age_sec)
-        users = list(_presence.values())
-
-    users.sort(key=lambda r: r.get("ts") or 0, reverse=True)
-    return {"ok": True, "users": users, "max_age_min": max_age_min}
-
-
-@app.post("/presence/signout")
-async def presence_signout(payload: Dict[str, Any]):
-    cid = (payload.get("client_id") or "").strip()
-    if not cid:
-        raise HTTPException(status_code=400, detail="client_id required")
-
-    with _presence_lock:
-        _presence.pop(cid, None)
-
-    return {"ok": True}
