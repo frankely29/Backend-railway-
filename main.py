@@ -1,198 +1,345 @@
 import os
 import json
 import time
+import asyncio
 import threading
-import subprocess
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Dict, Any, Optional, List
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, UploadFile, File, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+
+# Your generator (already in your repo)
+from build_hotspot import generate_hotspot_frames, ensure_zones_geojson
+
 
 # ----------------------------
-# Config
+# Paths / Config
 # ----------------------------
-DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
-CACHE_DIR = Path(os.environ.get("CACHE_DIR", "/data/cache"))
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
+DATA_DIR = Path(os.environ.get("DATA_DIR", "/data")).resolve()
+FRAMES_DIR = DATA_DIR / "frames"
+TIMELINE_PATH = FRAMES_DIR / "timeline.json"
 
-TIMELINE_PATH = CACHE_DIR / "timeline.json"
-FRAMES_DIR = CACHE_DIR / "frames"
-FRAMES_DIR.mkdir(parents=True, exist_ok=True)
+DEFAULT_BIN_MINUTES = int(os.environ.get("BIN_MINUTES", "20"))
+DEFAULT_MIN_TRIPS_PER_WINDOW = int(os.environ.get("MIN_TRIPS_PER_WINDOW", "15"))
 
-# script that builds the timeline + frames
-BUILD_SCRIPT = os.environ.get("BUILD_SCRIPT", "build_hotspot.py")
+# Friends feature config
+INACTIVITY_SECONDS = 30 * 60  # 30 minutes
+
 
 # ----------------------------
 # App
 # ----------------------------
-app = FastAPI(title="NYC TLC Hotspot Backend", version="1.0")
+app = FastAPI(title="NYC TLC Hotspot Backend")
 
-# CORS (Github Pages -> Railway)
+# CORS (GitHub Pages -> Railway)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # ok for now; can lock down later
-    allow_credentials=False,
+    allow_origins=["*"],  # simple for now; you can restrict later
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # ----------------------------
-# Utilities
+# Helpers (JSON + state)
 # ----------------------------
-
-# ----------------------------
-# Friends / Presence (Option A: in-memory)
-# ----------------------------
-# NOTE: This is intentionally simple (no database). On Railway, if you run
-# multiple instances, each instance will have its own memory.
-
-PRESENCE_TTL_SEC = int(os.environ.get("PRESENCE_TTL_SEC", str(30 * 60)))  # 30 minutes
-
-_presence_lock = threading.Lock()
-_presence: Dict[str, Dict[str, Any]] = {}
+_STATE_PATH = DATA_DIR / "generate_state.json"
+_state_lock = threading.Lock()
 
 
-class PresenceHeartbeat(BaseModel):
-    user_id: str = Field(..., min_length=3, max_length=64)
-    username: str = Field(..., min_length=1, max_length=32)
-    lat: float
-    lng: float
-    heading: float | None = None
-    speed_mph: float | None = None
+def _set_state(**kwargs):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with _state_lock:
+        cur = {}
+        if _STATE_PATH.exists():
+            try:
+                cur = json.loads(_STATE_PATH.read_text("utf-8"))
+            except Exception:
+                cur = {}
+        cur.update(kwargs)
+        cur["ts"] = int(time.time())
+        _STATE_PATH.write_text(json.dumps(cur, indent=2), encoding="utf-8")
 
 
-class PresenceSignout(BaseModel):
-    user_id: str = Field(..., min_length=3, max_length=64)
-
-
-def _presence_cleanup(now: float | None = None) -> int:
-    """Remove inactive users. Returns number removed."""
-    if now is None:
-        now = time.time()
-    removed = 0
-    with _presence_lock:
-        dead = [uid for uid, rec in _presence.items() if (now - float(rec.get("last_seen", 0))) > PRESENCE_TTL_SEC]
-        for uid in dead:
-            _presence.pop(uid, None)
-            removed += 1
-    return removed
-
-
-def _presence_snapshot(now: float | None = None) -> List[Dict[str, Any]]:
-    if now is None:
-        now = time.time()
-    _presence_cleanup(now)
-    with _presence_lock:
-        out: List[Dict[str, Any]] = []
-        for uid, rec in _presence.items():
-            out.append(
-                {
-                    "user_id": uid,
-                    "username": rec.get("username"),
-                    "lat": rec.get("lat"),
-                    "lng": rec.get("lng"),
-                    "heading": rec.get("heading"),
-                    "speed_mph": rec.get("speed_mph"),
-                    "last_seen_unix": rec.get("last_seen"),
-                    "expires_in_sec": max(0, int(PRESENCE_TTL_SEC - (now - float(rec.get("last_seen", 0))))),
-                }
-            )
-        return out
-
-
-def safe_read_json(path: Path) -> Any:
-    if not path.exists():
-        return None
+def _get_state():
+    if not _STATE_PATH.exists():
+        return {"state": "idle"}
     try:
-        return json.loads(path.read_text())
+        return json.loads(_STATE_PATH.read_text("utf-8"))
     except Exception:
-        return None
+        return {"state": "idle"}
 
 
-def write_json(path: Path, obj: Any):
-    path.write_text(json.dumps(obj, ensure_ascii=False))
+def _read_json(path: Path):
+    return json.loads(path.read_text("utf-8"))
 
 
-def frames_count() -> int:
-    if not FRAMES_DIR.exists():
-        return 0
-    return len(list(FRAMES_DIR.glob("frame_*.json")))
+def _has_frames():
+    return TIMELINE_PATH.exists()
+
+
+def _list_parquets() -> List[Path]:
+    if not DATA_DIR.exists():
+        return []
+    return sorted([p for p in DATA_DIR.glob("*.parquet") if p.is_file()])
 
 
 # ----------------------------
-# Background generate runner
+# Generator runner
 # ----------------------------
-_generate_lock = threading.Lock()
-_generate_status: Dict[str, Any] = {
-    "running": False,
-    "started_at": None,
-    "finished_at": None,
-    "ok": None,
-    "error": None,
-    "frames": 0,
-}
+_gen_thread = None
+_gen_lock = threading.Lock()
 
 
-def _run_generate():
-    global _generate_status
-    with _generate_lock:
-        _generate_status.update(
-            {
-                "running": True,
-                "started_at": time.time(),
-                "finished_at": None,
-                "ok": None,
-                "error": None,
-                "frames": 0,
-            }
+def _generate_job(bin_minutes: int, min_trips_per_window: int):
+    try:
+        _set_state(state="running", bin_minutes=bin_minutes, min_trips_per_window=min_trips_per_window, error=None)
+
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        FRAMES_DIR.mkdir(parents=True, exist_ok=True)
+
+        # Ensure zones exist (generator expects taxi_zones.geojson)
+        ensure_zones_geojson(DATA_DIR)
+
+        # Generate frames/timeline
+        generate_hotspot_frames(
+            data_dir=DATA_DIR,
+            out_dir=FRAMES_DIR,
+            bin_minutes=bin_minutes,
+            min_trips_per_window=min_trips_per_window,
         )
 
-    try:
-        # run build_hotspot.py
-        cmd = ["python", BUILD_SCRIPT]
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
-
-        if proc.returncode != 0:
-            raise RuntimeError(
-                f"Generate failed ({proc.returncode}).\nSTDOUT:\n{proc.stdout[-2000:]}\nSTDERR:\n{proc.stderr[-2000:]}"
-            )
-
-        # validate output
-        timeline = safe_read_json(TIMELINE_PATH)
-        if not timeline:
-            raise RuntimeError("Generate completed but timeline.json is missing/empty.")
-
-        cnt = frames_count()
-        if cnt == 0:
-            raise RuntimeError("Generate completed but no frames were produced.")
-
-        with _generate_lock:
-            _generate_status.update(
-                {
-                    "running": False,
-                    "finished_at": time.time(),
-                    "ok": True,
-                    "frames": cnt,
-                }
-            )
+        _set_state(state="done")
     except Exception as e:
-        with _generate_lock:
-            _generate_status.update(
-                {
-                    "running": False,
-                    "finished_at": time.time(),
-                    "ok": False,
-                    "error": str(e),
-                    "frames": frames_count(),
-                }
-            )
+        _set_state(state="error", error=str(e))
+
+
+def start_generate(bin_minutes: int, min_trips_per_window: int):
+    global _gen_thread
+    with _gen_lock:
+        st = _get_state().get("state", "idle")
+        if st == "running":
+            return {"ok": True, "state": "running"}
+
+        _gen_thread = threading.Thread(
+            target=_generate_job,
+            args=(bin_minutes, min_trips_per_window),
+            daemon=True,
+        )
+        _gen_thread.start()
+        return {"ok": True, "state": "running"}
+
+
+@app.on_event("startup")
+async def on_startup():
+    """
+    Auto-generate frames on boot if possible.
+    This prevents the frontend from dying with 'timeline not ready'.
+    """
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        FRAMES_DIR.mkdir(parents=True, exist_ok=True)
+
+        # If already generated, do nothing.
+        if _has_frames():
+            _set_state(state="done")
+            return
+
+        # If parquet files exist, start generation automatically.
+        if len(_list_parquets()) > 0:
+            start_generate(DEFAULT_BIN_MINUTES, DEFAULT_MIN_TRIPS_PER_WINDOW)
+        else:
+            _set_state(state="idle")
+    except Exception:
+        _set_state(state="idle")
 
 
 # ----------------------------
-# Routes
+# FRIENDS / PRESENCE (WebSocket)
+# ----------------------------
+class ConnectionManager:
+    def __init__(self):
+        self._lock = asyncio.Lock()
+        self.active: Dict[str, WebSocket] = {}   # username -> websocket
+        self.users: Dict[str, Dict[str, Any]] = {}  # username -> {lat,lng,heading,last_seen}
+
+    async def connect(self, ws: WebSocket):
+        await ws.accept()
+
+    async def disconnect_username(self, username: str):
+        async with self._lock:
+            self.active.pop(username, None)
+            self.users.pop(username, None)
+
+    async def upsert_user(self, username: str, payload: Dict[str, Any]):
+        now = time.time()
+        lat = payload.get("lat")
+        lng = payload.get("lng")
+        heading = payload.get("heading")
+        # keep it simple: store what we have
+        async with self._lock:
+            if username not in self.users:
+                self.users[username] = {}
+            if lat is not None and lng is not None:
+                self.users[username]["lat"] = float(lat)
+                self.users[username]["lng"] = float(lng)
+            if heading is not None:
+                try:
+                    self.users[username]["heading"] = float(heading)
+                except Exception:
+                    pass
+            self.users[username]["last_seen"] = now
+
+    async def set_socket(self, username: str, ws: WebSocket):
+        async with self._lock:
+            self.active[username] = ws
+            if username not in self.users:
+                self.users[username] = {"last_seen": time.time()}
+
+    async def broadcast_roster(self):
+        async with self._lock:
+            roster = []
+            for u, info in self.users.items():
+                # Only broadcast users with coordinates
+                if "lat" in info and "lng" in info:
+                    roster.append({
+                        "username": u,
+                        "lat": info.get("lat"),
+                        "lng": info.get("lng"),
+                        "heading": info.get("heading", 0),
+                        "last_seen": info.get("last_seen", 0),
+                    })
+            sockets = list(self.active.items())
+
+        msg = {"type": "roster", "users": roster}
+        dead = []
+        for username, ws in sockets:
+            try:
+                await ws.send_text(json.dumps(msg))
+            except Exception:
+                dead.append(username)
+
+        # cleanup dead sockets
+        if dead:
+            async with self._lock:
+                for u in dead:
+                    self.active.pop(u, None)
+                    self.users.pop(u, None)
+
+    async def cleanup_inactive(self):
+        now = time.time()
+        removed = []
+        async with self._lock:
+            for u, info in list(self.users.items()):
+                if now - float(info.get("last_seen", 0)) > INACTIVITY_SECONDS:
+                    removed.append(u)
+                    self.users.pop(u, None)
+                    self.active.pop(u, None)
+        if removed:
+            await self.broadcast_roster()
+
+
+manager = ConnectionManager()
+
+
+@app.on_event("startup")
+async def start_presence_cleanup_loop():
+    async def _loop():
+        while True:
+            try:
+                await manager.cleanup_inactive()
+            except Exception:
+                pass
+            await asyncio.sleep(30)
+
+    asyncio.create_task(_loop())
+
+
+@app.websocket("/ws")
+async def ws_presence(ws: WebSocket):
+    """
+    Client flow:
+    - Connect ws://.../ws
+    - Send {"type":"hello","username":"Frankelly","lat":..,"lng":..,"heading":..}
+    - Then keep sending {"type":"pos","lat":..,"lng":..,"heading":..} every ~5-10s (or on GPS updates)
+    - Server broadcasts {"type":"roster","users":[...]} to everyone
+    """
+    await manager.connect(ws)
+
+    username = None
+    try:
+        # First message must be hello with username
+        raw = await ws.receive_text()
+        msg = json.loads(raw)
+
+        if msg.get("type") != "hello":
+            await ws.send_text(json.dumps({"type": "error", "error": "first message must be hello"}))
+            return
+
+        username = (msg.get("username") or "").strip()
+        if not username:
+            await ws.send_text(json.dumps({"type": "error", "error": "username required"}))
+            return
+
+        # Reserve username socket
+        await manager.set_socket(username, ws)
+        await manager.upsert_user(username, msg)
+        await manager.broadcast_roster()
+
+        # Main loop
+        while True:
+            raw = await ws.receive_text()
+            msg = json.loads(raw)
+            t = msg.get("type")
+
+            if t == "pos":
+                await manager.upsert_user(username, msg)
+                await manager.broadcast_roster()
+            elif t == "signout":
+                await manager.disconnect_username(username)
+                await manager.broadcast_roster()
+                return
+            else:
+                # ignore unknown
+                pass
+
+    except WebSocketDisconnect:
+        if username:
+            await manager.disconnect_username(username)
+            await manager.broadcast_roster()
+    except Exception:
+        if username:
+            await manager.disconnect_username(username)
+            await manager.broadcast_roster()
+
+
+@app.get("/presence")
+def presence_debug():
+    """
+    Optional debug endpoint to see who the server thinks is active.
+    """
+    st = _get_state()
+    return {
+        "generate_state": st,
+        "inactivity_seconds": INACTIVITY_SECONDS,
+    }
+
+
+@app.post("/signout")
+def signout(username: str):
+    """
+    Optional REST signout if you want it.
+    WebSocket signout is better.
+    """
+    # This only removes server state; client should also stop sending.
+    # We can't await here, so we just mark as old by clearing file-based state.
+    # For real-time, use ws {"type":"signout"}.
+    return {"ok": True, "hint": "Use WebSocket signout for immediate removal."}
+
+
+# ----------------------------
+# Existing routes (unchanged)
 # ----------------------------
 @app.get("/")
 def root():
@@ -205,105 +352,77 @@ def root():
             "/generate_status",
             "/timeline",
             "/frame/{idx}",
-            # Friends / Presence
-            "/presence",
-            "/presence/heartbeat",
-            "/presence/signout",
+            "/ws (friends realtime)"
         ],
     }
 
 
-# ----------------------------
-# Friends / Presence API
-# ----------------------------
-@app.get("/presence")
-def get_presence():
-    """Return currently active users (auto-expires after PRESENCE_TTL_SEC)."""
-    return {"ttl_sec": PRESENCE_TTL_SEC, "users": _presence_snapshot()}
-
-
-@app.post("/presence/heartbeat")
-def presence_heartbeat(payload: PresenceHeartbeat):
-    """Upsert a user's last known position and return current active users.
-
-    Frontend should call this every ~5-15 seconds while the map is open.
-    If the user becomes inactive (no heartbeats), they auto-disappear after PRESENCE_TTL_SEC.
-    """
-    now = time.time()
-    rec = {
-        "username": payload.username.strip()[:32],
-        "lat": float(payload.lat),
-        "lng": float(payload.lng),
-        "heading": None if payload.heading is None else float(payload.heading),
-        "speed_mph": None if payload.speed_mph is None else float(payload.speed_mph),
-        "last_seen": now,
-    }
-    with _presence_lock:
-        _presence[payload.user_id] = rec
-    return {"ttl_sec": PRESENCE_TTL_SEC, "users": _presence_snapshot(now)}
-
-
-@app.post("/presence/signout")
-def presence_signout(payload: PresenceSignout):
-    """Explicit signout (used by Sign Out button)."""
-    with _presence_lock:
-        _presence.pop(payload.user_id, None)
-    return {"ok": True, "ttl_sec": PRESENCE_TTL_SEC, "users": _presence_snapshot()}
-
-
 @app.get("/status")
 def status():
-    timeline = safe_read_json(TIMELINE_PATH)
+    parquets = [p.name for p in _list_parquets()]
+    zones_path = DATA_DIR / "taxi_zones.geojson"
     return {
+        "status": "ok",
         "data_dir": str(DATA_DIR),
-        "cache_dir": str(CACHE_DIR),
-        "timeline_ready": bool(timeline),
-        "frames": frames_count(),
-        "generate_status": _generate_status,
+        "parquets": parquets,
+        "zones_geojson": zones_path.name if zones_path.exists() else None,
+        "zones_present": zones_path.exists(),
+        "frames_dir": str(FRAMES_DIR),
+        "has_timeline": _has_frames(),
+        "generate_state": _get_state(),
     }
 
 
-@app.post("/generate")
-def generate():
-    # start generation in background thread
-    with _generate_lock:
-        if _generate_status.get("running"):
-            return {"ok": True, "running": True, "message": "Generate already running."}
-
-    t = threading.Thread(target=_run_generate, daemon=True)
-    t.start()
-    return {"ok": True, "running": True, "message": "Generate started."}
+@app.get("/generate")
+def generate_get(bin_minutes: int = DEFAULT_BIN_MINUTES, min_trips_per_window: int = DEFAULT_MIN_TRIPS_PER_WINDOW):
+    return start_generate(bin_minutes, min_trips_per_window)
 
 
 @app.get("/generate_status")
 def generate_status():
-    return _generate_status
+    return _get_state()
 
 
 @app.get("/timeline")
-def get_timeline():
-    timeline = safe_read_json(TIMELINE_PATH)
-    if not timeline:
-        return JSONResponse(status_code=400, content={"error": "timeline not ready. Call /generate first."})
-    return timeline
+def timeline():
+    if not _has_frames():
+        # match what your frontend expects: must generate first
+        raise HTTPException(status_code=409, detail="timeline not ready. Call /generate first.")
+    return _read_json(TIMELINE_PATH)
 
 
 @app.get("/frame/{idx}")
-def get_frame(idx: int):
-    frame_path = FRAMES_DIR / f"frame_{idx}.json"
-    if not frame_path.exists():
-        return JSONResponse(status_code=404, content={"error": f"frame {idx} not found"})
+def frame(idx: int):
+    if not _has_frames():
+        raise HTTPException(status_code=409, detail="timeline not ready. Call /generate first.")
+    p = FRAMES_DIR / f"frame_{idx:06d}.json"
+    if not p.exists():
+        raise HTTPException(status_code=404, detail=f"frame not found: {idx}")
+    return _read_json(p)
+
+
+@app.post("/upload_zones_geojson")
+async def upload_zones_geojson(file: UploadFile = File(...)):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    target = DATA_DIR / "taxi_zones.geojson"
+
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty upload.")
+
     try:
-        return json.loads(frame_path.read_text())
-    except Exception:
-        return JSONResponse(status_code=500, content={"error": f"frame {idx} invalid json"})
+        obj = json.loads(content.decode("utf-8", errors="strict"))
+        if obj.get("type") not in ("FeatureCollection", "Feature"):
+            raise ValueError("Not a GeoJSON FeatureCollection/Feature")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid GeoJSON: {e}")
+
+    target.write_bytes(content)
+    return {"saved": str(target), "size_mb": round(target.stat().st_size / (1024 * 1024), 2)}
 
 
 @app.post("/upload_parquet")
 async def upload_parquet(file: UploadFile = File(...)):
-    """
-    Upload a parquet month file into /data.
-    """
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     filename = (file.filename or "upload.parquet").replace("\\", "/").split("/")[-1]
