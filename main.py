@@ -4,10 +4,12 @@ import os
 import json
 import time
 import threading
+import asyncio
+import uuid
 from pathlib import Path
 from typing import Dict, Any, List
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -40,6 +42,16 @@ _generate_state: Dict[str, Any] = {
     "error": None,
     "trace": None,
 }
+
+# ----------------------------
+# Friends / Presence (in-memory)
+# ----------------------------
+# NOTE: This is "best effort" realtime presence. If the Railway service restarts,
+# the in-memory presence list resets (users will reconnect automatically).
+_presence_lock = asyncio.Lock()
+_presence_users: Dict[str, Dict[str, Any]] = {}  # client_id -> {username, lat, lng, heading, updated_at_unix}
+_presence_sockets: Dict[str, WebSocket] = {}     # client_id -> websocket
+PRESENCE_TTL_SEC = int(os.environ.get("PRESENCE_TTL_SEC", str(30 * 60)))  # 30 minutes
 
 # ----------------------------
 # App
@@ -102,16 +114,62 @@ def _get_state() -> Dict[str, Any]:
         return dict(_generate_state)
 
 
-def _err(status_code: int, message: str) -> JSONResponse:
-    """
-    IMPORTANT:
-    Frontend app.js expects error JSON shaped like:
-      {"error": "message"}
-    And it currently shows errors like:
-      Error loading timeline: 400 @ ... :: {"error":"timeline not ready. Call /generate first."}
-    So we return that format consistently.
-    """
-    return JSONResponse(status_code=status_code, content={"error": message})
+# ----------------------------
+# Presence helpers
+# ----------------------------
+async def _presence_broadcast() -> None:
+    """Broadcast active users to all connected clients."""
+    async with _presence_lock:
+        users = [
+            {
+                "client_id": cid,
+                "username": u.get("username"),
+                "lat": u.get("lat"),
+                "lng": u.get("lng"),
+                "heading": u.get("heading"),
+                "updated_at_unix": u.get("updated_at_unix"),
+            }
+            for cid, u in _presence_users.items()
+        ]
+        sockets = list(_presence_sockets.items())
+
+    payload = json.dumps({"type": "users", "users": users})
+    dead: List[str] = []
+    for cid, ws in sockets:
+        try:
+            await ws.send_text(payload)
+        except Exception:
+            dead.append(cid)
+
+    if dead:
+        async with _presence_lock:
+            for cid in dead:
+                _presence_sockets.pop(cid, None)
+                _presence_users.pop(cid, None)
+
+
+async def _presence_cleanup_loop() -> None:
+    """Remove inactive users every 30s."""
+    while True:
+        await asyncio.sleep(30)
+        now = time.time()
+        removed = False
+        async with _presence_lock:
+            stale = [
+                cid for cid, u in _presence_users.items()
+                if (now - float(u.get("updated_at_unix", 0))) > PRESENCE_TTL_SEC
+            ]
+            for cid in stale:
+                _presence_users.pop(cid, None)
+                ws = _presence_sockets.pop(cid, None)
+                try:
+                    if ws:
+                        await ws.close()
+                except Exception:
+                    pass
+                removed = True
+        if removed:
+            await _presence_broadcast()
 
 
 def _generate_worker(bin_minutes: int, min_trips_per_window: int) -> None:
@@ -132,7 +190,7 @@ def _generate_worker(bin_minutes: int, min_trips_per_window: int) -> None:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         FRAMES_DIR.mkdir(parents=True, exist_ok=True)
 
-        # ensure zones exist (can create/download if missing depending on your build_hotspot.py)
+        # ensure zones exist
         zones_path = ensure_zones_geojson(DATA_DIR, force=False)
 
         # ensure at least one parquet exists
@@ -214,11 +272,6 @@ def auto_generate_if_missing():
     """
     - If /data/frames/timeline.json exists -> do nothing
     - Else -> start generation in background using defaults (if inputs exist)
-
-    FIX:
-    Your old logic required taxi_zones.geojson to already exist.
-    But your worker can create/download zones via ensure_zones_geojson().
-    So we auto-run if parquets exist.
     """
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -228,12 +281,11 @@ def auto_generate_if_missing():
             # Fill state with defaults for nicer status output
             try:
                 tl = _read_json(TIMELINE_PATH)
-                count = tl.get("count") if isinstance(tl, dict) else None
                 _set_state(
                     state="done",
                     bin_minutes=DEFAULT_BIN_MINUTES,
                     min_trips_per_window=DEFAULT_MIN_TRIPS_PER_WINDOW,
-                    result={"ok": True, "count": count},
+                    result={"ok": True, "count": tl.get("count")},
                 )
             except Exception:
                 _set_state(
@@ -244,15 +296,24 @@ def auto_generate_if_missing():
                 )
             return
 
+        zones_ok = (DATA_DIR / "taxi_zones.geojson").exists()
         parquets_ok = len(_list_parquets()) > 0
 
-        if parquets_ok:
+        if zones_ok and parquets_ok:
             start_generate(DEFAULT_BIN_MINUTES, DEFAULT_MIN_TRIPS_PER_WINDOW)
         else:
             _set_state(state="idle")
 
     except Exception:
         _set_state(state="idle")
+
+
+# ----------------------------
+# Start presence cleanup loop
+# ----------------------------
+@app.on_event("startup")
+async def _start_presence_cleanup():
+    asyncio.create_task(_presence_cleanup_loop())
 
 
 # ----------------------------
@@ -263,13 +324,8 @@ def root():
     return {
         "ok": True,
         "service": "NYC TLC Hotspot Backend",
-        "endpoints": ["/status", "/generate", "/generate_status", "/timeline", "/frame/{idx}"],
+        "endpoints": ["/status", "/generate", "/generate_status", "/timeline", "/frame/{idx}", "/ws"],
     }
-
-
-@app.get("/health")
-def health():
-    return {"ok": True, "ts": int(time.time())}
 
 
 @app.get("/status")
@@ -285,7 +341,107 @@ def status():
         "frames_dir": str(FRAMES_DIR),
         "has_timeline": _has_frames(),
         "generate_state": _get_state(),
+        "presence_ttl_sec": PRESENCE_TTL_SEC,
     }
+
+
+# ----------------------------
+# WebSocket: realtime friends
+# ----------------------------
+@app.websocket("/ws")
+async def ws_presence(websocket: WebSocket):
+    await websocket.accept()
+    client_id: str | None = None
+
+    try:
+        while True:
+            msg = await websocket.receive_text()
+            try:
+                obj = json.loads(msg)
+            except Exception:
+                continue
+
+            mtype = obj.get("type")
+            if mtype == "hello":
+                client_id = str(obj.get("client_id") or "")
+                if not client_id:
+                    client_id = str(uuid.uuid4())
+
+                username = str(obj.get("username") or "Friend")[:24]
+
+                async with _presence_lock:
+                    _presence_sockets[client_id] = websocket
+                    _presence_users.setdefault(client_id, {})
+                    _presence_users[client_id].update(
+                        {
+                            "username": username,
+                            "lat": _presence_users.get(client_id, {}).get("lat"),
+                            "lng": _presence_users.get(client_id, {}).get("lng"),
+                            "heading": _presence_users.get(client_id, {}).get("heading"),
+                            "updated_at_unix": time.time(),
+                        }
+                    )
+
+                await _presence_broadcast()
+
+            elif mtype in ("pos", "ping"):
+                cid = str(obj.get("client_id") or "")
+                if not cid:
+                    continue
+                client_id = cid
+
+                async with _presence_lock:
+                    u = _presence_users.get(cid)
+                    if not u:
+                        u = {"username": str(obj.get("username") or "Friend")[:24]}
+                        _presence_users[cid] = u
+
+                    # update position if provided
+                    if "lat" in obj and "lng" in obj:
+                        try:
+                            u["lat"] = float(obj.get("lat"))
+                            u["lng"] = float(obj.get("lng"))
+                        except Exception:
+                            pass
+                    if "heading" in obj:
+                        try:
+                            u["heading"] = float(obj.get("heading"))
+                        except Exception:
+                            pass
+
+                    # update username if provided
+                    if obj.get("username"):
+                        u["username"] = str(obj.get("username"))[:24]
+
+                    u["updated_at_unix"] = time.time()
+                    _presence_sockets[cid] = websocket
+
+                await _presence_broadcast()
+
+            elif mtype == "signout":
+                cid = str(obj.get("client_id") or "")
+                if cid:
+                    async with _presence_lock:
+                        _presence_users.pop(cid, None)
+                        _presence_sockets.pop(cid, None)
+                    await _presence_broadcast()
+                break
+
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        if client_id:
+            async with _presence_lock:
+                ws0 = _presence_sockets.get(client_id)
+                if ws0 is websocket:
+                    _presence_sockets.pop(client_id, None)
+                    _presence_users.pop(client_id, None)
+            try:
+                await _presence_broadcast()
+            except Exception:
+                pass
 
 
 @app.get("/generate")
@@ -301,21 +457,18 @@ def generate_status():
 
 @app.get("/timeline")
 def timeline():
-    # IMPORTANT: match frontend expected error shape + status code
     if not _has_frames():
-        return _err(400, "timeline not ready. Call /generate first.")
+        raise HTTPException(status_code=409, detail="timeline not ready. Call /generate first.")
     return _read_json(TIMELINE_PATH)
 
 
 @app.get("/frame/{idx}")
 def frame(idx: int):
-    # IMPORTANT: match frontend expected error shape + status code
     if not _has_frames():
-        return _err(400, "timeline not ready. Call /generate first.")
-
+        raise HTTPException(status_code=409, detail="timeline not ready. Call /generate first.")
     p = FRAMES_DIR / f"frame_{idx:06d}.json"
     if not p.exists():
-        return _err(404, f"frame not found: {idx}")
+        raise HTTPException(status_code=404, detail=f"frame not found: {idx}")
     return _read_json(p)
 
 
