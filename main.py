@@ -4,14 +4,12 @@ import os
 import json
 import time
 import threading
-import asyncio
-import uuid
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 from build_hotspot import ensure_zones_geojson, build_hotspots_frames
 
@@ -29,6 +27,67 @@ DEFAULT_MIN_TRIPS_PER_WINDOW = int(os.environ.get("DEFAULT_MIN_TRIPS_PER_WINDOW"
 # A simple file lock to prevent multi-start concurrency (best-effort)
 LOCK_PATH = DATA_DIR / ".generate.lock"
 
+# ----------------------------
+# Presence / Friends (in-memory)
+# NOTE: This is in-memory per Railway instance.
+# If you run multiple instances, you need Redis/DB.
+# ----------------------------
+PRESENCE_TIMEOUT_MS = int(os.environ.get("PRESENCE_TIMEOUT_MS", str(30 * 60 * 1000)))  # 30 minutes
+_presence_lock = threading.Lock()
+_presence_store: Dict[str, Dict[str, Any]] = {}  # username -> presence dict
+
+class PresencePayload(BaseModel):
+    username: str
+    session_token: str
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+    heading: Optional[float] = None
+    ts: Optional[int] = None  # ms since epoch
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _presence_cleanup_locked(now_ms: int) -> None:
+    # caller holds _presence_lock
+    dead = []
+    for u, d in _presence_store.items():
+        if now_ms - int(d.get("updated_at_ms", 0)) > PRESENCE_TIMEOUT_MS:
+            dead.append(u)
+    for u in dead:
+        _presence_store.pop(u, None)
+
+
+def _presence_snapshot() -> Dict[str, Any]:
+    now = _now_ms()
+    with _presence_lock:
+        _presence_cleanup_locked(now)
+
+        online = []
+        users = []
+        for u, d in _presence_store.items():
+            online.append(u)
+            lat = d.get("lat", None)
+            lng = d.get("lng", None)
+            if lat is not None and lng is not None:
+                users.append(
+                    {
+                        "username": u,
+                        "lat": lat,
+                        "lng": lng,
+                        "heading": d.get("heading", None),
+                        "updated_at_ms": d.get("updated_at_ms", None),
+                    }
+                )
+
+        # stable sort for nicer UI
+        online.sort(key=lambda x: x.lower())
+        users.sort(key=lambda x: x["username"].lower())
+
+        return {"online": online, "users": users, "timeout_ms": PRESENCE_TIMEOUT_MS}
+
+
 # In-memory job state
 _state_lock = threading.Lock()
 _generate_state: Dict[str, Any] = {
@@ -42,16 +101,6 @@ _generate_state: Dict[str, Any] = {
     "error": None,
     "trace": None,
 }
-
-# ----------------------------
-# Friends / Presence (in-memory)
-# ----------------------------
-# NOTE: This is "best effort" realtime presence. If the Railway service restarts,
-# the in-memory presence list resets (users will reconnect automatically).
-_presence_lock = asyncio.Lock()
-_presence_users: Dict[str, Dict[str, Any]] = {}  # client_id -> {username, lat, lng, heading, updated_at_unix}
-_presence_sockets: Dict[str, WebSocket] = {}     # client_id -> websocket
-PRESENCE_TTL_SEC = int(os.environ.get("PRESENCE_TTL_SEC", str(30 * 60)))  # 30 minutes
 
 # ----------------------------
 # App
@@ -114,64 +163,6 @@ def _get_state() -> Dict[str, Any]:
         return dict(_generate_state)
 
 
-# ----------------------------
-# Presence helpers
-# ----------------------------
-async def _presence_broadcast() -> None:
-    """Broadcast active users to all connected clients."""
-    async with _presence_lock:
-        users = [
-            {
-                "client_id": cid,
-                "username": u.get("username"),
-                "lat": u.get("lat"),
-                "lng": u.get("lng"),
-                "heading": u.get("heading"),
-                "updated_at_unix": u.get("updated_at_unix"),
-            }
-            for cid, u in _presence_users.items()
-        ]
-        sockets = list(_presence_sockets.items())
-
-    payload = json.dumps({"type": "users", "users": users})
-    dead: List[str] = []
-    for cid, ws in sockets:
-        try:
-            await ws.send_text(payload)
-        except Exception:
-            dead.append(cid)
-
-    if dead:
-        async with _presence_lock:
-            for cid in dead:
-                _presence_sockets.pop(cid, None)
-                _presence_users.pop(cid, None)
-
-
-async def _presence_cleanup_loop() -> None:
-    """Remove inactive users every 30s."""
-    while True:
-        await asyncio.sleep(30)
-        now = time.time()
-        removed = False
-        async with _presence_lock:
-            stale = [
-                cid for cid, u in _presence_users.items()
-                if (now - float(u.get("updated_at_unix", 0))) > PRESENCE_TTL_SEC
-            ]
-            for cid in stale:
-                _presence_users.pop(cid, None)
-                ws = _presence_sockets.pop(cid, None)
-                try:
-                    if ws:
-                        await ws.close()
-                except Exception:
-                    pass
-                removed = True
-        if removed:
-            await _presence_broadcast()
-
-
 def _generate_worker(bin_minutes: int, min_trips_per_window: int) -> None:
     start = time.time()
     _set_state(
@@ -218,6 +209,7 @@ def _generate_worker(bin_minutes: int, min_trips_per_window: int) -> None:
     except Exception as e:
         end = time.time()
         import traceback
+
         _set_state(
             state="error",
             finished_at_unix=end,
@@ -309,14 +301,6 @@ def auto_generate_if_missing():
 
 
 # ----------------------------
-# Start presence cleanup loop
-# ----------------------------
-@app.on_event("startup")
-async def _start_presence_cleanup():
-    asyncio.create_task(_presence_cleanup_loop())
-
-
-# ----------------------------
 # Routes
 # ----------------------------
 @app.get("/")
@@ -324,7 +308,17 @@ def root():
     return {
         "ok": True,
         "service": "NYC TLC Hotspot Backend",
-        "endpoints": ["/status", "/generate", "/generate_status", "/timeline", "/frame/{idx}", "/ws"],
+        "endpoints": [
+            "/status",
+            "/generate",
+            "/generate_status",
+            "/timeline",
+            "/frame/{idx}",
+            "/presence/list",
+            "/presence/signin",
+            "/presence/update",
+            "/presence/signout",
+        ],
     }
 
 
@@ -341,107 +335,8 @@ def status():
         "frames_dir": str(FRAMES_DIR),
         "has_timeline": _has_frames(),
         "generate_state": _get_state(),
-        "presence_ttl_sec": PRESENCE_TTL_SEC,
+        "presence": _presence_snapshot(),
     }
-
-
-# ----------------------------
-# WebSocket: realtime friends
-# ----------------------------
-@app.websocket("/ws")
-async def ws_presence(websocket: WebSocket):
-    await websocket.accept()
-    client_id: str | None = None
-
-    try:
-        while True:
-            msg = await websocket.receive_text()
-            try:
-                obj = json.loads(msg)
-            except Exception:
-                continue
-
-            mtype = obj.get("type")
-            if mtype == "hello":
-                client_id = str(obj.get("client_id") or "")
-                if not client_id:
-                    client_id = str(uuid.uuid4())
-
-                username = str(obj.get("username") or "Friend")[:24]
-
-                async with _presence_lock:
-                    _presence_sockets[client_id] = websocket
-                    _presence_users.setdefault(client_id, {})
-                    _presence_users[client_id].update(
-                        {
-                            "username": username,
-                            "lat": _presence_users.get(client_id, {}).get("lat"),
-                            "lng": _presence_users.get(client_id, {}).get("lng"),
-                            "heading": _presence_users.get(client_id, {}).get("heading"),
-                            "updated_at_unix": time.time(),
-                        }
-                    )
-
-                await _presence_broadcast()
-
-            elif mtype in ("pos", "ping"):
-                cid = str(obj.get("client_id") or "")
-                if not cid:
-                    continue
-                client_id = cid
-
-                async with _presence_lock:
-                    u = _presence_users.get(cid)
-                    if not u:
-                        u = {"username": str(obj.get("username") or "Friend")[:24]}
-                        _presence_users[cid] = u
-
-                    # update position if provided
-                    if "lat" in obj and "lng" in obj:
-                        try:
-                            u["lat"] = float(obj.get("lat"))
-                            u["lng"] = float(obj.get("lng"))
-                        except Exception:
-                            pass
-                    if "heading" in obj:
-                        try:
-                            u["heading"] = float(obj.get("heading"))
-                        except Exception:
-                            pass
-
-                    # update username if provided
-                    if obj.get("username"):
-                        u["username"] = str(obj.get("username"))[:24]
-
-                    u["updated_at_unix"] = time.time()
-                    _presence_sockets[cid] = websocket
-
-                await _presence_broadcast()
-
-            elif mtype == "signout":
-                cid = str(obj.get("client_id") or "")
-                if cid:
-                    async with _presence_lock:
-                        _presence_users.pop(cid, None)
-                        _presence_sockets.pop(cid, None)
-                    await _presence_broadcast()
-                break
-
-    except WebSocketDisconnect:
-        pass
-    except Exception:
-        pass
-    finally:
-        if client_id:
-            async with _presence_lock:
-                ws0 = _presence_sockets.get(client_id)
-                if ws0 is websocket:
-                    _presence_sockets.pop(client_id, None)
-                    _presence_users.pop(client_id, None)
-            try:
-                await _presence_broadcast()
-            except Exception:
-                pass
 
 
 @app.get("/generate")
@@ -515,3 +410,90 @@ async def upload_parquet(file: UploadFile = File(...)):
 
     target.write_bytes(content)
     return {"saved": str(target), "size_mb": round(target.stat().st_size / (1024 * 1024), 2)}
+
+
+# ----------------------------
+# Friends / Presence endpoints
+# ----------------------------
+@app.get("/presence/list")
+def presence_list():
+    """
+    Returns:
+      - online: list of usernames currently online (even if no GPS yet)
+      - users: list of users that have lat/lng so frontend can draw markers
+    """
+    return _presence_snapshot()
+
+
+@app.post("/presence/signin")
+def presence_signin(p: PresencePayload):
+    """
+    Sign in (creates/refreshes a session).
+    We accept session_token from the frontend; backend stores it and requires it for update/signout.
+    """
+    now = _now_ms()
+    with _presence_lock:
+        _presence_cleanup_locked(now)
+
+        # If user exists with different token, overwrite (latest wins)
+        _presence_store[p.username] = {
+            "username": p.username,
+            "session_token": p.session_token,
+            "lat": None,
+            "lng": None,
+            "heading": None,
+            "updated_at_ms": now,
+        }
+    return {"ok": True}
+
+
+@app.post("/presence/update")
+def presence_update(p: PresencePayload):
+    """
+    Update location/heading. Requires matching session_token.
+    """
+    now = p.ts if isinstance(p.ts, int) and p.ts > 0 else _now_ms()
+
+    with _presence_lock:
+        _presence_cleanup_locked(now)
+
+        d = _presence_store.get(p.username)
+        if not d:
+            return {"ok": False, "error": "not_signed_in"}
+
+        if d.get("session_token") != p.session_token:
+            return {"ok": False, "error": "bad_session"}
+
+        # Update GPS fields (allow None, but keep last known if None)
+        if p.lat is not None and p.lng is not None:
+            d["lat"] = float(p.lat)
+            d["lng"] = float(p.lng)
+
+        if p.heading is not None:
+            try:
+                d["heading"] = float(p.heading)
+            except Exception:
+                pass
+
+        d["updated_at_ms"] = now
+
+    return {"ok": True}
+
+
+@app.post("/presence/signout")
+def presence_signout(p: PresencePayload):
+    """
+    Sign out. Requires matching session_token.
+    """
+    with _presence_lock:
+        d = _presence_store.get(p.username)
+        if not d:
+            return {"ok": True}
+
+        if d.get("session_token") != p.session_token:
+            # don't allow random signouts
+            return {"ok": False, "error": "bad_session"}
+
+        _presence_store.pop(p.username, None)
+
+    return {"ok": True}
