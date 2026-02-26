@@ -6,7 +6,6 @@ from datetime import datetime, timedelta
 import json
 import duckdb
 
-
 REQUIRED_COLS = ["PULocationID", "pickup_datetime", "driver_pay", "trip_miles", "trip_time"]
 
 
@@ -55,22 +54,21 @@ def build_hotspots_frames(
       /data/frames/timeline.json
       /data/frames/frame_000000.json ... etc
 
-    Each frame contains:
-      - time
-      - polygons FeatureCollection
-      - each feature has:
-          LocationID, zone_name, borough,
-          rating, bucket,
-          pickups,
-          avg_driver_pay,
-          avg_trip_miles,
-          avg_trip_time_sec,
-          earnings_per_hour,
-          style(fillColor)
+    Each feature has:
+      LocationID, zone_name, borough,
+      rating, bucket,
+      pickups,
+      avg_driver_pay,
+      avg_trip_miles,
+      avg_trip_time_sec,
 
-    SINGLE LOGIC ONLY (NO FALLBACK):
-      Requires columns: PULocationID, pickup_datetime, driver_pay, trip_miles, trip_time
-      trip_time is treated as seconds (matches your debug sample values).
+      earnings_per_hour                 -> NOW: pay_per_clock_hour (REALISTIC WALL-CLOCK)
+      active_trip_earnings_per_hour     -> OLD: SUM(pay)/SUM(trip_time) (engaged-time only)
+
+    COLOR / RATING LOGIC (UPDATED):
+      rating prioritizes pickups first, then pay_per_clock_hour:
+        70% pickups percentile + 30% pay_per_clock_hour percentile
+      (no miles in the color logic)
     """
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -119,17 +117,12 @@ def build_hotspots_frames(
     parquet_list = [str(p) for p in parquet_files]
     parquet_sql = ", ".join("'" + p.replace("'", "''") + "'" for p in parquet_list)
 
+    window_hours = float(bin_minutes) / 60.0
+
     # ----------------------------
-    # SINGLE LOGIC SCORE
-    #
-    # We compute 3 drivers of profit strategy:
-    #   1) busy (pickups) - keeps you working
-    #   2) earnings_per_hour (sum pay / sum time) - true money per hour
-    #   3) long trips (avg_trip_miles) - favors longer rides
-    #
-    # Normalization uses percentile rank per-window (robust to outliers).
-    # Baseline uses percentile rank across zones (robust).
-    # Confidence uses pickups scaling (more trips -> more trust).
+    # UPDATED SCORING
+    # - pickups is the main truth signal (demand)
+    # - pay_per_clock_hour is the best "reality-based" money signal we can compute
     # ----------------------------
     sql = f"""
     WITH base AS (
@@ -198,88 +191,41 @@ def build_hotspots_frames(
         AVG(trip_time_sec) AS avg_trip_time_sec,
         SUM(driver_pay) AS sum_driver_pay,
         SUM(trip_time_sec) AS sum_trip_time_sec,
+
+        -- "REALITY-BASED" zone money flow per wall-clock hour of the window:
+        (SUM(driver_pay) / {window_hours}) AS pay_per_clock_hour,
+
+        -- Old metric (engaged trip-time only): can be inflated; we keep it for debugging/compare:
         CASE
           WHEN SUM(trip_time_sec) <= 0 THEN NULL
           ELSE SUM(driver_pay) / (SUM(trip_time_sec) / 3600.0)
-        END AS earnings_per_hour
+        END AS active_trip_earnings_per_hour
+
       FROM binned
       GROUP BY 1,2,3
       HAVING COUNT(*) >= {int(min_trips_per_window)}
     ),
 
-    -- Per-window percentile ranks
     win AS (
       SELECT
         *,
         LN(1 + pickups) AS log_pickups,
         ROW_NUMBER() OVER (PARTITION BY dow_m, bin_start_min ORDER BY LN(1 + pickups)) AS rn_pickups,
-        ROW_NUMBER() OVER (PARTITION BY dow_m, bin_start_min ORDER BY earnings_per_hour) AS rn_eph,
-        ROW_NUMBER() OVER (PARTITION BY dow_m, bin_start_min ORDER BY avg_trip_miles) AS rn_miles,
+        ROW_NUMBER() OVER (PARTITION BY dow_m, bin_start_min ORDER BY pay_per_clock_hour) AS rn_clock,
         COUNT(*) OVER (PARTITION BY dow_m, bin_start_min) AS n_in_window
       FROM agg
-      WHERE earnings_per_hour IS NOT NULL
+      WHERE pay_per_clock_hour IS NOT NULL
     ),
 
     win_scored AS (
       SELECT
         PULocationID, dow_m, bin_start_min,
-        pickups, avg_driver_pay, avg_trip_miles, avg_trip_time_sec, earnings_per_hour,
+        pickups, avg_driver_pay, avg_trip_miles, avg_trip_time_sec,
+        pay_per_clock_hour, active_trip_earnings_per_hour,
+
         CASE WHEN n_in_window <= 1 THEN 0.0 ELSE (rn_pickups - 1) * 1.0 / (n_in_window - 1) END AS vol_n,
-        CASE WHEN n_in_window <= 1 THEN 0.0 ELSE (rn_eph - 1) * 1.0 / (n_in_window - 1) END AS eph_n,
-        CASE WHEN n_in_window <= 1 THEN 0.0 ELSE (rn_miles - 1) * 1.0 / (n_in_window - 1) END AS miles_n
+        CASE WHEN n_in_window <= 1 THEN 0.0 ELSE (rn_clock   - 1) * 1.0 / (n_in_window - 1) END AS clock_n
       FROM win
-    ),
-
-    -- Baseline per-zone, ranked across zones
-    zone_base AS (
-      SELECT
-        PULocationID,
-        LN(1 + AVG(pickups)) AS base_log_pickups,
-        AVG(earnings_per_hour) AS base_eph,
-        AVG(avg_trip_miles) AS base_miles
-      FROM agg
-      WHERE earnings_per_hour IS NOT NULL
-      GROUP BY 1
-    ),
-
-    zone_ranked AS (
-      SELECT
-        *,
-        ROW_NUMBER() OVER (ORDER BY base_log_pickups) AS rn_base_pickups,
-        ROW_NUMBER() OVER (ORDER BY base_eph) AS rn_base_eph,
-        ROW_NUMBER() OVER (ORDER BY base_miles) AS rn_base_miles,
-        COUNT(*) OVER () AS n_zones
-      FROM zone_base
-    ),
-
-    zone_norm AS (
-      SELECT
-        PULocationID,
-        CASE WHEN n_zones <= 1 THEN 0.0 ELSE (rn_base_pickups - 1) * 1.0 / (n_zones - 1) END AS base_vol_n,
-        CASE WHEN n_zones <= 1 THEN 0.0 ELSE (rn_base_eph - 1) * 1.0 / (n_zones - 1) END AS base_eph_n,
-        CASE WHEN n_zones <= 1 THEN 0.0 ELSE (rn_base_miles - 1) * 1.0 / (n_zones - 1) END AS base_miles_n
-      FROM zone_ranked
-    ),
-
-    final AS (
-      SELECT
-        w.PULocationID,
-        w.dow_m,
-        w.bin_start_min,
-        w.pickups,
-        w.avg_driver_pay,
-        w.avg_trip_miles,
-        w.avg_trip_time_sec,
-        w.earnings_per_hour,
-
-        -- weights: stay busy + money/hr + long trips
-        (0.55*w.vol_n + 0.30*w.eph_n + 0.15*w.miles_n) AS moment_score,
-        (0.55*z.base_vol_n + 0.30*z.base_eph_n + 0.15*z.base_miles_n) AS base_score,
-
-        -- confidence by pickup count
-        LEAST(1.0, w.pickups / 50.0) AS conf
-      FROM win_scored w
-      JOIN zone_norm z USING (PULocationID)
     )
 
     SELECT
@@ -290,28 +236,29 @@ def build_hotspots_frames(
       avg_driver_pay,
       avg_trip_miles,
       avg_trip_time_sec,
-      earnings_per_hour,
+      pay_per_clock_hour,
+      active_trip_earnings_per_hour,
+
       CAST(
         ROUND(
           1 + 99 * LEAST(
             GREATEST(
-              ((0.70*moment_score + 0.30*base_score) * (0.50 + 0.50*conf)),
+              (0.70*vol_n + 0.30*clock_n),
               0.0
             ),
             1.0
           )
         ) AS INTEGER
       ) AS rating
-    FROM final
+
+    FROM win_scored
     ORDER BY dow_m, bin_start_min, PULocationID;
     """
 
-    # IMPORTANT: if required columns are missing, DuckDB will throw.
-    # We want that (single logic only).
     cur = con.execute(sql)
 
     # timeline labels (Mon-based week anchor)
-    week_start = datetime(2025, 1, 6, 0, 0, 0)  # Monday anchor
+    week_start = datetime(2025, 1, 6, 0, 0, 0)  # Monday anchor (your UI logic expects this)
     timeline: List[str] = []
     frame_count = 0
 
@@ -345,7 +292,11 @@ def build_hotspots_frames(
             break
         any_rows = True
 
-        for (zid, dow_m, bin_start_min, pickups, avg_pay, avg_miles, avg_time_sec, eph, rating) in batch:
+        for (
+            zid, dow_m, bin_start_min,
+            pickups, avg_pay, avg_miles, avg_time_sec,
+            pay_clock_hr, active_eph, rating
+        ) in batch:
             total_rows += 1
             key = (int(dow_m), int(bin_start_min))
 
@@ -368,6 +319,9 @@ def build_hotspots_frames(
             r = int(rating)
             bucket, fill = bucket_and_color_from_rating(r)
 
+            # IMPORTANT:
+            # Keep the frontend working by storing pay_per_clock_hour into earnings_per_hour.
+            # This makes the number more "reality-based" than the old engaged-time calculation.
             current_features.append({
                 "type": "Feature",
                 "geometry": geom,
@@ -375,13 +329,21 @@ def build_hotspots_frames(
                     "LocationID": zid_i,
                     "zone_name": name_by_id.get(zid_i, ""),
                     "borough": borough_by_id.get(zid_i, ""),
+
                     "rating": r,
                     "bucket": bucket,
                     "pickups": int(pickups),
+
                     "avg_driver_pay": None if avg_pay is None else float(avg_pay),
                     "avg_trip_miles": None if avg_miles is None else float(avg_miles),
                     "avg_trip_time_sec": None if avg_time_sec is None else float(avg_time_sec),
-                    "earnings_per_hour": None if eph is None else float(eph),
+
+                    # NEW "reality-based" money flow per clock-hour:
+                    "earnings_per_hour": None if pay_clock_hr is None else float(pay_clock_hr),
+
+                    # Old metric kept for debugging / comparison:
+                    "active_trip_earnings_per_hour": None if active_eph is None else float(active_eph),
+
                     "style": {
                         "color": fill,
                         "opacity": 0,
