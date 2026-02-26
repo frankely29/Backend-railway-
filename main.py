@@ -5,7 +5,7 @@ import json
 import time
 import threading
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,6 +22,10 @@ TIMELINE_PATH = FRAMES_DIR / "timeline.json"
 # Defaults for auto-generate (Option A)
 DEFAULT_BIN_MINUTES = int(os.environ.get("DEFAULT_BIN_MINUTES", "20"))
 DEFAULT_MIN_TRIPS_PER_WINDOW = int(os.environ.get("DEFAULT_MIN_TRIPS_PER_WINDOW", "25"))
+
+# Rating weights (pickups is main)
+RATING_W_PICKUPS = float(os.environ.get("RATING_W_PICKUPS", "0.65"))
+RATING_W_EPH = float(os.environ.get("RATING_W_EPH", "0.35"))
 
 # A simple file lock to prevent multi-start concurrency (best-effort)
 LOCK_PATH = DATA_DIR / ".generate.lock"
@@ -100,6 +104,156 @@ def _get_state() -> Dict[str, Any]:
         return dict(_generate_state)
 
 
+# ----------------------------
+# Rating / Color logic (ON-THE-FLY)
+# ----------------------------
+def _to_float(x) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+
+def _percentile_rank(sorted_vals: List[float], v: float) -> float:
+    """
+    Percentile rank in [0,1] using <= counting.
+    sorted_vals must be sorted ascending and non-empty.
+    """
+    n = len(sorted_vals)
+    if n <= 1:
+        return 0.0
+
+    lo, hi, ans = 0, n - 1, -1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if sorted_vals[mid] <= v:
+            ans = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+
+    if ans < 0:
+        return 0.0
+    return max(0.0, min(1.0, ans / (n - 1)))
+
+
+def _bucket_from_rating(r: float) -> str:
+    x = max(1, min(100, int(round(r))))
+    if x >= 90:
+        return "green"
+    if x >= 80:
+        return "purple"
+    if x >= 65:
+        return "blue"
+    if x >= 45:
+        return "sky"
+    if x >= 25:
+        return "yellow"
+    return "red"
+
+
+def _color_from_bucket(bucket: str) -> str:
+    return {
+        "green": "#00b050",
+        "purple": "#8000ff",
+        "blue": "#0066ff",
+        "sky": "#66ccff",
+        "yellow": "#ffd400",
+        "red": "#e60000",
+    }.get(bucket or "", "#999999")
+
+
+def apply_rating_and_style_to_frame(frame: Dict[str, Any], w_pickups: float, w_eph: float) -> Dict[str, Any]:
+    """
+    Modifies the frame in-place:
+      - computes rating/bucket/style.fillColor using pickups + earnings_per_hour percentiles
+    Returns the frame (same object) for convenience.
+    """
+    feats = (((frame or {}).get("polygons") or {}).get("features") or [])
+    if not feats:
+        return frame
+
+    pickups_vals: List[float] = []
+    eph_vals: List[float] = []
+
+    for f in feats:
+        props = (f or {}).get("properties") or {}
+        pu = _to_float(props.get("pickups"))
+        if pu is not None:
+            pickups_vals.append(pu)
+
+        eph = _to_float(props.get("earnings_per_hour"))
+        if eph is not None:
+            eph_vals.append(eph)
+
+    # Need enough values to be meaningful
+    pickups_ok = len(pickups_vals) >= 3
+    eph_ok = len(eph_vals) >= 3
+
+    if not pickups_ok:
+        return frame
+
+    pickups_sorted = sorted(pickups_vals)
+    eph_sorted = sorted(eph_vals) if eph_ok else []
+
+    # Normalize weights defensively
+    w_pickups = float(w_pickups)
+    w_eph = float(w_eph)
+    if w_pickups < 0:
+        w_pickups = 0.0
+    if w_eph < 0:
+        w_eph = 0.0
+    if w_pickups == 0 and w_eph == 0:
+        w_pickups = 1.0
+        w_eph = 0.0
+
+    # If eph missing, fall back to pickups-only
+    if not eph_ok:
+        w_pickups = 1.0
+        w_eph = 0.0
+
+    s = w_pickups + w_eph
+    w_pickups /= s
+    w_eph /= s
+
+    for f in feats:
+        props = (f or {}).get("properties") or {}
+
+        pu = _to_float(props.get("pickups")) or 0.0
+        pu_pct = _percentile_rank(pickups_sorted, pu)
+
+        if eph_ok:
+            eph = _to_float(props.get("earnings_per_hour"))
+            eph_pct = _percentile_rank(eph_sorted, eph) if eph is not None else 0.0
+            score = (w_pickups * pu_pct) + (w_eph * eph_pct)
+        else:
+            score = pu_pct
+
+        rating = 1.0 + 99.0 * score
+        bucket = _bucket_from_rating(rating)
+        color = _color_from_bucket(bucket)
+
+        props["rating"] = int(round(rating))
+        props["bucket"] = bucket
+
+        st = props.get("style") or {}
+        if not isinstance(st, dict):
+            st = {}
+
+        st["color"] = color
+        st["fillColor"] = color
+        st.setdefault("opacity", 0)
+        st.setdefault("weight", 0)
+        st.setdefault("fillOpacity", 0.82)
+
+        props["style"] = st
+        f["properties"] = props
+
+    return frame
+
+
 def _generate_worker(bin_minutes: int, min_trips_per_window: int) -> None:
     start = time.time()
     _set_state(
@@ -146,6 +300,7 @@ def _generate_worker(bin_minutes: int, min_trips_per_window: int) -> None:
     except Exception as e:
         end = time.time()
         import traceback
+
         _set_state(
             state="error",
             finished_at_unix=end,
@@ -169,7 +324,12 @@ def start_generate(bin_minutes: int, min_trips_per_window: int) -> Dict[str, Any
 
     if _lock_is_present():
         _set_state(state="running", bin_minutes=bin_minutes, min_trips_per_window=min_trips_per_window)
-        return {"ok": True, "state": "running", "bin_minutes": bin_minutes, "min_trips_per_window": min_trips_per_window}
+        return {
+            "ok": True,
+            "state": "running",
+            "bin_minutes": bin_minutes,
+            "min_trips_per_window": min_trips_per_window,
+        }
 
     _write_lock()
     _set_state(state="started", bin_minutes=bin_minutes, min_trips_per_window=min_trips_per_window)
@@ -253,6 +413,7 @@ def status():
         "frames_dir": str(FRAMES_DIR),
         "has_timeline": _has_frames(),
         "generate_state": _get_state(),
+        "rating_weights": {"pickups": RATING_W_PICKUPS, "earnings_per_hour": RATING_W_EPH},
     }
 
 
@@ -275,12 +436,21 @@ def timeline():
 
 @app.get("/frame/{idx}")
 def frame(idx: int):
+    """
+    Returns the frame, but ALSO recomputes rating/bucket/style on-the-fly
+    so the frontend colors always reflect: pickups + earnings_per_hour.
+    """
     if not _has_frames():
         raise HTTPException(status_code=409, detail="timeline not ready. Call /generate first.")
     p = FRAMES_DIR / f"frame_{idx:06d}.json"
     if not p.exists():
         raise HTTPException(status_code=404, detail=f"frame not found: {idx}")
-    return _read_json(p)
+
+    fr = _read_json(p)
+
+    # Apply new color logic here (no re-generate required)
+    apply_rating_and_style_to_frame(fr, w_pickups=RATING_W_PICKUPS, w_eph=RATING_W_EPH)
+    return fr
 
 
 @app.post("/upload_zones_geojson")
@@ -338,12 +508,10 @@ def debug_schema():
     con = duckdb.connect(database=":memory:")
     p0 = str(parquets[0])
 
-    # DuckDB can DESCRIBE a parquet scan
     cols = con.execute(f"DESCRIBE SELECT * FROM read_parquet('{p0}')").fetchall()
     columns = [{"name": r[0], "type": r[1]} for r in cols]
     lower = [c["name"].lower() for c in columns]
 
-    # exact name mapping if present
     selected = {}
     for k in ["PULocationID", "pickup_datetime", "driver_pay", "trip_miles", "trip_time", "dropoff_datetime"]:
         hit = None
@@ -364,6 +532,7 @@ def debug_schema():
         "selected_columns": selected,
         "missing_required": missing,
         "trip_time_unit_guess": "seconds",
+        "rating_weights": {"pickups": RATING_W_PICKUPS, "earnings_per_hour": RATING_W_EPH},
     }
 
 
@@ -475,4 +644,5 @@ def debug_frame_stats(idx: int):
             "earnings_per_hour": summary(eph),
             "avg_trip_miles": summary(miles),
         },
+        "rating_weights": {"pickups": RATING_W_PICKUPS, "earnings_per_hour": RATING_W_EPH},
     }
