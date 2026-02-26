@@ -5,9 +5,8 @@ import json
 import time
 import threading
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List
 
-import duckdb
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -24,7 +23,7 @@ TIMELINE_PATH = FRAMES_DIR / "timeline.json"
 DEFAULT_BIN_MINUTES = int(os.environ.get("DEFAULT_BIN_MINUTES", "20"))
 DEFAULT_MIN_TRIPS_PER_WINDOW = int(os.environ.get("DEFAULT_MIN_TRIPS_PER_WINDOW", "25"))
 
-# Best-effort file lock to prevent multi-start concurrency
+# A simple file lock to prevent multi-start concurrency (best-effort)
 LOCK_PATH = DATA_DIR / ".generate.lock"
 
 # In-memory job state
@@ -44,11 +43,11 @@ _generate_state: Dict[str, Any] = {
 # ----------------------------
 # App
 # ----------------------------
-app = FastAPI(title="NYC TLC Hotspot Backend", version="1.2")
+app = FastAPI(title="NYC TLC Hotspot Backend", version="1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # lock down later if desired
+    allow_origins=["*"],  # lock down later
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -101,80 +100,6 @@ def _get_state() -> Dict[str, Any]:
         return dict(_generate_state)
 
 
-def _duckdb_schema_for_parquets(parquets: List[Path]) -> Dict[str, Any]:
-    if not parquets:
-        return {"ok": False, "error": "No parquet files found."}
-
-    tmp_dir = DATA_DIR / "duckdb_tmp_debug"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-
-    con = duckdb.connect(database=":memory:")
-    con.execute("PRAGMA enable_progress_bar=false")
-    con.execute(f"PRAGMA temp_directory='{tmp_dir.as_posix()}'")
-
-    parquet_list = [str(p) for p in parquets]
-    parquet_sql = ", ".join("'" + p.replace("'", "''") + "'" for p in parquet_list)
-
-    rows = con.execute(f"DESCRIBE SELECT * FROM read_parquet([{parquet_sql}])").fetchall()
-    cols = [{"name": r[0], "type": r[1]} for r in rows]
-    lower = [c["name"].lower() for c in cols]
-
-    # what we WANT
-    want_candidates = {
-        "PULocationID": ["PULocationID", "pulocationid"],
-        "pickup_datetime": ["pickup_datetime", "Pickup_datetime", "PICKUP_DATETIME"],
-        "driver_pay": ["driver_pay", "Driver_pay"],
-        "trip_miles": ["trip_miles", "Trip_miles"],
-        "trip_time": ["trip_time", "Trip_time"],
-        "dropoff_datetime": ["dropoff_datetime", "Dropoff_datetime"],
-    }
-
-    selected: Dict[str, Optional[str]] = {}
-    for key, cands in want_candidates.items():
-        chosen = None
-        for c in cands:
-            if c.lower() in lower:
-                # return the actual cased version from cols
-                for cc in cols:
-                    if cc["name"].lower() == c.lower():
-                        chosen = cc["name"]
-                        break
-                if chosen:
-                    break
-        selected[key] = chosen
-
-    # Detect trip_time unit (seconds vs minutes) via quick median heuristic
-    trip_time_unit = None
-    trip_time_col = selected.get("trip_time")
-    if trip_time_col:
-        try:
-            med = con.execute(
-                f"""
-                SELECT approx_quantile(CAST({trip_time_col} AS DOUBLE), 0.5)
-                FROM read_parquet([{parquet_sql}])
-                WHERE {trip_time_col} IS NOT NULL
-                LIMIT 100000
-                """
-            ).fetchone()[0]
-            if med is not None:
-                # TLC FHV trip_time is typically seconds (often hundreds to thousands).
-                # If median > ~200, it's almost certainly seconds.
-                trip_time_unit = "seconds" if float(med) > 200 else "minutes"
-        except Exception:
-            trip_time_unit = None
-
-    con.close()
-
-    return {
-        "ok": True,
-        "files": [p.name for p in parquets],
-        "columns": cols,
-        "columns_lower": lower,
-        "selected_columns": selected,
-        "trip_time_unit_guess": trip_time_unit,
-    }
-
-
 def _generate_worker(bin_minutes: int, min_trips_per_window: int) -> None:
     start = time.time()
     _set_state(
@@ -201,7 +126,7 @@ def _generate_worker(bin_minutes: int, min_trips_per_window: int) -> None:
         if not parquets:
             raise RuntimeError("No .parquet files found in /data. Upload via POST /upload_parquet.")
 
-        # build frames (this function now auto-detects columns + falls back safely)
+        # build frames (SINGLE LOGIC ONLY; build_hotspot will error if columns missing)
         result = build_hotspots_frames(
             parquet_files=parquets,
             zones_geojson_path=zones_path,
@@ -260,10 +185,6 @@ def start_generate(bin_minutes: int, min_trips_per_window: int) -> Dict[str, Any
 # ----------------------------
 @app.on_event("startup")
 def auto_generate_if_missing():
-    """
-    If /data/frames/timeline.json exists -> do nothing
-    Else -> start generation in background using defaults (if inputs exist)
-    """
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         FRAMES_DIR.mkdir(parents=True, exist_ok=True)
@@ -400,93 +321,98 @@ async def upload_parquet(file: UploadFile = File(...)):
 
 
 # ----------------------------
-# DEBUG endpoints (Railway verification)
+# DEBUG (Railway verification)
 # ----------------------------
 @app.get("/debug/schema")
 def debug_schema():
+    """
+    Returns detected parquet columns + a mapping for the columns we expect.
+    This makes it obvious whether Railway is reading the right fields.
+    """
+    import duckdb
+
     parquets = _list_parquets()
-    return _duckdb_schema_for_parquets(parquets)
+    if not parquets:
+        raise HTTPException(status_code=404, detail="No parquet files found in /data")
+
+    con = duckdb.connect(database=":memory:")
+    p0 = str(parquets[0])
+
+    # DuckDB can DESCRIBE a parquet scan
+    cols = con.execute(f"DESCRIBE SELECT * FROM read_parquet('{p0}')").fetchall()
+    columns = [{"name": r[0], "type": r[1]} for r in cols]
+    lower = [c["name"].lower() for c in columns]
+
+    # exact name mapping if present
+    selected = {}
+    for k in ["PULocationID", "pickup_datetime", "driver_pay", "trip_miles", "trip_time", "dropoff_datetime"]:
+        hit = None
+        for c in columns:
+            if c["name"] == k:
+                hit = c["name"]
+                break
+        if hit:
+            selected[k] = hit
+
+    missing = [c for c in ["PULocationID", "pickup_datetime", "driver_pay", "trip_miles", "trip_time"] if c not in selected]
+
+    return {
+        "ok": True,
+        "files": [p.name for p in parquets],
+        "columns": columns,
+        "columns_lower": lower,
+        "selected_columns": selected,
+        "missing_required": missing,
+        "trip_time_unit_guess": "seconds",
+    }
 
 
 @app.get("/debug/sample")
 def debug_sample(limit: int = 5):
     """
-    Quick sanity check:
-      - shows selected columns + a few rows
-      - proves trip_time looks like seconds in your dataset
+    Sanity sample: show raw values for required columns.
     """
+    import duckdb
+
     parquets = _list_parquets()
     if not parquets:
-        return {"ok": False, "error": "No parquet files found."}
-
-    schema = _duckdb_schema_for_parquets(parquets)
-    if not schema.get("ok"):
-        return schema
-
-    sel = schema["selected_columns"]
-    need = ["PULocationID", "pickup_datetime"]
-    for k in need:
-        if not sel.get(k):
-            return {"ok": False, "error": f"Missing required column: {k}.", "selected_columns": sel}
-
-    tmp_dir = DATA_DIR / "duckdb_tmp_debug"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
+        raise HTTPException(status_code=404, detail="No parquet files found in /data")
 
     con = duckdb.connect(database=":memory:")
-    con.execute("PRAGMA enable_progress_bar=false")
-    con.execute(f"PRAGMA temp_directory='{tmp_dir.as_posix()}'")
-
-    parquet_list = [str(p) for p in parquets]
-    parquet_sql = ", ".join("'" + p.replace("'", "''") + "'" for p in parquet_list)
-
-    pu = sel["PULocationID"]
-    pd = sel["pickup_datetime"]
-    pay = sel.get("driver_pay")
-    miles = sel.get("trip_miles")
-    ttime = sel.get("trip_time")
-
-    # Build a safe select that works even if optional cols missing
-    cols_sql = [f"CAST({pu} AS INTEGER) AS PULocationID", f"CAST({pd} AS TIMESTAMP) AS pickup_datetime"]
-    if pay:
-        cols_sql.append(f"TRY_CAST({pay} AS DOUBLE) AS driver_pay")
-    else:
-        cols_sql.append("NULL::DOUBLE AS driver_pay")
-    if miles:
-        cols_sql.append(f"TRY_CAST({miles} AS DOUBLE) AS trip_miles")
-    else:
-        cols_sql.append("NULL::DOUBLE AS trip_miles")
-    if ttime:
-        cols_sql.append(f"TRY_CAST({ttime} AS DOUBLE) AS trip_time")
-    else:
-        cols_sql.append("NULL::DOUBLE AS trip_time")
+    plist = ",".join("'" + str(p).replace("'", "''") + "'" for p in parquets)
 
     q = f"""
-    SELECT {", ".join(cols_sql)}
-    FROM read_parquet([{parquet_sql}])
-    WHERE {pu} IS NOT NULL AND {pd} IS NOT NULL
-    LIMIT {int(limit)}
+      SELECT
+        CAST(PULocationID AS INTEGER) AS PULocationID,
+        CAST(pickup_datetime AS VARCHAR) AS pickup_datetime,
+        TRY_CAST(driver_pay AS DOUBLE) AS driver_pay,
+        TRY_CAST(trip_miles AS DOUBLE) AS trip_miles,
+        TRY_CAST(trip_time AS DOUBLE) AS trip_time
+      FROM read_parquet([{plist}])
+      WHERE
+        PULocationID IS NOT NULL
+        AND pickup_datetime IS NOT NULL
+        AND driver_pay IS NOT NULL
+        AND trip_miles IS NOT NULL
+        AND trip_time IS NOT NULL
+      LIMIT {int(max(1, min(limit, 50)))}
     """
     rows = con.execute(q).fetchall()
-    con.close()
 
     return {
         "ok": True,
         "files": [p.name for p in parquets],
         "selected_columns": ["PULocationID", "pickup_datetime", "driver_pay", "trip_miles", "trip_time"],
-        "rows": [
-            [r[0], r[1].isoformat() if r[1] else None, r[2], r[3], r[4]]
-            for r in rows
-        ],
-        "trip_time_unit_guess": schema.get("trip_time_unit_guess"),
-        "note": "Use /debug/schema to see exact column names; this endpoint is a quick value sanity-check.",
+        "rows": rows,
+        "trip_time_unit_guess": "seconds",
+        "note": "This endpoint is a quick value sanity-check.",
     }
 
 
 @app.get("/debug/frame_stats/{idx}")
 def debug_frame_stats(idx: int):
     """
-    Verifies per-frame metrics are present:
-      avg_trip_miles, avg_trip_minutes, pay_per_hour_zone
+    Reads a generated frame and summarizes whether the new metrics exist and look sane.
     """
     if not _has_frames():
         raise HTTPException(status_code=409, detail="timeline not ready. Call /generate first.")
@@ -496,66 +422,57 @@ def debug_frame_stats(idx: int):
         raise HTTPException(status_code=404, detail=f"frame not found: {idx}")
 
     frame = _read_json(p)
-    feats = (frame.get("polygons") or {}).get("features") or []
+    feats = (((frame or {}).get("polygons") or {}).get("features") or [])
 
-    def num(x):
+    def to_num(x):
         try:
             if x is None:
                 return None
-            v = float(x)
-            return v if v == v else None
+            return float(x)
         except Exception:
             return None
 
-    miles_vals = []
-    mins_vals = []
-    pph_vals = []
-
-    has_miles = 0
-    has_mins = 0
-    has_pph = 0
-
+    pickups = []
+    eph = []
+    miles = []
     for f in feats:
         props = (f or {}).get("properties") or {}
-        m = num(props.get("avg_trip_miles"))
-        t = num(props.get("avg_trip_minutes"))
-        pph = num(props.get("pay_per_hour_zone"))
-
+        pu = to_num(props.get("pickups"))
+        if pu is not None:
+            pickups.append(pu)
+        e = to_num(props.get("earnings_per_hour"))
+        if e is not None:
+            eph.append(e)
+        m = to_num(props.get("avg_trip_miles"))
         if m is not None:
-            has_miles += 1
-            miles_vals.append(m)
-        if t is not None:
-            has_mins += 1
-            mins_vals.append(t)
-        if pph is not None:
-            has_pph += 1
-            pph_vals.append(pph)
+            miles.append(m)
 
-    def summary(vals: List[float]):
-        if not vals:
+    def summary(arr):
+        if not arr:
             return None
-        vals2 = sorted(vals)
-        n = len(vals2)
+        arr2 = sorted(arr)
+        n = len(arr2)
         return {
-            "n": n,
-            "min": vals2[0],
-            "median": vals2[n // 2],
-            "max": vals2[-1],
+            "count": n,
+            "min": arr2[0],
+            "p50": arr2[n // 2],
+            "p90": arr2[int(n * 0.9) - 1 if n > 1 else 0],
+            "max": arr2[-1],
         }
 
     return {
         "ok": True,
         "idx": idx,
         "time": frame.get("time"),
-        "features": len(feats),
-        "present": {
-            "avg_trip_miles": f"{has_miles}/{len(feats)}",
-            "avg_trip_minutes": f"{has_mins}/{len(feats)}",
-            "pay_per_hour_zone": f"{has_pph}/{len(feats)}",
+        "feature_count": len(feats),
+        "has_new_metrics": {
+            "avg_trip_miles": any(((f.get("properties") or {}).get("avg_trip_miles") is not None) for f in feats),
+            "avg_trip_time_sec": any(((f.get("properties") or {}).get("avg_trip_time_sec") is not None) for f in feats),
+            "earnings_per_hour": any(((f.get("properties") or {}).get("earnings_per_hour") is not None) for f in feats),
         },
-        "stats": {
-            "avg_trip_miles": summary(miles_vals),
-            "avg_trip_minutes": summary(mins_vals),
-            "pay_per_hour_zone": summary(pph_vals),
+        "summary": {
+            "pickups": summary(pickups),
+            "earnings_per_hour": summary(eph),
+            "avg_trip_miles": summary(miles),
         },
     }
