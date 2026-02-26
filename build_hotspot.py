@@ -7,11 +7,6 @@ import json
 import duckdb
 
 
-# NYC TLC minimums you gave (used only when driver_pay missing AND we have miles+minutes)
-MIN_PER_MILE = 1.241
-MIN_PER_MINUTE = 0.659
-
-
 def ensure_zones_geojson(data_dir: Path, force: bool = False) -> Path:
     data_dir.mkdir(parents=True, exist_ok=True)
     geojson_path = data_dir / "taxi_zones.geojson"
@@ -31,7 +26,6 @@ def bucket_and_color_from_rating(rating: int) -> tuple[str, str]:
       Red    = Very Low / Avoid
     """
     r = int(rating)
-
     if r >= 90:
         return "green", "#00b050"
     if r >= 80:
@@ -45,121 +39,47 @@ def bucket_and_color_from_rating(rating: int) -> tuple[str, str]:
     return "red", "#e60000"
 
 
-def _detect_columns(con: duckdb.DuckDBPyConnection, parquet_sql: str) -> Dict[str, Any]:
-    """
-    Detect available columns in the parquet(s) and decide which to use.
-
-    Returns a dict with:
-      - columns_all (lowercased)
-      - chosen: pulocationid, pickup_datetime, driver_pay, trip_miles, trip_minutes (optional)
-      - trip_minutes_unit: "minutes" | "seconds" | None
-      - samples: quick stats for chosen optional columns
-    """
-    # read schema
+def _detect_columns(con: duckdb.DuckDBPyConnection, parquet_sql: str) -> Dict[str, Optional[str]]:
     rows = con.execute(f"DESCRIBE SELECT * FROM read_parquet([{parquet_sql}])").fetchall()
-    cols = [str(r[0]) for r in rows]
-    cols_l = [c.lower() for c in cols]
-    set_l = set(cols_l)
+    cols = [r[0] for r in rows]
+    lower = {c.lower(): c for c in cols}
 
-    def pick(*cands: str) -> Optional[str]:
-        for cand in cands:
-            if cand.lower() in set_l:
-                # return the original column name (exact case) if possible
-                idx = cols_l.index(cand.lower())
-                return cols[idx]
+    def pick(*names: str) -> Optional[str]:
+        for n in names:
+            if n.lower() in lower:
+                return lower[n.lower()]
         return None
 
-    chosen = {
-        "pulocationid": pick("PULocationID", "pu_location_id", "pulocation_id"),
-        "pickup_datetime": pick("pickup_datetime", "tpep_pickup_datetime", "pickup_time", "trip_pickup_datetime"),
-        "driver_pay": pick("driver_pay", "driverpay", "base_driver_pay", "driver_compensation"),
-        # distance candidates
-        "trip_miles": pick("trip_miles", "trip_distance", "trip_distance_miles", "distance_miles", "distance"),
-        # duration candidates
-        "trip_minutes": pick("trip_minutes", "trip_duration_minutes", "duration_minutes", "trip_time_minutes", "minutes"),
-    }
-
-    # If no explicit minutes col, try seconds-ish duration columns
-    if chosen["trip_minutes"] is None:
-        sec_col = pick(
-            "trip_seconds", "trip_duration_seconds", "duration_seconds", "trip_time_seconds",
-            "trip_time", "duration", "seconds"
-        )
-        if sec_col is not None:
-            chosen["trip_minutes"] = sec_col  # we'll infer unit below
-
-    # Infer unit for trip_minutes if it came from a generic "duration/trip_time" column
-    trip_minutes_unit: Optional[str] = None
-    samples: Dict[str, Any] = {}
-
-    if chosen["trip_minutes"]:
-        nm = chosen["trip_minutes"].lower()
-        if "sec" in nm or "second" in nm:
-            trip_minutes_unit = "seconds"
-        elif "min" in nm or "minute" in nm:
-            trip_minutes_unit = "minutes"
-        else:
-            # try to infer from typical magnitudes (quick sample)
-            try:
-                q = f"""
-                SELECT
-                  approx_quantile(TRY_CAST("{chosen["trip_minutes"]}" AS DOUBLE), 0.50) AS p50,
-                  approx_quantile(TRY_CAST("{chosen["trip_minutes"]}" AS DOUBLE), 0.90) AS p90
-                FROM read_parquet([{parquet_sql}])
-                WHERE "{chosen["trip_minutes"]}" IS NOT NULL
-                """
-                p50, p90 = con.execute(q).fetchone()
-                samples["trip_minutes_p50_raw"] = None if p50 is None else float(p50)
-                samples["trip_minutes_p90_raw"] = None if p90 is None else float(p90)
-
-                # crude but safe:
-                # if p90 is huge (e.g. > 600), it's almost certainly seconds
-                # if p90 is modest (e.g. < 240), it's probably minutes
-                if p90 is not None and float(p90) > 600:
-                    trip_minutes_unit = "seconds"
-                else:
-                    trip_minutes_unit = "minutes"
-            except Exception:
-                trip_minutes_unit = "minutes"
-
-    # small samples for miles too
-    if chosen["trip_miles"]:
-        try:
-            q = f"""
-            SELECT
-              approx_quantile(TRY_CAST("{chosen["trip_miles"]}" AS DOUBLE), 0.50) AS p50,
-              approx_quantile(TRY_CAST("{chosen["trip_miles"]}" AS DOUBLE), 0.90) AS p90
-            FROM read_parquet([{parquet_sql}])
-            WHERE "{chosen["trip_miles"]}" IS NOT NULL
-            """
-            p50, p90 = con.execute(q).fetchone()
-            samples["trip_miles_p50"] = None if p50 is None else float(p50)
-            samples["trip_miles_p90"] = None if p90 is None else float(p90)
-        except Exception:
-            pass
-
-    # sample pay too
-    if chosen["driver_pay"]:
-        try:
-            q = f"""
-            SELECT
-              approx_quantile(TRY_CAST("{chosen["driver_pay"]}" AS DOUBLE), 0.50) AS p50,
-              approx_quantile(TRY_CAST("{chosen["driver_pay"]}" AS DOUBLE), 0.90) AS p90
-            FROM read_parquet([{parquet_sql}])
-            WHERE "{chosen["driver_pay"]}" IS NOT NULL
-            """
-            p50, p90 = con.execute(q).fetchone()
-            samples["driver_pay_p50"] = None if p50 is None else float(p50)
-            samples["driver_pay_p90"] = None if p90 is None else float(p90)
-        except Exception:
-            pass
-
+    # Your dataset confirmed these exist:
     return {
-        "columns_all": cols_l,
-        "chosen": chosen,
-        "trip_minutes_unit": trip_minutes_unit,
-        "samples": samples,
+        "PULocationID": pick("PULocationID", "pulocationid"),
+        "pickup_datetime": pick("pickup_datetime", "Pickup_datetime"),
+        "driver_pay": pick("driver_pay", "Driver_pay"),
+        "trip_miles": pick("trip_miles", "Trip_miles"),
+        "trip_time": pick("trip_time", "Trip_time"),
     }
+
+
+def _guess_trip_time_unit(con: duckdb.DuckDBPyConnection, parquet_sql: str, trip_time_col: str) -> str:
+    """
+    TLC FHV trip_time is usually seconds. We auto-detect:
+      - if median > 200 -> seconds
+      - else -> minutes
+    """
+    try:
+        med = con.execute(
+            f"""
+            SELECT approx_quantile(TRY_CAST({trip_time_col} AS DOUBLE), 0.5)
+            FROM read_parquet([{parquet_sql}])
+            WHERE {trip_time_col} IS NOT NULL
+            LIMIT 100000
+            """
+        ).fetchone()[0]
+        if med is None:
+            return "seconds"
+        return "seconds" if float(med) > 200 else "minutes"
+    except Exception:
+        return "seconds"
 
 
 def build_hotspots_frames(
@@ -172,23 +92,16 @@ def build_hotspots_frames(
     """
     Writes:
       /data/frames/timeline.json
-      /data/frames/frame_000000.json ... etc
+      /data/frames/frame_000000.json ...
 
-    Each frame contains:
-      - time
-      - polygons FeatureCollection
-      - each feature has properties:
-          LocationID, zone_name, borough,
-          rating, bucket,
-          pickups,
-          avg_driver_pay,
-          (optional if inputs exist) avg_trip_miles, avg_trip_minutes,
-          (optional) total_driver_pay, pay_per_hour_zone,
-          style(fillColor)
+    Each feature includes (always):
+      LocationID, zone_name, borough, rating, bucket, pickups, avg_driver_pay
 
-    Fallback guarantee:
-      - If trip time/miles are missing, we do your old logic exactly (pickups + driver_pay).
-      - If driver_pay is missing but miles+minutes exist, we estimate pay using your minimum rates.
+    If time/miles exist, also includes:
+      avg_trip_miles, avg_trip_minutes, pay_per_hour_zone
+
+    SAFE FALLBACK:
+      If time/miles missing -> rating uses your old logic (busy + pay only).
     """
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -237,80 +150,89 @@ def build_hotspots_frames(
     parquet_list = [str(p) for p in parquet_files]
     parquet_sql = ", ".join("'" + p.replace("'", "''") + "'" for p in parquet_list)
 
-    detected = _detect_columns(con, parquet_sql)
-    chosen = detected["chosen"]
+    cols = _detect_columns(con, parquet_sql)
 
-    if not chosen["pulocationid"] or not chosen["pickup_datetime"]:
-        raise RuntimeError(
-            "Missing required columns. Need PULocationID + pickup_datetime (or equivalent). "
-            f"Detected chosen={chosen}"
-        )
+    if not cols["PULocationID"] or not cols["pickup_datetime"]:
+        raise RuntimeError(f"Missing required columns. Detected: {cols}")
 
-    have_pay = chosen["driver_pay"] is not None
-    have_miles = chosen["trip_miles"] is not None
-    have_minutes = chosen["trip_minutes"] is not None
-    minutes_unit = detected["trip_minutes_unit"] if have_minutes else None
+    has_pay = cols["driver_pay"] is not None
+    has_miles = cols["trip_miles"] is not None
+    has_time = cols["trip_time"] is not None
 
-    # Build expressions safely
-    pu_col = f'"{chosen["pulocationid"]}"'
-    dt_col = f'"{chosen["pickup_datetime"]}"'
+    trip_time_unit = "seconds"
+    if has_time and cols["trip_time"]:
+        trip_time_unit = _guess_trip_time_unit(con, parquet_sql, cols["trip_time"])
 
-    pay_expr = "NULL"
-    if have_pay:
-        pay_expr = f'TRY_CAST("{chosen["driver_pay"]}" AS DOUBLE)'
-
-    miles_expr = "NULL"
-    if have_miles:
-        miles_expr = f'TRY_CAST("{chosen["trip_miles"]}" AS DOUBLE)'
-
-    minutes_expr = "NULL"
-    if have_minutes:
-        raw = f'TRY_CAST("{chosen["trip_minutes"]}" AS DOUBLE)'
-        if minutes_unit == "seconds":
-            minutes_expr = f"({raw} / 60.0)"
+    # Convert trip_time to minutes safely
+    # - if unit == seconds => /60
+    # - if unit == minutes => use as-is
+    time_to_minutes_expr = "NULL::DOUBLE AS trip_minutes"
+    if has_time and cols["trip_time"]:
+        if trip_time_unit == "seconds":
+            time_to_minutes_expr = f"(TRY_CAST({cols['trip_time']} AS DOUBLE) / 60.0) AS trip_minutes"
         else:
-            minutes_expr = raw
+            time_to_minutes_expr = f"(TRY_CAST({cols['trip_time']} AS DOUBLE)) AS trip_minutes"
 
-    # If driver_pay missing but we have miles+minutes, estimate pay
-    # If driver_pay exists, keep it as the main pay metric (old behavior)
-    estimated_pay_expr = pay_expr
-    if (not have_pay) and have_miles and have_minutes:
-        estimated_pay_expr = f"""
-        (
-          ({miles_expr})*{MIN_PER_MILE} +
-          ({minutes_expr})*{MIN_PER_MINUTE}
-        )
-        """
+    miles_expr = "NULL::DOUBLE AS trip_miles"
+    if has_miles and cols["trip_miles"]:
+        miles_expr = f"(TRY_CAST({cols['trip_miles']} AS DOUBLE)) AS trip_miles"
 
-    # For scoring "pay", prefer pay_per_hour_zone when we can compute it
-    # (This is still data-driven; if pay missing, it becomes NULL and falls back.)
-    # We'll compute pay_per_hour_zone = SUM(estimated_pay)/hours_in_bin
-    hours_in_bin = float(bin_minutes) / 60.0
-
-    # Optional: long-trip signal
-    use_long_trip = have_miles  # only if we have miles
-
-    # Weights: keep your old logic unless miles exists.
-    # Old: 0.85 volume + 0.15 pay
-    # New (only if miles exists): 0.75 volume + 0.15 pay + 0.10 long_trip
-    if use_long_trip:
-        w_vol, w_pay, w_mi = 0.75, 0.15, 0.10
-    else:
-        w_vol, w_pay, w_mi = 0.85, 0.15, 0.0
+    pay_expr = "NULL::DOUBLE AS driver_pay"
+    if has_pay and cols["driver_pay"]:
+        pay_expr = f"(TRY_CAST({cols['driver_pay']} AS DOUBLE)) AS driver_pay"
 
     # ----------------------------
     # SQL build
+    #
+    # OLD LOGIC (fallback):
+    #   moment_score = 0.85*vol + 0.15*pay
+    #
+    # NEW LOGIC (when time/miles available):
+    #   still "busy first", but adds:
+    #     - pay_per_hour_zone (based on pay + duration)
+    #     - long trip signal (miles + minutes)
+    #
+    # All normalizations are percentile-rank based (robust to airport outliers).
     # ----------------------------
+
+    use_enhanced = (has_time or has_miles)  # if either exists, compute what we can
+
+    # weights: keep busy dominant
+    # if a metric missing, we exclude it and re-normalize weights in SQL
+    w_vol = 0.70
+    w_pay = 0.10
+    w_hourly = 0.10 if has_time and has_pay else 0.0
+    w_long = 0.10 if has_time or has_miles else 0.0
+
+    # renormalize
+    w_sum = w_vol + w_pay + w_hourly + w_long
+    w_vol /= w_sum
+    w_pay /= w_sum
+    if w_sum > 0:
+        w_hourly /= w_sum
+        w_long /= w_sum
+
+    # For long trip signal:
+    # - if both miles and minutes exist: long_n = 0.6*miles_n + 0.4*mins_n
+    # - if only one exists: use that one
+    long_expr = "0.0"
+    if has_miles and has_time:
+        long_expr = "(0.6*miles_n + 0.4*mins_n)"
+    elif has_miles:
+        long_expr = "miles_n"
+    elif has_time:
+        long_expr = "mins_n"
+
     sql = f"""
     WITH base AS (
       SELECT
-        CAST({pu_col} AS INTEGER) AS PULocationID,
-        {dt_col} AS pickup_datetime,
-        {estimated_pay_expr} AS driver_pay_calc,
-        {miles_expr} AS trip_miles,
-        {minutes_expr} AS trip_minutes
+        CAST({cols["PULocationID"]} AS INTEGER) AS PULocationID,
+        CAST({cols["pickup_datetime"]} AS TIMESTAMP) AS pickup_datetime,
+        {pay_expr},
+        {miles_expr},
+        {time_to_minutes_expr}
       FROM read_parquet([{parquet_sql}])
-      WHERE {pu_col} IS NOT NULL AND {dt_col} IS NOT NULL
+      WHERE {cols["PULocationID"]} IS NOT NULL AND {cols["pickup_datetime"]} IS NOT NULL
     ),
     t AS (
       SELECT
@@ -318,7 +240,7 @@ def build_hotspots_frames(
         CAST(EXTRACT('dow' FROM pickup_datetime) AS INTEGER) AS dow_i,  -- 0=Sun..6=Sat
         CAST(EXTRACT('hour' FROM pickup_datetime) AS INTEGER) AS hour_i,
         CAST(EXTRACT('minute' FROM pickup_datetime) AS INTEGER) AS minute_i,
-        driver_pay_calc,
+        driver_pay,
         trip_miles,
         trip_minutes
       FROM base
@@ -328,7 +250,7 @@ def build_hotspots_frames(
         PULocationID,
         CASE WHEN dow_i = 0 THEN 6 ELSE dow_i - 1 END AS dow_m,  -- Mon=0..Sun=6
         CAST(FLOOR((hour_i*60 + minute_i) / {int(bin_minutes)}) * {int(bin_minutes)} AS INTEGER) AS bin_start_min,
-        driver_pay_calc,
+        driver_pay,
         trip_miles,
         trip_minutes
       FROM t
@@ -339,8 +261,7 @@ def build_hotspots_frames(
         dow_m,
         bin_start_min,
         COUNT(*) AS pickups,
-        AVG(driver_pay_calc) AS avg_driver_pay,
-        SUM(driver_pay_calc) AS total_driver_pay,
+        AVG(driver_pay) AS avg_driver_pay,
         AVG(trip_miles) AS avg_trip_miles,
         AVG(trip_minutes) AS avg_trip_minutes
       FROM binned
@@ -348,50 +269,65 @@ def build_hotspots_frames(
       HAVING COUNT(*) >= {int(min_trips_per_window)}
     ),
 
-    scored_inputs AS (
+    -- compute hourly estimate if we have pay + minutes
+    agg2 AS (
       SELECT
         *,
-        (total_driver_pay / {hours_in_bin}) AS pay_per_hour_zone,
-        LN(1 + pickups) AS log_pickups
+        CASE
+          WHEN avg_driver_pay IS NULL OR avg_trip_minutes IS NULL OR avg_trip_minutes <= 0.001 THEN NULL
+          ELSE avg_driver_pay * 60.0 / avg_trip_minutes
+        END AS pay_per_hour_zone
       FROM agg
     ),
 
-    -- Per-window ranks (percentile-rank style, airport-safe)
+    -- window ranks (percentile based)
     win AS (
       SELECT
         *,
-        ROW_NUMBER() OVER (PARTITION BY dow_m, bin_start_min ORDER BY log_pickups) AS rn_pickups,
-        ROW_NUMBER() OVER (PARTITION BY dow_m, bin_start_min ORDER BY COALESCE(pay_per_hour_zone, avg_driver_pay)) AS rn_pay,
-        ROW_NUMBER() OVER (PARTITION BY dow_m, bin_start_min ORDER BY COALESCE(avg_trip_miles, 0.0)) AS rn_miles,
+        LN(1 + pickups) AS log_pickups,
+
+        ROW_NUMBER() OVER (PARTITION BY dow_m, bin_start_min ORDER BY LN(1 + pickups)) AS rn_pickups,
+        ROW_NUMBER() OVER (PARTITION BY dow_m, bin_start_min ORDER BY avg_driver_pay) AS rn_pay,
+        ROW_NUMBER() OVER (PARTITION BY dow_m, bin_start_min ORDER BY pay_per_hour_zone) AS rn_hourly,
+        ROW_NUMBER() OVER (PARTITION BY dow_m, bin_start_min ORDER BY avg_trip_miles) AS rn_miles,
+        ROW_NUMBER() OVER (PARTITION BY dow_m, bin_start_min ORDER BY avg_trip_minutes) AS rn_mins,
+
         COUNT(*) OVER (PARTITION BY dow_m, bin_start_min) AS n_in_window
-      FROM scored_inputs
+      FROM agg2
     ),
     win_scored AS (
       SELECT
         PULocationID, dow_m, bin_start_min,
-        pickups, avg_driver_pay, total_driver_pay, pay_per_hour_zone, avg_trip_miles, avg_trip_minutes,
+        pickups, avg_driver_pay, avg_trip_miles, avg_trip_minutes, pay_per_hour_zone,
+
         CASE WHEN n_in_window <= 1 THEN 0.0 ELSE (rn_pickups - 1) * 1.0 / (n_in_window - 1) END AS vol_n,
         CASE WHEN n_in_window <= 1 THEN 0.0 ELSE (rn_pay - 1) * 1.0 / (n_in_window - 1) END AS pay_n,
-        CASE WHEN n_in_window <= 1 THEN 0.0 ELSE (rn_miles - 1) * 1.0 / (n_in_window - 1) END AS miles_n
+        CASE WHEN n_in_window <= 1 THEN 0.0 ELSE (rn_hourly - 1) * 1.0 / (n_in_window - 1) END AS hourly_n,
+        CASE WHEN n_in_window <= 1 THEN 0.0 ELSE (rn_miles - 1) * 1.0 / (n_in_window - 1) END AS miles_n,
+        CASE WHEN n_in_window <= 1 THEN 0.0 ELSE (rn_mins - 1) * 1.0 / (n_in_window - 1) END AS mins_n
       FROM win
     ),
 
-    -- Baseline per-zone (rank-based, airport-safe)
+    -- zone baseline ranks (percentile based)
     zone_base AS (
       SELECT
         PULocationID,
         LN(1 + AVG(pickups)) AS base_log_pickups,
-        AVG(COALESCE(pay_per_hour_zone, avg_driver_pay)) AS base_pay_metric,
-        AVG(avg_trip_miles) AS base_trip_miles
-      FROM scored_inputs
+        AVG(avg_driver_pay) AS base_pay,
+        AVG(avg_trip_miles) AS base_miles,
+        AVG(avg_trip_minutes) AS base_mins,
+        AVG(pay_per_hour_zone) AS base_hourly
+      FROM agg2
       GROUP BY 1
     ),
     zone_ranked AS (
       SELECT
         *,
         ROW_NUMBER() OVER (ORDER BY base_log_pickups) AS rn_base_pickups,
-        ROW_NUMBER() OVER (ORDER BY base_pay_metric) AS rn_base_pay,
-        ROW_NUMBER() OVER (ORDER BY COALESCE(base_trip_miles, 0.0)) AS rn_base_miles,
+        ROW_NUMBER() OVER (ORDER BY base_pay) AS rn_base_pay,
+        ROW_NUMBER() OVER (ORDER BY base_hourly) AS rn_base_hourly,
+        ROW_NUMBER() OVER (ORDER BY base_miles) AS rn_base_miles,
+        ROW_NUMBER() OVER (ORDER BY base_mins) AS rn_base_mins,
         COUNT(*) OVER () AS n_zones
       FROM zone_base
     ),
@@ -400,7 +336,9 @@ def build_hotspots_frames(
         PULocationID,
         CASE WHEN n_zones <= 1 THEN 0.0 ELSE (rn_base_pickups - 1) * 1.0 / (n_zones - 1) END AS base_vol_n,
         CASE WHEN n_zones <= 1 THEN 0.0 ELSE (rn_base_pay - 1) * 1.0 / (n_zones - 1) END AS base_pay_n,
-        CASE WHEN n_zones <= 1 THEN 0.0 ELSE (rn_base_miles - 1) * 1.0 / (n_zones - 1) END AS base_miles_n
+        CASE WHEN n_zones <= 1 THEN 0.0 ELSE (rn_base_hourly - 1) * 1.0 / (n_zones - 1) END AS base_hourly_n,
+        CASE WHEN n_zones <= 1 THEN 0.0 ELSE (rn_base_miles - 1) * 1.0 / (n_zones - 1) END AS base_miles_n,
+        CASE WHEN n_zones <= 1 THEN 0.0 ELSE (rn_base_mins - 1) * 1.0 / (n_zones - 1) END AS base_mins_n
       FROM zone_ranked
     ),
 
@@ -411,13 +349,27 @@ def build_hotspots_frames(
         w.bin_start_min,
         w.pickups,
         w.avg_driver_pay,
-        w.total_driver_pay,
-        w.pay_per_hour_zone,
         w.avg_trip_miles,
         w.avg_trip_minutes,
+        w.pay_per_hour_zone,
 
-        ({w_vol}*w.vol_n + {w_pay}*w.pay_n + {w_mi}*w.miles_n) AS moment_score,
-        ({w_vol}*z.base_vol_n + {w_pay}*z.base_pay_n + {w_mi}*z.base_miles_n) AS base_score,
+        -- long trip signal
+        {long_expr} AS long_n,
+
+        -- busy-first scoring, includes hourly/long when available
+        ({w_vol}*w.vol_n + {w_pay}*w.pay_n + {w_hourly}*w.hourly_n + {w_long}*({long_expr})) AS moment_score,
+
+        -- baseline equivalents (use same weights)
+        ({w_vol}*z.base_vol_n + {w_pay}*z.base_pay_n + {w_hourly}*z.base_hourly_n
+          + {w_long}*(
+            CASE
+              WHEN {1 if (has_miles and has_time) else 0} = 1 THEN (0.6*z.base_miles_n + 0.4*z.base_mins_n)
+              WHEN {1 if has_miles else 0} = 1 THEN z.base_miles_n
+              WHEN {1 if has_time else 0} = 1 THEN z.base_mins_n
+              ELSE 0.0
+            END
+          )
+        ) AS base_score,
 
         LEAST(1.0, w.pickups / 50.0) AS conf
       FROM win_scored w
@@ -430,10 +382,9 @@ def build_hotspots_frames(
       bin_start_min,
       pickups,
       avg_driver_pay,
-      total_driver_pay,
-      pay_per_hour_zone,
       avg_trip_miles,
       avg_trip_minutes,
+      pay_per_hour_zone,
       CAST(
         ROUND(
           1 + 99 * LEAST(
@@ -470,13 +421,6 @@ def build_hotspots_frames(
         payload = {
             "time": current_time_iso,
             "polygons": {"type": "FeatureCollection", "features": current_features},
-            "meta": {
-                "bin_minutes": int(bin_minutes),
-                "min_trips_per_window": int(min_trips_per_window),
-                "columns_chosen": chosen,
-                "trip_minutes_unit": minutes_unit,
-                "weights": {"vol": w_vol, "pay": w_pay, "miles": w_mi},
-            },
         }
         frame_path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
 
@@ -493,7 +437,7 @@ def build_hotspots_frames(
             break
         any_rows = True
 
-        for (zid, dow_m, bin_start_min, pickups, avg_pay, total_pay, pay_per_hr, avg_mi, avg_min, rating) in batch:
+        for (zid, dow_m, bin_start_min, pickups, avg_pay, avg_miles, avg_mins, pph, rating) in batch:
             total_rows += 1
             key = (int(dow_m), int(bin_start_min))
 
@@ -516,33 +460,48 @@ def build_hotspots_frames(
             r = int(rating)
             bucket, fill = bucket_and_color_from_rating(r)
 
+            props: Dict[str, Any] = {
+                "LocationID": zid_i,
+                "zone_name": name_by_id.get(zid_i, ""),
+                "borough": borough_by_id.get(zid_i, ""),
+                "rating": r,
+                "bucket": bucket,
+                "pickups": int(pickups),
+                "avg_driver_pay": None if avg_pay is None else float(avg_pay),
+            }
+
+            # Only include new metrics if they exist (fallback safe)
+            if avg_miles is not None:
+                props["avg_trip_miles"] = float(avg_miles)
+            else:
+                props["avg_trip_miles"] = None
+
+            if avg_mins is not None:
+                props["avg_trip_minutes"] = float(avg_mins)
+            else:
+                props["avg_trip_minutes"] = None
+
+            if pph is not None:
+                props["pay_per_hour_zone"] = float(pph)
+            else:
+                props["pay_per_hour_zone"] = None
+
+            props["debug_trip_time_unit"] = trip_time_unit  # helps you verify unit used
+
+            props["avg_tips"] = None  # keep as you had it
+
+            props["style"] = {
+                "color": fill,
+                "opacity": 0,
+                "weight": 0,
+                "fillColor": fill,
+                "fillOpacity": 0.82
+            }
+
             current_features.append({
                 "type": "Feature",
                 "geometry": geom,
-                "properties": {
-                    "LocationID": zid_i,
-                    "zone_name": name_by_id.get(zid_i, ""),
-                    "borough": borough_by_id.get(zid_i, ""),
-                    "rating": r,
-                    "bucket": bucket,
-                    "pickups": int(pickups),
-                    "avg_driver_pay": None if avg_pay is None else float(avg_pay),
-
-                    # NEW (safe): may be null if columns missing
-                    "total_driver_pay": None if total_pay is None else float(total_pay),
-                    "pay_per_hour_zone": None if pay_per_hr is None else float(pay_per_hr),
-                    "avg_trip_miles": None if avg_mi is None else float(avg_mi),
-                    "avg_trip_minutes": None if avg_min is None else float(avg_min),
-
-                    "avg_tips": None,
-                    "style": {
-                        "color": fill,
-                        "opacity": 0,
-                        "weight": 0,
-                        "fillColor": fill,
-                        "fillOpacity": 0.82
-                    }
-                }
+                "properties": props,
             })
 
     if not any_rows:
@@ -551,30 +510,29 @@ def build_hotspots_frames(
     flush_frame()
 
     (out_dir / "timeline.json").write_text(
-        json.dumps({
-            "timeline": timeline,
-            "count": len(timeline),
-            "meta": {
-                "bin_minutes": int(bin_minutes),
-                "min_trips_per_window": int(min_trips_per_window),
-                "columns_chosen": chosen,
-                "trip_minutes_unit": minutes_unit,
-                "weights": {"vol": w_vol, "pay": w_pay, "miles": w_mi},
-                "samples": detected.get("samples", {}),
-            }
-        }, separators=(",", ":")),
+        json.dumps({"timeline": timeline, "count": len(timeline)}, separators=(",", ":")),
         encoding="utf-8"
     )
+
+    con.close()
 
     return {
         "ok": True,
         "count": len(timeline),
         "frames_dir": str(out_dir),
         "rows": total_rows,
-        "debug": {
-            "columns_chosen": chosen,
-            "trip_minutes_unit": minutes_unit,
-            "weights": {"vol": w_vol, "pay": w_pay, "miles": w_mi},
-            "samples": detected.get("samples", {}),
-        }
+        "detected": {
+            "PULocationID": cols["PULocationID"],
+            "pickup_datetime": cols["pickup_datetime"],
+            "driver_pay": cols["driver_pay"],
+            "trip_miles": cols["trip_miles"],
+            "trip_time": cols["trip_time"],
+            "trip_time_unit_used": trip_time_unit,
+        },
+        "weights_used": {
+            "vol": round(w_vol, 4),
+            "pay": round(w_pay, 4),
+            "hourly": round(w_hourly, 4),
+            "long": round(w_long, 4),
+        },
     }
