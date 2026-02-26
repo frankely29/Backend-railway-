@@ -6,8 +6,32 @@ from datetime import datetime, timedelta
 import json
 import duckdb
 
-
+# ----------------------------
+# REQUIRED INPUT COLUMNS
+# ----------------------------
 REQUIRED_COLS = ["PULocationID", "pickup_datetime", "driver_pay", "trip_miles", "trip_time"]
+
+# ----------------------------
+# RATING WEIGHTS (SINGLE SOURCE OF TRUTH)
+# Demand-first by design:
+#  - pickups dominates
+#  - zone_clock_per_hour is a small tie-breaker
+# ----------------------------
+WEIGHT_PICKUPS = 0.85
+WEIGHT_CLOCK = 0.15
+
+# Mix "current window" vs "zone baseline"
+WEIGHT_MOMENT = 0.80
+WEIGHT_BASE = 0.20
+
+# Confidence scaling
+CONF_PICKUPS_DENOM = 50.0     # pickups / 50 -> confidence up to 1.0
+CONF_FLOOR = 0.60             # multiplier floor
+CONF_CEIL_GAIN = 0.40         # additional multiplier when conf=1.0
+
+# Sanity filters (avoid insane outliers)
+MAX_TRIP_TIME_SEC = 6 * 3600
+MAX_TRIP_MILES = 200
 
 
 def ensure_zones_geojson(data_dir: Path, force: bool = False) -> Path:
@@ -73,15 +97,10 @@ def build_hotspots_frames(
       trip_time is treated as seconds.
 
     RATING (DEMAND FIRST):
-      - pickups is the dominant metric
+      - pickups is the dominant metric (percentile rank per window)
       - zone_clock_per_hour is a smaller tie-breaker
-
-      Weights:
-        85% pickups
-        15% zone_clock_per_hour
-      plus mild stabilization:
-        - a small baseline component (typical strength for that zone)
-        - confidence scaling based on pickup count
+      - small baseline component (typical strength for that zone)
+      - confidence scaling based on pickup count
     """
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -131,14 +150,7 @@ def build_hotspots_frames(
     parquet_sql = ", ".join("'" + p.replace("'", "''") + "'" for p in parquet_list)
 
     # ----------------------------
-    # DEMAND-FIRST scoring:
-    #  - per-window percentiles (robust)
-    #  - baseline per-zone percentiles (robust)
-    #  - confidence by pickups
-    #
-    # Main weights:
-    #   0.85 pickups
-    #   0.15 zone_clock_per_hour (avg pay / avg time)
+    # SQL (demand-first)
     # ----------------------------
     sql = f"""
     WITH base AS (
@@ -169,8 +181,8 @@ def build_hotspots_frames(
         driver_pay >= 0
         AND trip_miles >= 0
         AND trip_time_sec > 0
-        AND trip_time_sec < 6*3600  -- ignore anything longer than 6 hours
-        AND trip_miles < 200        -- sanity
+        AND trip_time_sec < {int(MAX_TRIP_TIME_SEC)}
+        AND trip_miles < {int(MAX_TRIP_MILES)}
     ),
 
     t AS (
@@ -220,7 +232,7 @@ def build_hotspots_frames(
       HAVING COUNT(*) >= {int(min_trips_per_window)}
     ),
 
-    -- Per-window percentile ranks
+    -- Per-window percentile ranks (robust), using log(pickups)
     win AS (
       SELECT
         *,
@@ -242,7 +254,7 @@ def build_hotspots_frames(
       FROM win
     ),
 
-    -- Baseline per-zone across all windows, then ranked across zones
+    -- Baseline per-zone across all windows (robust), then ranked across zones
     zone_base AS (
       SELECT
         PULocationID,
@@ -283,11 +295,11 @@ def build_hotspots_frames(
         w.active_trip_per_hour,
 
         -- DEMAND FIRST:
-        (0.85*w.vol_n + 0.15*w.clock_n) AS moment_score,
-        (0.85*z.base_vol_n + 0.15*z.base_clock_n) AS base_score,
+        ({WEIGHT_PICKUPS}*w.vol_n + {WEIGHT_CLOCK}*w.clock_n) AS moment_score,
+        ({WEIGHT_PICKUPS}*z.base_vol_n + {WEIGHT_CLOCK}*z.base_clock_n) AS base_score,
 
         -- confidence by pickup count (more trips -> more trust)
-        LEAST(1.0, w.pickups / 50.0) AS conf
+        LEAST(1.0, w.pickups / {float(CONF_PICKUPS_DENOM)}) AS conf
       FROM win_scored w
       JOIN zone_norm z USING (PULocationID)
     )
@@ -306,7 +318,7 @@ def build_hotspots_frames(
         ROUND(
           1 + 99 * LEAST(
             GREATEST(
-              ((0.80*moment_score + 0.20*base_score) * (0.60 + 0.40*conf)),
+              (({WEIGHT_MOMENT}*moment_score + {WEIGHT_BASE}*base_score) * ({float(CONF_FLOOR)} + {float(CONF_CEIL_GAIN)}*conf)),
               0.0
             ),
             1.0
@@ -397,7 +409,7 @@ def build_hotspots_frames(
                     "avg_trip_miles": None if avg_miles is None else float(avg_miles),
                     "avg_trip_time_sec": None if avg_time_sec is None else float(avg_time_sec),
 
-                    # These names match what your app.js popup is already showing:
+                    # these match your popup naming:
                     "zone_clock_per_hour": None if clock_hr is None else float(clock_hr),
                     "active_trip_per_hour": None if active_hr is None else float(active_hr),
 
@@ -421,4 +433,15 @@ def build_hotspots_frames(
         encoding="utf-8"
     )
 
-    return {"ok": True, "count": len(timeline), "frames_dir": str(out_dir), "rows": total_rows}
+    return {
+        "ok": True,
+        "count": len(timeline),
+        "frames_dir": str(out_dir),
+        "rows": total_rows,
+        "rating_weights": {
+            "pickups": WEIGHT_PICKUPS,
+            "zone_clock_per_hour": WEIGHT_CLOCK,
+            "moment": WEIGHT_MOMENT,
+            "base": WEIGHT_BASE,
+        }
+    }
