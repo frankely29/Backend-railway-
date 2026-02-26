@@ -8,29 +8,23 @@ from pathlib import Path
 from typing import Dict, Any, List
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from build_hotspot import ensure_zones_geojson, build_hotspots_frames
 
-# ----------------------------
-# Paths (Railway volume)
-# ----------------------------
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 FRAMES_DIR = Path(os.environ.get("FRAMES_DIR", str(DATA_DIR / "frames")))
 TIMELINE_PATH = FRAMES_DIR / "timeline.json"
+DEBUG_META_PATH = FRAMES_DIR / "debug_meta.json"
 
-# Defaults for auto-generate (Option A)
 DEFAULT_BIN_MINUTES = int(os.environ.get("DEFAULT_BIN_MINUTES", "20"))
 DEFAULT_MIN_TRIPS_PER_WINDOW = int(os.environ.get("DEFAULT_MIN_TRIPS_PER_WINDOW", "25"))
 
-# A simple file lock to prevent multi-start concurrency (best-effort)
 LOCK_PATH = DATA_DIR / ".generate.lock"
 
-# In-memory job state
 _state_lock = threading.Lock()
 _generate_state: Dict[str, Any] = {
-    "state": "idle",  # idle | started | running | done | error
+    "state": "idle",
     "bin_minutes": None,
     "min_trips_per_window": None,
     "started_at_unix": None,
@@ -41,23 +35,17 @@ _generate_state: Dict[str, Any] = {
     "trace": None,
 }
 
-# ----------------------------
-# App
-# ----------------------------
 app = FastAPI(title="NYC TLC Hotspot Backend", version="1.0")
 
-# Allow GitHub Pages frontend to call Railway backend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # lock down later if you want
+    allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ----------------------------
-# Utilities
-# ----------------------------
+
 def _list_parquets() -> List[Path]:
     if not DATA_DIR.exists():
         return []
@@ -120,15 +108,12 @@ def _generate_worker(bin_minutes: int, min_trips_per_window: int) -> None:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         FRAMES_DIR.mkdir(parents=True, exist_ok=True)
 
-        # ensure zones exist
         zones_path = ensure_zones_geojson(DATA_DIR, force=False)
 
-        # ensure at least one parquet exists
         parquets = _list_parquets()
         if not parquets:
             raise RuntimeError("No .parquet files found in /data. Upload via POST /upload_parquet.")
 
-        # build frames
         result = build_hotspots_frames(
             parquet_files=parquets,
             zones_geojson_path=zones_path,
@@ -160,7 +145,6 @@ def _generate_worker(bin_minutes: int, min_trips_per_window: int) -> None:
 
 
 def start_generate(bin_minutes: int, min_trips_per_window: int) -> Dict[str, Any]:
-    # Avoid double runs
     st = _get_state()
     if st["state"] in ("started", "running"):
         return {
@@ -170,7 +154,6 @@ def start_generate(bin_minutes: int, min_trips_per_window: int) -> Dict[str, Any
             "min_trips_per_window": st["min_trips_per_window"],
         }
 
-    # File lock guard (best-effort across restarts)
     if _lock_is_present():
         _set_state(state="running", bin_minutes=bin_minutes, min_trips_per_window=min_trips_per_window)
         return {"ok": True, "state": "running", "bin_minutes": bin_minutes, "min_trips_per_window": min_trips_per_window}
@@ -184,36 +167,14 @@ def start_generate(bin_minutes: int, min_trips_per_window: int) -> Dict[str, Any
     return {"ok": True, "state": "started", "bin_minutes": bin_minutes, "min_trips_per_window": min_trips_per_window}
 
 
-# ----------------------------
-# Option A: Auto-generate ONCE if missing
-# ----------------------------
 @app.on_event("startup")
 def auto_generate_if_missing():
-    """
-    - If /data/frames/timeline.json exists -> do nothing
-    - Else -> start generation in background using defaults (if inputs exist)
-    """
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         FRAMES_DIR.mkdir(parents=True, exist_ok=True)
 
         if _has_frames():
-            # Fill state with defaults for nicer status output
-            try:
-                tl = _read_json(TIMELINE_PATH)
-                _set_state(
-                    state="done",
-                    bin_minutes=DEFAULT_BIN_MINUTES,
-                    min_trips_per_window=DEFAULT_MIN_TRIPS_PER_WINDOW,
-                    result={"ok": True, "count": tl.get("count")},
-                )
-            except Exception:
-                _set_state(
-                    state="done",
-                    bin_minutes=DEFAULT_BIN_MINUTES,
-                    min_trips_per_window=DEFAULT_MIN_TRIPS_PER_WINDOW,
-                    result={"ok": True},
-                )
+            _set_state(state="done", bin_minutes=DEFAULT_BIN_MINUTES, min_trips_per_window=DEFAULT_MIN_TRIPS_PER_WINDOW, result={"ok": True})
             return
 
         zones_ok = (DATA_DIR / "taxi_zones.geojson").exists()
@@ -229,15 +190,11 @@ def auto_generate_if_missing():
 
 
 # ----------------------------
-# Routes
+# Public routes (existing)
 # ----------------------------
 @app.get("/")
 def root():
-    return {
-        "ok": True,
-        "service": "NYC TLC Hotspot Backend",
-        "endpoints": ["/status", "/generate", "/generate_status", "/timeline", "/frame/{idx}"],
-    }
+    return {"ok": True, "service": "NYC TLC Hotspot Backend", "endpoints": ["/status", "/generate", "/generate_status", "/timeline", "/frame/{idx}", "/debug/health", "/debug/schema", "/debug/frames", "/debug/frame/{idx}"]}
 
 
 @app.get("/status")
@@ -258,7 +215,6 @@ def status():
 
 @app.get("/generate")
 def generate_get(bin_minutes: int = DEFAULT_BIN_MINUTES, min_trips_per_window: int = DEFAULT_MIN_TRIPS_PER_WINDOW):
-    # Starts generation async
     return start_generate(bin_minutes, min_trips_per_window)
 
 
@@ -286,10 +242,6 @@ def frame(idx: int):
 
 @app.post("/upload_zones_geojson")
 async def upload_zones_geojson(file: UploadFile = File(...)):
-    """
-    Upload the TLC taxi zones geojson file.
-    Must be valid GeoJSON content.
-    """
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     target = DATA_DIR / "taxi_zones.geojson"
 
@@ -297,7 +249,6 @@ async def upload_zones_geojson(file: UploadFile = File(...)):
     if not content:
         raise HTTPException(status_code=400, detail="Empty upload.")
 
-    # Basic validation: should parse as JSON
     try:
         obj = json.loads(content.decode("utf-8", errors="strict"))
         if obj.get("type") not in ("FeatureCollection", "Feature"):
@@ -311,9 +262,6 @@ async def upload_zones_geojson(file: UploadFile = File(...)):
 
 @app.post("/upload_parquet")
 async def upload_parquet(file: UploadFile = File(...)):
-    """
-    Upload a parquet month file into /data.
-    """
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     filename = (file.filename or "upload.parquet").replace("\\", "/").split("/")[-1]
@@ -327,3 +275,100 @@ async def upload_parquet(file: UploadFile = File(...)):
 
     target.write_bytes(content)
     return {"saved": str(target), "size_mb": round(target.stat().st_size / (1024 * 1024), 2)}
+
+
+# ----------------------------
+# DEBUG routes (NEW)
+# ----------------------------
+@app.get("/debug/health")
+def debug_health():
+    return {
+        "ok": True,
+        "has_timeline": _has_frames(),
+        "parquet_files": [p.name for p in _list_parquets()],
+        "zones_present": (DATA_DIR / "taxi_zones.geojson").exists(),
+        "state": _get_state().get("state"),
+    }
+
+
+@app.get("/debug/schema")
+def debug_schema():
+    """
+    Shows parquet columns Railway is actually reading.
+    """
+    import duckdb
+
+    parqs = _list_parquets()
+    if not parqs:
+        raise HTTPException(status_code=404, detail="No parquet files found in /data")
+
+    con = duckdb.connect(database=":memory:")
+    parquet_sql = ", ".join("'" + str(p).replace("'", "''") + "'" for p in parqs)
+    desc = con.execute(f"DESCRIBE SELECT * FROM read_parquet([{parquet_sql}])").fetchall()
+    cols = [str(r[0]) for r in desc]
+
+    lower = {c.lower() for c in cols}
+    return {
+        "parquets": [p.name for p in parqs],
+        "column_count": len(cols),
+        "columns": cols,
+        "has_driver_pay": "driver_pay" in lower,
+        "has_pickup_datetime": "pickup_datetime" in lower,
+        "has_pulocationid": "pulocationid" in lower,
+        "has_trip_time": ("trip_time" in lower),
+        "has_trip_miles": ("trip_miles" in lower),
+    }
+
+
+@app.get("/debug/frames")
+def debug_frames():
+    """
+    Shows build metadata (weights, detected flags, skips).
+    """
+    if not DEBUG_META_PATH.exists():
+        raise HTTPException(status_code=404, detail="debug_meta.json not found. Run /generate first.")
+    return _read_json(DEBUG_META_PATH)
+
+
+@app.get("/debug/frame/{idx}")
+def debug_frame(idx: int):
+    """
+    Validates a single frame for missing fields.
+    """
+    p = FRAMES_DIR / f"frame_{idx:06d}.json"
+    if not p.exists():
+        raise HTTPException(status_code=404, detail=f"frame not found: {idx}")
+
+    frame = _read_json(p)
+    feats = (frame.get("polygons") or {}).get("features") or []
+
+    missing_geom = 0
+    missing_rating = 0
+    missing_bucket = 0
+    missing_pickups = 0
+    missing_pay = 0
+
+    for f in feats:
+        if not f.get("geometry"):
+            missing_geom += 1
+        props = f.get("properties") or {}
+        if props.get("rating") is None:
+            missing_rating += 1
+        if not props.get("bucket"):
+            missing_bucket += 1
+        if props.get("pickups") is None:
+            missing_pickups += 1
+        if props.get("avg_driver_pay") is None:
+            missing_pay += 1
+
+    return {
+        "idx": idx,
+        "time": frame.get("time"),
+        "feature_count": len(feats),
+        "missing_geometry": missing_geom,
+        "missing_rating": missing_rating,
+        "missing_bucket": missing_bucket,
+        "missing_pickups": missing_pickups,
+        "missing_avg_driver_pay": missing_pay,
+        "note": "If trip_time/trip_miles are missing in schema, those extra fields will not exist by design (fallback mode)."
+    }
