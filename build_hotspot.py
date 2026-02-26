@@ -1,3 +1,4 @@
+# FULL UPDATED FILE
 from __future__ import annotations
 
 from pathlib import Path
@@ -12,31 +13,16 @@ def ensure_zones_geojson(data_dir: Path, force: bool = False) -> Path:
     geojson_path = data_dir / "taxi_zones.geojson"
     if geojson_path.exists() and geojson_path.stat().st_size > 0 and not force:
         return geojson_path
-    raise RuntimeError("Missing /data/taxi_zones.geojson. Upload it via POST /upload_zones_geojson.")
+    raise RuntimeError("Missing /data/taxi_zones.geojson.")
 
 
 def bucket_and_color_from_rating(rating: int) -> tuple[str, str]:
-    """
-    STRICT bucket order requested:
-      Green  = Highest
-      Purple = High
-      Blue   = Medium
-      Sky    = Normal
-      Yellow = Below Normal
-      Red    = Very Low / Avoid
-    """
     r = int(rating)
-
-    if r >= 90:
-        return "green", "#00b050"
-    if r >= 80:
-        return "purple", "#8000ff"
-    if r >= 65:
-        return "blue", "#0066ff"
-    if r >= 45:
-        return "sky", "#66ccff"
-    if r >= 25:
-        return "yellow", "#ffd400"
+    if r >= 90: return "green", "#00b050"
+    if r >= 80: return "purple", "#8000ff"
+    if r >= 65: return "blue", "#0066ff"
+    if r >= 45: return "sky", "#66ccff"
+    if r >= 25: return "yellow", "#ffd400"
     return "red", "#e60000"
 
 
@@ -47,27 +33,9 @@ def build_hotspots_frames(
     bin_minutes: int = 20,
     min_trips_per_window: int = 25,
 ) -> Dict[str, Any]:
-    """
-    Writes:
-      /data/frames/timeline.json
-      /data/frames/frame_000000.json ... etc
 
-    Each frame contains:
-      - time
-      - polygons FeatureCollection
-      - each feature has:
-          LocationID, zone_name, borough, rating, bucket, pickups, avg_driver_pay, style(fillColor)
-
-    FACTS + REALISM GUARANTEE:
-      - Per-window normalization is percentile-rank based (NOT min/max), so airports cannot flatten the city.
-      - Baseline per-zone normalization is ALSO percentile-rank based (NOT global min/max),
-        so airports cannot compress baseline scores either.
-    """
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # ----------------------------
-    # Load zone geometry + names
-    # ----------------------------
     zones = json.loads(zones_geojson_path.read_text(encoding="utf-8"))
 
     geom_by_id: Dict[int, Any] = {}
@@ -79,70 +47,57 @@ def build_hotspots_frames(
         zid = props.get("LocationID")
         if zid is None:
             continue
-        try:
-            zid_int = int(zid)
-        except Exception:
-            continue
+        zid_int = int(zid)
+        geom_by_id[zid_int] = f.get("geometry")
+        name_by_id[zid_int] = str(props.get("zone") or "")
+        borough_by_id[zid_int] = str(props.get("borough") or "")
 
-        geom = f.get("geometry")
-        if geom:
-            geom_by_id[zid_int] = geom
-
-        zone_name = props.get("zone") or props.get("Zone") or props.get("name") or props.get("Name") or ""
-        borough = props.get("borough") or props.get("Borough") or props.get("boro") or props.get("Boro") or ""
-
-        name_by_id[zid_int] = str(zone_name) if zone_name is not None else ""
-        borough_by_id[zid_int] = str(borough) if borough is not None else ""
-
-    if not geom_by_id:
-        raise RuntimeError("taxi_zones.geojson missing usable properties.LocationID geometry.")
-
-    # ----------------------------
-    # DuckDB (spill to volume)
-    # ----------------------------
     tmp_dir = out_dir.parent / "duckdb_tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
     con = duckdb.connect(database=":memory:")
-    con.execute("PRAGMA enable_progress_bar=false")
     con.execute(f"PRAGMA temp_directory='{tmp_dir.as_posix()}'")
 
     parquet_list = [str(p) for p in parquet_files]
     parquet_sql = ", ".join("'" + p.replace("'", "''") + "'" for p in parquet_list)
 
-    # ----------------------------
-    # SQL build
-    #
-    # - "busy" drives score (pickups) more than pay, as you requested.
-    # - Per-window normalization uses percentile rank (no max/min) so airports don't dominate.
-    # - Baseline per-zone normalization ALSO uses percentile rank (no global min/max),
-    #   so airports cannot compress base_score either.
-    # - Confidence scales down low-sample windows (still data-driven).
-    # ----------------------------
+    # Detect columns
+    desc = con.execute(f"DESCRIBE SELECT * FROM read_parquet([{parquet_sql}])").fetchall()
+    cols = {r[0].lower() for r in desc}
+
+    has_time = "trip_time" in cols
+    has_miles = "trip_miles" in cols
+
     sql = f"""
     WITH base AS (
       SELECT
         CAST(PULocationID AS INTEGER) AS PULocationID,
         pickup_datetime,
-        TRY_CAST(driver_pay AS DOUBLE) AS driver_pay
+        TRY_CAST(driver_pay AS DOUBLE) AS driver_pay,
+        {"TRY_CAST(trip_time AS DOUBLE)" if has_time else "NULL"} AS trip_time_sec,
+        {"TRY_CAST(trip_miles AS DOUBLE)" if has_miles else "NULL"} AS trip_miles
       FROM read_parquet([{parquet_sql}])
-      WHERE PULocationID IS NOT NULL AND pickup_datetime IS NOT NULL
+      WHERE PULocationID IS NOT NULL
     ),
     t AS (
       SELECT
         PULocationID,
-        CAST(EXTRACT('dow' FROM pickup_datetime) AS INTEGER) AS dow_i,  -- 0=Sun..6=Sat
+        CAST(EXTRACT('dow' FROM pickup_datetime) AS INTEGER) AS dow_i,
         CAST(EXTRACT('hour' FROM pickup_datetime) AS INTEGER) AS hour_i,
         CAST(EXTRACT('minute' FROM pickup_datetime) AS INTEGER) AS minute_i,
-        driver_pay
+        driver_pay,
+        trip_time_sec,
+        trip_miles
       FROM base
     ),
     binned AS (
       SELECT
         PULocationID,
-        CASE WHEN dow_i = 0 THEN 6 ELSE dow_i - 1 END AS dow_m,  -- Mon=0..Sun=6
-        CAST(FLOOR((hour_i*60 + minute_i) / {int(bin_minutes)}) * {int(bin_minutes)} AS INTEGER) AS bin_start_min,
-        driver_pay
+        CASE WHEN dow_i = 0 THEN 6 ELSE dow_i - 1 END AS dow_m,
+        CAST(FLOOR((hour_i*60 + minute_i) / {bin_minutes}) * {bin_minutes} AS INTEGER) AS bin_start_min,
+        driver_pay,
+        trip_time_sec,
+        trip_miles
       FROM t
     ),
     agg AS (
@@ -151,202 +106,121 @@ def build_hotspots_frames(
         dow_m,
         bin_start_min,
         COUNT(*) AS pickups,
-        AVG(driver_pay) AS avg_driver_pay
+        AVG(driver_pay) AS avg_driver_pay,
+        AVG(trip_miles) AS avg_trip_miles,
+        AVG(trip_time_sec)/60.0 AS avg_trip_minutes,
+        CASE
+          WHEN SUM(trip_time_sec) > 0
+          THEN SUM(driver_pay) / (SUM(trip_time_sec)/3600.0)
+          ELSE NULL
+        END AS driver_pay_per_hour
       FROM binned
       GROUP BY 1,2,3
-      HAVING COUNT(*) >= {int(min_trips_per_window)}
+      HAVING COUNT(*) >= {min_trips_per_window}
     ),
-
-    -- ----------------------------
-    -- Per-window percentile-rank normalization (robust to airport outliers)
-    -- ----------------------------
     win AS (
-      SELECT
-        *,
-        LN(1 + pickups) AS log_pickups,
-        ROW_NUMBER() OVER (PARTITION BY dow_m, bin_start_min ORDER BY LN(1 + pickups)) AS rn_pickups,
-        ROW_NUMBER() OVER (PARTITION BY dow_m, bin_start_min ORDER BY avg_driver_pay) AS rn_pay,
-        COUNT(*) OVER (PARTITION BY dow_m, bin_start_min) AS n_in_window
+      SELECT *,
+        LN(1+pickups) AS log_pickups,
+        ROW_NUMBER() OVER (PARTITION BY dow_m,bin_start_min ORDER BY LN(1+pickups)) rn_pickups,
+        ROW_NUMBER() OVER (PARTITION BY dow_m,bin_start_min ORDER BY driver_pay_per_hour) rn_hourly,
+        ROW_NUMBER() OVER (PARTITION BY dow_m,bin_start_min ORDER BY avg_trip_miles) rn_miles,
+        COUNT(*) OVER (PARTITION BY dow_m,bin_start_min) n
       FROM agg
     ),
-    win_scored AS (
-      SELECT
-        PULocationID, dow_m, bin_start_min, pickups, avg_driver_pay,
-        CASE
-          WHEN n_in_window <= 1 THEN 0.0
-          ELSE (rn_pickups - 1) * 1.0 / (n_in_window - 1)
-        END AS vol_n,
-        CASE
-          WHEN n_in_window <= 1 THEN 0.0
-          ELSE (rn_pay - 1) * 1.0 / (n_in_window - 1)
-        END AS pay_n
+    scored AS (
+      SELECT *,
+        (rn_pickups-1)/(n-1) AS vol_n,
+        (rn_hourly-1)/(n-1) AS hourly_n,
+        (rn_miles-1)/(n-1) AS miles_n
       FROM win
-    ),
-
-    -- ----------------------------
-    -- Baseline per-zone (historical typical level)
-    -- IMPORTANT CHANGE: baseline normalization uses percentile ranks (NOT min/max)
-    -- so airports cannot compress baseline for all other zones.
-    -- ----------------------------
-    zone_base AS (
-      SELECT
-        PULocationID,
-        LN(1 + AVG(pickups)) AS base_log_pickups,
-        AVG(avg_driver_pay) AS base_pay
-      FROM agg
-      GROUP BY 1
-    ),
-    zone_ranked AS (
-      SELECT
-        *,
-        ROW_NUMBER() OVER (ORDER BY base_log_pickups) AS rn_base_pickups,
-        ROW_NUMBER() OVER (ORDER BY base_pay) AS rn_base_pay,
-        COUNT(*) OVER () AS n_zones
-      FROM zone_base
-    ),
-    zone_norm AS (
-      SELECT
-        PULocationID,
-        CASE
-          WHEN n_zones <= 1 THEN 0.0
-          ELSE (rn_base_pickups - 1) * 1.0 / (n_zones - 1)
-        END AS base_vol_n,
-        CASE
-          WHEN n_zones <= 1 THEN 0.0
-          ELSE (rn_base_pay - 1) * 1.0 / (n_zones - 1)
-        END AS base_pay_n
-      FROM zone_ranked
-    ),
-
-    final AS (
-      SELECT
-        w.PULocationID,
-        w.dow_m,
-        w.bin_start_min,
-        w.pickups,
-        w.avg_driver_pay,
-
-        -- Your rule: mostly busy, some driver pay
-        (0.85*w.vol_n + 0.15*w.pay_n) AS moment_score,
-        (0.85*z.base_vol_n + 0.15*z.base_pay_n) AS base_score,
-
-        -- confidence: more pickups -> more trust in moment_score
-        LEAST(1.0, w.pickups / 50.0) AS conf
-      FROM win_scored w
-      JOIN zone_norm z USING (PULocationID)
     )
-
     SELECT
-      PULocationID,
-      dow_m,
-      bin_start_min,
-      pickups,
-      avg_driver_pay,
+      PULocationID,dow_m,bin_start_min,pickups,
+      avg_driver_pay,avg_trip_miles,avg_trip_minutes,
+      driver_pay_per_hour,
       CAST(
         ROUND(
-          1 + 99 * LEAST(
+          1 + 99 *
+          LEAST(
             GREATEST(
-              ((0.70*moment_score + 0.30*base_score) * (0.50 + 0.50*conf)),
+              (0.50*hourly_n + 0.35*vol_n + 0.15*miles_n),
               0.0
             ),
             1.0
           )
         ) AS INTEGER
-      ) AS rating
-    FROM final
-    ORDER BY dow_m, bin_start_min, PULocationID;
+      ) rating
+    FROM scored
+    ORDER BY dow_m,bin_start_min,PULocationID;
     """
 
     cur = con.execute(sql)
 
-    # timeline labels (Mon-based week anchor)
-    week_start = datetime(2025, 1, 6, 0, 0, 0)  # Monday anchor
-    timeline: List[str] = []
-    frame_count = 0
+    week_start = datetime(2025,1,6,0,0,0)
+    timeline=[]
+    frame_count=0
+    current_key=None
+    current_features=[]
+    current_time_iso=None
 
-    current_key: Tuple[int, int] | None = None
-    current_features: List[Dict[str, Any]] = []
-    current_time_iso: str | None = None
-
-    def flush_frame():
-        nonlocal frame_count, current_features, current_time_iso
-        if current_time_iso is None:
-            return
-
+    def flush():
+        nonlocal frame_count,current_features,current_time_iso
+        if not current_time_iso: return
         timeline.append(current_time_iso)
         frame_path = out_dir / f"frame_{frame_count:06d}.json"
-        payload = {
-            "time": current_time_iso,
-            "polygons": {"type": "FeatureCollection", "features": current_features},
-        }
-        frame_path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
-
-        frame_count += 1
-        current_features = []
-        current_time_iso = None
-
-    total_rows = 0
-    any_rows = False
+        frame_path.write_text(json.dumps({
+            "time":current_time_iso,
+            "polygons":{"type":"FeatureCollection","features":current_features}
+        },separators=(",",":")))
+        frame_count+=1
+        current_features=[]
+        current_time_iso=None
 
     while True:
         batch = cur.fetchmany(5000)
-        if not batch:
-            break
-        any_rows = True
+        if not batch: break
 
-        for (zid, dow_m, bin_start_min, pickups, avg_pay, rating) in batch:
-            total_rows += 1
-            key = (int(dow_m), int(bin_start_min))
+        for row in batch:
+            zid,dow_m,bin_start,pickups,avg_pay,avg_mi,avg_min,pay_hr,rating=row
+            key=(dow_m,bin_start)
+            if current_key is None: current_key=key
+            if key!=current_key:
+                flush()
+                current_key=key
 
-            if current_key is None:
-                current_key = key
-            if key != current_key:
-                flush_frame()
-                current_key = key
+            ts=week_start+timedelta(days=dow_m,hours=bin_start//60,minutes=bin_start%60)
+            current_time_iso=ts.strftime("%Y-%m-%dT%H:%M:%S")
 
-            hour = int(bin_start_min // 60)
-            minute = int(bin_start_min % 60)
-            ts = week_start + timedelta(days=int(dow_m), hours=hour, minutes=minute)
-            current_time_iso = ts.strftime("%Y-%m-%dT%H:%M:%S")
-
-            zid_i = int(zid)
-            geom = geom_by_id.get(zid_i)
-            if not geom:
-                continue
-
-            r = int(rating)
-            bucket, fill = bucket_and_color_from_rating(r)
+            bucket,fill=bucket_and_color_from_rating(rating)
 
             current_features.append({
-                "type": "Feature",
-                "geometry": geom,
-                "properties": {
-                    "LocationID": zid_i,
-                    "zone_name": name_by_id.get(zid_i, ""),
-                    "borough": borough_by_id.get(zid_i, ""),
-                    "rating": r,
-                    "bucket": bucket,
-                    "pickups": int(pickups),
-                    "avg_driver_pay": None if avg_pay is None else float(avg_pay),
-                    "avg_tips": None,
-                    "style": {
-                        "color": fill,
-                        "opacity": 0,
-                        "weight": 0,
-                        "fillColor": fill,
-                        "fillOpacity": 0.82
+                "type":"Feature",
+                "geometry":geom_by_id.get(int(zid)),
+                "properties":{
+                    "LocationID":int(zid),
+                    "zone_name":name_by_id.get(int(zid),""),
+                    "borough":borough_by_id.get(int(zid),""),
+                    "rating":int(rating),
+                    "bucket":bucket,
+                    "pickups":int(pickups),
+                    "avg_driver_pay":avg_pay,
+                    "avg_trip_miles":avg_mi,
+                    "avg_trip_minutes":avg_min,
+                    "driver_pay_per_hour":pay_hr,
+                    "style":{
+                        "color":fill,
+                        "opacity":0,
+                        "weight":0,
+                        "fillColor":fill,
+                        "fillOpacity":0.82
                     }
                 }
             })
 
-    if not any_rows:
-        raise RuntimeError("No data after filtering. Lower min_trips_per_window.")
+    flush()
 
-    flush_frame()
-
-    (out_dir / "timeline.json").write_text(
-        json.dumps({"timeline": timeline, "count": len(timeline)}, separators=(",", ":")),
-        encoding="utf-8"
+    (out_dir/"timeline.json").write_text(
+        json.dumps({"timeline":timeline,"count":len(timeline)},separators=(",",":"))
     )
 
-    return {"ok": True, "count": len(timeline), "frames_dir": str(out_dir), "rows": total_rows}
+    return {"ok":True,"count":len(timeline)}
