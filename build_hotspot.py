@@ -6,33 +6,6 @@ from datetime import datetime, timedelta
 import json
 import duckdb
 
-# ----------------------------
-# REQUIRED INPUT COLUMNS
-# ----------------------------
-REQUIRED_COLS = ["PULocationID", "pickup_datetime", "driver_pay", "trip_miles", "trip_time"]
-
-# ----------------------------
-# RATING WEIGHTS (SINGLE SOURCE OF TRUTH)
-# Demand-first by design:
-#  - pickups dominates
-#  - zone_clock_per_hour is a small tie-breaker
-# ----------------------------
-WEIGHT_PICKUPS = 0.85
-WEIGHT_CLOCK = 0.15
-
-# Mix "current window" vs "zone baseline"
-WEIGHT_MOMENT = 0.80
-WEIGHT_BASE = 0.20
-
-# Confidence scaling
-CONF_PICKUPS_DENOM = 50.0     # pickups / 50 -> confidence up to 1.0
-CONF_FLOOR = 0.60             # multiplier floor
-CONF_CEIL_GAIN = 0.40         # additional multiplier when conf=1.0
-
-# Sanity filters (avoid insane outliers)
-MAX_TRIP_TIME_SEC = 6 * 3600
-MAX_TRIP_MILES = 200
-
 
 def ensure_zones_geojson(data_dir: Path, force: bool = False) -> Path:
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -53,6 +26,7 @@ def bucket_and_color_from_rating(rating: int) -> tuple[str, str]:
       Red    = Very Low / Avoid
     """
     r = int(rating)
+
     if r >= 90:
         return "green", "#00b050"
     if r >= 80:
@@ -82,25 +56,12 @@ def build_hotspots_frames(
       - time
       - polygons FeatureCollection
       - each feature has:
-          LocationID, zone_name, borough,
-          rating, bucket,
-          pickups,
-          avg_driver_pay,
-          avg_trip_miles,
-          avg_trip_time_sec,
-          zone_clock_per_hour,      # avg_driver_pay / (avg_trip_time_sec/3600)
-          active_trip_per_hour,     # sum_driver_pay / (sum_trip_time_sec/3600)
-          style(fillColor)
+          LocationID, zone_name, borough, rating, bucket, pickups, avg_driver_pay, style(fillColor)
 
-    SINGLE LOGIC ONLY (NO FALLBACK):
-      Requires columns: PULocationID, pickup_datetime, driver_pay, trip_miles, trip_time
-      trip_time is treated as seconds.
-
-    RATING (DEMAND FIRST):
-      - pickups is the dominant metric (percentile rank per window)
-      - zone_clock_per_hour is a smaller tie-breaker
-      - small baseline component (typical strength for that zone)
-      - confidence scaling based on pickup count
+    FACTS + REALISM GUARANTEE:
+      - Per-window normalization is percentile-rank based (NOT min/max), so airports cannot flatten the city.
+      - Baseline per-zone normalization is ALSO percentile-rank based (NOT global min/max),
+        so airports cannot compress baseline scores either.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -150,135 +111,110 @@ def build_hotspots_frames(
     parquet_sql = ", ".join("'" + p.replace("'", "''") + "'" for p in parquet_list)
 
     # ----------------------------
-    # SQL (demand-first)
+    # SQL build
+    #
+    # - "busy" drives score (pickups) more than pay, as you requested.
+    # - Per-window normalization uses percentile rank (no max/min) so airports don't dominate.
+    # - Baseline per-zone normalization ALSO uses percentile rank (no global min/max),
+    #   so airports cannot compress base_score either.
+    # - Confidence scales down low-sample windows (still data-driven).
     # ----------------------------
     sql = f"""
     WITH base AS (
       SELECT
         CAST(PULocationID AS INTEGER) AS PULocationID,
         pickup_datetime,
-        TRY_CAST(driver_pay AS DOUBLE) AS driver_pay,
-        TRY_CAST(trip_miles AS DOUBLE) AS trip_miles,
-        TRY_CAST(trip_time AS DOUBLE) AS trip_time_sec
+        TRY_CAST(driver_pay AS DOUBLE) AS driver_pay
       FROM read_parquet([{parquet_sql}])
-      WHERE
-        PULocationID IS NOT NULL
-        AND pickup_datetime IS NOT NULL
-        AND driver_pay IS NOT NULL
-        AND trip_miles IS NOT NULL
-        AND trip_time IS NOT NULL
+      WHERE PULocationID IS NOT NULL AND pickup_datetime IS NOT NULL
     ),
-
-    cleaned AS (
-      SELECT
-        PULocationID,
-        pickup_datetime,
-        driver_pay,
-        trip_miles,
-        trip_time_sec
-      FROM base
-      WHERE
-        driver_pay >= 0
-        AND trip_miles >= 0
-        AND trip_time_sec > 0
-        AND trip_time_sec < {int(MAX_TRIP_TIME_SEC)}
-        AND trip_miles < {int(MAX_TRIP_MILES)}
-    ),
-
     t AS (
       SELECT
         PULocationID,
         CAST(EXTRACT('dow' FROM pickup_datetime) AS INTEGER) AS dow_i,  -- 0=Sun..6=Sat
         CAST(EXTRACT('hour' FROM pickup_datetime) AS INTEGER) AS hour_i,
         CAST(EXTRACT('minute' FROM pickup_datetime) AS INTEGER) AS minute_i,
-        driver_pay,
-        trip_miles,
-        trip_time_sec
-      FROM cleaned
+        driver_pay
+      FROM base
     ),
-
     binned AS (
       SELECT
         PULocationID,
         CASE WHEN dow_i = 0 THEN 6 ELSE dow_i - 1 END AS dow_m,  -- Mon=0..Sun=6
         CAST(FLOOR((hour_i*60 + minute_i) / {int(bin_minutes)}) * {int(bin_minutes)} AS INTEGER) AS bin_start_min,
-        driver_pay,
-        trip_miles,
-        trip_time_sec
+        driver_pay
       FROM t
     ),
-
     agg AS (
       SELECT
         PULocationID,
         dow_m,
         bin_start_min,
         COUNT(*) AS pickups,
-        AVG(driver_pay) AS avg_driver_pay,
-        AVG(trip_miles) AS avg_trip_miles,
-        AVG(trip_time_sec) AS avg_trip_time_sec,
-        SUM(driver_pay) AS sum_driver_pay,
-        SUM(trip_time_sec) AS sum_trip_time_sec,
-        CASE
-          WHEN AVG(trip_time_sec) <= 0 THEN NULL
-          ELSE AVG(driver_pay) / (AVG(trip_time_sec) / 3600.0)
-        END AS zone_clock_per_hour,
-        CASE
-          WHEN SUM(trip_time_sec) <= 0 THEN NULL
-          ELSE SUM(driver_pay) / (SUM(trip_time_sec) / 3600.0)
-        END AS active_trip_per_hour
+        AVG(driver_pay) AS avg_driver_pay
       FROM binned
       GROUP BY 1,2,3
       HAVING COUNT(*) >= {int(min_trips_per_window)}
     ),
 
-    -- Per-window percentile ranks (robust), using log(pickups)
+    -- ----------------------------
+    -- Per-window percentile-rank normalization (robust to airport outliers)
+    -- ----------------------------
     win AS (
       SELECT
         *,
         LN(1 + pickups) AS log_pickups,
         ROW_NUMBER() OVER (PARTITION BY dow_m, bin_start_min ORDER BY LN(1 + pickups)) AS rn_pickups,
-        ROW_NUMBER() OVER (PARTITION BY dow_m, bin_start_min ORDER BY zone_clock_per_hour) AS rn_clock,
+        ROW_NUMBER() OVER (PARTITION BY dow_m, bin_start_min ORDER BY avg_driver_pay) AS rn_pay,
         COUNT(*) OVER (PARTITION BY dow_m, bin_start_min) AS n_in_window
       FROM agg
-      WHERE zone_clock_per_hour IS NOT NULL
     ),
-
     win_scored AS (
       SELECT
-        PULocationID, dow_m, bin_start_min,
-        pickups, avg_driver_pay, avg_trip_miles, avg_trip_time_sec,
-        zone_clock_per_hour, active_trip_per_hour,
-        CASE WHEN n_in_window <= 1 THEN 0.0 ELSE (rn_pickups - 1) * 1.0 / (n_in_window - 1) END AS vol_n,
-        CASE WHEN n_in_window <= 1 THEN 0.0 ELSE (rn_clock - 1) * 1.0 / (n_in_window - 1) END AS clock_n
+        PULocationID, dow_m, bin_start_min, pickups, avg_driver_pay,
+        CASE
+          WHEN n_in_window <= 1 THEN 0.0
+          ELSE (rn_pickups - 1) * 1.0 / (n_in_window - 1)
+        END AS vol_n,
+        CASE
+          WHEN n_in_window <= 1 THEN 0.0
+          ELSE (rn_pay - 1) * 1.0 / (n_in_window - 1)
+        END AS pay_n
       FROM win
     ),
 
-    -- Baseline per-zone across all windows (robust), then ranked across zones
+    -- ----------------------------
+    -- Baseline per-zone (historical typical level)
+    -- IMPORTANT CHANGE: baseline normalization uses percentile ranks (NOT min/max)
+    -- so airports cannot compress baseline for all other zones.
+    -- ----------------------------
     zone_base AS (
       SELECT
         PULocationID,
         LN(1 + AVG(pickups)) AS base_log_pickups,
-        AVG(zone_clock_per_hour) AS base_clock
+        AVG(avg_driver_pay) AS base_pay
       FROM agg
-      WHERE zone_clock_per_hour IS NOT NULL
       GROUP BY 1
     ),
-
     zone_ranked AS (
       SELECT
         *,
         ROW_NUMBER() OVER (ORDER BY base_log_pickups) AS rn_base_pickups,
-        ROW_NUMBER() OVER (ORDER BY base_clock) AS rn_base_clock,
+        ROW_NUMBER() OVER (ORDER BY base_pay) AS rn_base_pay,
         COUNT(*) OVER () AS n_zones
       FROM zone_base
     ),
-
     zone_norm AS (
       SELECT
         PULocationID,
-        CASE WHEN n_zones <= 1 THEN 0.0 ELSE (rn_base_pickups - 1) * 1.0 / (n_zones - 1) END AS base_vol_n,
-        CASE WHEN n_zones <= 1 THEN 0.0 ELSE (rn_base_clock - 1) * 1.0 / (n_zones - 1) END AS base_clock_n
+        CASE
+          WHEN n_zones <= 1 THEN 0.0
+          ELSE (rn_base_pickups - 1) * 1.0 / (n_zones - 1)
+        END AS base_vol_n,
+        CASE
+          WHEN n_zones <= 1 THEN 0.0
+          ELSE (rn_base_pay - 1) * 1.0 / (n_zones - 1)
+        END AS base_pay_n
       FROM zone_ranked
     ),
 
@@ -289,17 +225,13 @@ def build_hotspots_frames(
         w.bin_start_min,
         w.pickups,
         w.avg_driver_pay,
-        w.avg_trip_miles,
-        w.avg_trip_time_sec,
-        w.zone_clock_per_hour,
-        w.active_trip_per_hour,
 
-        -- DEMAND FIRST:
-        ({WEIGHT_PICKUPS}*w.vol_n + {WEIGHT_CLOCK}*w.clock_n) AS moment_score,
-        ({WEIGHT_PICKUPS}*z.base_vol_n + {WEIGHT_CLOCK}*z.base_clock_n) AS base_score,
+        -- Your rule: mostly busy, some driver pay
+        (0.85*w.vol_n + 0.15*w.pay_n) AS moment_score,
+        (0.85*z.base_vol_n + 0.15*z.base_pay_n) AS base_score,
 
-        -- confidence by pickup count (more trips -> more trust)
-        LEAST(1.0, w.pickups / {float(CONF_PICKUPS_DENOM)}) AS conf
+        -- confidence: more pickups -> more trust in moment_score
+        LEAST(1.0, w.pickups / 50.0) AS conf
       FROM win_scored w
       JOIN zone_norm z USING (PULocationID)
     )
@@ -310,15 +242,11 @@ def build_hotspots_frames(
       bin_start_min,
       pickups,
       avg_driver_pay,
-      avg_trip_miles,
-      avg_trip_time_sec,
-      zone_clock_per_hour,
-      active_trip_per_hour,
       CAST(
         ROUND(
           1 + 99 * LEAST(
             GREATEST(
-              (({WEIGHT_MOMENT}*moment_score + {WEIGHT_BASE}*base_score) * ({float(CONF_FLOOR)} + {float(CONF_CEIL_GAIN)}*conf)),
+              ((0.70*moment_score + 0.30*base_score) * (0.50 + 0.50*conf)),
               0.0
             ),
             1.0
@@ -366,12 +294,7 @@ def build_hotspots_frames(
             break
         any_rows = True
 
-        for (
-            zid, dow_m, bin_start_min,
-            pickups, avg_pay, avg_miles, avg_time_sec,
-            clock_hr, active_hr,
-            rating
-        ) in batch:
+        for (zid, dow_m, bin_start_min, pickups, avg_pay, rating) in batch:
             total_rows += 1
             key = (int(dow_m), int(bin_start_min))
 
@@ -404,15 +327,8 @@ def build_hotspots_frames(
                     "rating": r,
                     "bucket": bucket,
                     "pickups": int(pickups),
-
                     "avg_driver_pay": None if avg_pay is None else float(avg_pay),
-                    "avg_trip_miles": None if avg_miles is None else float(avg_miles),
-                    "avg_trip_time_sec": None if avg_time_sec is None else float(avg_time_sec),
-
-                    # these match your popup naming:
-                    "zone_clock_per_hour": None if clock_hr is None else float(clock_hr),
-                    "active_trip_per_hour": None if active_hr is None else float(active_hr),
-
+                    "avg_tips": None,
                     "style": {
                         "color": fill,
                         "opacity": 0,
@@ -433,15 +349,4 @@ def build_hotspots_frames(
         encoding="utf-8"
     )
 
-    return {
-        "ok": True,
-        "count": len(timeline),
-        "frames_dir": str(out_dir),
-        "rows": total_rows,
-        "rating_weights": {
-            "pickups": WEIGHT_PICKUPS,
-            "zone_clock_per_hour": WEIGHT_CLOCK,
-            "moment": WEIGHT_MOMENT,
-            "base": WEIGHT_BASE,
-        }
-    }
+    return {"ok": True, "count": len(timeline), "frames_dir": str(out_dir), "rows": total_rows}
