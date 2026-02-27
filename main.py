@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Dict, Any, List
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from build_hotspot import ensure_zones_geojson, build_hotspots_frames
