@@ -12,14 +12,10 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from build_hotspot import ensure_zones_geojson, build_hotspots_frames
 
-# ----------------------------
-# Paths (Railway volume)
-# ----------------------------
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 FRAMES_DIR = Path(os.environ.get("FRAMES_DIR", str(DATA_DIR / "frames")))
 TIMELINE_PATH = FRAMES_DIR / "timeline.json"
 
-# Defaults
 DEFAULT_BIN_MINUTES = int(os.environ.get("DEFAULT_BIN_MINUTES", "20"))
 DEFAULT_MIN_TRIPS_PER_WINDOW = int(os.environ.get("DEFAULT_MIN_TRIPS_PER_WINDOW", "25"))
 
@@ -27,7 +23,7 @@ LOCK_PATH = DATA_DIR / ".generate.lock"
 
 _state_lock = threading.Lock()
 _generate_state: Dict[str, Any] = {
-    "state": "idle",  # idle | started | running | done | error
+    "state": "idle",
     "bin_minutes": None,
     "min_trips_per_window": None,
     "started_at_unix": None,
@@ -48,14 +44,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ----------------------------
-# Utilities
-# ----------------------------
 def _list_parquets() -> List[Path]:
     if not DATA_DIR.exists():
         return []
     return sorted([p for p in DATA_DIR.glob("*.parquet") if p.is_file()])
-
 
 def _has_frames() -> bool:
     try:
@@ -63,15 +55,12 @@ def _has_frames() -> bool:
     except Exception:
         return False
 
-
 def _read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
-
 
 def _write_lock() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     LOCK_PATH.write_text(str(int(time.time())), encoding="utf-8")
-
 
 def _clear_lock() -> None:
     try:
@@ -80,20 +69,16 @@ def _clear_lock() -> None:
     except Exception:
         pass
 
-
 def _lock_is_present() -> bool:
     return LOCK_PATH.exists()
-
 
 def _set_state(**kwargs):
     with _state_lock:
         _generate_state.update(kwargs)
 
-
 def _get_state() -> Dict[str, Any]:
     with _state_lock:
         return dict(_generate_state)
-
 
 def _generate_worker(bin_minutes: int, min_trips_per_window: int) -> None:
     start = time.time()
@@ -148,7 +133,6 @@ def _generate_worker(bin_minutes: int, min_trips_per_window: int) -> None:
     finally:
         _clear_lock()
 
-
 def start_generate(bin_minutes: int, min_trips_per_window: int) -> Dict[str, Any]:
     st = _get_state()
     if st["state"] in ("started", "running"):
@@ -171,13 +155,8 @@ def start_generate(bin_minutes: int, min_trips_per_window: int) -> Dict[str, Any
 
     return {"ok": True, "state": "started", "bin_minutes": bin_minutes, "min_trips_per_window": min_trips_per_window}
 
-
 @app.on_event("startup")
 def auto_generate_if_missing():
-    """
-    - If timeline exists -> do nothing
-    - Else -> start generation in background using defaults (if inputs exist)
-    """
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         FRAMES_DIR.mkdir(parents=True, exist_ok=True)
@@ -211,10 +190,6 @@ def auto_generate_if_missing():
     except Exception:
         _set_state(state="idle")
 
-
-# ----------------------------
-# Routes
-# ----------------------------
 @app.get("/")
 def root():
     return {
@@ -222,7 +197,6 @@ def root():
         "service": "NYC TLC Hotspot Backend",
         "endpoints": ["/status", "/generate", "/generate_status", "/timeline", "/frame/{idx}"],
     }
-
 
 @app.get("/status")
 def status():
@@ -239,23 +213,19 @@ def status():
         "generate_state": _get_state(),
     }
 
-
 @app.get("/generate")
 def generate_get(bin_minutes: int = DEFAULT_BIN_MINUTES, min_trips_per_window: int = DEFAULT_MIN_TRIPS_PER_WINDOW):
     return start_generate(bin_minutes, min_trips_per_window)
 
-
 @app.get("/generate_status")
 def generate_status():
     return _get_state()
-
 
 @app.get("/timeline")
 def timeline():
     if not _has_frames():
         raise HTTPException(status_code=409, detail="timeline not ready. Call /generate first.")
     return _read_json(TIMELINE_PATH)
-
 
 @app.get("/frame/{idx}")
 def frame(idx: int):
@@ -265,7 +235,6 @@ def frame(idx: int):
     if not p.exists():
         raise HTTPException(status_code=404, detail=f"frame not found: {idx}")
     return _read_json(p)
-
 
 @app.post("/upload_zones_geojson")
 async def upload_zones_geojson(file: UploadFile = File(...)):
@@ -285,7 +254,6 @@ async def upload_zones_geojson(file: UploadFile = File(...)):
 
     target.write_bytes(content)
     return {"saved": str(target), "size_mb": round(target.stat().st_size / (1024 * 1024), 2)}
-
 
 @app.post("/upload_parquet")
 async def upload_parquet(file: UploadFile = File(...)):
