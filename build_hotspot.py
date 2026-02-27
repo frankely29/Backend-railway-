@@ -48,15 +48,15 @@ def build_hotspots_frames(
     min_trips_per_window: int = 25,
 ) -> Dict[str, Any]:
     """
-    OPTION A (IMPORTANT):
-      - Every frame includes ALL TLC zones.
-      - Zones that don't meet min_trips_per_window are included as:
-          bucket="nodata", rating=None, low_sample=True, fillColor=grey
-      - This is why grey zones will now have popups AND you can draw X markers on them.
-
     Writes:
       /data/frames/timeline.json
       /data/frames/frame_000000.json ... etc
+
+    Each frame contains:
+      - time
+      - polygons FeatureCollection
+      - each feature has:
+          LocationID, zone_name, borough, rating, bucket, pickups, avg_driver_pay, style(fillColor)
 
     FACTS + REALISM GUARANTEE:
       - Per-window normalization is percentile-rank based (NOT min/max), so airports cannot flatten the city.
@@ -97,10 +97,6 @@ def build_hotspots_frames(
     if not geom_by_id:
         raise RuntimeError("taxi_zones.geojson missing usable properties.LocationID geometry.")
 
-    zone_ids = sorted(geom_by_id.keys())
-    if not zone_ids:
-        raise RuntimeError("No zone IDs found in taxi_zones.geojson.")
-
     # ----------------------------
     # DuckDB (spill to volume)
     # ----------------------------
@@ -114,15 +110,14 @@ def build_hotspots_frames(
     parquet_list = [str(p) for p in parquet_files]
     parquet_sql = ", ".join("'" + p.replace("'", "''") + "'" for p in parquet_list)
 
-    # Create a zones table inside DuckDB so we can output ALL zones for ALL frames
-    con.execute("CREATE TEMP TABLE zones (PULocationID INTEGER);")
-    # Insert values
-    # (fast enough for ~263 zones)
-    values_sql = ", ".join(f"({int(z)})" for z in zone_ids)
-    con.execute(f"INSERT INTO zones VALUES {values_sql};")
-
     # ----------------------------
-    # SQL build (same scoring, but output ALL zones per window)
+    # SQL build
+    #
+    # - "busy" drives score (pickups) more than pay, as you requested.
+    # - Per-window normalization uses percentile rank (no max/min) so airports don't dominate.
+    # - Baseline per-zone normalization ALSO uses percentile rank (no global min/max),
+    #   so airports cannot compress base_score either.
+    # - Confidence scales down low-sample windows (still data-driven).
     # ----------------------------
     sql = f"""
     WITH base AS (
@@ -150,9 +145,7 @@ def build_hotspots_frames(
         driver_pay
       FROM t
     ),
-
-    -- Agg for ALL zones/windows (no HAVING filter here)
-    agg_all AS (
+    agg AS (
       SELECT
         PULocationID,
         dow_m,
@@ -161,17 +154,12 @@ def build_hotspots_frames(
         AVG(driver_pay) AS avg_driver_pay
       FROM binned
       GROUP BY 1,2,3
+      HAVING COUNT(*) >= {int(min_trips_per_window)}
     ),
 
-    -- Agg used for scoring only (your HAVING threshold)
-    agg_scored AS (
-      SELECT
-        *
-      FROM agg_all
-      WHERE pickups >= {int(min_trips_per_window)}
-    ),
-
+    -- ----------------------------
     -- Per-window percentile-rank normalization (robust to airport outliers)
+    -- ----------------------------
     win AS (
       SELECT
         *,
@@ -179,7 +167,7 @@ def build_hotspots_frames(
         ROW_NUMBER() OVER (PARTITION BY dow_m, bin_start_min ORDER BY LN(1 + pickups)) AS rn_pickups,
         ROW_NUMBER() OVER (PARTITION BY dow_m, bin_start_min ORDER BY avg_driver_pay) AS rn_pay,
         COUNT(*) OVER (PARTITION BY dow_m, bin_start_min) AS n_in_window
-      FROM agg_scored
+      FROM agg
     ),
     win_scored AS (
       SELECT
@@ -195,13 +183,17 @@ def build_hotspots_frames(
       FROM win
     ),
 
-    -- Baseline per-zone (historical typical level), normalized by percentile ranks
+    -- ----------------------------
+    -- Baseline per-zone (historical typical level)
+    -- IMPORTANT CHANGE: baseline normalization uses percentile ranks (NOT min/max)
+    -- so airports cannot compress baseline for all other zones.
+    -- ----------------------------
     zone_base AS (
       SELECT
         PULocationID,
         LN(1 + AVG(pickups)) AS base_log_pickups,
         AVG(avg_driver_pay) AS base_pay
-      FROM agg_scored
+      FROM agg
       GROUP BY 1
     ),
     zone_ranked AS (
@@ -226,7 +218,7 @@ def build_hotspots_frames(
       FROM zone_ranked
     ),
 
-    final_scored AS (
+    final AS (
       SELECT
         w.PULocationID,
         w.dow_m,
@@ -234,7 +226,7 @@ def build_hotspots_frames(
         w.pickups,
         w.avg_driver_pay,
 
-        -- mostly busy, some driver pay
+        -- Your rule: mostly busy, some driver pay
         (0.85*w.vol_n + 0.15*w.pay_n) AS moment_score,
         (0.85*z.base_vol_n + 0.15*z.base_pay_n) AS base_score,
 
@@ -242,65 +234,27 @@ def build_hotspots_frames(
         LEAST(1.0, w.pickups / 50.0) AS conf
       FROM win_scored w
       JOIN zone_norm z USING (PULocationID)
-    ),
-
-    scored_ratings AS (
-      SELECT
-        PULocationID,
-        dow_m,
-        bin_start_min,
-        pickups,
-        avg_driver_pay,
-        CAST(
-          ROUND(
-            1 + 99 * LEAST(
-              GREATEST(
-                ((0.70*moment_score + 0.30*base_score) * (0.50 + 0.50*conf)),
-                0.0
-              ),
-              1.0
-            )
-          ) AS INTEGER
-        ) AS rating
-      FROM final_scored
-    ),
-
-    -- windows (always 504 when bin_minutes=20)
-    windows AS (
-      SELECT
-        dow_m,
-        bin_start_min
-      FROM (
-        SELECT
-          CAST(d AS INTEGER) AS dow_m
-        FROM range(0, 7) tbl(d)
-      ) dows
-      CROSS JOIN (
-        SELECT
-          CAST(b AS INTEGER) AS bin_start_min
-        FROM range(0, 1440, {int(bin_minutes)}) tbl(b)
-      ) bins
     )
 
-    -- OUTPUT: all zones for all windows, left-join agg + rating
     SELECT
-      z.PULocationID,
-      w.dow_m,
-      w.bin_start_min,
-      COALESCE(a.pickups, 0) AS pickups,
-      a.avg_driver_pay AS avg_driver_pay,
-      r.rating AS rating
-    FROM windows w
-    CROSS JOIN zones z
-    LEFT JOIN agg_all a
-      ON a.dow_m = w.dow_m
-      AND a.bin_start_min = w.bin_start_min
-      AND a.PULocationID = z.PULocationID
-    LEFT JOIN scored_ratings r
-      ON r.dow_m = w.dow_m
-      AND r.bin_start_min = w.bin_start_min
-      AND r.PULocationID = z.PULocationID
-    ORDER BY w.dow_m, w.bin_start_min, z.PULocationID;
+      PULocationID,
+      dow_m,
+      bin_start_min,
+      pickups,
+      avg_driver_pay,
+      CAST(
+        ROUND(
+          1 + 99 * LEAST(
+            GREATEST(
+              ((0.70*moment_score + 0.30*base_score) * (0.50 + 0.50*conf)),
+              0.0
+            ),
+            1.0
+          )
+        ) AS INTEGER
+      ) AS rating
+    FROM final
+    ORDER BY dow_m, bin_start_min, PULocationID;
     """
 
     cur = con.execute(sql)
@@ -314,8 +268,6 @@ def build_hotspots_frames(
     current_features: List[Dict[str, Any]] = []
     current_time_iso: str | None = None
 
-    GREY_FILL = "#bdbdbd"
-
     def flush_frame():
         nonlocal frame_count, current_features, current_time_iso
         if current_time_iso is None:
@@ -326,10 +278,6 @@ def build_hotspots_frames(
         payload = {
             "time": current_time_iso,
             "polygons": {"type": "FeatureCollection", "features": current_features},
-            "meta": {
-                "bin_minutes": int(bin_minutes),
-                "min_trips_per_window": int(min_trips_per_window),
-            },
         }
         frame_path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
 
@@ -341,18 +289,17 @@ def build_hotspots_frames(
     any_rows = False
 
     while True:
-        batch = cur.fetchmany(8000)
+        batch = cur.fetchmany(5000)
         if not batch:
             break
         any_rows = True
 
         for (zid, dow_m, bin_start_min, pickups, avg_pay, rating) in batch:
             total_rows += 1
-
             key = (int(dow_m), int(bin_start_min))
+
             if current_key is None:
                 current_key = key
-
             if key != current_key:
                 flush_frame()
                 current_key = key
@@ -367,17 +314,8 @@ def build_hotspots_frames(
             if not geom:
                 continue
 
-            # Determine style + bucket
-            if rating is None:
-                # low-sample/no-data for this window
-                bucket = "nodata"
-                fill = GREY_FILL
-                r_val = None
-                low_sample = True
-            else:
-                r_val = int(rating)
-                bucket, fill = bucket_and_color_from_rating(r_val)
-                low_sample = False
+            r = int(rating)
+            bucket, fill = bucket_and_color_from_rating(r)
 
             current_features.append({
                 "type": "Feature",
@@ -386,12 +324,11 @@ def build_hotspots_frames(
                     "LocationID": zid_i,
                     "zone_name": name_by_id.get(zid_i, ""),
                     "borough": borough_by_id.get(zid_i, ""),
-                    "rating": r_val,
+                    "rating": r,
                     "bucket": bucket,
-                    "pickups": int(pickups) if pickups is not None else 0,
+                    "pickups": int(pickups),
                     "avg_driver_pay": None if avg_pay is None else float(avg_pay),
-                    "low_sample": bool(low_sample),
-                    "min_trips_per_window": int(min_trips_per_window),
+                    "avg_tips": None,
                     "style": {
                         "color": fill,
                         "opacity": 0,
@@ -403,7 +340,7 @@ def build_hotspots_frames(
             })
 
     if not any_rows:
-        raise RuntimeError("No rows returned. Check parquet inputs and schema.")
+        raise RuntimeError("No data after filtering. Lower min_trips_per_window.")
 
     flush_frame()
 
