@@ -8,16 +8,10 @@ from pathlib import Path
 from typing import Dict, Any, List
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-from build_hotspot import (
-    ensure_zones_geojson,
-    build_hotspots_frames,
-    WEIGHT_PICKUPS,
-    WEIGHT_CLOCK,
-    WEIGHT_MOMENT,
-    WEIGHT_BASE,
-)
+from build_hotspot import ensure_zones_geojson, build_hotspots_frames
 
 # ----------------------------
 # Paths (Railway volume)
@@ -26,7 +20,7 @@ DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 FRAMES_DIR = Path(os.environ.get("FRAMES_DIR", str(DATA_DIR / "frames")))
 TIMELINE_PATH = FRAMES_DIR / "timeline.json"
 
-# Defaults for auto-generate
+# Defaults for auto-generate (Option A)
 DEFAULT_BIN_MINUTES = int(os.environ.get("DEFAULT_BIN_MINUTES", "20"))
 DEFAULT_MIN_TRIPS_PER_WINDOW = int(os.environ.get("DEFAULT_MIN_TRIPS_PER_WINDOW", "25"))
 
@@ -52,9 +46,10 @@ _generate_state: Dict[str, Any] = {
 # ----------------------------
 app = FastAPI(title="NYC TLC Hotspot Backend", version="1.0")
 
+# Allow GitHub Pages frontend to call Railway backend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # lock down later
+    allow_origins=["*"],  # lock down later if you want
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -165,6 +160,7 @@ def _generate_worker(bin_minutes: int, min_trips_per_window: int) -> None:
 
 
 def start_generate(bin_minutes: int, min_trips_per_window: int) -> Dict[str, Any]:
+    # Avoid double runs
     st = _get_state()
     if st["state"] in ("started", "running"):
         return {
@@ -172,28 +168,12 @@ def start_generate(bin_minutes: int, min_trips_per_window: int) -> Dict[str, Any
             "state": st["state"],
             "bin_minutes": st["bin_minutes"],
             "min_trips_per_window": st["min_trips_per_window"],
-            "rating_weights": {
-                "pickups": WEIGHT_PICKUPS,
-                "zone_clock_per_hour": WEIGHT_CLOCK,
-                "moment": WEIGHT_MOMENT,
-                "base": WEIGHT_BASE,
-            },
         }
 
+    # File lock guard (best-effort across restarts)
     if _lock_is_present():
         _set_state(state="running", bin_minutes=bin_minutes, min_trips_per_window=min_trips_per_window)
-        return {
-            "ok": True,
-            "state": "running",
-            "bin_minutes": bin_minutes,
-            "min_trips_per_window": min_trips_per_window,
-            "rating_weights": {
-                "pickups": WEIGHT_PICKUPS,
-                "zone_clock_per_hour": WEIGHT_CLOCK,
-                "moment": WEIGHT_MOMENT,
-                "base": WEIGHT_BASE,
-            },
-        }
+        return {"ok": True, "state": "running", "bin_minutes": bin_minutes, "min_trips_per_window": min_trips_per_window}
 
     _write_lock()
     _set_state(state="started", bin_minutes=bin_minutes, min_trips_per_window=min_trips_per_window)
@@ -201,31 +181,24 @@ def start_generate(bin_minutes: int, min_trips_per_window: int) -> Dict[str, Any
     t = threading.Thread(target=_generate_worker, args=(bin_minutes, min_trips_per_window), daemon=True)
     t.start()
 
-    return {
-        "ok": True,
-        "state": "started",
-        "bin_minutes": bin_minutes,
-        "min_trips_per_window": min_trips_per_window,
-        "rating_weights": {
-            "pickups": WEIGHT_PICKUPS,
-            "zone_clock_per_hour": WEIGHT_CLOCK,
-            "moment": WEIGHT_MOMENT,
-            "base": WEIGHT_BASE,
-        },
-    }
+    return {"ok": True, "state": "started", "bin_minutes": bin_minutes, "min_trips_per_window": min_trips_per_window}
 
 
 # ----------------------------
-# Auto-generate once if missing
+# Option A: Auto-generate ONCE if missing
 # ----------------------------
 @app.on_event("startup")
 def auto_generate_if_missing():
+    """
+    - If /data/frames/timeline.json exists -> do nothing
+    - Else -> start generation in background using defaults (if inputs exist)
+    """
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         FRAMES_DIR.mkdir(parents=True, exist_ok=True)
 
         if _has_frames():
-            # Mark done so UI sees ready state
+            # Fill state with defaults for nicer status output
             try:
                 tl = _read_json(TIMELINE_PATH)
                 _set_state(
@@ -263,16 +236,7 @@ def root():
     return {
         "ok": True,
         "service": "NYC TLC Hotspot Backend",
-        "endpoints": [
-            "/status",
-            "/generate",
-            "/generate_status",
-            "/timeline",
-            "/frame/{idx}",
-            "/debug/schema",
-            "/debug/sample",
-            "/debug/frame_stats/{idx}",
-        ],
+        "endpoints": ["/status", "/generate", "/generate_status", "/timeline", "/frame/{idx}"],
     }
 
 
@@ -289,19 +253,12 @@ def status():
         "frames_dir": str(FRAMES_DIR),
         "has_timeline": _has_frames(),
         "generate_state": _get_state(),
-        # ✅ This now matches build_hotspot.py (no more stale hardcoded values)
-        "rating_weights": {
-            "pickups": WEIGHT_PICKUPS,
-            "zone_clock_per_hour": WEIGHT_CLOCK,
-            "moment": WEIGHT_MOMENT,
-            "base": WEIGHT_BASE,
-        },
     }
 
 
 @app.get("/generate")
 def generate_get(bin_minutes: int = DEFAULT_BIN_MINUTES, min_trips_per_window: int = DEFAULT_MIN_TRIPS_PER_WINDOW):
-    # Note: calling /generate again after code changes is required to rebuild frames with new scoring
+    # Starts generation async
     return start_generate(bin_minutes, min_trips_per_window)
 
 
@@ -329,6 +286,10 @@ def frame(idx: int):
 
 @app.post("/upload_zones_geojson")
 async def upload_zones_geojson(file: UploadFile = File(...)):
+    """
+    Upload the TLC taxi zones geojson file.
+    Must be valid GeoJSON content.
+    """
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     target = DATA_DIR / "taxi_zones.geojson"
 
@@ -336,6 +297,7 @@ async def upload_zones_geojson(file: UploadFile = File(...)):
     if not content:
         raise HTTPException(status_code=400, detail="Empty upload.")
 
+    # Basic validation: should parse as JSON
     try:
         obj = json.loads(content.decode("utf-8", errors="strict"))
         if obj.get("type") not in ("FeatureCollection", "Feature"):
@@ -349,6 +311,9 @@ async def upload_zones_geojson(file: UploadFile = File(...)):
 
 @app.post("/upload_parquet")
 async def upload_parquet(file: UploadFile = File(...)):
+    """
+    Upload a parquet month file into /data.
+    """
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     filename = (file.filename or "upload.parquet").replace("\\", "/").split("/")[-1]
@@ -362,184 +327,3 @@ async def upload_parquet(file: UploadFile = File(...)):
 
     target.write_bytes(content)
     return {"saved": str(target), "size_mb": round(target.stat().st_size / (1024 * 1024), 2)}
-
-
-# ----------------------------
-# DEBUG (Railway verification)
-# ----------------------------
-@app.get("/debug/schema")
-def debug_schema():
-    """
-    Returns detected parquet columns + a mapping for the columns we expect.
-    """
-    import duckdb
-
-    parquets = _list_parquets()
-    if not parquets:
-        raise HTTPException(status_code=404, detail="No parquet files found in /data")
-
-    con = duckdb.connect(database=":memory:")
-    p0 = str(parquets[0])
-
-    cols = con.execute(f"DESCRIBE SELECT * FROM read_parquet('{p0}')").fetchall()
-    columns = [{"name": r[0], "type": r[1]} for r in cols]
-    lower = [c["name"].lower() for c in columns]
-
-    selected = {}
-    for k in ["PULocationID", "pickup_datetime", "driver_pay", "trip_miles", "trip_time", "dropoff_datetime"]:
-        hit = None
-        for c in columns:
-            if c["name"] == k:
-                hit = c["name"]
-                break
-        if hit:
-            selected[k] = hit
-
-    missing = [c for c in ["PULocationID", "pickup_datetime", "driver_pay", "trip_miles", "trip_time"] if c not in selected]
-
-    return {
-        "ok": True,
-        "files": [p.name for p in parquets],
-        "columns": columns,
-        "columns_lower": lower,
-        "selected_columns": selected,
-        "missing_required": missing,
-        "trip_time_unit_guess": "seconds",
-    }
-
-
-@app.get("/debug/sample")
-def debug_sample(limit: int = 5):
-    """
-    Sanity sample: show raw values for required columns.
-    """
-    import duckdb
-
-    parquets = _list_parquets()
-    if not parquets:
-        raise HTTPException(status_code=404, detail="No parquet files found in /data")
-
-    con = duckdb.connect(database=":memory:")
-    plist = ",".join("'" + str(p).replace("'", "''") + "'" for p in parquets)
-
-    q = f"""
-      SELECT
-        CAST(PULocationID AS INTEGER) AS PULocationID,
-        CAST(pickup_datetime AS VARCHAR) AS pickup_datetime,
-        TRY_CAST(driver_pay AS DOUBLE) AS driver_pay,
-        TRY_CAST(trip_miles AS DOUBLE) AS trip_miles,
-        TRY_CAST(trip_time AS DOUBLE) AS trip_time
-      FROM read_parquet([{plist}])
-      WHERE
-        PULocationID IS NOT NULL
-        AND pickup_datetime IS NOT NULL
-        AND driver_pay IS NOT NULL
-        AND trip_miles IS NOT NULL
-        AND trip_time IS NOT NULL
-      LIMIT {int(max(1, min(limit, 50)))}
-    """
-    rows = con.execute(q).fetchall()
-
-    return {
-        "ok": True,
-        "files": [p.name for p in parquets],
-        "selected_columns": ["PULocationID", "pickup_datetime", "driver_pay", "trip_miles", "trip_time"],
-        "rows": rows,
-        "trip_time_unit_guess": "seconds",
-        "note": "Quick value sanity-check.",
-    }
-
-
-@app.get("/debug/frame_stats/{idx}")
-def debug_frame_stats(idx: int):
-    """
-    Reads a generated frame and summarizes whether the demand-first metrics exist and look sane.
-    """
-    if not _has_frames():
-        raise HTTPException(status_code=409, detail="timeline not ready. Call /generate first.")
-
-    p = FRAMES_DIR / f"frame_{idx:06d}.json"
-    if not p.exists():
-        raise HTTPException(status_code=404, detail=f"frame not found: {idx}")
-
-    frame = _read_json(p)
-    feats = (((frame or {}).get("polygons") or {}).get("features") or [])
-
-    def to_num(x):
-        try:
-            if x is None:
-                return None
-            return float(x)
-        except Exception:
-            return None
-
-    pickups = []
-    clock = []
-    active = []
-    miles = []
-    tsec = []
-    rating = []
-    for f in feats:
-        props = (f or {}).get("properties") or {}
-        pu = to_num(props.get("pickups"))
-        if pu is not None:
-            pickups.append(pu)
-
-        c = to_num(props.get("zone_clock_per_hour"))
-        if c is not None:
-            clock.append(c)
-
-        a = to_num(props.get("active_trip_per_hour"))
-        if a is not None:
-            active.append(a)
-
-        m = to_num(props.get("avg_trip_miles"))
-        if m is not None:
-            miles.append(m)
-
-        ts = to_num(props.get("avg_trip_time_sec"))
-        if ts is not None:
-            tsec.append(ts)
-
-        r = to_num(props.get("rating"))
-        if r is not None:
-            rating.append(r)
-
-    def summary(arr):
-        if not arr:
-            return None
-        arr2 = sorted(arr)
-        n = len(arr2)
-        return {
-            "count": n,
-            "min": arr2[0],
-            "p50": arr2[n // 2],
-            "p90": arr2[int(n * 0.9) - 1 if n > 1 else 0],
-            "max": arr2[-1],
-        }
-
-    return {
-        "ok": True,
-        "idx": idx,
-        "time": frame.get("time"),
-        "feature_count": len(feats),
-        "has_metrics": {
-            "pickups": any(((f.get("properties") or {}).get("pickups") is not None) for f in feats),
-            "zone_clock_per_hour": any(((f.get("properties") or {}).get("zone_clock_per_hour") is not None) for f in feats),
-            "active_trip_per_hour": any(((f.get("properties") or {}).get("active_trip_per_hour") is not None) for f in feats),
-        },
-        "rating_weights": {
-            "pickups": WEIGHT_PICKUPS,
-            "zone_clock_per_hour": WEIGHT_CLOCK,
-            "moment": WEIGHT_MOMENT,
-            "base": WEIGHT_BASE,
-        },
-        "summary": {
-            "rating": summary(rating),
-            "pickups": summary(pickups),
-            "zone_clock_per_hour": summary(clock),
-            "active_trip_per_hour": summary(active),
-            "avg_trip_miles": summary(miles),
-            "avg_trip_time_sec": summary(tsec),
-        },
-    }
