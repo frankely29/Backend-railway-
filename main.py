@@ -13,11 +13,11 @@ import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from build_hotspot import build_hotspots_frames, ensure_zones_geojson
+from build_hotspot import ensure_zones_geojson, build_hotspots_frames
 
 # =========================================================
 # Paths (Railway volume)
@@ -25,25 +25,19 @@ from build_hotspot import build_hotspots_frames, ensure_zones_geojson
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 FRAMES_DIR = Path(os.environ.get("FRAMES_DIR", str(DATA_DIR / "frames")))
 TIMELINE_PATH = FRAMES_DIR / "timeline.json"
-LOCK_PATH = DATA_DIR / ".generate.lock"
 
 DEFAULT_BIN_MINUTES = int(os.environ.get("DEFAULT_BIN_MINUTES", "20"))
 DEFAULT_MIN_TRIPS_PER_WINDOW = int(os.environ.get("DEFAULT_MIN_TRIPS_PER_WINDOW", "25"))
 
+LOCK_PATH = DATA_DIR / ".generate.lock"
+
 # Community DB (SQLite on Railway Volume)
 COMMUNITY_DB_PATH = Path(os.environ.get("COMMUNITY_DB", str(DATA_DIR / "community.db")))
 
-# =========================================================
 # Auth / Admin config
-# =========================================================
-# IMPORTANT: MUST be set in Railway -> your backend service -> Variables
-JWT_SECRET = os.environ.get("JWT_SECRET", "").strip()
-
-# Optional (recommended): guarantees YOU are admin every deploy
-ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "").strip().lower()  # set to: elokotron1@hotmail.com
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")  # set to your chosen admin password
-
-# Optional: lets you make an admin via signup with a bootstrap token
+JWT_SECRET = os.environ.get("JWT_SECRET", "")  # REQUIRED (set in Railway)
+ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "").strip().lower()
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 ADMIN_BOOTSTRAP_TOKEN = os.environ.get("ADMIN_BOOTSTRAP_TOKEN", "").strip()
 
 TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "7"))
@@ -70,11 +64,11 @@ _generate_state: Dict[str, Any] = {
 # =========================================================
 # App
 # =========================================================
-app = FastAPI(title="NYC TLC Hotspot Backend", version="2.0")
+app = FastAPI(title="NYC TLC Hotspot Backend", version="2.1")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # lock down later if you want
+    allow_origins=["*"],  # lock down later
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -202,12 +196,10 @@ def start_generate(bin_minutes: int, min_trips_per_window: int) -> Dict[str, Any
 
     return {"ok": True, "state": "started", "bin_minutes": bin_minutes, "min_trips_per_window": min_trips_per_window}
 
-
 # =========================================================
 # Community DB (SQLite)
 # =========================================================
 _db_lock = threading.Lock()
-
 
 def _db() -> sqlite3.Connection:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -247,7 +239,6 @@ def _db_query_all(sql: str, params: Tuple[Any, ...] = ()) -> List[sqlite3.Row]:
 
 
 def _db_init() -> None:
-    # users
     _db_exec(
         """
         CREATE TABLE IF NOT EXISTS users (
@@ -262,7 +253,6 @@ def _db_init() -> None:
         );
         """
     )
-    # presence
     _db_exec(
         """
         CREATE TABLE IF NOT EXISTS presence (
@@ -276,7 +266,6 @@ def _db_init() -> None:
         );
         """
     )
-    # events (police/pickup)
     _db_exec(
         """
         CREATE TABLE IF NOT EXISTS events (
@@ -285,8 +274,8 @@ def _db_init() -> None:
           user_id INTEGER NOT NULL,
           lat REAL NOT NULL,
           lng REAL NOT NULL,
-          text TEXT,                        -- note text
-          zone_id INTEGER,                  -- for pickup logs (optional)
+          text TEXT,                        -- text only
+          zone_id INTEGER,                  -- optional (pickup)
           created_at INTEGER NOT NULL,
           expires_at INTEGER NOT NULL,
           FOREIGN KEY(user_id) REFERENCES users(id)
@@ -296,12 +285,10 @@ def _db_init() -> None:
     _db_exec("CREATE INDEX IF NOT EXISTS idx_events_type_time ON events(type, created_at);")
     _db_exec("CREATE INDEX IF NOT EXISTS idx_events_expires ON events(expires_at);")
 
-
 # =========================================================
 # Auth helpers (no external deps)
 # =========================================================
 def _require_jwt_secret() -> None:
-    # If missing, logins break. Do NOT auto-generate per deploy.
     if not JWT_SECRET or len(JWT_SECRET) < 24:
         raise HTTPException(
             status_code=500,
@@ -358,44 +345,8 @@ def _hash_password(password: str, salt_b64: Optional[str] = None) -> Tuple[str, 
         salt_b64 = _b64url(salt)
     else:
         salt = _b64url_decode(salt_b64)
-
     dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 200_000)
     return salt_b64, _b64url(dk)
-
-
-def _is_first_user() -> bool:
-    row = _db_query_one("SELECT COUNT(*) AS c FROM users")
-    return int(row["c"]) == 0 if row else True
-
-
-def _ensure_admin_seed() -> None:
-    """
-    If ADMIN_EMAIL + ADMIN_PASSWORD are set:
-    - create that user if missing
-    - force it to be admin
-    This is how you guarantee you are ALWAYS admin.
-    """
-    if not ADMIN_EMAIL or not ADMIN_PASSWORD:
-        return
-
-    existing = _db_query_one("SELECT * FROM users WHERE lower(email)=lower(?) LIMIT 1", (ADMIN_EMAIL,))
-    now = int(time.time())
-    trial_expires = now + TRIAL_DAYS * 86400
-
-    if existing:
-        # ensure admin + enabled
-        if int(existing["is_admin"]) != 1 or int(existing["is_disabled"]) != 0:
-            _db_exec("UPDATE users SET is_admin=1, is_disabled=0 WHERE id=?", (int(existing["id"]),))
-        return
-
-    salt, ph = _hash_password(ADMIN_PASSWORD)
-    _db_exec(
-        """
-        INSERT INTO users(email, pass_salt, pass_hash, is_admin, is_disabled, created_at, trial_expires_at)
-        VALUES(?,?,?,?,?,?,?)
-        """,
-        (ADMIN_EMAIL, salt, ph, 1, 0, now, trial_expires),
-    )
 
 
 def _auth_user_from_request(req: Request) -> sqlite3.Row:
@@ -415,61 +366,53 @@ def _auth_user_from_request(req: Request) -> sqlite3.Row:
 
 def require_user(req: Request) -> sqlite3.Row:
     user = _auth_user_from_request(req)
-    # trial enforcement (admins bypass)
-    if int(user["is_admin"]) != 1:
-        if int(time.time()) > int(user["trial_expires_at"]):
-            raise HTTPException(status_code=402, detail="Trial expired")
+    _enforce_trial_or_admin(user)
     return user
 
 
-def require_admin(user: sqlite3.Row = Depends(require_user)) -> sqlite3.Row:
+def require_admin(req: Request) -> sqlite3.Row:
+    user = _auth_user_from_request(req)
     if int(user["is_admin"]) != 1:
         raise HTTPException(status_code=403, detail="Admin only")
     return user
 
 
-# =========================================================
-# Schemas
-# =========================================================
-class SignupPayload(BaseModel):
-    email: str
-    password: str
-    bootstrap_token: Optional[str] = None
+def _enforce_trial_or_admin(user: sqlite3.Row) -> None:
+    if int(user["is_admin"]) == 1:
+        return
+    if int(time.time()) > int(user["trial_expires_at"]):
+        raise HTTPException(status_code=402, detail="Trial expired")
 
 
-class LoginPayload(BaseModel):
-    email: str
-    password: str
+def _is_first_user() -> bool:
+    row = _db_query_one("SELECT COUNT(*) AS c FROM users")
+    return int(row["c"]) == 0 if row else True
 
 
-class PresencePayload(BaseModel):
-    lat: float
-    lng: float
-    heading: Optional[float] = None
-    accuracy: Optional[float] = None
+def _ensure_admin_seed() -> None:
+    """
+    Optional: if ADMIN_EMAIL + ADMIN_PASSWORD are set, ensure that admin exists.
+    This gives you control without needing to 'sign up' as a regular user.
+    """
+    if not ADMIN_EMAIL or not ADMIN_PASSWORD:
+        return
 
+    existing = _db_query_one("SELECT * FROM users WHERE lower(email)=lower(?) LIMIT 1", (ADMIN_EMAIL,))
+    if existing:
+        if int(existing["is_admin"]) != 1:
+            _db_exec("UPDATE users SET is_admin=1, is_disabled=0 WHERE id=?", (int(existing["id"]),))
+        return
 
-class PolicePayload(BaseModel):
-    lat: float
-    lng: float
-    note: Optional[str] = ""
-
-
-class PickupPayload(BaseModel):
-    lat: float
-    lng: float
-    zone_id: Optional[int] = None
-
-
-class AdminDisablePayload(BaseModel):
-    user_id: int
-    disabled: bool
-
-
-class AdminResetPayload(BaseModel):
-    user_id: int
-    new_password: str
-
+    now = int(time.time())
+    trial_expires = now + TRIAL_DAYS * 86400
+    salt, ph = _hash_password(ADMIN_PASSWORD)
+    _db_exec(
+        """
+        INSERT INTO users(email, pass_salt, pass_hash, is_admin, is_disabled, created_at, trial_expires_at)
+        VALUES(?,?,?,?,?,?,?)
+        """,
+        (ADMIN_EMAIL, salt, ph, 1, 0, now, trial_expires),
+    )
 
 # =========================================================
 # Startup
@@ -478,7 +421,6 @@ class AdminResetPayload(BaseModel):
 def startup():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     FRAMES_DIR.mkdir(parents=True, exist_ok=True)
-
     _db_init()
     _ensure_admin_seed()
 
@@ -511,7 +453,6 @@ def startup():
             _set_state(state="idle")
     except Exception:
         _set_state(state="idle")
-
 
 # =========================================================
 # Core routes
@@ -556,9 +497,7 @@ def status():
         "generate_state": _get_state(),
         "community_db": str(COMMUNITY_DB_PATH),
         "trial_days": TRIAL_DAYS,
-        # helpful debugging:
-        "admin_email_configured": bool(ADMIN_EMAIL),
-        "jwt_configured": bool(JWT_SECRET and len(JWT_SECRET) >= 24),
+        "auth_enabled": bool(JWT_SECRET and len(JWT_SECRET) >= 24),
     }
 
 
@@ -621,38 +560,57 @@ async def upload_parquet(file: UploadFile = File(...)):
     content = await file.read()
     if not content:
         raise HTTPException(status_code=400, detail="Empty upload.")
-
     target.write_bytes(content)
+
     return {"saved": str(target), "size_mb": round(target.stat().st_size / (1024 * 1024), 2)}
 
+# =========================================================
+# AUTH + COMMUNITY (THIS FIXES YOUR 404 /auth/signup)
+# =========================================================
+class SignupPayload(BaseModel):
+    email: str
+    password: str
+    bootstrap_token: Optional[str] = None
 
-# =========================================================
-# Auth endpoints
-# =========================================================
+
+class LoginPayload(BaseModel):
+    email: str
+    password: str
+
+
+def _decide_admin_for_signup(email: str, bootstrap_token: Optional[str]) -> int:
+    is_admin = 0
+
+    # First user is always admin (so you never lose control)
+    if _is_first_user():
+        is_admin = 1
+
+    # If ADMIN_EMAIL matches, force admin
+    if ADMIN_EMAIL and email == ADMIN_EMAIL:
+        is_admin = 1
+
+    # Optional bootstrap token can also grant admin
+    if ADMIN_BOOTSTRAP_TOKEN and bootstrap_token and bootstrap_token == ADMIN_BOOTSTRAP_TOKEN:
+        is_admin = 1
+
+    return is_admin
+
+
 @app.post("/auth/signup")
 def auth_signup(payload: SignupPayload):
     _require_jwt_secret()
 
-    email = payload.email.strip().lower()
+    email = (payload.email or "").strip().lower()
     if not email or "@" not in email:
         raise HTTPException(status_code=400, detail="Invalid email")
     if not payload.password or len(payload.password) < 6:
         raise HTTPException(status_code=400, detail="Password must be at least 6 chars")
 
-    # Decide admin:
-    # - First user ever -> admin
-    # - ADMIN_EMAIL match -> admin
-    # - bootstrap token match -> admin
-    is_admin = 0
-    if _is_first_user():
-        is_admin = 1
-    if ADMIN_EMAIL and email == ADMIN_EMAIL:
-        is_admin = 1
-    if ADMIN_BOOTSTRAP_TOKEN and payload.bootstrap_token and payload.bootstrap_token == ADMIN_BOOTSTRAP_TOKEN:
-        is_admin = 1
-
     now = int(time.time())
     trial_expires = now + TRIAL_DAYS * 86400
+
+    is_admin = _decide_admin_for_signup(email, payload.bootstrap_token)
+
     salt, ph = _hash_password(payload.password)
 
     try:
@@ -666,15 +624,15 @@ def auth_signup(payload: SignupPayload):
     except sqlite3.IntegrityError:
         raise HTTPException(status_code=409, detail="Email already exists")
 
-    return {"ok": True, "created": True, "email": email, "is_admin": bool(is_admin)}
+    return {"ok": True, "created": True, "email": email, "is_admin": bool(is_admin), "trial_expires_at": trial_expires}
 
 
 @app.post("/auth/login")
 def auth_login(payload: LoginPayload):
     _require_jwt_secret()
 
-    email = payload.email.strip().lower()
-    if not email or "@" not in email:
+    email = (payload.email or "").strip().lower()
+    if not email:
         raise HTTPException(status_code=400, detail="Invalid email")
 
     row = _db_query_one("SELECT * FROM users WHERE lower(email)=lower(?) LIMIT 1", (email,))
@@ -683,33 +641,32 @@ def auth_login(payload: LoginPayload):
     if int(row["is_disabled"]) == 1:
         raise HTTPException(status_code=403, detail="Account disabled")
 
-    salt = str(row["pass_salt"])
-    _, check = _hash_password(payload.password, salt)
-    if not hmac.compare_digest(check, str(row["pass_hash"])):
+    salt = row["pass_salt"]
+    _, check = _hash_password(payload.password, salt_b64=salt)
+    if not hmac.compare_digest(check, row["pass_hash"]):
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
     now = int(time.time())
-    token = _make_token(
-        {
-            "uid": int(row["id"]),
-            "email": str(row["email"]),
-            "is_admin": int(row["is_admin"]),
-            "iat": now,
-            "exp": now + TOKEN_TTL_SECONDS,
-        }
-    )
+    exp = now + TOKEN_TTL_SECONDS
+    token = _make_token({"uid": int(row["id"]), "email": email, "exp": exp})
 
-    return {"ok": True, "token": token, "email": email, "is_admin": bool(int(row["is_admin"]))}
+    return {"ok": True, "token": token, "email": email, "is_admin": bool(int(row["is_admin"])), "exp": exp}
 
 
 @app.get("/me")
 def me(user: sqlite3.Row = Depends(require_user)):
-    return {"ok": True, "email": user["email"], "is_admin": bool(int(user["is_admin"]))}
-
+    return {"ok": True, "email": user["email"], "is_admin": bool(int(user["is_admin"])), "trial_expires_at": int(user["trial_expires_at"])}
 
 # =========================================================
-# Presence endpoints
+# PRESENCE
 # =========================================================
+class PresencePayload(BaseModel):
+    lat: float
+    lng: float
+    heading: Optional[float] = None
+    accuracy: Optional[float] = None
+
+
 @app.post("/presence/update")
 def presence_update(payload: PresencePayload, user: sqlite3.Row = Depends(require_user)):
     now = int(time.time())
@@ -718,9 +675,13 @@ def presence_update(payload: PresencePayload, user: sqlite3.Row = Depends(requir
         INSERT INTO presence(user_id, lat, lng, heading, accuracy, updated_at)
         VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(user_id) DO UPDATE SET
-          lat=excluded.lat, lng=excluded.lng, heading=excluded.heading, accuracy=excluded.accuracy, updated_at=excluded.updated_at
+          lat=excluded.lat,
+          lng=excluded.lng,
+          heading=excluded.heading,
+          accuracy=excluded.accuracy,
+          updated_at=excluded.updated_at
         """,
-        (int(user["id"]), payload.lat, payload.lng, payload.heading, payload.accuracy, now),
+        (int(user["id"]), float(payload.lat), float(payload.lng), payload.heading, payload.accuracy, now),
     )
     return {"ok": True}
 
@@ -740,21 +701,32 @@ def presence_all(max_age_sec: int = PRESENCE_STALE_SECONDS):
     items = [dict(r) for r in rows]
     return {"ok": True, "count": len(items), "items": items}
 
+# =========================================================
+# EVENTS
+# =========================================================
+class PolicePayload(BaseModel):
+    lat: float
+    lng: float
+    note: Optional[str] = ""
 
-# =========================================================
-# Events endpoints
-# =========================================================
+
+class PickupPayload(BaseModel):
+    lat: float
+    lng: float
+    zone_id: Optional[int] = None
+
+
 @app.post("/events/police")
 def report_police(payload: PolicePayload, user: sqlite3.Row = Depends(require_user)):
     now = int(time.time())
     expires = now + EVENT_DEFAULT_WINDOW_SECONDS
-    note = (payload.note or "").strip()
+    txt = (payload.note or "").strip()
     _db_exec(
         """
         INSERT INTO events(type, user_id, lat, lng, text, zone_id, created_at, expires_at)
         VALUES(?,?,?,?,?,?,?,?)
         """,
-        ("police", int(user["id"]), payload.lat, payload.lng, note, None, now, expires),
+        ("police", int(user["id"]), float(payload.lat), float(payload.lng), txt, None, now, expires),
     )
     return {"ok": True}
 
@@ -762,10 +734,10 @@ def report_police(payload: PolicePayload, user: sqlite3.Row = Depends(require_us
 @app.get("/events/police")
 def get_police(window_sec: int = 6 * 3600):
     now = int(time.time())
-    cutoff = now - max(60, min(7 * 24 * 3600, int(window_sec)))
+    cutoff = now - max(300, min(7 * 24 * 3600, int(window_sec)))
     rows = _db_query_all(
         """
-        SELECT id, lat, lng, text AS note, created_at
+        SELECT id, lat, lng, text, created_at, expires_at
         FROM events
         WHERE type='police' AND created_at >= ? AND expires_at >= ?
         ORDER BY created_at DESC
@@ -786,13 +758,12 @@ def log_pickup(payload: PickupPayload, user: sqlite3.Row = Depends(require_user)
         INSERT INTO events(type, user_id, lat, lng, text, zone_id, created_at, expires_at)
         VALUES(?,?,?,?,?,?,?,?)
         """,
-        ("pickup", int(user["id"]), payload.lat, payload.lng, "", payload.zone_id, now, expires),
+        ("pickup", int(user["id"]), float(payload.lat), float(payload.lng), "", payload.zone_id, now, expires),
     )
     return {"ok": True}
 
-
 # =========================================================
-# Admin endpoints (manage ALL accounts)
+# ADMIN (manage all accounts)
 # =========================================================
 @app.get("/admin/users")
 def admin_users(admin: sqlite3.Row = Depends(require_admin)):
@@ -807,13 +778,20 @@ def admin_users(admin: sqlite3.Row = Depends(require_admin)):
     return {"ok": True, "count": len(items), "items": items}
 
 
+class AdminDisablePayload(BaseModel):
+    user_id: int
+    disabled: bool
+
+
 @app.post("/admin/users/disable")
 def admin_disable_user(payload: AdminDisablePayload, admin: sqlite3.Row = Depends(require_admin)):
-    # prevent disabling yourself accidentally
-    if int(payload.user_id) == int(admin["id"]) and payload.disabled:
-        raise HTTPException(status_code=400, detail="You cannot disable your own admin account")
     _db_exec("UPDATE users SET is_disabled=? WHERE id=?", (1 if payload.disabled else 0, int(payload.user_id)))
     return {"ok": True}
+
+
+class AdminResetPayload(BaseModel):
+    user_id: int
+    new_password: str
 
 
 @app.post("/admin/users/reset_password")
@@ -821,8 +799,5 @@ def admin_reset_password(payload: AdminResetPayload, admin: sqlite3.Row = Depend
     if not payload.new_password or len(payload.new_password) < 6:
         raise HTTPException(status_code=400, detail="Password must be at least 6 chars")
     salt, ph = _hash_password(payload.new_password)
-    _db_exec(
-        "UPDATE users SET pass_salt=?, pass_hash=? WHERE id=?",
-        (salt, ph, int(payload.user_id)),
-    )
+    _db_exec("UPDATE users SET pass_salt=?, pass_hash=? WHERE id=?", (salt, ph, int(payload.user_id)))
     return {"ok": True}
