@@ -64,7 +64,7 @@ _generate_state: Dict[str, Any] = {
 # =========================================================
 # App
 # =========================================================
-app = FastAPI(title="NYC TLC Hotspot Backend", version="2.2")
+app = FastAPI(title="NYC TLC Hotspot Backend", version="2.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -239,14 +239,11 @@ def _db_query_all(sql: str, params: Tuple[Any, ...] = ()) -> List[sqlite3.Row]:
 
 
 def _db_init() -> None:
-    # NOTE: create with newest columns; old DBs are handled by migration below.
     _db_exec(
         """
         CREATE TABLE IF NOT EXISTS users (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           email TEXT NOT NULL UNIQUE,
-          display_name TEXT,                     -- NEW (username shown on map)
-          ghost_mode INTEGER NOT NULL DEFAULT 0, -- NEW (1 hides you from map)
           pass_salt TEXT NOT NULL,
           pass_hash TEXT NOT NULL,
           is_admin INTEGER NOT NULL DEFAULT 0,
@@ -392,19 +389,13 @@ def _is_first_user() -> bool:
     return int(row["c"]) == 0 if row else True
 
 
-def _default_display_name(email: str) -> str:
-    e = (email or "").strip()
-    if "@" in e:
-        return e.split("@", 1)[0][:24] or "Driver"
-    return "Driver"
-
-
 # =========================================================
-# DB migration + admin seed + force admin
+# FIXED: DB migration + admin seed + force admin
 # =========================================================
 def _ensure_user_columns() -> None:
     """
     Safe migration: add missing columns if the users table is older.
+    Uses _db() (NOT _db_connect).
     """
     try:
         conn = _db()
@@ -412,12 +403,7 @@ def _ensure_user_columns() -> None:
         cur.execute("PRAGMA table_info(users)")
         cols = [r[1] for r in cur.fetchall()]
 
-        if "display_name" not in cols:
-            cur.execute("ALTER TABLE users ADD COLUMN display_name TEXT")
-        if "ghost_mode" not in cols:
-            cur.execute("ALTER TABLE users ADD COLUMN ghost_mode INTEGER DEFAULT 0")
-
-        # existing legacy checks
+        # Only add if missing (SQLite ALTER TABLE is limited but ok here)
         if "pass_salt" not in cols:
             cur.execute("ALTER TABLE users ADD COLUMN pass_salt TEXT")
         if "pass_hash" not in cols:
@@ -437,20 +423,10 @@ def _ensure_user_columns() -> None:
         print("Migration check failed:", e)
 
 
-def _backfill_missing_display_names() -> None:
-    try:
-        rows = _db_query_all("SELECT id, email, display_name FROM users")
-        for r in rows:
-            dn = (r["display_name"] or "").strip()
-            if dn:
-                continue
-            dn2 = _default_display_name(str(r["email"] or ""))
-            _db_exec("UPDATE users SET display_name=? WHERE id=?", (dn2, int(r["id"])))
-    except Exception as e:
-        print("Display-name backfill failed:", e)
-
-
 def _ensure_admin_seed() -> None:
+    """
+    If ADMIN_EMAIL + ADMIN_PASSWORD are set, ensure the admin exists.
+    """
     if not ADMIN_EMAIL or not ADMIN_PASSWORD:
         return
 
@@ -466,14 +442,17 @@ def _ensure_admin_seed() -> None:
 
     _db_exec(
         """
-        INSERT INTO users(email, display_name, ghost_mode, pass_salt, pass_hash, is_admin, is_disabled, created_at, trial_expires_at)
-        VALUES(?,?,?,?,?,?,?,?,?)
+        INSERT INTO users(email, pass_salt, pass_hash, is_admin, is_disabled, created_at, trial_expires_at)
+        VALUES(?,?,?,?,?,?,?)
         """,
-        (ADMIN_EMAIL, _default_display_name(ADMIN_EMAIL), 0, salt, ph, 1, 0, now, trial_expires),
+        (ADMIN_EMAIL, salt, ph, 1, 0, now, trial_expires),
     )
 
 
 def _force_admin_email() -> None:
+    """
+    Optional hard-force your email to admin.
+    """
     try:
         _db_exec("UPDATE users SET is_admin = 1 WHERE lower(email)=lower(?)", ("elokotron1@hotmail.com",))
     except Exception as e:
@@ -481,7 +460,7 @@ def _force_admin_email() -> None:
 
 
 # =========================================================
-# Startup
+# Startup (FIXED DECORATOR)
 # =========================================================
 @app.on_event("startup")
 def startup():
@@ -490,7 +469,6 @@ def startup():
 
     _db_init()
     _ensure_user_columns()
-    _backfill_missing_display_names()
     _ensure_admin_seed()
     _force_admin_email()
 
@@ -541,10 +519,7 @@ def root():
             "/auth/signup",
             "/auth/login",
             "/me",
-            "/me/profile",
-            "/me/ghost",
             "/presence/update",
-            "/presence/clear",
             "/presence/all",
             "/events/police",
             "/events/pickup",
@@ -643,7 +618,6 @@ async def upload_parquet(file: UploadFile = File(...)):
 class SignupPayload(BaseModel):
     email: str
     password: str
-    display_name: Optional[str] = None
     bootstrap_token: Optional[str] = None
 
 
@@ -654,24 +628,17 @@ class LoginPayload(BaseModel):
 
 def _decide_admin_for_signup(email: str, bootstrap_token: Optional[str]) -> int:
     is_admin = 0
+
     if _is_first_user():
         is_admin = 1
+
     if ADMIN_EMAIL and email == ADMIN_EMAIL:
         is_admin = 1
+
     if ADMIN_BOOTSTRAP_TOKEN and bootstrap_token and bootstrap_token == ADMIN_BOOTSTRAP_TOKEN:
         is_admin = 1
+
     return is_admin
-
-
-def _clean_display_name(name: Optional[str], email: str) -> str:
-    n = (name or "").strip()
-    if not n:
-        return _default_display_name(email)
-    # keep it simple + safe
-    n = n.replace("\n", " ").replace("\r", " ").strip()
-    if len(n) > 24:
-        n = n[:24]
-    return n or _default_display_name(email)
 
 
 @app.post("/auth/signup")
@@ -689,20 +656,19 @@ def auth_signup(payload: SignupPayload):
 
     is_admin = _decide_admin_for_signup(email, payload.bootstrap_token)
     salt, ph = _hash_password(payload.password)
-    dn = _clean_display_name(payload.display_name, email)
 
     try:
         _db_exec(
             """
-            INSERT INTO users(email, display_name, ghost_mode, pass_salt, pass_hash, is_admin, is_disabled, created_at, trial_expires_at)
-            VALUES(?,?,?,?,?,?,?,?,?)
+            INSERT INTO users(email, pass_salt, pass_hash, is_admin, is_disabled, created_at, trial_expires_at)
+            VALUES(?,?,?,?,?,?,?)
             """,
-            (email, dn, 0, salt, ph, is_admin, 0, now, trial_expires),
+            (email, salt, ph, is_admin, 0, now, trial_expires),
         )
     except sqlite3.IntegrityError:
         raise HTTPException(status_code=409, detail="Email already exists")
 
-    return {"ok": True, "created": True, "email": email, "display_name": dn, "is_admin": bool(is_admin), "trial_expires_at": trial_expires}
+    return {"ok": True, "created": True, "email": email, "is_admin": bool(is_admin), "trial_expires_at": trial_expires}
 
 
 @app.post("/auth/login")
@@ -724,60 +690,21 @@ def auth_login(payload: LoginPayload):
     if not hmac.compare_digest(check, row["pass_hash"]):
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
-    dn = (row["display_name"] or "").strip() or _default_display_name(email)
-
     now = int(time.time())
     exp = now + TOKEN_TTL_SECONDS
     token = _make_token({"uid": int(row["id"]), "email": email, "exp": exp})
 
-    return {
-        "ok": True,
-        "token": token,
-        "email": email,
-        "user_id": int(row["id"]),
-        "display_name": dn,
-        "ghost_mode": bool(int(row["ghost_mode"] or 0)),
-        "is_admin": bool(int(row["is_admin"])),
-        "exp": exp,
-    }
+    return {"ok": True, "token": token, "email": email, "is_admin": bool(int(row["is_admin"])), "exp": exp}
 
 
 @app.get("/me")
 def me(user: sqlite3.Row = Depends(require_user)):
-    dn = (user["display_name"] or "").strip() or _default_display_name(str(user["email"] or ""))
     return {
         "ok": True,
-        "id": int(user["id"]),  # IMPORTANT: frontend uses this to hide self in /presence/all
-        "display_name": dn,
-        "ghost_mode": bool(int(user["ghost_mode"] or 0)),
+        "email": user["email"],
         "is_admin": bool(int(user["is_admin"])),
         "trial_expires_at": int(user["trial_expires_at"]),
     }
-
-
-class ProfilePayload(BaseModel):
-    display_name: str
-
-
-@app.post("/me/profile")
-def me_profile(payload: ProfilePayload, user: sqlite3.Row = Depends(require_user)):
-    dn = _clean_display_name(payload.display_name, str(user["email"] or ""))
-    _db_exec("UPDATE users SET display_name=? WHERE id=?", (dn, int(user["id"])))
-    return {"ok": True, "display_name": dn}
-
-
-class GhostPayload(BaseModel):
-    enabled: bool
-
-
-@app.post("/me/ghost")
-def me_ghost(payload: GhostPayload, user: sqlite3.Row = Depends(require_user)):
-    en = 1 if bool(payload.enabled) else 0
-    _db_exec("UPDATE users SET ghost_mode=? WHERE id=?", (en, int(user["id"])))
-    if en == 1:
-        # immediately hide them from the map
-        _db_exec("DELETE FROM presence WHERE user_id=?", (int(user["id"]),))
-    return {"ok": True, "ghost_mode": bool(en)}
 
 # =========================================================
 # PRESENCE
@@ -791,11 +718,6 @@ class PresencePayload(BaseModel):
 
 @app.post("/presence/update")
 def presence_update(payload: PresencePayload, user: sqlite3.Row = Depends(require_user)):
-    # If ghost_mode ON, do not publish presence (and clear any existing row)
-    if int(user["ghost_mode"] or 0) == 1:
-        _db_exec("DELETE FROM presence WHERE user_id=?", (int(user["id"]),))
-        return {"ok": True, "ghost_mode": True}
-
     now = int(time.time())
     _db_exec(
         """
@@ -813,26 +735,15 @@ def presence_update(payload: PresencePayload, user: sqlite3.Row = Depends(requir
     return {"ok": True}
 
 
-@app.post("/presence/clear")
-def presence_clear(user: sqlite3.Row = Depends(require_user)):
-    _db_exec("DELETE FROM presence WHERE user_id=?", (int(user["id"]),))
-    return {"ok": True}
-
-
 @app.get("/presence/all")
-def presence_all(max_age_sec: int = PRESENCE_STALE_SECONDS, viewer: sqlite3.Row = Depends(require_user)):
-    # Auth required: only signed-in drivers can see drivers
+def presence_all(max_age_sec: int = PRESENCE_STALE_SECONDS):
     cutoff = int(time.time()) - max(5, min(3600, int(max_age_sec)))
     rows = _db_query_all(
         """
-        SELECT
-          p.user_id,
-          COALESCE(NULLIF(TRIM(u.display_name), ''), substr(u.email, 1, instr(u.email,'@')-1), 'Driver') AS display_name,
-          p.lat, p.lng, p.heading, p.accuracy, p.updated_at
+        SELECT p.user_id, u.email, p.lat, p.lng, p.heading, p.accuracy, p.updated_at
         FROM presence p
         LEFT JOIN users u ON u.id = p.user_id
         WHERE p.updated_at >= ?
-          AND COALESCE(u.ghost_mode, 0) = 0
         """,
         (cutoff,),
     )
@@ -870,7 +781,7 @@ def report_police(payload: PolicePayload, user: sqlite3.Row = Depends(require_us
 
 
 @app.get("/events/police")
-def get_police(window_sec: int = 6 * 3600, viewer: sqlite3.Row = Depends(require_user)):
+def get_police(window_sec: int = 6 * 3600):
     now = int(time.time())
     cutoff = now - max(300, min(7 * 24 * 3600, int(window_sec)))
     rows = _db_query_all(
@@ -901,13 +812,13 @@ def log_pickup(payload: PickupPayload, user: sqlite3.Row = Depends(require_user)
     return {"ok": True}
 
 # =========================================================
-# ADMIN
+# ADMIN (manage all accounts)
 # =========================================================
 @app.get("/admin/users")
 def admin_users(admin: sqlite3.Row = Depends(require_admin)):
     rows = _db_query_all(
         """
-        SELECT id, email, display_name, ghost_mode, is_admin, is_disabled, created_at, trial_expires_at
+        SELECT id, email, is_admin, is_disabled, created_at, trial_expires_at
         FROM users
         ORDER BY created_at ASC
         """
