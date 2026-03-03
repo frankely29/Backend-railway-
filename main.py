@@ -45,6 +45,10 @@ TOKEN_TTL_SECONDS = int(os.environ.get("TOKEN_TTL_SECONDS", str(30 * 24 * 3600))
 PRESENCE_STALE_SECONDS = int(os.environ.get("PRESENCE_STALE_SECONDS", "300"))  # 5 min
 EVENT_DEFAULT_WINDOW_SECONDS = int(os.environ.get("EVENT_DEFAULT_WINDOW_SECONDS", str(24 * 3600)))  # 24h
 
+# display name rules
+DISPLAY_NAME_MIN_LEN = int(os.environ.get("DISPLAY_NAME_MIN_LEN", "2"))
+DISPLAY_NAME_MAX_LEN = int(os.environ.get("DISPLAY_NAME_MAX_LEN", "18"))
+
 # =========================================================
 # In-memory job state (hotspot generate)
 # =========================================================
@@ -64,7 +68,7 @@ _generate_state: Dict[str, Any] = {
 # =========================================================
 # App
 # =========================================================
-app = FastAPI(title="NYC TLC Hotspot Backend", version="2.1")
+app = FastAPI(title="NYC TLC Hotspot Backend", version="2.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -246,6 +250,7 @@ def _db_init() -> None:
           email TEXT NOT NULL UNIQUE,
           pass_salt TEXT NOT NULL,
           pass_hash TEXT NOT NULL,
+          display_name TEXT,
           is_admin INTEGER NOT NULL DEFAULT 0,
           is_disabled INTEGER NOT NULL DEFAULT 0,
           created_at INTEGER NOT NULL,
@@ -389,6 +394,35 @@ def _is_first_user() -> bool:
     return int(row["c"]) == 0 if row else True
 
 
+def _sanitize_display_name(name: str) -> str:
+    n = (name or "").strip()
+    if not n:
+        return ""
+    # keep only simple characters (no email, no symbols spam)
+    allowed = []
+    for ch in n:
+        if ch.isalnum() or ch in (" ", "_", "-"):
+            allowed.append(ch)
+    n2 = "".join(allowed).strip()
+    # collapse spaces
+    while "  " in n2:
+        n2 = n2.replace("  ", " ")
+    if len(n2) < DISPLAY_NAME_MIN_LEN:
+        return ""
+    if len(n2) > DISPLAY_NAME_MAX_LEN:
+        n2 = n2[:DISPLAY_NAME_MAX_LEN].rstrip()
+    # prevent showing emails
+    if "@" in n2 or "." in n2 and " " not in n2 and len(n2) > 8:
+        # crude check: if it looks like an email/domain, reject
+        return ""
+    return n2
+
+
+def _default_display_name_from_email(email: str) -> str:
+    base = (email.split("@", 1)[0] if email and "@" in email else "Driver").strip()
+    base = _sanitize_display_name(base) or "Driver"
+    return base
+
 # =========================================================
 # FIXED: DB migration + admin seed + force admin
 # =========================================================
@@ -408,6 +442,8 @@ def _ensure_user_columns() -> None:
             cur.execute("ALTER TABLE users ADD COLUMN pass_salt TEXT")
         if "pass_hash" not in cols:
             cur.execute("ALTER TABLE users ADD COLUMN pass_hash TEXT")
+        if "display_name" not in cols:
+            cur.execute("ALTER TABLE users ADD COLUMN display_name TEXT")
         if "is_admin" not in cols:
             cur.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER DEFAULT 0")
         if "is_disabled" not in cols:
@@ -434,18 +470,22 @@ def _ensure_admin_seed() -> None:
     if existing:
         if int(existing["is_admin"]) != 1:
             _db_exec("UPDATE users SET is_admin=1, is_disabled=0 WHERE id=?", (int(existing["id"]),))
+        # ensure display_name exists
+        if not (existing["display_name"] or "").strip():
+            _db_exec("UPDATE users SET display_name=? WHERE id=?", (_default_display_name_from_email(ADMIN_EMAIL), int(existing["id"])))
         return
 
     now = int(time.time())
     trial_expires = now + TRIAL_DAYS * 86400
     salt, ph = _hash_password(ADMIN_PASSWORD)
+    dn = _default_display_name_from_email(ADMIN_EMAIL)
 
     _db_exec(
         """
-        INSERT INTO users(email, pass_salt, pass_hash, is_admin, is_disabled, created_at, trial_expires_at)
-        VALUES(?,?,?,?,?,?,?)
+        INSERT INTO users(email, pass_salt, pass_hash, display_name, is_admin, is_disabled, created_at, trial_expires_at)
+        VALUES(?,?,?,?,?,?,?,?)
         """,
-        (ADMIN_EMAIL, salt, ph, 1, 0, now, trial_expires),
+        (ADMIN_EMAIL, salt, ph, dn, 1, 0, now, trial_expires),
     )
 
 
@@ -459,8 +499,19 @@ def _force_admin_email() -> None:
         print("Admin enforcement failed:", e)
 
 
+def _backfill_missing_display_names() -> None:
+    try:
+        rows = _db_query_all("SELECT id, email, display_name FROM users")
+        for r in rows:
+            if (r["display_name"] or "").strip():
+                continue
+            dn = _default_display_name_from_email(r["email"])
+            _db_exec("UPDATE users SET display_name=? WHERE id=?", (dn, int(r["id"])))
+    except Exception as e:
+        print("Display name backfill failed:", e)
+
 # =========================================================
-# Startup (FIXED DECORATOR)
+# Startup
 # =========================================================
 @app.on_event("startup")
 def startup():
@@ -471,6 +522,7 @@ def startup():
     _ensure_user_columns()
     _ensure_admin_seed()
     _force_admin_email()
+    _backfill_missing_display_names()
 
     # Auto-fill generate state if frames already exist
     try:
@@ -519,6 +571,7 @@ def root():
             "/auth/signup",
             "/auth/login",
             "/me",
+            "/me/profile",
             "/presence/update",
             "/presence/all",
             "/events/police",
@@ -618,12 +671,17 @@ async def upload_parquet(file: UploadFile = File(...)):
 class SignupPayload(BaseModel):
     email: str
     password: str
+    display_name: Optional[str] = None
     bootstrap_token: Optional[str] = None
 
 
 class LoginPayload(BaseModel):
     email: str
     password: str
+
+
+class UpdateProfilePayload(BaseModel):
+    display_name: str
 
 
 def _decide_admin_for_signup(email: str, bootstrap_token: Optional[str]) -> int:
@@ -657,18 +715,27 @@ def auth_signup(payload: SignupPayload):
     is_admin = _decide_admin_for_signup(email, payload.bootstrap_token)
     salt, ph = _hash_password(payload.password)
 
+    dn = _sanitize_display_name(payload.display_name or "") or _default_display_name_from_email(email)
+
     try:
         _db_exec(
             """
-            INSERT INTO users(email, pass_salt, pass_hash, is_admin, is_disabled, created_at, trial_expires_at)
-            VALUES(?,?,?,?,?,?,?)
+            INSERT INTO users(email, pass_salt, pass_hash, display_name, is_admin, is_disabled, created_at, trial_expires_at)
+            VALUES(?,?,?,?,?,?,?,?)
             """,
-            (email, salt, ph, is_admin, 0, now, trial_expires),
+            (email, salt, ph, dn, is_admin, 0, now, trial_expires),
         )
     except sqlite3.IntegrityError:
         raise HTTPException(status_code=409, detail="Email already exists")
 
-    return {"ok": True, "created": True, "email": email, "is_admin": bool(is_admin), "trial_expires_at": trial_expires}
+    return {
+        "ok": True,
+        "created": True,
+        "email": email,
+        "display_name": dn,
+        "is_admin": bool(is_admin),
+        "trial_expires_at": trial_expires,
+    }
 
 
 @app.post("/auth/login")
@@ -694,17 +761,35 @@ def auth_login(payload: LoginPayload):
     exp = now + TOKEN_TTL_SECONDS
     token = _make_token({"uid": int(row["id"]), "email": email, "exp": exp})
 
-    return {"ok": True, "token": token, "email": email, "is_admin": bool(int(row["is_admin"])), "exp": exp}
+    return {
+        "ok": True,
+        "token": token,
+        "email": email,
+        "display_name": row["display_name"] or _default_display_name_from_email(email),
+        "is_admin": bool(int(row["is_admin"])),
+        "exp": exp,
+    }
 
 
 @app.get("/me")
 def me(user: sqlite3.Row = Depends(require_user)):
+    # DO NOT expose email unless you really want it. Keeping it for now for your UI.
     return {
         "ok": True,
         "email": user["email"],
+        "display_name": user["display_name"] or _default_display_name_from_email(user["email"]),
         "is_admin": bool(int(user["is_admin"])),
         "trial_expires_at": int(user["trial_expires_at"]),
     }
+
+
+@app.post("/me/profile")
+def update_profile(payload: UpdateProfilePayload, user: sqlite3.Row = Depends(require_user)):
+    dn = _sanitize_display_name(payload.display_name or "")
+    if not dn:
+        raise HTTPException(status_code=400, detail=f"Invalid display name ({DISPLAY_NAME_MIN_LEN}-{DISPLAY_NAME_MAX_LEN} chars; letters/numbers/space/_/- only).")
+    _db_exec("UPDATE users SET display_name=? WHERE id=?", (dn, int(user["id"])))
+    return {"ok": True, "display_name": dn}
 
 # =========================================================
 # PRESENCE
@@ -738,16 +823,38 @@ def presence_update(payload: PresencePayload, user: sqlite3.Row = Depends(requir
 @app.get("/presence/all")
 def presence_all(max_age_sec: int = PRESENCE_STALE_SECONDS):
     cutoff = int(time.time()) - max(5, min(3600, int(max_age_sec)))
+
+    # IMPORTANT: return display_name, NEVER email (privacy)
     rows = _db_query_all(
         """
-        SELECT p.user_id, u.email, p.lat, p.lng, p.heading, p.accuracy, p.updated_at
+        SELECT
+          p.user_id,
+          COALESCE(NULLIF(TRIM(u.display_name), ''), 'Driver') AS display_name,
+          p.lat,
+          p.lng,
+          p.heading,
+          p.accuracy,
+          p.updated_at
         FROM presence p
         LEFT JOIN users u ON u.id = p.user_id
         WHERE p.updated_at >= ?
         """,
         (cutoff,),
     )
-    items = [dict(r) for r in rows]
+
+    items = []
+    for r in rows:
+        items.append(
+            {
+                "user_id": int(r["user_id"]),
+                "display_name": r["display_name"],
+                "lat": float(r["lat"]),
+                "lng": float(r["lng"]),
+                "heading": r["heading"],
+                "accuracy": r["accuracy"],
+                "updated_at": int(r["updated_at"]),
+            }
+        )
     return {"ok": True, "count": len(items), "items": items}
 
 # =========================================================
@@ -818,7 +925,7 @@ def log_pickup(payload: PickupPayload, user: sqlite3.Row = Depends(require_user)
 def admin_users(admin: sqlite3.Row = Depends(require_admin)):
     rows = _db_query_all(
         """
-        SELECT id, email, is_admin, is_disabled, created_at, trial_expires_at
+        SELECT id, email, display_name, is_admin, is_disabled, created_at, trial_expires_at
         FROM users
         ORDER BY created_at ASC
         """
