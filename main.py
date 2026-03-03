@@ -389,7 +389,9 @@ def _is_first_user() -> bool:
     return int(row["c"]) == 0 if row else True
 
 
-def _ensure_admin_seed() -> None:
+def _ensure_user_columns()
+    _ensure_admin_seed()
+    _force_admin_email() -> None:
     """
     Optional: if ADMIN_EMAIL + ADMIN_PASSWORD are set, ensure that admin exists.
     This gives you control without needing to 'sign up' as a regular user.
@@ -418,11 +420,44 @@ def _ensure_admin_seed() -> None:
 # Startup
 # =========================================================
 @app.on_event("startup")
+
+# ================= SAFE DB MIGRATION =================
+def _ensure_user_columns():
+    try:
+        conn = _db_connect()
+        cur = conn.cursor()
+        cur.execute("PRAGMA table_info(users)")
+        cols = [r[1] for r in cur.fetchall()]
+        if "pass_salt" not in cols:
+            cur.execute("ALTER TABLE users ADD COLUMN pass_salt TEXT")
+        if "pass_hash" not in cols:
+            cur.execute("ALTER TABLE users ADD COLUMN pass_hash TEXT")
+        if "is_admin" not in cols:
+            cur.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER DEFAULT 0")
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print("Migration check failed:", e)
+
+# ================= FORCE ADMIN EMAIL =================
+def _force_admin_email():
+    try:
+        conn = _db_connect()
+        cur = conn.cursor()
+        cur.execute("UPDATE users SET is_admin = 1 WHERE email = ?", ("elokotron1@hotmail.com",))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print("Admin enforcement failed:", e)
+
+
 def startup():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     FRAMES_DIR.mkdir(parents=True, exist_ok=True)
     _db_init()
+    _ensure_user_columns()
     _ensure_admin_seed()
+    _force_admin_email()
 
     # Auto-fill generate state if frames already exist
     try:
