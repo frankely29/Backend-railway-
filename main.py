@@ -202,7 +202,7 @@ def start_generate(bin_minutes: int, min_trips_per_window: int) -> Dict[str, Any
 _db_lock = threading.Lock()
 
 def _db() -> sqlite3.Connection:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    COMMUNITY_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(COMMUNITY_DB_PATH), check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
@@ -244,6 +244,7 @@ def _db_init() -> None:
         CREATE TABLE IF NOT EXISTS users (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           email TEXT NOT NULL UNIQUE,
+          display_name TEXT,
           pass_salt TEXT NOT NULL,
           pass_hash TEXT NOT NULL,
           is_admin INTEGER NOT NULL DEFAULT 0,
@@ -339,23 +340,26 @@ def _verify_token(token: str) -> Dict[str, Any]:
         raise HTTPException(status_code=401, detail="Invalid token")
 
 
-def _hash_password(password: str, salt_b64: Optional[str] = None) -> Tuple[str, str]:
-    if salt_b64 is None:
-        salt = secrets.token_bytes(16)
-        salt_b64 = _b64url(salt)
-    else:
-        salt = _b64url_decode(salt_b64)
-    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 200_000)
-    return salt_b64, _b64url(dk)
+def _hash_password(password: str) -> Tuple[str, str]:
+    salt = secrets.token_hex(16)
+    ph = hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
+    return salt, ph
+
+
+def _verify_password(password: str, salt: str, ph: str) -> bool:
+    return hashlib.sha256((salt + password).encode("utf-8")).hexdigest() == ph
 
 
 def _auth_user_from_request(req: Request) -> sqlite3.Row:
     auth = req.headers.get("authorization", "")
     if not auth.lower().startswith("bearer "):
-        raise HTTPException(status_code=401, detail="Missing Bearer token")
+        raise HTTPException(status_code=401, detail="Missing token")
     token = auth.split(" ", 1)[1].strip()
     payload = _verify_token(token)
     uid = int(payload.get("uid", 0))
+    if not uid:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
     row = _db_query_one("SELECT * FROM users WHERE id=? LIMIT 1", (uid,))
     if not row:
         raise HTTPException(status_code=401, detail="User not found")
@@ -404,6 +408,8 @@ def _ensure_user_columns() -> None:
         cols = [r[1] for r in cur.fetchall()]
 
         # Only add if missing (SQLite ALTER TABLE is limited but ok here)
+        if "display_name" not in cols:
+            cur.execute("ALTER TABLE users ADD COLUMN display_name TEXT")
         if "pass_salt" not in cols:
             cur.execute("ALTER TABLE users ADD COLUMN pass_salt TEXT")
         if "pass_hash" not in cols:
@@ -523,35 +529,35 @@ def root():
             "/presence/all",
             "/events/police",
             "/events/pickup",
-            "/admin/users",
-            "/admin/users/disable",
-            "/admin/users/reset_password",
         ],
     }
 
 
 @app.get("/status")
 def status():
-    parquets = [p.name for p in _list_parquets()]
-    zones_path = DATA_DIR / "taxi_zones.geojson"
     return {
-        "status": "ok",
+        "ok": True,
+        "frames_ready": _has_frames(),
         "data_dir": str(DATA_DIR),
-        "parquets": parquets,
-        "zones_geojson": zones_path.name if zones_path.exists() else None,
-        "zones_present": zones_path.exists(),
         "frames_dir": str(FRAMES_DIR),
-        "has_timeline": _has_frames(),
-        "generate_state": _get_state(),
-        "community_db": str(COMMUNITY_DB_PATH),
-        "trial_days": TRIAL_DAYS,
-        "auth_enabled": bool(JWT_SECRET and len(JWT_SECRET) >= 24),
+        "parquets": [p.name for p in _list_parquets()],
     }
 
 
-@app.get("/generate")
-def generate_get(bin_minutes: int = DEFAULT_BIN_MINUTES, min_trips_per_window: int = DEFAULT_MIN_TRIPS_PER_WINDOW):
-    return start_generate(bin_minutes, min_trips_per_window)
+@app.post("/upload_parquet")
+async def upload_parquet(file: UploadFile = File(...)):
+    if not file.filename.lower().endswith(".parquet"):
+        raise HTTPException(status_code=400, detail="Only .parquet files allowed")
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    out = DATA_DIR / file.filename
+    content = await file.read()
+    out.write_bytes(content)
+    return {"ok": True, "saved": out.name, "size": len(content)}
+
+
+@app.post("/generate")
+def generate(bin_minutes: int = DEFAULT_BIN_MINUTES, min_trips_per_window: int = DEFAULT_MIN_TRIPS_PER_WINDOW):
+    return start_generate(int(bin_minutes), int(min_trips_per_window))
 
 
 @app.get("/generate_status")
@@ -562,149 +568,103 @@ def generate_status():
 @app.get("/timeline")
 def timeline():
     if not _has_frames():
-        raise HTTPException(status_code=409, detail="timeline not ready. Call /generate first.")
+        raise HTTPException(status_code=400, detail="timeline not ready. Call /generate first.")
     return _read_json(TIMELINE_PATH)
 
 
 @app.get("/frame/{idx}")
 def frame(idx: int):
     if not _has_frames():
-        raise HTTPException(status_code=409, detail="timeline not ready. Call /generate first.")
-    p = FRAMES_DIR / f"frame_{idx:06d}.json"
+        raise HTTPException(status_code=400, detail="timeline not ready. Call /generate first.")
+    p = FRAMES_DIR / f"frame_{idx}.json"
     if not p.exists():
-        raise HTTPException(status_code=404, detail=f"frame not found: {idx}")
+        raise HTTPException(status_code=404, detail="frame not found")
     return _read_json(p)
 
-
-@app.post("/upload_zones_geojson")
-async def upload_zones_geojson(file: UploadFile = File(...)):
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    target = DATA_DIR / "taxi_zones.geojson"
-
-    content = await file.read()
-    if not content:
-        raise HTTPException(status_code=400, detail="Empty upload.")
-
-    try:
-        obj = json.loads(content.decode("utf-8", errors="strict"))
-        if obj.get("type") not in ("FeatureCollection", "Feature"):
-            raise ValueError("Not a GeoJSON FeatureCollection/Feature")
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid GeoJSON: {e}")
-
-    target.write_bytes(content)
-    return {"saved": str(target), "size_mb": round(target.stat().st_size / (1024 * 1024), 2)}
-
-
-@app.post("/upload_parquet")
-async def upload_parquet(file: UploadFile = File(...)):
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-    filename = (file.filename or "upload.parquet").replace("\\", "/").split("/")[-1]
-    if not filename.lower().endswith(".parquet"):
-        raise HTTPException(status_code=400, detail="File must be .parquet")
-
-    target = DATA_DIR / filename
-    content = await file.read()
-    if not content:
-        raise HTTPException(status_code=400, detail="Empty upload.")
-    target.write_bytes(content)
-
-    return {"saved": str(target), "size_mb": round(target.stat().st_size / (1024 * 1024), 2)}
-
 # =========================================================
-# AUTH + COMMUNITY
+# AUTH
 # =========================================================
-class SignupPayload(BaseModel):
+class AuthPayload(BaseModel):
     email: str
     password: str
-    bootstrap_token: Optional[str] = None
-
-
-class LoginPayload(BaseModel):
-    email: str
-    password: str
-
-
-def _decide_admin_for_signup(email: str, bootstrap_token: Optional[str]) -> int:
-    is_admin = 0
-
-    if _is_first_user():
-        is_admin = 1
-
-    if ADMIN_EMAIL and email == ADMIN_EMAIL:
-        is_admin = 1
-
-    if ADMIN_BOOTSTRAP_TOKEN and bootstrap_token and bootstrap_token == ADMIN_BOOTSTRAP_TOKEN:
-        is_admin = 1
-
-    return is_admin
 
 
 @app.post("/auth/signup")
-def auth_signup(payload: SignupPayload):
-    _require_jwt_secret()
-
+def signup(payload: AuthPayload):
     email = (payload.email or "").strip().lower()
-    if not email or "@" not in email:
-        raise HTTPException(status_code=400, detail="Invalid email")
-    if not payload.password or len(payload.password) < 6:
-        raise HTTPException(status_code=400, detail="Password must be at least 6 chars")
+    password = payload.password or ""
+    if "@" not in email or len(password) < 4:
+        raise HTTPException(status_code=400, detail="Invalid email or password too short")
+
+    exists = _db_query_one("SELECT id FROM users WHERE lower(email)=lower(?) LIMIT 1", (email,))
+    if exists:
+        raise HTTPException(status_code=400, detail="Email already registered")
 
     now = int(time.time())
     trial_expires = now + TRIAL_DAYS * 86400
+    salt, ph = _hash_password(password)
 
-    is_admin = _decide_admin_for_signup(email, payload.bootstrap_token)
-    salt, ph = _hash_password(payload.password)
-
-    try:
-        _db_exec(
-            """
-            INSERT INTO users(email, pass_salt, pass_hash, is_admin, is_disabled, created_at, trial_expires_at)
-            VALUES(?,?,?,?,?,?,?)
-            """,
-            (email, salt, ph, is_admin, 0, now, trial_expires),
-        )
-    except sqlite3.IntegrityError:
-        raise HTTPException(status_code=409, detail="Email already exists")
-
-    return {"ok": True, "created": True, "email": email, "is_admin": bool(is_admin), "trial_expires_at": trial_expires}
+    is_admin = 1 if (_is_first_user() and ADMIN_BOOTSTRAP_TOKEN) else 0
+    _db_exec(
+        """
+        INSERT INTO users(email, pass_salt, pass_hash, is_admin, is_disabled, created_at, trial_expires_at)
+        VALUES(?,?,?,?,?,?,?)
+        """,
+        (email, salt, ph, is_admin, 0, now, trial_expires),
+    )
+    return {"ok": True}
 
 
 @app.post("/auth/login")
-def auth_login(payload: LoginPayload):
-    _require_jwt_secret()
-
+def login(payload: AuthPayload):
     email = (payload.email or "").strip().lower()
-    if not email:
-        raise HTTPException(status_code=400, detail="Invalid email")
+    password = payload.password or ""
 
     row = _db_query_one("SELECT * FROM users WHERE lower(email)=lower(?) LIMIT 1", (email,))
     if not row:
-        raise HTTPException(status_code=401, detail="Invalid email or password")
+        raise HTTPException(status_code=401, detail="Invalid email/password")
     if int(row["is_disabled"]) == 1:
         raise HTTPException(status_code=403, detail="Account disabled")
 
-    salt = row["pass_salt"]
-    _, check = _hash_password(payload.password, salt_b64=salt)
-    if not hmac.compare_digest(check, row["pass_hash"]):
-        raise HTTPException(status_code=401, detail="Invalid email or password")
+    if not _verify_password(password, row["pass_salt"], row["pass_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid email/password")
 
     now = int(time.time())
     exp = now + TOKEN_TTL_SECONDS
-    token = _make_token({"uid": int(row["id"]), "email": email, "exp": exp})
+    token = _make_token({"uid": int(row["id"]), "exp": exp})
 
-    return {"ok": True, "token": token, "email": email, "is_admin": bool(int(row["is_admin"])), "exp": exp}
+    return {"ok": True, "token": token, "exp": exp}
 
 
 @app.get("/me")
 def me(user: sqlite3.Row = Depends(require_user)):
+    dn = None
+    try:
+        dn = user["display_name"] if "display_name" in user.keys() else None
+    except Exception:
+        dn = None
     return {
         "ok": True,
+        "id": int(user["id"]),
         "email": user["email"],
+        "display_name": dn,
         "is_admin": bool(int(user["is_admin"])),
         "trial_expires_at": int(user["trial_expires_at"]),
     }
+
+
+class NamePayload(BaseModel):
+    display_name: str
+
+
+@app.post("/profile/name")
+def set_profile_name(payload: NamePayload, user: sqlite3.Row = Depends(require_user)):
+    name = (payload.display_name or "").strip()
+    # Public map label: simple rules
+    if len(name) < 2 or len(name) > 18 or "@" in name:
+        raise HTTPException(status_code=400, detail="Invalid display name")
+    _db_exec("UPDATE users SET display_name=? WHERE id=?", (name, int(user["id"])))
+    return {"ok": True, "display_name": name}
 
 # =========================================================
 # PRESENCE
@@ -740,7 +700,7 @@ def presence_all(max_age_sec: int = PRESENCE_STALE_SECONDS):
     cutoff = int(time.time()) - max(5, min(3600, int(max_age_sec)))
     rows = _db_query_all(
         """
-        SELECT p.user_id, u.email, p.lat, p.lng, p.heading, p.accuracy, p.updated_at
+        SELECT p.user_id, u.display_name, u.email, p.lat, p.lng, p.heading, p.accuracy, p.updated_at
         FROM presence p
         LEFT JOIN users u ON u.id = p.user_id
         WHERE p.updated_at >= ?
@@ -788,14 +748,12 @@ def get_police(window_sec: int = 6 * 3600):
         """
         SELECT id, lat, lng, text, created_at, expires_at
         FROM events
-        WHERE type='police' AND created_at >= ? AND expires_at >= ?
+        WHERE type='police' AND expires_at >= ? AND created_at >= ?
         ORDER BY created_at DESC
-        LIMIT 200
         """,
-        (cutoff, now),
+        (now, cutoff),
     )
-    items = [dict(r) for r in rows]
-    return {"ok": True, "count": len(items), "items": items}
+    return {"ok": True, "count": len(rows), "items": [dict(r) for r in rows]}
 
 
 @app.post("/events/pickup")
@@ -811,42 +769,18 @@ def log_pickup(payload: PickupPayload, user: sqlite3.Row = Depends(require_user)
     )
     return {"ok": True}
 
-# =========================================================
-# ADMIN (manage all accounts)
-# =========================================================
-@app.get("/admin/users")
-def admin_users(admin: sqlite3.Row = Depends(require_admin)):
+
+@app.get("/events/pickup")
+def get_pickups(window_sec: int = 6 * 3600):
+    now = int(time.time())
+    cutoff = now - max(300, min(7 * 24 * 3600, int(window_sec)))
     rows = _db_query_all(
         """
-        SELECT id, email, is_admin, is_disabled, created_at, trial_expires_at
-        FROM users
-        ORDER BY created_at ASC
-        """
+        SELECT id, lat, lng, zone_id, created_at, expires_at
+        FROM events
+        WHERE type='pickup' AND expires_at >= ? AND created_at >= ?
+        ORDER BY created_at DESC
+        """,
+        (now, cutoff),
     )
-    items = [dict(r) for r in rows]
-    return {"ok": True, "count": len(items), "items": items}
-
-
-class AdminDisablePayload(BaseModel):
-    user_id: int
-    disabled: bool
-
-
-@app.post("/admin/users/disable")
-def admin_disable_user(payload: AdminDisablePayload, admin: sqlite3.Row = Depends(require_admin)):
-    _db_exec("UPDATE users SET is_disabled=? WHERE id=?", (1 if payload.disabled else 0, int(payload.user_id)))
-    return {"ok": True}
-
-
-class AdminResetPayload(BaseModel):
-    user_id: int
-    new_password: str
-
-
-@app.post("/admin/users/reset_password")
-def admin_reset_password(payload: AdminResetPayload, admin: sqlite3.Row = Depends(require_admin)):
-    if not payload.new_password or len(payload.new_password) < 6:
-        raise HTTPException(status_code=400, detail="Password must be at least 6 chars")
-    salt, ph = _hash_password(payload.new_password)
-    _db_exec("UPDATE users SET pass_salt=?, pass_hash=? WHERE id=?", (salt, ph, int(payload.user_id)))
-    return {"ok": True}
+    return {"ok": True, "count": len(rows), "items": [dict(r) for r in rows]}
