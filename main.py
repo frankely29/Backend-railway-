@@ -389,7 +389,7 @@ def _is_first_user() -> bool:
     return int(row["c"]) == 0 if row else True
 
 
-def _ensure_user_columns()
+def _ensure_user_columns():
     _ensure_admin_seed()
     _force_admin_email() -> None:
     """
