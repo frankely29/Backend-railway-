@@ -244,14 +244,16 @@ def _db_init() -> None:
         CREATE TABLE IF NOT EXISTS users (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           email TEXT NOT NULL UNIQUE,
+          display_name TEXT,                -- public name shown on map
+          avatar_url TEXT,                  -- optional profile photo URL
+          ghost_mode INTEGER NOT NULL DEFAULT 0, -- if 1, user hidden from map
           pass_salt TEXT NOT NULL,
           pass_hash TEXT NOT NULL,
           is_admin INTEGER NOT NULL DEFAULT 0,
           is_disabled INTEGER NOT NULL DEFAULT 0,
           created_at INTEGER NOT NULL,
           trial_expires_at INTEGER NOT NULL
-        );
-        """
+        );        """
     )
     _db_exec(
         """
@@ -284,6 +286,60 @@ def _db_init() -> None:
     )
     _db_exec("CREATE INDEX IF NOT EXISTS idx_events_type_time ON events(type, created_at);")
     _db_exec("CREATE INDEX IF NOT EXISTS idx_events_expires ON events(expires_at);")
+
+def _table_columns(table: str) -> List[str]:
+    rows = _db_query_all(f"PRAGMA table_info({table});")
+    return [str(r["name"]) for r in rows]
+
+def _db_migrate() -> None:
+    """Idempotent schema migrations for existing Railway volumes."""
+    # users: add missing columns safely
+    try:
+        cols = set(_table_columns("users"))
+    except Exception:
+        cols = set()
+
+    if "users" in cols:
+        # (this branch won't happen; PRAGMA returns column list, not table)
+        pass
+
+    if cols:
+        # Add new columns if missing
+        if "display_name" not in cols:
+            _db_exec("ALTER TABLE users ADD COLUMN display_name TEXT;")
+        if "avatar_url" not in cols:
+            _db_exec("ALTER TABLE users ADD COLUMN avatar_url TEXT;")
+        if "ghost_mode" not in cols:
+            _db_exec("ALTER TABLE users ADD COLUMN ghost_mode INTEGER NOT NULL DEFAULT 0;")
+
+        # Handle older broken schema that didn't have pass_salt/pass_hash
+        if "pass_salt" not in cols:
+            _db_exec("ALTER TABLE users ADD COLUMN pass_salt TEXT NOT NULL DEFAULT '';")
+        if "pass_hash" not in cols:
+            _db_exec("ALTER TABLE users ADD COLUMN pass_hash TEXT NOT NULL DEFAULT '';")
+        if "is_admin" not in cols:
+            _db_exec("ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0;")
+        if "is_disabled" not in cols:
+            _db_exec("ALTER TABLE users ADD COLUMN is_disabled INTEGER NOT NULL DEFAULT 0;")
+        if "created_at" not in cols:
+            _db_exec("ALTER TABLE users ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0;")
+        if "trial_expires_at" not in cols:
+            _db_exec("ALTER TABLE users ADD COLUMN trial_expires_at INTEGER NOT NULL DEFAULT 0;")
+
+        # Backfill display_name for existing users
+        _db_exec(
+            "UPDATE users SET display_name = COALESCE(display_name, substr(email, 1, instr(email, '@')-1)) "
+            "WHERE display_name IS NULL OR display_name = '';"
+        )
+
+    # presence: add accuracy column if missing (older db)
+    try:
+        pcols = set(_table_columns("presence"))
+        if "accuracy" not in pcols:
+            _db_exec("ALTER TABLE presence ADD COLUMN accuracy REAL;")
+    except Exception:
+        pass
+
 
 # =========================================================
 # Auth helpers (no external deps)
@@ -442,10 +498,10 @@ def _ensure_admin_seed() -> None:
 
     _db_exec(
         """
-        INSERT INTO users(email, pass_salt, pass_hash, is_admin, is_disabled, created_at, trial_expires_at)
-        VALUES(?,?,?,?,?,?,?)
+        INSERT INTO users(email, display_name, avatar_url, ghost_mode, pass_salt, pass_hash, is_admin, is_disabled, created_at, trial_expires_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?)
         """,
-        (ADMIN_EMAIL, salt, ph, 1, 0, now, trial_expires),
+        (ADMIN_EMAIL, ADMIN_EMAIL.split("@",1)[0], None, 0, salt, ph, 1, 0, now, trial_expires),
     )
 
 
@@ -618,6 +674,7 @@ async def upload_parquet(file: UploadFile = File(...)):
 class SignupPayload(BaseModel):
     email: str
     password: str
+    display_name: Optional[str] = None  # public name shown on map
     bootstrap_token: Optional[str] = None
 
 
@@ -657,13 +714,20 @@ def auth_signup(payload: SignupPayload):
     is_admin = _decide_admin_for_signup(email, payload.bootstrap_token)
     salt, ph = _hash_password(payload.password)
 
+    display_name = (payload.display_name or "").strip()
+    if not display_name:
+        display_name = email.split("@", 1)[0]
+    # prevent leaking emails as names
+    if "@" in display_name:
+        display_name = display_name.replace("@", "_")
+
     try:
         _db_exec(
             """
-            INSERT INTO users(email, pass_salt, pass_hash, is_admin, is_disabled, created_at, trial_expires_at)
-            VALUES(?,?,?,?,?,?,?)
+            INSERT INTO users(email, display_name, avatar_url, ghost_mode, pass_salt, pass_hash, is_admin, is_disabled, created_at, trial_expires_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?)
             """,
-            (email, salt, ph, is_admin, 0, now, trial_expires),
+            (email, display_name, None, 0, salt, ph, is_admin, 0, now, trial_expires),
         )
     except sqlite3.IntegrityError:
         raise HTTPException(status_code=409, detail="Email already exists")
@@ -704,6 +768,9 @@ def me(user: sqlite3.Row = Depends(require_user)):
         "email": user["email"],
         "is_admin": bool(int(user["is_admin"])),
         "trial_expires_at": int(user["trial_expires_at"]),
+        "display_name": user.get("display_name") if hasattr(user, "get") else user["display_name"],
+        "avatar_url": user.get("avatar_url") if hasattr(user, "get") else user["avatar_url"],
+        "ghost_mode": bool(int(user["ghost_mode"])) if user["ghost_mode"] is not None else False,
     }
 
 # =========================================================
@@ -714,11 +781,24 @@ class PresencePayload(BaseModel):
     lng: float
     heading: Optional[float] = None
     accuracy: Optional[float] = None
+    name: Optional[str] = None          # user's chosen public name
+    ghost_mode: Optional[bool] = None   # if true, hide from map
 
 
 @app.post("/presence/update")
 def presence_update(payload: PresencePayload, user: sqlite3.Row = Depends(require_user)):
     now = int(time.time())
+
+    # Optional: update user's public profile info (name / ghost mode) from the client.
+    if payload.name is not None:
+        dn = str(payload.name).strip()
+        if dn:
+            if "@" in dn:
+                dn = dn.replace("@", "_")
+            _db_exec("UPDATE users SET display_name=? WHERE id=?", (dn[:48], int(user["id"])))
+    if payload.ghost_mode is not None:
+        _db_exec("UPDATE users SET ghost_mode=? WHERE id=?", (1 if payload.ghost_mode else 0, int(user["id"])))
+
     _db_exec(
         """
         INSERT INTO presence(user_id, lat, lng, heading, accuracy, updated_at)
@@ -740,10 +820,10 @@ def presence_all(max_age_sec: int = PRESENCE_STALE_SECONDS):
     cutoff = int(time.time()) - max(5, min(3600, int(max_age_sec)))
     rows = _db_query_all(
         """
-        SELECT p.user_id, u.email, p.lat, p.lng, p.heading, p.accuracy, p.updated_at
+        SELECT p.user_id, u.display_name, u.avatar_url, u.ghost_mode, p.lat, p.lng, p.heading, p.accuracy, p.updated_at
         FROM presence p
         LEFT JOIN users u ON u.id = p.user_id
-        WHERE p.updated_at >= ?
+        WHERE p.updated_at >= ? AND COALESCE(u.ghost_mode,0)=0
         """,
         (cutoff,),
     )
