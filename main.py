@@ -201,9 +201,10 @@ def start_generate(bin_minutes: int, min_trips_per_window: int) -> Dict[str, Any
 # =========================================================
 _db_lock = threading.Lock()
 
+
 def _db() -> sqlite3.Connection:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(COMMUNITY_DB_PATH), check_same_thread=False)
+    COMMUNITY_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(COMMUNITY_DB_PATH))
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -244,6 +245,7 @@ def _db_init() -> None:
         CREATE TABLE IF NOT EXISTS users (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           email TEXT NOT NULL UNIQUE,
+          display_name TEXT,
           pass_salt TEXT NOT NULL,
           pass_hash TEXT NOT NULL,
           is_admin INTEGER NOT NULL DEFAULT 0,
@@ -404,6 +406,8 @@ def _ensure_user_columns() -> None:
         cols = [r[1] for r in cur.fetchall()]
 
         # Only add if missing (SQLite ALTER TABLE is limited but ok here)
+        if "display_name" not in cols:
+            cur.execute("ALTER TABLE users ADD COLUMN display_name TEXT")
         if "pass_salt" not in cols:
             cur.execute("ALTER TABLE users ADD COLUMN pass_salt TEXT")
         if "pass_hash" not in cols:
@@ -460,7 +464,7 @@ def _force_admin_email() -> None:
 
 
 # =========================================================
-# Startup (FIXED DECORATOR)
+# Startup
 # =========================================================
 @app.on_event("startup")
 def startup():
@@ -519,6 +523,7 @@ def root():
             "/auth/signup",
             "/auth/login",
             "/me",
+            "/profile/name",
             "/presence/update",
             "/presence/all",
             "/events/police",
@@ -539,85 +544,77 @@ def status():
         "data_dir": str(DATA_DIR),
         "parquets": parquets,
         "zones_geojson": zones_path.name if zones_path.exists() else None,
-        "zones_present": zones_path.exists(),
-        "frames_dir": str(FRAMES_DIR),
-        "has_timeline": _has_frames(),
+        "frames_ready": _has_frames(),
         "generate_state": _get_state(),
-        "community_db": str(COMMUNITY_DB_PATH),
-        "trial_days": TRIAL_DAYS,
-        "auth_enabled": bool(JWT_SECRET and len(JWT_SECRET) >= 24),
     }
 
 
-@app.get("/generate")
-def generate_get(bin_minutes: int = DEFAULT_BIN_MINUTES, min_trips_per_window: int = DEFAULT_MIN_TRIPS_PER_WINDOW):
+class GeneratePayload(BaseModel):
+    bin_minutes: Optional[int] = None
+    min_trips_per_window: Optional[int] = None
+
+
+@app.post("/generate")
+def generate(payload: GeneratePayload):
+    bin_minutes = int(payload.bin_minutes or DEFAULT_BIN_MINUTES)
+    min_trips_per_window = int(payload.min_trips_per_window or DEFAULT_MIN_TRIPS_PER_WINDOW)
+    if bin_minutes not in (10, 15, 20, 30, 60):
+        raise HTTPException(status_code=400, detail="bin_minutes must be one of 10,15,20,30,60")
+    if min_trips_per_window < 1:
+        raise HTTPException(status_code=400, detail="min_trips_per_window must be >= 1")
     return start_generate(bin_minutes, min_trips_per_window)
 
 
 @app.get("/generate_status")
 def generate_status():
-    return _get_state()
+    return {"ok": True, **_get_state()}
 
 
 @app.get("/timeline")
 def timeline():
     if not _has_frames():
-        raise HTTPException(status_code=409, detail="timeline not ready. Call /generate first.")
+        raise HTTPException(status_code=503, detail="timeline not ready. Call /generate first.")
     return _read_json(TIMELINE_PATH)
 
 
 @app.get("/frame/{idx}")
 def frame(idx: int):
     if not _has_frames():
-        raise HTTPException(status_code=409, detail="timeline not ready. Call /generate first.")
-    p = FRAMES_DIR / f"frame_{idx:06d}.json"
-    if not p.exists():
-        raise HTTPException(status_code=404, detail=f"frame not found: {idx}")
-    return _read_json(p)
+        raise HTTPException(status_code=503, detail="timeline not ready. Call /generate first.")
+    tl = _read_json(TIMELINE_PATH)
+    items = tl.get("items") or []
+    if idx < 0 or idx >= len(items):
+        raise HTTPException(status_code=404, detail="frame idx out of range")
+    rel = items[idx].get("path")
+    if not rel:
+        raise HTTPException(status_code=404, detail="frame path missing")
+    fp = (FRAMES_DIR / rel.replace("/frames/", "").lstrip("/"))
+    if not fp.exists():
+        raise HTTPException(status_code=404, detail="frame file missing")
+    return _read_json(fp)
 
-
-@app.post("/upload_zones_geojson")
-async def upload_zones_geojson(file: UploadFile = File(...)):
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    target = DATA_DIR / "taxi_zones.geojson"
-
-    content = await file.read()
-    if not content:
-        raise HTTPException(status_code=400, detail="Empty upload.")
-
-    try:
-        obj = json.loads(content.decode("utf-8", errors="strict"))
-        if obj.get("type") not in ("FeatureCollection", "Feature"):
-            raise ValueError("Not a GeoJSON FeatureCollection/Feature")
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid GeoJSON: {e}")
-
-    target.write_bytes(content)
-    return {"saved": str(target), "size_mb": round(target.stat().st_size / (1024 * 1024), 2)}
-
-
-@app.post("/upload_parquet")
-async def upload_parquet(file: UploadFile = File(...)):
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-    filename = (file.filename or "upload.parquet").replace("\\", "/").split("/")[-1]
-    if not filename.lower().endswith(".parquet"):
-        raise HTTPException(status_code=400, detail="File must be .parquet")
-
-    target = DATA_DIR / filename
-    content = await file.read()
-    if not content:
-        raise HTTPException(status_code=400, detail="Empty upload.")
-    target.write_bytes(content)
-
-    return {"saved": str(target), "size_mb": round(target.stat().st_size / (1024 * 1024), 2)}
 
 # =========================================================
-# AUTH + COMMUNITY
+# Upload parquet (admin only)
+# =========================================================
+@app.post("/upload_parquet")
+def upload_parquet(file: UploadFile = File(...), user: sqlite3.Row = Depends(require_admin)):
+    if not file.filename.lower().endswith(".parquet"):
+        raise HTTPException(status_code=400, detail="Upload a .parquet file")
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    out = DATA_DIR / file.filename
+    with out.open("wb") as f:
+        f.write(file.file.read())
+    return {"ok": True, "saved": str(out)}
+
+
+# =========================================================
+# Auth routes
 # =========================================================
 class SignupPayload(BaseModel):
     email: str
     password: str
+    display_name: Optional[str] = None
     bootstrap_token: Optional[str] = None
 
 
@@ -627,18 +624,11 @@ class LoginPayload(BaseModel):
 
 
 def _decide_admin_for_signup(email: str, bootstrap_token: Optional[str]) -> int:
-    is_admin = 0
-
-    if _is_first_user():
-        is_admin = 1
-
-    if ADMIN_EMAIL and email == ADMIN_EMAIL:
-        is_admin = 1
-
     if ADMIN_BOOTSTRAP_TOKEN and bootstrap_token and bootstrap_token == ADMIN_BOOTSTRAP_TOKEN:
-        is_admin = 1
-
-    return is_admin
+        return 1
+    if _is_first_user() and ADMIN_EMAIL and email == ADMIN_EMAIL:
+        return 1
+    return 0
 
 
 @app.post("/auth/signup")
@@ -657,13 +647,19 @@ def auth_signup(payload: SignupPayload):
     is_admin = _decide_admin_for_signup(email, payload.bootstrap_token)
     salt, ph = _hash_password(payload.password)
 
+    # display_name: optional for backward compatibility
+    display_name = (payload.display_name or "").strip()
+    if not display_name:
+        display_name = (email.split("@")[0] if "@" in email else "Driver")
+    display_name = display_name[:18]
+
     try:
         _db_exec(
             """
-            INSERT INTO users(email, pass_salt, pass_hash, is_admin, is_disabled, created_at, trial_expires_at)
-            VALUES(?,?,?,?,?,?,?)
+            INSERT INTO users(email, display_name, pass_salt, pass_hash, is_admin, is_disabled, created_at, trial_expires_at)
+            VALUES(?,?,?,?,?,?,?,?)
             """,
-            (email, salt, ph, is_admin, 0, now, trial_expires),
+            (email, display_name, salt, ph, is_admin, 0, now, trial_expires),
         )
     except sqlite3.IntegrityError:
         raise HTTPException(status_code=409, detail="Email already exists")
@@ -676,7 +672,7 @@ def auth_login(payload: LoginPayload):
     _require_jwt_secret()
 
     email = (payload.email or "").strip().lower()
-    if not email:
+    if not email or "@" not in email:
         raise HTTPException(status_code=400, detail="Invalid email")
 
     row = _db_query_one("SELECT * FROM users WHERE lower(email)=lower(?) LIMIT 1", (email,))
@@ -701,10 +697,37 @@ def auth_login(payload: LoginPayload):
 def me(user: sqlite3.Row = Depends(require_user)):
     return {
         "ok": True,
+        "id": int(user["id"]),
         "email": user["email"],
+        "display_name": (user["display_name"] if "display_name" in user.keys() else None),
         "is_admin": bool(int(user["is_admin"])),
         "trial_expires_at": int(user["trial_expires_at"]),
     }
+
+
+# =========================================================
+# PROFILE (set public display name)
+# =========================================================
+class ProfileNamePayload(BaseModel):
+    display_name: str
+
+
+def _clean_display_name(name: str, fallback: str) -> str:
+    n = (name or "").strip()
+    n = "".join(ch for ch in n if ch.isprintable())
+    n = n[:18]
+    if not n or len(n) < 2 or "@" in n:
+        n = fallback
+    return n
+
+
+@app.post("/profile/name")
+def profile_set_name(payload: ProfileNamePayload, user_row: sqlite3.Row = Depends(require_user)):
+    fallback = ((user_row["email"].split("@")[0] if "@" in user_row["email"] else "Driver")[:18]) if user_row["email"] else "Driver"
+    n = _clean_display_name(payload.display_name, fallback)
+    _db_exec("UPDATE users SET display_name=? WHERE id=?", (n, int(user_row["id"])))
+    return {"ok": True, "display_name": n}
+
 
 # =========================================================
 # PRESENCE
@@ -740,7 +763,7 @@ def presence_all(max_age_sec: int = PRESENCE_STALE_SECONDS):
     cutoff = int(time.time()) - max(5, min(3600, int(max_age_sec)))
     rows = _db_query_all(
         """
-        SELECT p.user_id, u.email, p.lat, p.lng, p.heading, p.accuracy, p.updated_at
+        SELECT p.user_id, u.email, u.display_name, p.lat, p.lng, p.heading, p.accuracy, p.updated_at
         FROM presence p
         LEFT JOIN users u ON u.id = p.user_id
         WHERE p.updated_at >= ?
@@ -749,6 +772,7 @@ def presence_all(max_age_sec: int = PRESENCE_STALE_SECONDS):
     )
     items = [dict(r) for r in rows]
     return {"ok": True, "count": len(items), "items": items}
+
 
 # =========================================================
 # EVENTS
@@ -790,16 +814,14 @@ def get_police(window_sec: int = 6 * 3600):
         FROM events
         WHERE type='police' AND created_at >= ? AND expires_at >= ?
         ORDER BY created_at DESC
-        LIMIT 200
         """,
         (cutoff, now),
     )
-    items = [dict(r) for r in rows]
-    return {"ok": True, "count": len(items), "items": items}
+    return {"ok": True, "count": len(rows), "items": [dict(r) for r in rows]}
 
 
 @app.post("/events/pickup")
-def log_pickup(payload: PickupPayload, user: sqlite3.Row = Depends(require_user)):
+def report_pickup(payload: PickupPayload, user: sqlite3.Row = Depends(require_user)):
     now = int(time.time())
     expires = now + EVENT_DEFAULT_WINDOW_SECONDS
     _db_exec(
@@ -811,42 +833,18 @@ def log_pickup(payload: PickupPayload, user: sqlite3.Row = Depends(require_user)
     )
     return {"ok": True}
 
-# =========================================================
-# ADMIN (manage all accounts)
-# =========================================================
-@app.get("/admin/users")
-def admin_users(admin: sqlite3.Row = Depends(require_admin)):
+
+@app.get("/events/pickup")
+def get_pickup(window_sec: int = 6 * 3600):
+    now = int(time.time())
+    cutoff = now - max(300, min(7 * 24 * 3600, int(window_sec)))
     rows = _db_query_all(
         """
-        SELECT id, email, is_admin, is_disabled, created_at, trial_expires_at
-        FROM users
-        ORDER BY created_at ASC
-        """
+        SELECT id, lat, lng, zone_id, created_at, expires_at
+        FROM events
+        WHERE type='pickup' AND created_at >= ? AND expires_at >= ?
+        ORDER BY created_at DESC
+        """,
+        (cutoff, now),
     )
-    items = [dict(r) for r in rows]
-    return {"ok": True, "count": len(items), "items": items}
-
-
-class AdminDisablePayload(BaseModel):
-    user_id: int
-    disabled: bool
-
-
-@app.post("/admin/users/disable")
-def admin_disable_user(payload: AdminDisablePayload, admin: sqlite3.Row = Depends(require_admin)):
-    _db_exec("UPDATE users SET is_disabled=? WHERE id=?", (1 if payload.disabled else 0, int(payload.user_id)))
-    return {"ok": True}
-
-
-class AdminResetPayload(BaseModel):
-    user_id: int
-    new_password: str
-
-
-@app.post("/admin/users/reset_password")
-def admin_reset_password(payload: AdminResetPayload, admin: sqlite3.Row = Depends(require_admin)):
-    if not payload.new_password or len(payload.new_password) < 6:
-        raise HTTPException(status_code=400, detail="Password must be at least 6 chars")
-    salt, ph = _hash_password(payload.new_password)
-    _db_exec("UPDATE users SET pass_salt=?, pass_hash=? WHERE id=?", (salt, ph, int(payload.user_id)))
-    return {"ok": True}
+    return {"ok": True, "count": len(rows), "items": [dict(r) for r in rows]}
