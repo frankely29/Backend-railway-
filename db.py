@@ -1,18 +1,20 @@
 import os
-import psycopg
-from contextlib import contextmanager
-from psycopg.rows import dict_row
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, declarative_base
 
-DATABASE_URL = os.environ.get("DATABASE_URL")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL not set")
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+)
 
-@contextmanager
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
 def get_db():
-    conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
+    db = SessionLocal()
     try:
-        yield conn
-        conn.commit()
+        yield db
     finally:
-        conn.close()
+        db.close()
