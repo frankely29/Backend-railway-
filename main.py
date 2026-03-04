@@ -13,11 +13,11 @@ import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from build_hotspot import build_hotspots_frames, ensure_zones_geojson
+from build_hotspot import ensure_zones_geojson, build_hotspots_frames
 
 # =========================================================
 # Paths (Railway volume)
@@ -35,10 +35,10 @@ LOCK_PATH = DATA_DIR / ".generate.lock"
 COMMUNITY_DB_PATH = Path(os.environ.get("COMMUNITY_DB", str(DATA_DIR / "community.db")))
 
 # Auth / Admin config
-JWT_SECRET = os.environ.get("JWT_SECRET", "")  # REQUIRED for stable logins across deploys
-ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "").strip().lower()  # optional
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")  # optional
-ADMIN_BOOTSTRAP_TOKEN = os.environ.get("ADMIN_BOOTSTRAP_TOKEN", "")  # optional
+JWT_SECRET = os.environ.get("JWT_SECRET", "")  # REQUIRED (set in Railway)
+ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "").strip().lower()
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
+ADMIN_BOOTSTRAP_TOKEN = os.environ.get("ADMIN_BOOTSTRAP_TOKEN", "").strip()
 
 TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "7"))
 TOKEN_TTL_SECONDS = int(os.environ.get("TOKEN_TTL_SECONDS", str(30 * 24 * 3600)))  # 30 days
@@ -64,11 +64,11 @@ _generate_state: Dict[str, Any] = {
 # =========================================================
 # App
 # =========================================================
-app = FastAPI(title="NYC TLC Hotspot Backend", version="2.0")
+app = FastAPI(title="NYC TLC Hotspot Backend", version="2.1")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # lock down later if you want
+    allow_origins=["*"],  # lock down later
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -196,12 +196,10 @@ def start_generate(bin_minutes: int, min_trips_per_window: int) -> Dict[str, Any
 
     return {"ok": True, "state": "started", "bin_minutes": bin_minutes, "min_trips_per_window": min_trips_per_window}
 
-
 # =========================================================
 # Community DB (SQLite)
 # =========================================================
 _db_lock = threading.Lock()
-
 
 def _db() -> sqlite3.Connection:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -255,7 +253,6 @@ def _db_init() -> None:
         );
         """
     )
-
     _db_exec(
         """
         CREATE TABLE IF NOT EXISTS presence (
@@ -269,8 +266,6 @@ def _db_init() -> None:
         );
         """
     )
-
-    # IMPORTANT: includes zone_id (your API uses it)
     _db_exec(
         """
         CREATE TABLE IF NOT EXISTS events (
@@ -280,17 +275,15 @@ def _db_init() -> None:
           lat REAL NOT NULL,
           lng REAL NOT NULL,
           text TEXT,                        -- text only
-          zone_id INTEGER,                  -- optional for pickup
+          zone_id INTEGER,                  -- optional (pickup)
           created_at INTEGER NOT NULL,
           expires_at INTEGER NOT NULL,
           FOREIGN KEY(user_id) REFERENCES users(id)
         );
         """
     )
-
     _db_exec("CREATE INDEX IF NOT EXISTS idx_events_type_time ON events(type, created_at);")
     _db_exec("CREATE INDEX IF NOT EXISTS idx_events_expires ON events(expires_at);")
-
 
 # =========================================================
 # Auth helpers (no external deps)
@@ -352,12 +345,11 @@ def _hash_password(password: str, salt_b64: Optional[str] = None) -> Tuple[str, 
         salt_b64 = _b64url(salt)
     else:
         salt = _b64url_decode(salt_b64)
-
     dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 200_000)
     return salt_b64, _b64url(dk)
 
 
-def require_user(req: Request) -> sqlite3.Row:
+def _auth_user_from_request(req: Request) -> sqlite3.Row:
     auth = req.headers.get("authorization", "")
     if not auth.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="Missing Bearer token")
@@ -372,10 +364,24 @@ def require_user(req: Request) -> sqlite3.Row:
     return row
 
 
-def require_admin(user: sqlite3.Row = Depends(require_user)) -> sqlite3.Row:
+def require_user(req: Request) -> sqlite3.Row:
+    user = _auth_user_from_request(req)
+    _enforce_trial_or_admin(user)
+    return user
+
+
+def require_admin(req: Request) -> sqlite3.Row:
+    user = _auth_user_from_request(req)
     if int(user["is_admin"]) != 1:
         raise HTTPException(status_code=403, detail="Admin only")
     return user
+
+
+def _enforce_trial_or_admin(user: sqlite3.Row) -> None:
+    if int(user["is_admin"]) == 1:
+        return
+    if int(time.time()) > int(user["trial_expires_at"]):
+        raise HTTPException(status_code=402, detail="Trial expired")
 
 
 def _is_first_user() -> bool:
@@ -407,7 +413,6 @@ def _ensure_admin_seed() -> None:
         """,
         (ADMIN_EMAIL, salt, ph, 1, 0, now, trial_expires),
     )
-
 
 # =========================================================
 # Startup
@@ -448,7 +453,6 @@ def startup():
             _set_state(state="idle")
     except Exception:
         _set_state(state="idle")
-
 
 # =========================================================
 # Core routes
@@ -493,6 +497,7 @@ def status():
         "generate_state": _get_state(),
         "community_db": str(COMMUNITY_DB_PATH),
         "trial_days": TRIAL_DAYS,
+        "auth_enabled": bool(JWT_SECRET and len(JWT_SECRET) >= 24),
     }
 
 
@@ -559,9 +564,8 @@ async def upload_parquet(file: UploadFile = File(...)):
 
     return {"saved": str(target), "size_mb": round(target.stat().st_size / (1024 * 1024), 2)}
 
-
 # =========================================================
-# AUTH + COMMUNITY
+# AUTH + COMMUNITY (THIS FIXES YOUR 404 /auth/signup)
 # =========================================================
 class SignupPayload(BaseModel):
     email: str
@@ -576,12 +580,19 @@ class LoginPayload(BaseModel):
 
 def _decide_admin_for_signup(email: str, bootstrap_token: Optional[str]) -> int:
     is_admin = 0
+
+    # First user is always admin (so you never lose control)
     if _is_first_user():
         is_admin = 1
+
+    # If ADMIN_EMAIL matches, force admin
     if ADMIN_EMAIL and email == ADMIN_EMAIL:
         is_admin = 1
+
+    # Optional bootstrap token can also grant admin
     if ADMIN_BOOTSTRAP_TOKEN and bootstrap_token and bootstrap_token == ADMIN_BOOTSTRAP_TOKEN:
         is_admin = 1
+
     return is_admin
 
 
@@ -599,6 +610,7 @@ def auth_signup(payload: SignupPayload):
     trial_expires = now + TRIAL_DAYS * 86400
 
     is_admin = _decide_admin_for_signup(email, payload.bootstrap_token)
+
     salt, ph = _hash_password(payload.password)
 
     try:
@@ -643,13 +655,7 @@ def auth_login(payload: LoginPayload):
 
 @app.get("/me")
 def me(user: sqlite3.Row = Depends(require_user)):
-    return {
-        "ok": True,
-        "email": user["email"],
-        "is_admin": bool(int(user["is_admin"])),
-        "trial_expires_at": int(user["trial_expires_at"]),
-    }
-
+    return {"ok": True, "email": user["email"], "is_admin": bool(int(user["is_admin"])), "trial_expires_at": int(user["trial_expires_at"])}
 
 # =========================================================
 # PRESENCE
@@ -692,8 +698,8 @@ def presence_all(max_age_sec: int = PRESENCE_STALE_SECONDS):
         """,
         (cutoff,),
     )
-    return {"ok": True, "count": len(rows), "items": [dict(r) for r in rows]}
-
+    items = [dict(r) for r in rows]
+    return {"ok": True, "count": len(items), "items": items}
 
 # =========================================================
 # EVENTS
@@ -715,7 +721,6 @@ def report_police(payload: PolicePayload, user: sqlite3.Row = Depends(require_us
     now = int(time.time())
     expires = now + EVENT_DEFAULT_WINDOW_SECONDS
     txt = (payload.note or "").strip()
-
     _db_exec(
         """
         INSERT INTO events(type, user_id, lat, lng, text, zone_id, created_at, expires_at)
@@ -740,14 +745,14 @@ def get_police(window_sec: int = 6 * 3600):
         """,
         (cutoff, now),
     )
-    return {"ok": True, "count": len(rows), "items": [dict(r) for r in rows]}
+    items = [dict(r) for r in rows]
+    return {"ok": True, "count": len(items), "items": items}
 
 
 @app.post("/events/pickup")
 def log_pickup(payload: PickupPayload, user: sqlite3.Row = Depends(require_user)):
     now = int(time.time())
     expires = now + EVENT_DEFAULT_WINDOW_SECONDS
-
     _db_exec(
         """
         INSERT INTO events(type, user_id, lat, lng, text, zone_id, created_at, expires_at)
@@ -756,7 +761,6 @@ def log_pickup(payload: PickupPayload, user: sqlite3.Row = Depends(require_user)
         ("pickup", int(user["id"]), float(payload.lat), float(payload.lng), "", payload.zone_id, now, expires),
     )
     return {"ok": True}
-
 
 # =========================================================
 # ADMIN (manage all accounts)
@@ -770,7 +774,8 @@ def admin_users(admin: sqlite3.Row = Depends(require_admin)):
         ORDER BY created_at ASC
         """
     )
-    return {"ok": True, "count": len(rows), "items": [dict(r) for r in rows]}
+    items = [dict(r) for r in rows]
+    return {"ok": True, "count": len(items), "items": items}
 
 
 class AdminDisablePayload(BaseModel):
