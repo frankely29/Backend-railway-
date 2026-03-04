@@ -1,4 +1,4 @@
-# ====================== presence.py ======================
+# presence.py
 from datetime import datetime, timezone, timedelta
 from fastapi import APIRouter, Depends, Header
 from sqlalchemy.orm import Session
@@ -40,7 +40,7 @@ def presence_nearby(max_age_sec: int = 20, db: Session = Depends(get_db)):
         db.query(Presence, User)
         .join(User, User.id == Presence.user_id)
         .filter(Presence.updated_at >= cutoff)
-        .filter(User.ghost_mode == False)   # ← GHOST MODE WORKS
+        .filter(User.ghost_mode == False)
         .all()
     )
 
@@ -49,7 +49,7 @@ def presence_nearby(max_age_sec: int = 20, db: Session = Depends(get_db)):
         out.append({
             "user_id": u.id,
             "display_name": u.display_name,
-            "avatar_url": u.avatar_url,          # ← AVATAR SHOWN NEXT TO ARROW
+            "avatar_url": u.avatar_url,
             "lat": p.lat,
             "lng": p.lng,
             "heading": p.heading,
