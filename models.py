@@ -1,4 +1,4 @@
-# ====================== models.py ======================
+# models.py
 import uuid
 from datetime import datetime, timezone
 from sqlalchemy import Column, String, DateTime, Float, Integer, ForeignKey, Text, Boolean
@@ -16,7 +16,7 @@ class User(Base):
     password_hash = Column(String, nullable=False)
     display_name = Column(String, nullable=False)
     avatar_url = Column(String, nullable=True)
-    ghost_mode = Column(Boolean, default=False, nullable=False)   # NEW
+    ghost_mode = Column(Boolean, default=False, nullable=False)
     role = Column(String, nullable=False, default="user")
     created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
     last_login_at = Column(DateTime(timezone=True), nullable=True)
