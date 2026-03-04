@@ -218,17 +218,6 @@ def _db_exec(sql: str, params: Tuple[Any, ...] = ()) -> None:
             conn.close()
 
 
-def _db_insert(sql: str, params: Tuple[Any, ...] = ()) -> int:
-    with _db_lock:
-        conn = _db()
-        try:
-            cur = conn.execute(sql, params)
-            conn.commit()
-            return int(cur.lastrowid)
-        finally:
-            conn.close()
-
-
 def _db_query_one(sql: str, params: Tuple[Any, ...] = ()) -> Optional[sqlite3.Row]:
     with _db_lock:
         conn = _db()
@@ -295,19 +284,6 @@ def _db_init() -> None:
     )
     _db_exec("CREATE INDEX IF NOT EXISTS idx_events_type_time ON events(type, created_at);")
     _db_exec("CREATE INDEX IF NOT EXISTS idx_events_expires ON events(expires_at);")
-    _db_exec(
-        """
-        CREATE TABLE IF NOT EXISTS chat_messages (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          room TEXT NOT NULL,
-          user_id INTEGER NOT NULL,
-          text TEXT NOT NULL,
-          created_at INTEGER NOT NULL,
-          FOREIGN KEY(user_id) REFERENCES users(id)
-        );
-        """
-    )
-    _db_exec("CREATE INDEX IF NOT EXISTS idx_chat_room_id ON chat_messages(room, id);")
 
 # =========================================================
 # Auth helpers (no external deps)
@@ -535,8 +511,6 @@ def root():
         "ok": True,
         "service": "NYC TLC Hotspot Backend",
         "endpoints": [
-            "/hot97",
-            "/hot-97",
             "/status",
             "/generate",
             "/generate_status",
@@ -549,24 +523,11 @@ def root():
             "/presence/all",
             "/events/police",
             "/events/pickup",
-            "/chat/send",
-            "/chat/since",
             "/admin/users",
             "/admin/users/disable",
             "/admin/users/reset_password",
         ],
     }
-
-
-@app.get("/hot97")
-@app.get("/hot-97")
-def hot97_alias():
-    """
-    Legacy compatibility route used by older clients.
-    Returns the same payload as /status so callers can verify the backend
-    and current hotspot generation state.
-    """
-    return status()
 
 
 @app.get("/status")
@@ -804,11 +765,6 @@ class PickupPayload(BaseModel):
     zone_id: Optional[int] = None
 
 
-class ChatSendPayload(BaseModel):
-    text: str
-    room: Optional[str] = "global"
-
-
 @app.post("/events/police")
 def report_police(payload: PolicePayload, user: sqlite3.Row = Depends(require_user)):
     now = int(time.time())
@@ -854,65 +810,6 @@ def log_pickup(payload: PickupPayload, user: sqlite3.Row = Depends(require_user)
         ("pickup", int(user["id"]), float(payload.lat), float(payload.lng), "", payload.zone_id, now, expires),
     )
     return {"ok": True}
-
-
-# =========================================================
-# CHAT
-# =========================================================
-@app.post("/chat/send")
-def chat_send(payload: ChatSendPayload, user: sqlite3.Row = Depends(require_user)):
-    room = (payload.room or "global").strip() or "global"
-    text = (payload.text or "").strip()
-
-    if not text:
-        raise HTTPException(status_code=400, detail="text required")
-    if len(text) > 500:
-        raise HTTPException(status_code=400, detail="text too long")
-
-    now = int(time.time())
-    message_id = _db_insert(
-        """
-        INSERT INTO chat_messages(room, user_id, text, created_at)
-        VALUES(?,?,?,?)
-        """,
-        (room, int(user["id"]), text, now),
-    )
-
-    return {"ok": True, "id": message_id, "created_at": now}
-
-
-@app.get("/chat/since")
-def chat_since(room: str = "global", since_id: int = 0, limit: int = 50):
-    clean_room = (room or "global").strip() or "global"
-    safe_limit = max(1, min(200, int(limit)))
-    safe_since_id = max(0, int(since_id))
-
-    rows = _db_query_all(
-        """
-        SELECT c.id, c.room, c.user_id, c.text, c.created_at, u.email
-        FROM chat_messages c
-        LEFT JOIN users u ON u.id = c.user_id
-        WHERE c.room = ? AND c.id > ?
-        ORDER BY c.id ASC
-        LIMIT ?
-        """,
-        (clean_room, safe_since_id, safe_limit),
-    )
-
-    items = [
-        {
-            "id": int(row["id"]),
-            "room": row["room"],
-            "user_id": int(row["user_id"]),
-            "display_name": row["email"] or "Unknown",
-            "text": row["text"],
-            "created_at": int(row["created_at"]),
-        }
-        for row in rows
-    ]
-
-    return {"ok": True, "count": len(items), "items": items}
-
 
 # =========================================================
 # ADMIN (manage all accounts)
