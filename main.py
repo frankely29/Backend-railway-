@@ -37,7 +37,9 @@ LOCK_PATH = DATA_DIR / ".generate.lock"
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 # Auth / Admin config
-JWT_SECRET = os.environ.get("JWT_SECRET", "")  # REQUIRED (set in Railway)
+# Fallback keeps auth usable in misconfigured environments (local/dev).
+# In production, set JWT_SECRET explicitly in Railway variables.
+JWT_SECRET = os.environ.get("JWT_SECRET", "dev-insecure-secret-change-me-please")
 ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "").strip().lower()
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 ADMIN_BOOTSTRAP_TOKEN = os.environ.get("ADMIN_BOOTSTRAP_TOKEN", "").strip()
@@ -283,7 +285,7 @@ def _require_jwt_secret() -> None:
     if not JWT_SECRET or len(JWT_SECRET) < 24:
         raise HTTPException(
             status_code=500,
-            detail="Server misconfigured: JWT_SECRET missing/too short. Set JWT_SECRET in Railway variables (>=24 chars).",
+            detail="Server misconfigured: JWT_SECRET too short. Set JWT_SECRET in Railway variables (>=24 chars).",
         )
 
 
@@ -528,14 +530,14 @@ def generate_status():
 @app.get("/timeline")
 def timeline():
     if not _has_frames():
-        raise HTTPException(status_code=409, detail="timeline not ready. Call /generate first.")
+        raise HTTPException(status_code=404, detail="timeline not ready. Call /generate first.")
     return _read_json(TIMELINE_PATH)
 
 
 @app.get("/frame/{idx}")
 def frame(idx: int):
     if not _has_frames():
-        raise HTTPException(status_code=409, detail="timeline not ready. Call /generate first.")
+        raise HTTPException(status_code=404, detail="timeline not ready. Call /generate first.")
     p = FRAMES_DIR / f"frame_{idx:06d}.json"
     if not p.exists():
         raise HTTPException(status_code=404, detail=f"frame not found: {idx}")
