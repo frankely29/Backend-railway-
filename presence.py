@@ -1,6 +1,5 @@
-# presence.py
 from datetime import datetime, timezone, timedelta
-from fastapi import APIRouter, Depends, Header
+from fastapi import APIRouter, Depends, Header, HTTPException
 from sqlalchemy.orm import Session
 from db import get_db
 from models import Presence, User
@@ -34,13 +33,13 @@ def presence_update(payload: dict, authorization: str | None = Header(default=No
 
 @router.get("/presence/nearby")
 def presence_nearby(max_age_sec: int = 20, db: Session = Depends(get_db)):
+    # public list: shows everyone who updated recently
     cutoff = datetime.now(timezone.utc) - timedelta(seconds=max_age_sec)
 
     rows = (
         db.query(Presence, User)
         .join(User, User.id == Presence.user_id)
         .filter(Presence.updated_at >= cutoff)
-        .filter(User.ghost_mode == False)
         .all()
     )
 
