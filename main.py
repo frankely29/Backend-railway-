@@ -389,43 +389,10 @@ def _is_first_user() -> bool:
     return int(row["c"]) == 0 if row else True
 
 
-# =========================================================
-# FIXED: DB migration + admin seed + force admin
-# =========================================================
-def _ensure_user_columns() -> None:
-    """
-    Safe migration: add missing columns if the users table is older.
-    Uses _db() (NOT _db_connect).
-    """
-    try:
-        conn = _db()
-        cur = conn.cursor()
-        cur.execute("PRAGMA table_info(users)")
-        cols = [r[1] for r in cur.fetchall()]
-
-        # Only add if missing (SQLite ALTER TABLE is limited but ok here)
-        if "pass_salt" not in cols:
-            cur.execute("ALTER TABLE users ADD COLUMN pass_salt TEXT")
-        if "pass_hash" not in cols:
-            cur.execute("ALTER TABLE users ADD COLUMN pass_hash TEXT")
-        if "is_admin" not in cols:
-            cur.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER DEFAULT 0")
-        if "is_disabled" not in cols:
-            cur.execute("ALTER TABLE users ADD COLUMN is_disabled INTEGER DEFAULT 0")
-        if "created_at" not in cols:
-            cur.execute("ALTER TABLE users ADD COLUMN created_at INTEGER")
-        if "trial_expires_at" not in cols:
-            cur.execute("ALTER TABLE users ADD COLUMN trial_expires_at INTEGER")
-
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        print("Migration check failed:", e)
-
-
 def _ensure_admin_seed() -> None:
     """
-    If ADMIN_EMAIL + ADMIN_PASSWORD are set, ensure the admin exists.
+    Optional: if ADMIN_EMAIL + ADMIN_PASSWORD are set, ensure that admin exists.
+    This gives you control without needing to 'sign up' as a regular user.
     """
     if not ADMIN_EMAIL or not ADMIN_PASSWORD:
         return
@@ -439,7 +406,6 @@ def _ensure_admin_seed() -> None:
     now = int(time.time())
     trial_expires = now + TRIAL_DAYS * 86400
     salt, ph = _hash_password(ADMIN_PASSWORD)
-
     _db_exec(
         """
         INSERT INTO users(email, pass_salt, pass_hash, is_admin, is_disabled, created_at, trial_expires_at)
@@ -448,29 +414,15 @@ def _ensure_admin_seed() -> None:
         (ADMIN_EMAIL, salt, ph, 1, 0, now, trial_expires),
     )
 
-
-def _force_admin_email() -> None:
-    """
-    Optional hard-force your email to admin.
-    """
-    try:
-        _db_exec("UPDATE users SET is_admin = 1 WHERE lower(email)=lower(?)", ("elokotron1@hotmail.com",))
-    except Exception as e:
-        print("Admin enforcement failed:", e)
-
-
 # =========================================================
-# Startup (FIXED DECORATOR)
+# Startup
 # =========================================================
 @app.on_event("startup")
 def startup():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     FRAMES_DIR.mkdir(parents=True, exist_ok=True)
-
     _db_init()
-    _ensure_user_columns()
     _ensure_admin_seed()
-    _force_admin_email()
 
     # Auto-fill generate state if frames already exist
     try:
@@ -613,7 +565,7 @@ async def upload_parquet(file: UploadFile = File(...)):
     return {"saved": str(target), "size_mb": round(target.stat().st_size / (1024 * 1024), 2)}
 
 # =========================================================
-# AUTH + COMMUNITY
+# AUTH + COMMUNITY (THIS FIXES YOUR 404 /auth/signup)
 # =========================================================
 class SignupPayload(BaseModel):
     email: str
@@ -629,12 +581,15 @@ class LoginPayload(BaseModel):
 def _decide_admin_for_signup(email: str, bootstrap_token: Optional[str]) -> int:
     is_admin = 0
 
+    # First user is always admin (so you never lose control)
     if _is_first_user():
         is_admin = 1
 
+    # If ADMIN_EMAIL matches, force admin
     if ADMIN_EMAIL and email == ADMIN_EMAIL:
         is_admin = 1
 
+    # Optional bootstrap token can also grant admin
     if ADMIN_BOOTSTRAP_TOKEN and bootstrap_token and bootstrap_token == ADMIN_BOOTSTRAP_TOKEN:
         is_admin = 1
 
@@ -655,6 +610,7 @@ def auth_signup(payload: SignupPayload):
     trial_expires = now + TRIAL_DAYS * 86400
 
     is_admin = _decide_admin_for_signup(email, payload.bootstrap_token)
+
     salt, ph = _hash_password(payload.password)
 
     try:
@@ -699,12 +655,7 @@ def auth_login(payload: LoginPayload):
 
 @app.get("/me")
 def me(user: sqlite3.Row = Depends(require_user)):
-    return {
-        "ok": True,
-        "email": user["email"],
-        "is_admin": bool(int(user["is_admin"])),
-        "trial_expires_at": int(user["trial_expires_at"]),
-    }
+    return {"ok": True, "email": user["email"], "is_admin": bool(int(user["is_admin"])), "trial_expires_at": int(user["trial_expires_at"])}
 
 # =========================================================
 # PRESENCE
