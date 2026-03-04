@@ -511,6 +511,8 @@ def root():
         "ok": True,
         "service": "NYC TLC Hotspot Backend",
         "endpoints": [
+            "/hot97",
+            "/hot-97",
             "/status",
             "/generate",
             "/generate_status",
@@ -528,6 +530,17 @@ def root():
             "/admin/users/reset_password",
         ],
     }
+
+
+@app.get("/hot97")
+@app.get("/hot-97")
+def hot97_alias():
+    """
+    Legacy compatibility route used by older clients.
+    Returns the same payload as /status so callers can verify the backend
+    and current hotspot generation state.
+    """
+    return status()
 
 
 @app.get("/status")
