@@ -6,12 +6,14 @@ import hmac
 import json
 import os
 import secrets
-import sqlite3
 import threading
 import time
 import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+import psycopg
+from psycopg.rows import dict_row
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
@@ -31,8 +33,8 @@ DEFAULT_MIN_TRIPS_PER_WINDOW = int(os.environ.get("DEFAULT_MIN_TRIPS_PER_WINDOW"
 
 LOCK_PATH = DATA_DIR / ".generate.lock"
 
-# Community DB (SQLite on Railway Volume)
-COMMUNITY_DB_PATH = Path(os.environ.get("COMMUNITY_DB", str(DATA_DIR / "community.db")))
+# Community DB (Postgres)
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 # Auth / Admin config
 JWT_SECRET = os.environ.get("JWT_SECRET", "")  # REQUIRED (set in Railway)
@@ -197,88 +199,77 @@ def start_generate(bin_minutes: int, min_trips_per_window: int) -> Dict[str, Any
     return {"ok": True, "state": "started", "bin_minutes": bin_minutes, "min_trips_per_window": min_trips_per_window}
 
 # =========================================================
-# Community DB (SQLite)
+# Community DB (Postgres)
 # =========================================================
 _db_lock = threading.Lock()
 
-def _db() -> sqlite3.Connection:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(COMMUNITY_DB_PATH), check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+
+def _db() -> psycopg.Connection:
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL not set")
+    return psycopg.connect(DATABASE_URL, row_factory=dict_row)
 
 
 def _db_exec(sql: str, params: Tuple[Any, ...] = ()) -> None:
     with _db_lock:
-        conn = _db()
-        try:
+        with _db() as conn:
             conn.execute(sql, params)
             conn.commit()
-        finally:
-            conn.close()
 
 
-def _db_query_one(sql: str, params: Tuple[Any, ...] = ()) -> Optional[sqlite3.Row]:
+def _db_query_one(sql: str, params: Tuple[Any, ...] = ()) -> Optional[Dict[str, Any]]:
     with _db_lock:
-        conn = _db()
-        try:
+        with _db() as conn:
             cur = conn.execute(sql, params)
             return cur.fetchone()
-        finally:
-            conn.close()
 
 
-def _db_query_all(sql: str, params: Tuple[Any, ...] = ()) -> List[sqlite3.Row]:
+def _db_query_all(sql: str, params: Tuple[Any, ...] = ()) -> List[Dict[str, Any]]:
     with _db_lock:
-        conn = _db()
-        try:
+        with _db() as conn:
             cur = conn.execute(sql, params)
             return list(cur.fetchall())
-        finally:
-            conn.close()
 
 
 def _db_init() -> None:
     _db_exec(
         """
         CREATE TABLE IF NOT EXISTS users (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          id BIGSERIAL PRIMARY KEY,
           email TEXT NOT NULL UNIQUE,
           pass_salt TEXT NOT NULL,
           pass_hash TEXT NOT NULL,
-          is_admin INTEGER NOT NULL DEFAULT 0,
-          is_disabled INTEGER NOT NULL DEFAULT 0,
-          created_at INTEGER NOT NULL,
-          trial_expires_at INTEGER NOT NULL
+          is_admin BOOLEAN NOT NULL DEFAULT FALSE,
+          is_disabled BOOLEAN NOT NULL DEFAULT FALSE,
+          created_at BIGINT NOT NULL,
+          trial_expires_at BIGINT NOT NULL
         );
         """
     )
     _db_exec(
         """
         CREATE TABLE IF NOT EXISTS presence (
-          user_id INTEGER PRIMARY KEY,
-          lat REAL NOT NULL,
-          lng REAL NOT NULL,
-          heading REAL,
-          accuracy REAL,
-          updated_at INTEGER NOT NULL,
-          FOREIGN KEY(user_id) REFERENCES users(id)
+          user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+          lat DOUBLE PRECISION NOT NULL,
+          lng DOUBLE PRECISION NOT NULL,
+          heading DOUBLE PRECISION,
+          accuracy DOUBLE PRECISION,
+          updated_at BIGINT NOT NULL
         );
         """
     )
     _db_exec(
         """
         CREATE TABLE IF NOT EXISTS events (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          type TEXT NOT NULL,               -- 'police' | 'pickup'
-          user_id INTEGER NOT NULL,
-          lat REAL NOT NULL,
-          lng REAL NOT NULL,
-          text TEXT,                        -- text only
-          zone_id INTEGER,                  -- optional (pickup)
-          created_at INTEGER NOT NULL,
-          expires_at INTEGER NOT NULL,
-          FOREIGN KEY(user_id) REFERENCES users(id)
+          id BIGSERIAL PRIMARY KEY,
+          type TEXT NOT NULL,
+          user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          lat DOUBLE PRECISION NOT NULL,
+          lng DOUBLE PRECISION NOT NULL,
+          text TEXT,
+          zone_id BIGINT,
+          created_at BIGINT NOT NULL,
+          expires_at BIGINT NOT NULL
         );
         """
     )
@@ -349,14 +340,14 @@ def _hash_password(password: str, salt_b64: Optional[str] = None) -> Tuple[str, 
     return salt_b64, _b64url(dk)
 
 
-def _auth_user_from_request(req: Request) -> sqlite3.Row:
+def _auth_user_from_request(req: Request) -> Dict[str, Any]:
     auth = req.headers.get("authorization", "")
     if not auth.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="Missing Bearer token")
     token = auth.split(" ", 1)[1].strip()
     payload = _verify_token(token)
     uid = int(payload.get("uid", 0))
-    row = _db_query_one("SELECT * FROM users WHERE id=? LIMIT 1", (uid,))
+    row = _db_query_one("SELECT * FROM users WHERE id=%s LIMIT 1", (uid,))
     if not row:
         raise HTTPException(status_code=401, detail="User not found")
     if int(row["is_disabled"]) == 1:
@@ -364,20 +355,20 @@ def _auth_user_from_request(req: Request) -> sqlite3.Row:
     return row
 
 
-def require_user(req: Request) -> sqlite3.Row:
+def require_user(req: Request) -> Dict[str, Any]:
     user = _auth_user_from_request(req)
     _enforce_trial_or_admin(user)
     return user
 
 
-def require_admin(req: Request) -> sqlite3.Row:
+def require_admin(req: Request) -> Dict[str, Any]:
     user = _auth_user_from_request(req)
     if int(user["is_admin"]) != 1:
         raise HTTPException(status_code=403, detail="Admin only")
     return user
 
 
-def _enforce_trial_or_admin(user: sqlite3.Row) -> None:
+def _enforce_trial_or_admin(user: Dict[str, Any]) -> None:
     if int(user["is_admin"]) == 1:
         return
     if int(time.time()) > int(user["trial_expires_at"]):
@@ -393,34 +384,8 @@ def _is_first_user() -> bool:
 # FIXED: DB migration + admin seed + force admin
 # =========================================================
 def _ensure_user_columns() -> None:
-    """
-    Safe migration: add missing columns if the users table is older.
-    Uses _db() (NOT _db_connect).
-    """
-    try:
-        conn = _db()
-        cur = conn.cursor()
-        cur.execute("PRAGMA table_info(users)")
-        cols = [r[1] for r in cur.fetchall()]
-
-        # Only add if missing (SQLite ALTER TABLE is limited but ok here)
-        if "pass_salt" not in cols:
-            cur.execute("ALTER TABLE users ADD COLUMN pass_salt TEXT")
-        if "pass_hash" not in cols:
-            cur.execute("ALTER TABLE users ADD COLUMN pass_hash TEXT")
-        if "is_admin" not in cols:
-            cur.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER DEFAULT 0")
-        if "is_disabled" not in cols:
-            cur.execute("ALTER TABLE users ADD COLUMN is_disabled INTEGER DEFAULT 0")
-        if "created_at" not in cols:
-            cur.execute("ALTER TABLE users ADD COLUMN created_at INTEGER")
-        if "trial_expires_at" not in cols:
-            cur.execute("ALTER TABLE users ADD COLUMN trial_expires_at INTEGER")
-
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        print("Migration check failed:", e)
+    """Kept for backward compatibility; Postgres schema is managed in _db_init()."""
+    return
 
 
 def _ensure_admin_seed() -> None:
@@ -430,10 +395,10 @@ def _ensure_admin_seed() -> None:
     if not ADMIN_EMAIL or not ADMIN_PASSWORD:
         return
 
-    existing = _db_query_one("SELECT * FROM users WHERE lower(email)=lower(?) LIMIT 1", (ADMIN_EMAIL,))
+    existing = _db_query_one("SELECT * FROM users WHERE lower(email)=lower(%s) LIMIT 1", (ADMIN_EMAIL,))
     if existing:
         if int(existing["is_admin"]) != 1:
-            _db_exec("UPDATE users SET is_admin=1, is_disabled=0 WHERE id=?", (int(existing["id"]),))
+            _db_exec("UPDATE users SET is_admin=1, is_disabled=0 WHERE id=%s", (int(existing["id"]),))
         return
 
     now = int(time.time())
@@ -443,7 +408,7 @@ def _ensure_admin_seed() -> None:
     _db_exec(
         """
         INSERT INTO users(email, pass_salt, pass_hash, is_admin, is_disabled, created_at, trial_expires_at)
-        VALUES(?,?,?,?,?,?,?)
+        VALUES(%s,%s,%s,%s,%s,%s,%s)
         """,
         (ADMIN_EMAIL, salt, ph, 1, 0, now, trial_expires),
     )
@@ -454,7 +419,7 @@ def _force_admin_email() -> None:
     Optional hard-force your email to admin.
     """
     try:
-        _db_exec("UPDATE users SET is_admin = 1 WHERE lower(email)=lower(?)", ("elokotron1@hotmail.com",))
+        _db_exec("UPDATE users SET is_admin = 1 WHERE lower(email)=lower(%s)", ("elokotron1@hotmail.com",))
     except Exception as e:
         print("Admin enforcement failed:", e)
 
@@ -543,7 +508,8 @@ def status():
         "frames_dir": str(FRAMES_DIR),
         "has_timeline": _has_frames(),
         "generate_state": _get_state(),
-        "community_db": str(COMMUNITY_DB_PATH),
+        "community_db": "postgres",
+        "database_url_configured": bool(DATABASE_URL),
         "trial_days": TRIAL_DAYS,
         "auth_enabled": bool(JWT_SECRET and len(JWT_SECRET) >= 24),
     }
@@ -661,11 +627,11 @@ def auth_signup(payload: SignupPayload):
         _db_exec(
             """
             INSERT INTO users(email, pass_salt, pass_hash, is_admin, is_disabled, created_at, trial_expires_at)
-            VALUES(?,?,?,?,?,?,?)
+            VALUES(%s,%s,%s,%s,%s,%s,%s)
             """,
             (email, salt, ph, is_admin, 0, now, trial_expires),
         )
-    except sqlite3.IntegrityError:
+    except psycopg.IntegrityError:
         raise HTTPException(status_code=409, detail="Email already exists")
 
     return {"ok": True, "created": True, "email": email, "is_admin": bool(is_admin), "trial_expires_at": trial_expires}
@@ -679,7 +645,7 @@ def auth_login(payload: LoginPayload):
     if not email:
         raise HTTPException(status_code=400, detail="Invalid email")
 
-    row = _db_query_one("SELECT * FROM users WHERE lower(email)=lower(?) LIMIT 1", (email,))
+    row = _db_query_one("SELECT * FROM users WHERE lower(email)=lower(%s) LIMIT 1", (email,))
     if not row:
         raise HTTPException(status_code=401, detail="Invalid email or password")
     if int(row["is_disabled"]) == 1:
@@ -698,7 +664,7 @@ def auth_login(payload: LoginPayload):
 
 
 @app.get("/me")
-def me(user: sqlite3.Row = Depends(require_user)):
+def me(user: Dict[str, Any] = Depends(require_user)):
     return {
         "ok": True,
         "email": user["email"],
@@ -717,18 +683,18 @@ class PresencePayload(BaseModel):
 
 
 @app.post("/presence/update")
-def presence_update(payload: PresencePayload, user: sqlite3.Row = Depends(require_user)):
+def presence_update(payload: PresencePayload, user: Dict[str, Any] = Depends(require_user)):
     now = int(time.time())
     _db_exec(
         """
         INSERT INTO presence(user_id, lat, lng, heading, accuracy, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET
-          lat=excluded.lat,
-          lng=excluded.lng,
-          heading=excluded.heading,
-          accuracy=excluded.accuracy,
-          updated_at=excluded.updated_at
+        VALUES (%s, %s, %s, %s, %s, %s)
+        ON CONFLICT (user_id) DO UPDATE SET
+          lat=EXCLUDED.lat,
+          lng=EXCLUDED.lng,
+          heading=EXCLUDED.heading,
+          accuracy=EXCLUDED.accuracy,
+          updated_at=EXCLUDED.updated_at
         """,
         (int(user["id"]), float(payload.lat), float(payload.lng), payload.heading, payload.accuracy, now),
     )
@@ -743,7 +709,7 @@ def presence_all(max_age_sec: int = PRESENCE_STALE_SECONDS):
         SELECT p.user_id, u.email, p.lat, p.lng, p.heading, p.accuracy, p.updated_at
         FROM presence p
         LEFT JOIN users u ON u.id = p.user_id
-        WHERE p.updated_at >= ?
+        WHERE p.updated_at >= %s
         """,
         (cutoff,),
     )
@@ -766,14 +732,14 @@ class PickupPayload(BaseModel):
 
 
 @app.post("/events/police")
-def report_police(payload: PolicePayload, user: sqlite3.Row = Depends(require_user)):
+def report_police(payload: PolicePayload, user: Dict[str, Any] = Depends(require_user)):
     now = int(time.time())
     expires = now + EVENT_DEFAULT_WINDOW_SECONDS
     txt = (payload.note or "").strip()
     _db_exec(
         """
         INSERT INTO events(type, user_id, lat, lng, text, zone_id, created_at, expires_at)
-        VALUES(?,?,?,?,?,?,?,?)
+        VALUES(%s,%s,%s,%s,%s,%s,%s,%s)
         """,
         ("police", int(user["id"]), float(payload.lat), float(payload.lng), txt, None, now, expires),
     )
@@ -788,7 +754,7 @@ def get_police(window_sec: int = 6 * 3600):
         """
         SELECT id, lat, lng, text, created_at, expires_at
         FROM events
-        WHERE type='police' AND created_at >= ? AND expires_at >= ?
+        WHERE type='police' AND created_at >= %s AND expires_at >= %s
         ORDER BY created_at DESC
         LIMIT 200
         """,
@@ -799,13 +765,13 @@ def get_police(window_sec: int = 6 * 3600):
 
 
 @app.post("/events/pickup")
-def log_pickup(payload: PickupPayload, user: sqlite3.Row = Depends(require_user)):
+def log_pickup(payload: PickupPayload, user: Dict[str, Any] = Depends(require_user)):
     now = int(time.time())
     expires = now + EVENT_DEFAULT_WINDOW_SECONDS
     _db_exec(
         """
         INSERT INTO events(type, user_id, lat, lng, text, zone_id, created_at, expires_at)
-        VALUES(?,?,?,?,?,?,?,?)
+        VALUES(%s,%s,%s,%s,%s,%s,%s,%s)
         """,
         ("pickup", int(user["id"]), float(payload.lat), float(payload.lng), "", payload.zone_id, now, expires),
     )
@@ -815,7 +781,7 @@ def log_pickup(payload: PickupPayload, user: sqlite3.Row = Depends(require_user)
 # ADMIN (manage all accounts)
 # =========================================================
 @app.get("/admin/users")
-def admin_users(admin: sqlite3.Row = Depends(require_admin)):
+def admin_users(admin: Dict[str, Any] = Depends(require_admin)):
     rows = _db_query_all(
         """
         SELECT id, email, is_admin, is_disabled, created_at, trial_expires_at
@@ -833,8 +799,8 @@ class AdminDisablePayload(BaseModel):
 
 
 @app.post("/admin/users/disable")
-def admin_disable_user(payload: AdminDisablePayload, admin: sqlite3.Row = Depends(require_admin)):
-    _db_exec("UPDATE users SET is_disabled=? WHERE id=?", (1 if payload.disabled else 0, int(payload.user_id)))
+def admin_disable_user(payload: AdminDisablePayload, admin: Dict[str, Any] = Depends(require_admin)):
+    _db_exec("UPDATE users SET is_disabled=%s WHERE id=%s", (1 if payload.disabled else 0, int(payload.user_id)))
     return {"ok": True}
 
 
@@ -844,9 +810,9 @@ class AdminResetPayload(BaseModel):
 
 
 @app.post("/admin/users/reset_password")
-def admin_reset_password(payload: AdminResetPayload, admin: sqlite3.Row = Depends(require_admin)):
+def admin_reset_password(payload: AdminResetPayload, admin: Dict[str, Any] = Depends(require_admin)):
     if not payload.new_password or len(payload.new_password) < 6:
         raise HTTPException(status_code=400, detail="Password must be at least 6 chars")
     salt, ph = _hash_password(payload.new_password)
-    _db_exec("UPDATE users SET pass_salt=?, pass_hash=? WHERE id=?", (salt, ph, int(payload.user_id)))
+    _db_exec("UPDATE users SET pass_salt=%s, pass_hash=%s WHERE id=%s", (salt, ph, int(payload.user_id)))
     return {"ok": True}
