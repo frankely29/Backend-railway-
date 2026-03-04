@@ -3,7 +3,6 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
-import imghdr
 import json
 import os
 import secrets
@@ -11,13 +10,11 @@ import sqlite3
 import threading
 import time
 import traceback
-import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from build_hotspot import ensure_zones_geojson, build_hotspots_frames
@@ -33,7 +30,6 @@ DEFAULT_BIN_MINUTES = int(os.environ.get("DEFAULT_BIN_MINUTES", "20"))
 DEFAULT_MIN_TRIPS_PER_WINDOW = int(os.environ.get("DEFAULT_MIN_TRIPS_PER_WINDOW", "25"))
 
 LOCK_PATH = DATA_DIR / ".generate.lock"
-AVATARS_DIR = DATA_DIR / "avatars"
 
 # Community DB (SQLite on Railway Volume)
 COMMUNITY_DB_PATH = Path(os.environ.get("COMMUNITY_DB", str(DATA_DIR / "community.db")))
@@ -248,16 +244,14 @@ def _db_init() -> None:
         CREATE TABLE IF NOT EXISTS users (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           email TEXT NOT NULL UNIQUE,
-          display_name TEXT,                -- public name shown on map
-          avatar_url TEXT,                  -- optional profile photo URL
-          ghost_mode INTEGER NOT NULL DEFAULT 0, -- if 1, user hidden from map
           pass_salt TEXT NOT NULL,
           pass_hash TEXT NOT NULL,
           is_admin INTEGER NOT NULL DEFAULT 0,
           is_disabled INTEGER NOT NULL DEFAULT 0,
           created_at INTEGER NOT NULL,
           trial_expires_at INTEGER NOT NULL
-        );        """
+        );
+        """
     )
     _db_exec(
         """
@@ -290,87 +284,6 @@ def _db_init() -> None:
     )
     _db_exec("CREATE INDEX IF NOT EXISTS idx_events_type_time ON events(type, created_at);")
     _db_exec("CREATE INDEX IF NOT EXISTS idx_events_expires ON events(expires_at);")
-    _db_exec(
-        """
-        CREATE TABLE IF NOT EXISTS chat_messages (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          room TEXT NOT NULL DEFAULT 'global',
-          user_id INTEGER NOT NULL,
-          text TEXT NOT NULL,
-          created_at INTEGER NOT NULL,
-          FOREIGN KEY(user_id) REFERENCES users(id)
-        );
-        """
-    )
-    _db_exec("CREATE INDEX IF NOT EXISTS idx_chat_room_time ON chat_messages(room, created_at);")
-
-def _table_columns(table: str) -> List[str]:
-    rows = _db_query_all(f"PRAGMA table_info({table});")
-    return [str(r["name"]) for r in rows]
-
-def _db_migrate() -> None:
-    """Idempotent schema migrations for existing Railway volumes."""
-    # users: add missing columns safely
-    try:
-        cols = set(_table_columns("users"))
-    except Exception:
-        cols = set()
-
-    if cols:
-        # Add new columns if missing
-        if "display_name" not in cols:
-            _db_exec("ALTER TABLE users ADD COLUMN display_name TEXT;")
-        if "avatar_url" not in cols:
-            _db_exec("ALTER TABLE users ADD COLUMN avatar_url TEXT;")
-        if "ghost_mode" not in cols:
-            _db_exec("ALTER TABLE users ADD COLUMN ghost_mode INTEGER NOT NULL DEFAULT 0;")
-
-        # Handle older broken schema that didn't have pass_salt/pass_hash
-        if "pass_salt" not in cols:
-            _db_exec("ALTER TABLE users ADD COLUMN pass_salt TEXT NOT NULL DEFAULT '';")
-        if "pass_hash" not in cols:
-            _db_exec("ALTER TABLE users ADD COLUMN pass_hash TEXT NOT NULL DEFAULT '';")
-        if "is_admin" not in cols:
-            _db_exec("ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0;")
-        if "is_disabled" not in cols:
-            _db_exec("ALTER TABLE users ADD COLUMN is_disabled INTEGER NOT NULL DEFAULT 0;")
-        if "created_at" not in cols:
-            _db_exec("ALTER TABLE users ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0;")
-        if "trial_expires_at" not in cols:
-            _db_exec("ALTER TABLE users ADD COLUMN trial_expires_at INTEGER NOT NULL DEFAULT 0;")
-
-        # Backfill display_name for existing users
-        _db_exec(
-            "UPDATE users SET display_name = COALESCE(display_name, substr(email, 1, instr(email, '@')-1)) "
-            "WHERE display_name IS NULL OR display_name = '';"
-        )
-
-    # presence: add accuracy column if missing (older db)
-    try:
-        pcols = set(_table_columns("presence"))
-        if "accuracy" not in pcols:
-            _db_exec("ALTER TABLE presence ADD COLUMN accuracy REAL;")
-    except Exception:
-        pass
-
-    # chat_messages: created by newer versions, but ensure if absent in older db volumes.
-    try:
-        _db_exec(
-            """
-            CREATE TABLE IF NOT EXISTS chat_messages (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              room TEXT NOT NULL DEFAULT 'global',
-              user_id INTEGER NOT NULL,
-              text TEXT NOT NULL,
-              created_at INTEGER NOT NULL,
-              FOREIGN KEY(user_id) REFERENCES users(id)
-            );
-            """
-        )
-        _db_exec("CREATE INDEX IF NOT EXISTS idx_chat_room_time ON chat_messages(room, created_at);")
-    except Exception:
-        pass
-
 
 # =========================================================
 # Auth helpers (no external deps)
@@ -529,10 +442,10 @@ def _ensure_admin_seed() -> None:
 
     _db_exec(
         """
-        INSERT INTO users(email, display_name, avatar_url, ghost_mode, pass_salt, pass_hash, is_admin, is_disabled, created_at, trial_expires_at)
-        VALUES(?,?,?,?,?,?,?,?,?,?)
+        INSERT INTO users(email, pass_salt, pass_hash, is_admin, is_disabled, created_at, trial_expires_at)
+        VALUES(?,?,?,?,?,?,?)
         """,
-        (ADMIN_EMAIL, ADMIN_EMAIL.split("@",1)[0], None, 0, salt, ph, 1, 0, now, trial_expires),
+        (ADMIN_EMAIL, salt, ph, 1, 0, now, trial_expires),
     )
 
 
@@ -553,10 +466,8 @@ def _force_admin_email() -> None:
 def startup():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     FRAMES_DIR.mkdir(parents=True, exist_ok=True)
-    AVATARS_DIR.mkdir(parents=True, exist_ok=True)
 
     _db_init()
-    _db_migrate()
     _ensure_user_columns()
     _ensure_admin_seed()
     _force_admin_email()
@@ -591,9 +502,6 @@ def startup():
     except Exception:
         _set_state(state="idle")
 
-
-app.mount("/avatars", StaticFiles(directory=str(AVATARS_DIR)), name="avatars")
-
 # =========================================================
 # Core routes
 # =========================================================
@@ -611,11 +519,8 @@ def root():
             "/auth/signup",
             "/auth/login",
             "/me",
-            "/me/avatar",
             "/presence/update",
             "/presence/all",
-            "/chat/send",
-            "/chat/since",
             "/events/police",
             "/events/pickup",
             "/admin/users",
@@ -713,7 +618,6 @@ async def upload_parquet(file: UploadFile = File(...)):
 class SignupPayload(BaseModel):
     email: str
     password: str
-    display_name: Optional[str] = None  # public name shown on map
     bootstrap_token: Optional[str] = None
 
 
@@ -753,20 +657,13 @@ def auth_signup(payload: SignupPayload):
     is_admin = _decide_admin_for_signup(email, payload.bootstrap_token)
     salt, ph = _hash_password(payload.password)
 
-    display_name = (payload.display_name or "").strip()
-    if not display_name:
-        display_name = email.split("@", 1)[0]
-    # prevent leaking emails as names
-    if "@" in display_name:
-        display_name = display_name.replace("@", "_")
-
     try:
         _db_exec(
             """
-            INSERT INTO users(email, display_name, avatar_url, ghost_mode, pass_salt, pass_hash, is_admin, is_disabled, created_at, trial_expires_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?)
+            INSERT INTO users(email, pass_salt, pass_hash, is_admin, is_disabled, created_at, trial_expires_at)
+            VALUES(?,?,?,?,?,?,?)
             """,
-            (email, display_name, None, 0, salt, ph, is_admin, 0, now, trial_expires),
+            (email, salt, ph, is_admin, 0, now, trial_expires),
         )
     except sqlite3.IntegrityError:
         raise HTTPException(status_code=409, detail="Email already exists")
@@ -807,42 +704,7 @@ def me(user: sqlite3.Row = Depends(require_user)):
         "email": user["email"],
         "is_admin": bool(int(user["is_admin"])),
         "trial_expires_at": int(user["trial_expires_at"]),
-        "display_name": user.get("display_name") if hasattr(user, "get") else user["display_name"],
-        "avatar_url": user.get("avatar_url") if hasattr(user, "get") else user["avatar_url"],
-        "ghost_mode": bool(int(user["ghost_mode"])) if user["ghost_mode"] is not None else False,
     }
-
-
-@app.post("/me/avatar")
-async def upload_my_avatar(file: UploadFile = File(...), user: sqlite3.Row = Depends(require_user)):
-    content = await file.read()
-    if not content:
-        raise HTTPException(status_code=400, detail="Empty upload")
-    if len(content) > 5 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail="Avatar too large (max 5MB)")
-
-    kind = imghdr.what(None, h=content)
-    ext = "jpg" if kind == "jpeg" else kind
-    if ext not in {"jpg", "png", "webp"}:
-        raise HTTPException(status_code=400, detail="Avatar must be jpg, png, or webp")
-
-    filename = f"u{int(user['id'])}_{uuid.uuid4().hex[:10]}.{ext}"
-    target = AVATARS_DIR / filename
-    target.write_bytes(content)
-
-    # Remove older avatars to control storage growth.
-    old = user["avatar_url"]
-    if old and old.startswith("/avatars/"):
-        old_path = AVATARS_DIR / old.replace("/avatars/", "", 1)
-        if old_path.exists() and old_path != target:
-            try:
-                old_path.unlink()
-            except Exception:
-                pass
-
-    avatar_url = f"/avatars/{filename}"
-    _db_exec("UPDATE users SET avatar_url=? WHERE id=?", (avatar_url, int(user["id"])))
-    return {"ok": True, "avatar_url": avatar_url}
 
 # =========================================================
 # PRESENCE
@@ -852,24 +714,11 @@ class PresencePayload(BaseModel):
     lng: float
     heading: Optional[float] = None
     accuracy: Optional[float] = None
-    name: Optional[str] = None          # user's chosen public name
-    ghost_mode: Optional[bool] = None   # if true, hide from map
 
 
 @app.post("/presence/update")
 def presence_update(payload: PresencePayload, user: sqlite3.Row = Depends(require_user)):
     now = int(time.time())
-
-    # Optional: update user's public profile info (name / ghost mode) from the client.
-    if payload.name is not None:
-        dn = str(payload.name).strip()
-        if dn:
-            if "@" in dn:
-                dn = dn.replace("@", "_")
-            _db_exec("UPDATE users SET display_name=? WHERE id=?", (dn[:48], int(user["id"])))
-    if payload.ghost_mode is not None:
-        _db_exec("UPDATE users SET ghost_mode=? WHERE id=?", (1 if payload.ghost_mode else 0, int(user["id"])))
-
     _db_exec(
         """
         INSERT INTO presence(user_id, lat, lng, heading, accuracy, updated_at)
@@ -891,65 +740,12 @@ def presence_all(max_age_sec: int = PRESENCE_STALE_SECONDS):
     cutoff = int(time.time()) - max(5, min(3600, int(max_age_sec)))
     rows = _db_query_all(
         """
-        SELECT p.user_id, u.display_name, u.avatar_url, u.ghost_mode, p.lat, p.lng, p.heading, p.accuracy, p.updated_at
+        SELECT p.user_id, u.email, p.lat, p.lng, p.heading, p.accuracy, p.updated_at
         FROM presence p
         LEFT JOIN users u ON u.id = p.user_id
-        WHERE p.updated_at >= ? AND COALESCE(u.ghost_mode,0)=0
+        WHERE p.updated_at >= ?
         """,
         (cutoff,),
-    )
-    items = [dict(r) for r in rows]
-    return {"ok": True, "count": len(items), "items": items}
-
-# =========================================================
-# CHAT (text-only)
-# =========================================================
-class ChatSendPayload(BaseModel):
-    room: Optional[str] = "global"
-    text: str
-
-
-@app.post("/chat/send")
-def chat_send(payload: ChatSendPayload, user: sqlite3.Row = Depends(require_user)):
-    room = (payload.room or "global").strip().lower()[:64]
-    if not room:
-        room = "global"
-    text = (payload.text or "").strip()
-    if not text:
-        raise HTTPException(status_code=400, detail="text required")
-    if len(text) > 600:
-        raise HTTPException(status_code=400, detail="text too long")
-
-    now = int(time.time())
-    _db_exec(
-        "INSERT INTO chat_messages(room, user_id, text, created_at) VALUES(?,?,?,?)",
-        (room, int(user["id"]), text, now),
-    )
-    row = _db_query_one(
-        "SELECT id FROM chat_messages WHERE room=? AND user_id=? AND created_at=? ORDER BY id DESC LIMIT 1",
-        (room, int(user["id"]), now),
-    )
-    return {"ok": True, "id": int(row["id"]) if row else None, "created_at": now}
-
-
-@app.get("/chat/since")
-def chat_since(room: str = "global", since_id: int = 0, limit: int = 100):
-    room = (room or "global").strip().lower()[:64]
-    lim = max(1, min(200, int(limit)))
-    sid = max(0, int(since_id))
-
-    rows = _db_query_all(
-        """
-        SELECT m.id, m.room, m.user_id, m.text, m.created_at,
-               COALESCE(u.display_name, u.email, 'Driver') AS display_name,
-               u.avatar_url AS avatar_url
-        FROM chat_messages m
-        LEFT JOIN users u ON u.id = m.user_id
-        WHERE m.room = ? AND m.id > ?
-        ORDER BY m.id ASC
-        LIMIT ?
-        """,
-        (room, sid, lim),
     )
     items = [dict(r) for r in rows]
     return {"ok": True, "count": len(items), "items": items}
