@@ -1,20 +1,34 @@
+from __future__ import annotations
+
 import os
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, declarative_base
+from contextlib import contextmanager
+from typing import Iterator, Optional
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+import psycopg2
+import psycopg2.extras
 
-engine = create_engine(
-    DATABASE_URL,
-    pool_pre_ping=True,
-)
 
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
+def _database_url() -> str:
+    url = os.environ.get("DATABASE_URL", "").strip()
+    if not url:
+        raise RuntimeError("DATABASE_URL is not set. Attach Postgres in Railway so DATABASE_URL exists.")
+    # Railway sometimes uses postgres:// which psycopg2 accepts, but keep it safe:
+    if url.startswith("postgres://"):
+        url = "postgresql://" + url[len("postgres://") :]
+    return url
 
-def get_db():
-    db = SessionLocal()
+
+@contextmanager
+def get_db() -> Iterator[psycopg2.extensions.connection]:
+    conn: Optional[psycopg2.extensions.connection] = None
     try:
-        yield db
+        conn = psycopg2.connect(_database_url(), cursor_factory=psycopg2.extras.RealDictCursor)
+        yield conn
+        conn.commit()
+    except Exception:
+        if conn is not None:
+            conn.rollback()
+        raise
     finally:
-        db.close()
+        if conn is not None:
+            conn.close()
