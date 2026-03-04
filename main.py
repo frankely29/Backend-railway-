@@ -64,7 +64,7 @@ _generate_state: Dict[str, Any] = {
 # =========================================================
 # App
 # =========================================================
-app = FastAPI(title="NYC TLC Hotspot Backend", version="2.1")
+app = FastAPI(title="NYC TLC Hotspot Backend", version="2.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -186,7 +186,12 @@ def start_generate(bin_minutes: int, min_trips_per_window: int) -> Dict[str, Any
 
     if _lock_is_present():
         _set_state(state="running", bin_minutes=bin_minutes, min_trips_per_window=min_trips_per_window)
-        return {"ok": True, "state": "running", "bin_minutes": bin_minutes, "min_trips_per_window": min_trips_per_window}
+        return {
+            "ok": True,
+            "state": "running",
+            "bin_minutes": bin_minutes,
+            "min_trips_per_window": min_trips_per_window,
+        }
 
     _write_lock()
     _set_state(state="started", bin_minutes=bin_minutes, min_trips_per_window=min_trips_per_window)
@@ -196,10 +201,12 @@ def start_generate(bin_minutes: int, min_trips_per_window: int) -> Dict[str, Any
 
     return {"ok": True, "state": "started", "bin_minutes": bin_minutes, "min_trips_per_window": min_trips_per_window}
 
+
 # =========================================================
 # Community DB (SQLite)
 # =========================================================
 _db_lock = threading.Lock()
+
 
 def _db() -> sqlite3.Connection:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -238,6 +245,21 @@ def _db_query_all(sql: str, params: Tuple[Any, ...] = ()) -> List[sqlite3.Row]:
             conn.close()
 
 
+def _try_alter(sql: str) -> None:
+    """SQLite: ALTER TABLE ADD COLUMN has no IF NOT EXISTS. This keeps startup safe."""
+    with _db_lock:
+        conn = _db()
+        try:
+            try:
+                conn.execute(sql)
+                conn.commit()
+            except sqlite3.OperationalError:
+                # column likely already exists
+                pass
+        finally:
+            conn.close()
+
+
 def _db_init() -> None:
     _db_exec(
         """
@@ -253,6 +275,20 @@ def _db_init() -> None:
         );
         """
     )
+
+    # ---- MIGRATION: add username + ghost mode (safe) ----
+    _try_alter("ALTER TABLE users ADD COLUMN display_name TEXT;")
+    _try_alter("ALTER TABLE users ADD COLUMN ghost_mode INTEGER NOT NULL DEFAULT 0;")
+
+    # Fill missing display_name for existing users
+    _db_exec(
+        """
+        UPDATE users
+        SET display_name = COALESCE(display_name, substr(email, 1, instr(email, '@')-1))
+        WHERE display_name IS NULL OR trim(display_name) = '';
+        """
+    )
+
     _db_exec(
         """
         CREATE TABLE IF NOT EXISTS presence (
@@ -284,6 +320,7 @@ def _db_init() -> None:
     )
     _db_exec("CREATE INDEX IF NOT EXISTS idx_events_type_time ON events(type, created_at);")
     _db_exec("CREATE INDEX IF NOT EXISTS idx_events_expires ON events(expires_at);")
+
 
 # =========================================================
 # Auth helpers (no external deps)
@@ -401,18 +438,29 @@ def _ensure_admin_seed() -> None:
     if existing:
         if int(existing["is_admin"]) != 1:
             _db_exec("UPDATE users SET is_admin=1, is_disabled=0 WHERE id=?", (int(existing["id"]),))
+        # ensure display_name exists
+        _db_exec(
+            """
+            UPDATE users
+            SET display_name = COALESCE(display_name, substr(email, 1, instr(email, '@')-1))
+            WHERE id=?;
+            """,
+            (int(existing["id"]),),
+        )
         return
 
     now = int(time.time())
     trial_expires = now + TRIAL_DAYS * 86400
     salt, ph = _hash_password(ADMIN_PASSWORD)
+    display_name = ADMIN_EMAIL.split("@")[0] if "@" in ADMIN_EMAIL else "Admin"
     _db_exec(
         """
-        INSERT INTO users(email, pass_salt, pass_hash, is_admin, is_disabled, created_at, trial_expires_at)
-        VALUES(?,?,?,?,?,?,?)
+        INSERT INTO users(email, pass_salt, pass_hash, is_admin, is_disabled, created_at, trial_expires_at, display_name, ghost_mode)
+        VALUES(?,?,?,?,?,?,?,?,?)
         """,
-        (ADMIN_EMAIL, salt, ph, 1, 0, now, trial_expires),
+        (ADMIN_EMAIL, salt, ph, 1, 0, now, trial_expires, display_name, 0),
     )
+
 
 # =========================================================
 # Startup
@@ -454,6 +502,7 @@ def startup():
     except Exception:
         _set_state(state="idle")
 
+
 # =========================================================
 # Core routes
 # =========================================================
@@ -471,6 +520,7 @@ def root():
             "/auth/signup",
             "/auth/login",
             "/me",
+            "/me/update",
             "/presence/update",
             "/presence/all",
             "/events/police",
@@ -564,18 +614,31 @@ async def upload_parquet(file: UploadFile = File(...)):
 
     return {"saved": str(target), "size_mb": round(target.stat().st_size / (1024 * 1024), 2)}
 
+
 # =========================================================
-# AUTH + COMMUNITY (THIS FIXES YOUR 404 /auth/signup)
+# AUTH + COMMUNITY
 # =========================================================
 class SignupPayload(BaseModel):
     email: str
     password: str
+    display_name: Optional[str] = None
     bootstrap_token: Optional[str] = None
 
 
 class LoginPayload(BaseModel):
     email: str
     password: str
+
+
+def _clean_display_name(name: str, email: str) -> str:
+    n = (name or "").strip()
+    if not n:
+        n = (email.split("@")[0] if "@" in email else "Driver")
+    # keep it simple & safe
+    n = " ".join(n.split())
+    if len(n) > 28:
+        n = n[:28]
+    return n
 
 
 def _decide_admin_for_signup(email: str, bootstrap_token: Optional[str]) -> int:
@@ -610,21 +673,41 @@ def auth_signup(payload: SignupPayload):
     trial_expires = now + TRIAL_DAYS * 86400
 
     is_admin = _decide_admin_for_signup(email, payload.bootstrap_token)
+    display_name = _clean_display_name(payload.display_name or "", email)
 
     salt, ph = _hash_password(payload.password)
 
     try:
         _db_exec(
             """
-            INSERT INTO users(email, pass_salt, pass_hash, is_admin, is_disabled, created_at, trial_expires_at)
-            VALUES(?,?,?,?,?,?,?)
+            INSERT INTO users(email, pass_salt, pass_hash, is_admin, is_disabled, created_at, trial_expires_at, display_name, ghost_mode)
+            VALUES(?,?,?,?,?,?,?,?,?)
             """,
-            (email, salt, ph, is_admin, 0, now, trial_expires),
+            (email, salt, ph, is_admin, 0, now, trial_expires, display_name, 0),
         )
     except sqlite3.IntegrityError:
         raise HTTPException(status_code=409, detail="Email already exists")
 
-    return {"ok": True, "created": True, "email": email, "is_admin": bool(is_admin), "trial_expires_at": trial_expires}
+    # IMPORTANT: return token so frontend signup works immediately
+    row = _db_query_one("SELECT * FROM users WHERE lower(email)=lower(?) LIMIT 1", (email,))
+    if not row:
+        raise HTTPException(status_code=500, detail="Signup created user but cannot load it")
+
+    exp = now + TOKEN_TTL_SECONDS
+    token = _make_token({"uid": int(row["id"]), "email": email, "exp": exp})
+
+    return {
+        "ok": True,
+        "created": True,
+        "token": token,
+        "id": int(row["id"]),
+        "email": email,
+        "display_name": row["display_name"],
+        "ghost_mode": bool(int(row.get("ghost_mode", 0))) if hasattr(row, "get") else bool(int(row["ghost_mode"])) if "ghost_mode" in row.keys() else False,
+        "is_admin": bool(is_admin),
+        "trial_expires_at": trial_expires,
+        "exp": exp,
+    }
 
 
 @app.post("/auth/login")
@@ -646,16 +729,87 @@ def auth_login(payload: LoginPayload):
     if not hmac.compare_digest(check, row["pass_hash"]):
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
+    # ensure display_name exists (in case older row)
+    dn = (row["display_name"] or "").strip() if "display_name" in row.keys() else ""
+    if not dn:
+        dn = _clean_display_name("", email)
+        _db_exec("UPDATE users SET display_name=? WHERE id=?", (dn, int(row["id"])))
+
     now = int(time.time())
     exp = now + TOKEN_TTL_SECONDS
     token = _make_token({"uid": int(row["id"]), "email": email, "exp": exp})
 
-    return {"ok": True, "token": token, "email": email, "is_admin": bool(int(row["is_admin"])), "exp": exp}
+    ghost = bool(int(row["ghost_mode"])) if "ghost_mode" in row.keys() and row["ghost_mode"] is not None else False
+
+    return {
+        "ok": True,
+        "token": token,
+        "id": int(row["id"]),
+        "email": email,
+        "display_name": dn,
+        "ghost_mode": ghost,
+        "is_admin": bool(int(row["is_admin"])),
+        "trial_expires_at": int(row["trial_expires_at"]),
+        "exp": exp,
+    }
 
 
 @app.get("/me")
 def me(user: sqlite3.Row = Depends(require_user)):
-    return {"ok": True, "email": user["email"], "is_admin": bool(int(user["is_admin"])), "trial_expires_at": int(user["trial_expires_at"])}
+    dn = (user["display_name"] or "").strip() if "display_name" in user.keys() else ""
+    if not dn:
+        dn = _clean_display_name("", user["email"])
+    ghost = bool(int(user["ghost_mode"])) if "ghost_mode" in user.keys() and user["ghost_mode"] is not None else False
+    return {
+        "ok": True,
+        "id": int(user["id"]),
+        "email": user["email"],
+        "display_name": dn,
+        "ghost_mode": ghost,
+        "is_admin": bool(int(user["is_admin"])),
+        "trial_expires_at": int(user["trial_expires_at"]),
+    }
+
+
+class MeUpdatePayload(BaseModel):
+    display_name: Optional[str] = None
+    ghost_mode: Optional[bool] = None
+
+
+@app.post("/me/update")
+def me_update(payload: MeUpdatePayload, user: sqlite3.Row = Depends(require_user)):
+    # optional endpoint (safe): update username and/or ghost mode
+    new_dn = None
+    if payload.display_name is not None:
+        new_dn = _clean_display_name(payload.display_name, user["email"])
+
+    new_ghost = None
+    if payload.ghost_mode is not None:
+        new_ghost = 1 if bool(payload.ghost_mode) else 0
+
+    if new_dn is None and new_ghost is None:
+        return {"ok": True, "updated": False}
+
+    if new_dn is not None and new_ghost is not None:
+        _db_exec("UPDATE users SET display_name=?, ghost_mode=? WHERE id=?", (new_dn, new_ghost, int(user["id"])))
+    elif new_dn is not None:
+        _db_exec("UPDATE users SET display_name=? WHERE id=?", (new_dn, int(user["id"])))
+    else:
+        _db_exec("UPDATE users SET ghost_mode=? WHERE id=?", (new_ghost, int(user["id"])))
+
+    row = _db_query_one("SELECT id, email, display_name, ghost_mode, is_admin, trial_expires_at FROM users WHERE id=? LIMIT 1", (int(user["id"]),))
+    if not row:
+        return {"ok": True, "updated": True}
+
+    return {
+        "ok": True,
+        "updated": True,
+        "id": int(row["id"]),
+        "email": row["email"],
+        "display_name": (row["display_name"] or _clean_display_name("", row["email"])),
+        "ghost_mode": bool(int(row["ghost_mode"])) if row["ghost_mode"] is not None else False,
+    }
+
 
 # =========================================================
 # PRESENCE
@@ -670,6 +824,8 @@ class PresencePayload(BaseModel):
 @app.post("/presence/update")
 def presence_update(payload: PresencePayload, user: sqlite3.Row = Depends(require_user)):
     now = int(time.time())
+
+    # if ghost mode is on, we still accept updates but do not show in /presence/all
     _db_exec(
         """
         INSERT INTO presence(user_id, lat, lng, heading, accuracy, updated_at)
@@ -687,19 +843,54 @@ def presence_update(payload: PresencePayload, user: sqlite3.Row = Depends(requir
 
 
 @app.get("/presence/all")
-def presence_all(max_age_sec: int = PRESENCE_STALE_SECONDS):
+def presence_all(
+    max_age_sec: int = PRESENCE_STALE_SECONDS,
+    viewer: sqlite3.Row = Depends(require_user),  # REQUIRE AUTH (frontend already sends token)
+):
     cutoff = int(time.time()) - max(5, min(3600, int(max_age_sec)))
     rows = _db_query_all(
         """
-        SELECT p.user_id, u.email, p.lat, p.lng, p.heading, p.accuracy, p.updated_at
+        SELECT
+          p.user_id,
+          u.email,
+          u.display_name,
+          u.ghost_mode,
+          p.lat,
+          p.lng,
+          p.heading,
+          p.accuracy,
+          p.updated_at
         FROM presence p
         LEFT JOIN users u ON u.id = p.user_id
         WHERE p.updated_at >= ?
+          AND COALESCE(u.ghost_mode, 0) = 0
         """,
         (cutoff,),
     )
-    items = [dict(r) for r in rows]
+
+    items: List[Dict[str, Any]] = []
+    for r in rows:
+        email = (r["email"] or "").strip()
+        dn = (r["display_name"] or "").strip()
+        if not dn:
+            dn = _clean_display_name("", email or "Driver")
+
+        items.append(
+            {
+                "user_id": int(r["user_id"]),
+                "email": email,
+                "display_name": dn,
+                "lat": float(r["lat"]),
+                "lng": float(r["lng"]),
+                "heading": float(r["heading"]) if r["heading"] is not None else None,
+                "accuracy": float(r["accuracy"]) if r["accuracy"] is not None else None,
+                "updated_at": int(r["updated_at"]),
+                "updated_at_unix": int(r["updated_at"]),
+            }
+        )
+
     return {"ok": True, "count": len(items), "items": items}
+
 
 # =========================================================
 # EVENTS
@@ -714,6 +905,7 @@ class PickupPayload(BaseModel):
     lat: float
     lng: float
     zone_id: Optional[int] = None
+    # Frontend may send extra fields (frame_time, location_id, zone_name, borough, ts_unix) – pydantic ignores extras by default.
 
 
 @app.post("/events/police")
@@ -762,6 +954,7 @@ def log_pickup(payload: PickupPayload, user: sqlite3.Row = Depends(require_user)
     )
     return {"ok": True}
 
+
 # =========================================================
 # ADMIN (manage all accounts)
 # =========================================================
@@ -769,7 +962,7 @@ def log_pickup(payload: PickupPayload, user: sqlite3.Row = Depends(require_user)
 def admin_users(admin: sqlite3.Row = Depends(require_admin)):
     rows = _db_query_all(
         """
-        SELECT id, email, is_admin, is_disabled, created_at, trial_expires_at
+        SELECT id, email, display_name, ghost_mode, is_admin, is_disabled, created_at, trial_expires_at
         FROM users
         ORDER BY created_at ASC
         """
