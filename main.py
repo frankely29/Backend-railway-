@@ -94,6 +94,47 @@ def _has_frames() -> bool:
         return False
 
 
+def _timeline_ready() -> bool:
+    if _has_frames():
+        return True
+    return _rebuild_timeline_from_frames()
+
+
+def _frame_files() -> List[Path]:
+    if not FRAMES_DIR.exists():
+        return []
+    return sorted([p for p in FRAMES_DIR.glob("frame_*.json") if p.is_file()])
+
+
+def _rebuild_timeline_from_frames() -> bool:
+    """
+    Repair timeline.json from existing frame files.
+    Returns True only when a valid timeline.json was written.
+    """
+    frames = _frame_files()
+    if not frames:
+        return False
+
+    timeline: List[str] = []
+    for frame_path in frames:
+        try:
+            frame_payload = _read_json(frame_path)
+            ts = frame_payload.get("time")
+            if ts:
+                timeline.append(str(ts))
+        except Exception:
+            continue
+
+    if not timeline:
+        return False
+
+    TIMELINE_PATH.write_text(
+        json.dumps({"timeline": timeline, "count": len(timeline)}, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    return True
+
+
 def _read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -441,7 +482,7 @@ def startup():
 
     # Auto-fill generate state if frames already exist
     try:
-        if _has_frames():
+        if _timeline_ready():
             try:
                 tl = _read_json(TIMELINE_PATH)
                 _set_state(
@@ -508,7 +549,7 @@ def status():
         "zones_geojson": zones_path.name if zones_path.exists() else None,
         "zones_present": zones_path.exists(),
         "frames_dir": str(FRAMES_DIR),
-        "has_timeline": _has_frames(),
+        "has_timeline": _timeline_ready(),
         "generate_state": _get_state(),
         "community_db": "postgres",
         "database_url_configured": bool(DATABASE_URL),
@@ -529,14 +570,14 @@ def generate_status():
 
 @app.get("/timeline")
 def timeline():
-    if not _has_frames():
+    if not _timeline_ready():
         raise HTTPException(status_code=404, detail="timeline not ready. Call /generate first.")
     return _read_json(TIMELINE_PATH)
 
 
 @app.get("/frame/{idx}")
 def frame(idx: int):
-    if not _has_frames():
+    if not _timeline_ready():
         raise HTTPException(status_code=404, detail="timeline not ready. Call /generate first.")
     p = FRAMES_DIR / f"frame_{idx:06d}.json"
     if not p.exists():
