@@ -1,10 +1,8 @@
-# models.py
 import uuid
-from datetime import datetime, timezone
-from sqlalchemy import Column, String, DateTime, Float, Integer, ForeignKey, Text, Boolean
-from sqlalchemy.orm import declarative_base
-
-Base = declarative_base()
+from datetime import datetime, timezone, timedelta
+from sqlalchemy import Column, String, DateTime, Float, Integer, ForeignKey, Text
+from sqlalchemy.orm import relationship
+from db import Base
 
 def utcnow():
     return datetime.now(timezone.utc)
@@ -16,7 +14,6 @@ class User(Base):
     password_hash = Column(String, nullable=False)
     display_name = Column(String, nullable=False)
     avatar_url = Column(String, nullable=True)
-    ghost_mode = Column(Boolean, default=False, nullable=False)
     role = Column(String, nullable=False, default="user")
     created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
     last_login_at = Column(DateTime(timezone=True), nullable=True)
@@ -26,7 +23,7 @@ class SubscriptionState(Base):
     user_id = Column(String, ForeignKey("users.id"), primary_key=True)
     trial_start = Column(DateTime(timezone=True), nullable=False)
     trial_end = Column(DateTime(timezone=True), nullable=False)
-    status = Column(String, nullable=False, default="trial")
+    status = Column(String, nullable=False, default="trial")  # trial|active|expired
 
 class Presence(Base):
     __tablename__ = "presence"
