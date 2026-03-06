@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import logging
 import os
 import secrets
 import sqlite3
@@ -31,6 +32,8 @@ from core import (
     _require_jwt_secret,
     require_user,
 )
+
+logger = logging.getLogger(__name__)
 
 # =========================================================
 # Paths (Railway volume)
@@ -1024,6 +1027,8 @@ def _chat_row_to_payload(row: Dict[str, Any]) -> Dict[str, Any]:
 
     item: Dict[str, Any] = {
         "id": int(row["id"]),
+        "sender_id": int(row["user_id"]),
+        "user_id": int(row["user_id"]),
         "display_name": row.get("display_name"),
         "type": row.get("type", "text"),
         "text": row.get("message") if row.get("type", "text") == "text" else None,
@@ -1048,13 +1053,14 @@ def _clean_chat_message(message: str) -> str:
 
 class _VoiceUploadResult(BaseModel):
     ok: bool
-    id: int
+    message: Dict[str, Any]
 
 
 @app.post("/chat/send")
 def chat_send(payload: ChatSendPayload, user: sqlite3.Row = Depends(require_user)):
     message = _clean_chat_message(payload.text)
     room = _normalize_chat_room(payload.room)
+    user_id = int(user["id"])
     display_name = _clean_display_name(user["display_name"] or "", user["email"])
 
     with get_postgres_db() as conn:
@@ -1063,15 +1069,14 @@ def chat_send(payload: ChatSendPayload, user: sqlite3.Row = Depends(require_user
                 """
                 INSERT INTO chat_messages(room, user_id, display_name, message, type, created_at, expires_at)
                 VALUES (%s, %s, %s, %s, 'text', NOW(), NOW() + INTERVAL '24 hours')
-                RETURNING id
+                RETURNING id, user_id, display_name, message, type, audio_path, audio_mime, audio_duration_sec, created_at
                 """,
-                (room, int(user["id"]), display_name, message),
+                (room, user_id, display_name, message),
             )
             row = cur.fetchone()
         conn.commit()
-    new_id = int(row["id"])
 
-    return {"ok": True, "id": new_id}
+    return {"ok": True, "message": _chat_row_to_payload(dict(row))}
 
 
 @app.get("/chat/recent")
@@ -1082,10 +1087,11 @@ def chat_recent(limit: int = 50, room: str = "global", user: sqlite3.Row = Depen
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT id, user_id, display_name, message, type, audio_path, audio_mime, audio_duration_sec, created_at
-                FROM chat_messages
-                WHERE room = %s AND expires_at > NOW()
-                ORDER BY id DESC
+                SELECT m.id, m.user_id, u.display_name, m.message, m.type, m.audio_path, m.audio_mime, m.audio_duration_sec, m.created_at
+                FROM chat_messages m
+                JOIN users u ON u.id = m.user_id
+                WHERE m.room = %s AND m.expires_at > NOW()
+                ORDER BY m.id DESC
                 LIMIT %s
                 """,
                 (safe_room, safe_limit),
@@ -1103,60 +1109,119 @@ async def chat_send_voice(
     user: sqlite3.Row = Depends(require_user),
 ):
     safe_room = _normalize_chat_room(room)
+    user_id = int(user["id"])
     mime = (audio.content_type or "").lower().strip()
-    ext = _voice_ext_for_mime(mime)
+    logger.info(
+        "chat_send_voice start room=%s user_id=%s content_type=%s filename=%s",
+        safe_room,
+        user_id,
+        mime,
+        audio.filename,
+    )
 
     size = 0
-    chunks: List[bytes] = []
-    while True:
-        chunk = await audio.read(64 * 1024)
-        if not chunk:
-            break
-        size += len(chunk)
-        if size > MAX_VOICE_BYTES:
-            raise HTTPException(status_code=413, detail="Voice too large")
-        chunks.append(chunk)
-    body = b"".join(chunks)
-    if not body:
-        raise HTTPException(status_code=400, detail="Audio file is empty")
-
-    with get_postgres_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT created_at FROM chat_messages
-                WHERE user_id = %s AND type = 'voice'
-                ORDER BY created_at DESC
-                LIMIT 1
-                """,
-                (int(user["id"]),),
+    try:
+        ext = _voice_ext_for_mime(mime)
+        chunks: List[bytes] = []
+        while True:
+            chunk = await audio.read(64 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > MAX_VOICE_BYTES:
+                logger.warning(
+                    "chat_send_voice payload too large user_id=%s content_type=%s filename=%s bytes=%s",
+                    user_id,
+                    mime,
+                    audio.filename,
+                    size,
+                )
+                raise HTTPException(status_code=413, detail="Voice too large")
+            chunks.append(chunk)
+        body = b"".join(chunks)
+        if not body:
+            logger.warning(
+                "chat_send_voice empty payload user_id=%s content_type=%s filename=%s bytes=%s",
+                user_id,
+                mime,
+                audio.filename,
+                size,
             )
-            latest_voice = cur.fetchone()
-            if latest_voice:
-                created_at = latest_voice["created_at"]
-                delta = (time.time() - created_at.timestamp()) if hasattr(created_at, "timestamp") else 0
-                if delta < VOICE_RATE_LIMIT_SECONDS:
-                    raise HTTPException(status_code=429, detail="Voice rate limit exceeded")
+            raise HTTPException(status_code=400, detail="Audio file is empty")
 
-            CHAT_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
-            epoch_ms = int(time.time() * 1000)
-            token = secrets.token_hex(4)
-            fname = f"{_safe_room_for_filename(safe_room)}_{int(user['id'])}_{epoch_ms}_{token}.{ext}"
-            target = CHAT_AUDIO_DIR / fname
-            target.write_bytes(body)
+        with get_postgres_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT created_at FROM chat_messages
+                    WHERE user_id = %s AND type = 'voice'
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    (user_id,),
+                )
+                latest_voice = cur.fetchone()
+                if latest_voice:
+                    created_at = latest_voice["created_at"]
+                    delta = (time.time() - created_at.timestamp()) if hasattr(created_at, "timestamp") else 0
+                    if delta < VOICE_RATE_LIMIT_SECONDS:
+                        logger.warning(
+                            "chat_send_voice rate limited user_id=%s content_type=%s filename=%s bytes=%s",
+                            user_id,
+                            mime,
+                            audio.filename,
+                            size,
+                        )
+                        raise HTTPException(status_code=429, detail="Voice rate limit exceeded")
 
-            display_name = _clean_display_name(user["display_name"] or "", user["email"])
-            cur.execute(
-                """
-                INSERT INTO chat_messages(room, user_id, display_name, message, type, audio_path, audio_mime, audio_duration_sec, created_at, expires_at)
-                VALUES (%s, %s, %s, '', 'voice', %s, %s, NULL, NOW(), NOW() + INTERVAL '24 hours')
-                RETURNING id
-                """,
-                (safe_room, int(user["id"]), display_name, str(target), mime),
-            )
-            row = cur.fetchone()
+                CHAT_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+                epoch_ms = int(time.time() * 1000)
+                token = secrets.token_hex(4)
+                fname = f"{_safe_room_for_filename(safe_room)}_{user_id}_{epoch_ms}_{token}.{ext}"
+                target = CHAT_AUDIO_DIR / fname
+                target.write_bytes(body)
 
-    return {"ok": True, "id": int(row["id"])}
+                display_name = _clean_display_name(user["display_name"] or "", user["email"])
+                cur.execute(
+                    """
+                    INSERT INTO chat_messages(room, user_id, display_name, message, type, audio_path, audio_mime, audio_duration_sec, created_at, expires_at)
+                    VALUES (%s, %s, %s, '', 'voice', %s, %s, NULL, NOW(), NOW() + INTERVAL '24 hours')
+                    RETURNING id, user_id, display_name, message, type, audio_path, audio_mime, audio_duration_sec, created_at
+                    """,
+                    (safe_room, user_id, display_name, str(target), mime),
+                )
+                row = cur.fetchone()
+            conn.commit()
+
+        logger.info(
+            "chat_send_voice success user_id=%s content_type=%s filename=%s bytes=%s id=%s",
+            user_id,
+            mime,
+            audio.filename,
+            size,
+            row["id"],
+        )
+        return {"ok": True, "message": _chat_row_to_payload(dict(row))}
+    except HTTPException as exc:
+        logger.warning(
+            "chat_send_voice http error user_id=%s status=%s content_type=%s filename=%s bytes=%s detail=%s",
+            user_id,
+            exc.status_code,
+            mime,
+            audio.filename,
+            size,
+            exc.detail,
+        )
+        raise
+    except Exception:
+        logger.exception(
+            "chat_send_voice crash user_id=%s content_type=%s filename=%s bytes=%s",
+            user_id,
+            mime,
+            audio.filename,
+            size,
+        )
+        raise HTTPException(status_code=500, detail="Voice upload failed")
 
 
 @app.get("/chat/since")
@@ -1179,12 +1244,13 @@ def chat_since(
             if effective_since is not None:
                 cur.execute(
                     """
-                    SELECT id, user_id, display_name, message, type, audio_path, audio_mime, audio_duration_sec, created_at
-                    FROM chat_messages
-                    WHERE room = %s
-                      AND expires_at > NOW()
-                      AND id > %s
-                    ORDER BY id ASC
+                    SELECT m.id, m.user_id, u.display_name, m.message, m.type, m.audio_path, m.audio_mime, m.audio_duration_sec, m.created_at
+                    FROM chat_messages m
+                    JOIN users u ON u.id = m.user_id
+                    WHERE m.room = %s
+                      AND m.expires_at > NOW()
+                      AND m.id > %s
+                    ORDER BY m.id ASC
                     LIMIT %s
                     """,
                     (safe_room, effective_since, safe_limit),
@@ -1192,11 +1258,12 @@ def chat_since(
             else:
                 cur.execute(
                     """
-                    SELECT id, user_id, display_name, message, type, audio_path, audio_mime, audio_duration_sec, created_at
-                    FROM chat_messages
-                    WHERE room = %s
-                      AND expires_at > NOW()
-                    ORDER BY id ASC
+                    SELECT m.id, m.user_id, u.display_name, m.message, m.type, m.audio_path, m.audio_mime, m.audio_duration_sec, m.created_at
+                    FROM chat_messages m
+                    JOIN users u ON u.id = m.user_id
+                    WHERE m.room = %s
+                      AND m.expires_at > NOW()
+                    ORDER BY m.id ASC
                     LIMIT %s
                     """,
                     (safe_room, safe_limit),
