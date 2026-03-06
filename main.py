@@ -119,9 +119,10 @@ cors_origins = _build_cors_origins()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=cors_origins or ["*"],
-    allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type"],
+    allow_origin_regex=r"https://([a-z0-9-]+\.)?github\.io",
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # =========================================================
@@ -1022,7 +1023,7 @@ def _chat_row_to_payload(row: Dict[str, Any]) -> Dict[str, Any]:
 def _clean_chat_message(message: str) -> str:
     cleaned = (message or "").strip()
     if not cleaned:
-        raise HTTPException(status_code=400, detail="Message cannot be empty")
+        raise HTTPException(status_code=422, detail="Message cannot be empty")
     if len(cleaned) > 280:
         raise HTTPException(status_code=400, detail="Message too long (max 280)")
     return cleaned
@@ -1050,6 +1051,7 @@ def chat_send(payload: ChatSendPayload, user: sqlite3.Row = Depends(require_user
                 (room, int(user["id"]), display_name, message),
             )
             row = cur.fetchone()
+        conn.commit()
     new_id = int(row["id"])
 
     return {"ok": True, "id": new_id}
@@ -1149,20 +1151,40 @@ def chat_since(room: str = "global", since_id: int = 0, after_id: Optional[int] 
 
     with get_postgres_db() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT id, user_id, display_name, message, type, audio_path, audio_mime, audio_duration_sec, created_at
-                FROM chat_messages
-                WHERE room = %s AND expires_at > NOW() AND id > %s
-                ORDER BY id ASC
-                LIMIT %s
-                """,
-                (safe_room, effective_since, safe_limit),
-            )
+            if effective_since > 0:
+                cur.execute(
+                    """
+                    SELECT id, user_id, display_name, message, type, audio_path, audio_mime, audio_duration_sec, created_at
+                    FROM chat_messages
+                    WHERE room = %s
+                      AND expires_at > NOW()
+                      AND id > %s
+                    ORDER BY id ASC
+                    LIMIT %s
+                    """,
+                    (safe_room, effective_since, safe_limit),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT id, user_id, display_name, message, type, audio_path, audio_mime, audio_duration_sec, created_at
+                    FROM chat_messages
+                    WHERE room = %s
+                      AND expires_at > NOW()
+                    ORDER BY id ASC
+                    LIMIT %s
+                    """,
+                    (safe_room, safe_limit),
+                )
             rows = cur.fetchall()
 
     items = [_chat_row_to_payload(dict(r)) for r in rows]
-    return {"ok": True, "items": items}
+    return {"ok": True, "items": items, "messages": items}
+
+
+@app.get("/chat/ping")
+def chat_ping():
+    return {"ok": True, "time": int(time.time())}
 
 
 @app.get("/chat/audio/{filename}")
