@@ -355,6 +355,7 @@ def _db_init() -> None:
         WHERE display_name IS NULL OR trim(display_name) = '';
         """
     )
+    _db_exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_display_name_unique_ci ON users(lower(display_name));")
 
     _db_exec(
         """
@@ -725,6 +726,10 @@ def auth_signup(payload: SignupPayload):
     is_admin = _decide_admin_for_signup(email, payload.bootstrap_token)
     display_name = _clean_display_name(payload.display_name or "", email)
 
+    existing_name = _db_query_one("SELECT id FROM users WHERE lower(display_name)=lower(?) LIMIT 1", (display_name,))
+    if existing_name:
+        raise HTTPException(status_code=400, detail="display_name already exists")
+
     salt, ph = _hash_password(payload.password)
 
     try:
@@ -811,13 +816,11 @@ def me(user: sqlite3.Row = Depends(require_user)):
         dn = _clean_display_name("", user["email"])
     ghost = bool(int(user["ghost_mode"])) if "ghost_mode" in user.keys() and user["ghost_mode"] is not None else False
     return {
-        "ok": True,
         "id": int(user["id"]),
         "email": user["email"],
         "display_name": dn,
         "ghost_mode": ghost,
         "is_admin": bool(int(user["is_admin"])),
-        "trial_expires_at": int(user["trial_expires_at"]),
     }
 
 
@@ -832,6 +835,12 @@ def me_update(payload: MeUpdatePayload, user: sqlite3.Row = Depends(require_user
     new_dn = None
     if payload.display_name is not None:
         new_dn = _clean_display_name(payload.display_name, user["email"])
+        existing_name = _db_query_one(
+            "SELECT id FROM users WHERE lower(display_name)=lower(?) AND id<>? LIMIT 1",
+            (new_dn, int(user["id"])),
+        )
+        if existing_name:
+            raise HTTPException(status_code=400, detail="display_name already exists")
 
     new_ghost = None
     if payload.ghost_mode is not None:
@@ -895,11 +904,19 @@ def presence_update(payload: PresencePayload, user: sqlite3.Row = Depends(requir
 @app.get("/presence/all")
 def presence_all(
     max_age_sec: int = PRESENCE_STALE_SECONDS,
+    include_ghost: bool = False,
     viewer: sqlite3.Row = Depends(require_user),  # REQUIRE AUTH (frontend already sends token)
 ):
     cutoff = int(time.time()) - max(5, min(3600, int(max_age_sec)))
+    show_ghost = bool(include_ghost and int(viewer["is_admin"]) == 1)
+
+    where_clause = "WHERE p.updated_at >= ?"
+    params: List[Any] = [cutoff]
+    if not show_ghost:
+        where_clause += " AND COALESCE(u.ghost_mode, 0) = 0"
+
     rows = _db_query_all(
-        """
+        f"""
         SELECT
           p.user_id,
           u.email,
@@ -912,10 +929,9 @@ def presence_all(
           p.updated_at
         FROM presence p
         LEFT JOIN users u ON u.id = p.user_id
-        WHERE p.updated_at >= ?
-          AND COALESCE(u.ghost_mode, 0) = 0
+        {where_clause}
         """,
-        (cutoff,),
+        tuple(params),
     )
 
     items: List[Dict[str, Any]] = []
@@ -930,6 +946,7 @@ def presence_all(
                 "user_id": int(r["user_id"]),
                 "email": email,
                 "display_name": dn,
+                "ghost_mode": bool(int(r["ghost_mode"])) if r["ghost_mode"] is not None else False,
                 "lat": float(r["lat"]),
                 "lng": float(r["lng"]),
                 "heading": float(r["heading"]) if r["heading"] is not None else None,
