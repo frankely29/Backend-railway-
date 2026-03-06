@@ -421,11 +421,12 @@ def _ensure_admin_seed() -> None:
     existing = _db_query_one("SELECT * FROM users WHERE lower(email)=lower(?) LIMIT 1", (ADMIN_EMAIL,))
     if existing:
         if int(existing["is_admin"]) != 1:
-            # Use booleans for Postgres, integers for SQLite
+            # Update flags to match the column type. Postgres may store these as boolean,
+            # SQLite stores them as integers. We cast using SQL to whichever type is stored.
             if DB_BACKEND == "postgres":
-                _db_exec("UPDATE users SET is_admin=true, is_disabled=false WHERE id=?", (int(existing["id"]),))
+                _db_exec("UPDATE users SET is_admin = TRUE, is_disabled = FALSE WHERE id=?", (int(existing["id"]),))
             else:
-                _db_exec("UPDATE users SET is_admin=1, is_disabled=0 WHERE id=?", (int(existing["id"]),))
+                _db_exec("UPDATE users SET is_admin = 1, is_disabled = 0 WHERE id=?", (int(existing["id"]),))
         # ensure display_name exists
         _db_exec(
             """
@@ -441,10 +442,10 @@ def _ensure_admin_seed() -> None:
     trial_expires = now + TRIAL_DAYS * 86400
     salt, ph = _hash_password(ADMIN_PASSWORD)
     display_name = ADMIN_EMAIL.split("@")[0] if "@" in ADMIN_EMAIL else "Admin"
-    # Insert admin user; use booleans for Postgres, integers for SQLite
+    # Insert admin user. Postgres allows boolean values, SQLite uses integers.
     is_admin_val = True if DB_BACKEND == "postgres" else 1
     is_disabled_val = False if DB_BACKEND == "postgres" else 0
-    ghost_mode_val = 0  # always store ghost_mode as integer
+    ghost_mode_val = 0  # ghost_mode is always stored as integer, even in Postgres
     _db_exec(
         """
         INSERT INTO users(email, pass_salt, pass_hash, is_admin, is_disabled, created_at, trial_expires_at, display_name, ghost_mode)
