@@ -427,25 +427,36 @@ def _ensure_admin_seed() -> None:
                 _db_exec("UPDATE users SET is_admin = TRUE, is_disabled = FALSE WHERE id=?", (int(existing["id"]),))
             else:
                 _db_exec("UPDATE users SET is_admin = 1, is_disabled = 0 WHERE id=?", (int(existing["id"]),))
-        # ensure display_name exists
-        _db_exec(
-            """
-            UPDATE users
-            SET display_name = COALESCE(display_name, substr(email, 1, instr(email, '@')-1))
-            WHERE id=?;
-            """,
-            (int(existing["id"]),),
-        )
+        # ensure display_name exists: use SQLite functions for SQLite, PostgreSQL functions for Postgres
+        if DB_BACKEND == "postgres":
+            _db_exec(
+                """
+                UPDATE users
+                SET display_name = COALESCE(display_name, split_part(email, '@', 1))
+                WHERE id=?;
+                """,
+                (int(existing["id"]),),
+            )
+        else:
+            _db_exec(
+                """
+                UPDATE users
+                SET display_name = COALESCE(display_name, substr(email, 1, instr(email, '@')-1))
+                WHERE id=?;
+                """,
+                (int(existing["id"]),),
+            )
         return
 
     now = int(time.time())
     trial_expires = now + TRIAL_DAYS * 86400
     salt, ph = _hash_password(ADMIN_PASSWORD)
     display_name = ADMIN_EMAIL.split("@")[0] if "@" in ADMIN_EMAIL else "Admin"
-    # Insert admin user. Postgres allows boolean values, SQLite uses integers.
+    # Insert admin user; use booleans for Postgres, integers for SQLite.
     is_admin_val = True if DB_BACKEND == "postgres" else 1
     is_disabled_val = False if DB_BACKEND == "postgres" else 0
-    ghost_mode_val = 0  # ghost_mode is always stored as integer, even in Postgres
+    # ghost_mode is always stored as integer in both DB backends; do not use boolean.
+    ghost_mode_val = 0
     _db_exec(
         """
         INSERT INTO users(email, pass_salt, pass_hash, is_admin, is_disabled, created_at, trial_expires_at, display_name, ghost_mode)
