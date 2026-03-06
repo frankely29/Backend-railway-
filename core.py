@@ -152,13 +152,16 @@ def _clean_display_name(name: str, email: str) -> str:
     return n
 
 
-def _hash_password(password: str, salt_b64: Optional[str] = None) -> Tuple[str, str]:
+CURRENT_PBKDF2_ITERATIONS = 200_000
+
+
+def _hash_password(password: str, salt_b64: Optional[str] = None, iterations: int = CURRENT_PBKDF2_ITERATIONS) -> Tuple[str, str]:
     if salt_b64 is None:
         salt = secrets.token_bytes(16)
         salt_b64 = _b64url(salt)
     else:
         salt = _b64url_decode(salt_b64)
-    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 200_000)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, int(iterations))
     return salt_b64, _b64url(dk)
 
 

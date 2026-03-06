@@ -239,8 +239,8 @@ def _db_init() -> None:
               email TEXT NOT NULL UNIQUE,
               pass_salt TEXT NOT NULL,
               pass_hash TEXT NOT NULL,
-              is_admin INTEGER NOT NULL DEFAULT 0,
-              is_disabled INTEGER NOT NULL DEFAULT 0,
+              is_admin BOOLEAN NOT NULL DEFAULT FALSE,
+              is_disabled BOOLEAN NOT NULL DEFAULT FALSE,
               created_at BIGINT NOT NULL,
               trial_expires_at BIGINT NOT NULL
             );
@@ -253,7 +253,19 @@ def _db_init() -> None:
         )
         _try_alter(
             "ALTER TABLE users ADD COLUMN ghost_mode INTEGER NOT NULL DEFAULT 0;",
-            "ALTER TABLE users ADD COLUMN IF NOT EXISTS ghost_mode INTEGER NOT NULL DEFAULT 0;",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS ghost_mode BOOLEAN NOT NULL DEFAULT FALSE;",
+        )
+
+        _db_exec(
+            """
+            ALTER TABLE users
+            ALTER COLUMN is_admin TYPE BOOLEAN USING (CASE WHEN lower(is_admin::text) IN ('1', 't', 'true') THEN TRUE ELSE FALSE END),
+            ALTER COLUMN is_admin SET DEFAULT FALSE,
+            ALTER COLUMN is_disabled TYPE BOOLEAN USING (CASE WHEN lower(is_disabled::text) IN ('1', 't', 'true') THEN TRUE ELSE FALSE END),
+            ALTER COLUMN is_disabled SET DEFAULT FALSE,
+            ALTER COLUMN ghost_mode TYPE BOOLEAN USING (CASE WHEN lower(ghost_mode::text) IN ('1', 't', 'true') THEN TRUE ELSE FALSE END),
+            ALTER COLUMN ghost_mode SET DEFAULT FALSE
+            """
         )
 
         _db_exec(
@@ -400,7 +412,7 @@ def _db_init() -> None:
 # =========================================================
 def require_admin(req: Request) -> sqlite3.Row:
     user = _auth_user_from_request(req)
-    if int(user["is_admin"]) != 1:
+    if _flag_to_int(user["is_admin"]) != 1:
         raise HTTPException(status_code=403, detail="Admin only")
     return user
 
@@ -433,6 +445,14 @@ def _is_bool_column(table: str, column: str) -> bool:
         return False
 
 
+def _flag_to_int(value: Any) -> int:
+    if isinstance(value, bool):
+        return 1 if value else 0
+    if value is None:
+        return 0
+    return int(value)
+
+
 def _ensure_admin_seed() -> None:
     """
     Optional: if ADMIN_EMAIL + ADMIN_PASSWORD are set, ensure that admin exists.
@@ -443,7 +463,7 @@ def _ensure_admin_seed() -> None:
 
     existing = _db_query_one("SELECT * FROM users WHERE lower(email)=lower(?) LIMIT 1", (ADMIN_EMAIL,))
     if existing:
-        if int(existing["is_admin"]) != 1:
+        if _flag_to_int(existing["is_admin"]) != 1:
             admin_is_bool = _is_bool_column("users", "is_admin")
             disabled_is_bool = _is_bool_column("users", "is_disabled")
             is_admin_val = True if admin_is_bool else 1
@@ -737,7 +757,7 @@ def auth_signup(payload: SignupPayload):
         "id": int(row["id"]),
         "email": email,
         "display_name": row["display_name"],
-        "ghost_mode": bool(int(row.get("ghost_mode", 0))) if hasattr(row, "get") else bool(int(row["ghost_mode"])) if "ghost_mode" in row.keys() else False,
+        "ghost_mode": bool(_flag_to_int(row.get("ghost_mode", 0))) if hasattr(row, "get") else bool(_flag_to_int(row["ghost_mode"])) if "ghost_mode" in row.keys() else False,
         "is_admin": bool(is_admin),
         "trial_expires_at": trial_expires,
         "exp": exp,
@@ -755,7 +775,7 @@ def auth_login(payload: LoginPayload):
     row = _db_query_one("SELECT * FROM users WHERE lower(email)=lower(?) LIMIT 1", (email,))
     if not row:
         raise HTTPException(status_code=401, detail="Invalid email or password")
-    if int(row["is_disabled"]) == 1:
+    if _flag_to_int(row["is_disabled"]) == 1:
         raise HTTPException(status_code=403, detail="Account disabled")
 
     # Trim any whitespace/newlines on stored salt and hash; some databases
@@ -763,8 +783,16 @@ def auth_login(payload: LoginPayload):
     salt = (row["pass_salt"] or "").strip()
     stored_hash = (row["pass_hash"] or "").strip()
     _, check = _hash_password(payload.password, salt_b64=salt)
+    matched_legacy = False
     if not hmac.compare_digest(check, stored_hash):
-        raise HTTPException(status_code=401, detail="Invalid email or password")
+        _, legacy_check = _hash_password(payload.password, salt_b64=salt, iterations=100_000)
+        if not hmac.compare_digest(legacy_check, stored_hash):
+            raise HTTPException(status_code=401, detail="Invalid email or password")
+        matched_legacy = True
+
+    if matched_legacy:
+        _, upgraded_hash = _hash_password(payload.password, salt_b64=salt)
+        _db_exec("UPDATE users SET pass_hash=? WHERE id=?", (upgraded_hash, int(row["id"])))
 
     # ensure display_name exists (in case older row)
     dn = (row["display_name"] or "").strip() if "display_name" in row.keys() else ""
@@ -776,7 +804,7 @@ def auth_login(payload: LoginPayload):
     exp = now + TOKEN_TTL_SECONDS
     token = _make_token({"uid": int(row["id"]), "email": email, "exp": exp})
 
-    ghost = bool(int(row["ghost_mode"])) if "ghost_mode" in row.keys() and row["ghost_mode"] is not None else False
+    ghost = bool(_flag_to_int(row["ghost_mode"])) if "ghost_mode" in row.keys() and row["ghost_mode"] is not None else False
 
     return {
         "ok": True,
@@ -785,7 +813,7 @@ def auth_login(payload: LoginPayload):
         "email": email,
         "display_name": dn,
         "ghost_mode": ghost,
-        "is_admin": bool(int(row["is_admin"])),
+        "is_admin": bool(_flag_to_int(row["is_admin"])),
         "trial_expires_at": int(row["trial_expires_at"]),
         "exp": exp,
     }
@@ -796,14 +824,14 @@ def me(user: sqlite3.Row = Depends(require_user)):
     dn = (user["display_name"] or "").strip() if "display_name" in user.keys() else ""
     if not dn:
         dn = _clean_display_name("", user["email"])
-    ghost = bool(int(user["ghost_mode"])) if "ghost_mode" in user.keys() and user["ghost_mode"] is not None else False
+    ghost = bool(_flag_to_int(user["ghost_mode"])) if "ghost_mode" in user.keys() and user["ghost_mode"] is not None else False
     return {
         "ok": True,
         "id": int(user["id"]),
         "email": user["email"],
         "display_name": dn,
         "ghost_mode": ghost,
-        "is_admin": bool(int(user["is_admin"])),
+        "is_admin": bool(_flag_to_int(user["is_admin"])),
         "trial_expires_at": int(user["trial_expires_at"]),
     }
 
@@ -822,7 +850,8 @@ def me_update(payload: MeUpdatePayload, user: sqlite3.Row = Depends(require_user
 
     new_ghost = None
     if payload.ghost_mode is not None:
-        new_ghost = 1 if bool(payload.ghost_mode) else 0
+        ghost_is_bool = _is_bool_column("users", "ghost_mode")
+        new_ghost = bool(payload.ghost_mode) if ghost_is_bool else (1 if bool(payload.ghost_mode) else 0)
 
     if new_dn is None and new_ghost is None:
         return {"ok": True, "updated": False}
@@ -844,7 +873,7 @@ def me_update(payload: MeUpdatePayload, user: sqlite3.Row = Depends(require_user
         "id": int(row["id"]),
         "email": row["email"],
         "display_name": (row["display_name"] or _clean_display_name("", row["email"])),
-        "ghost_mode": bool(int(row["ghost_mode"])) if row["ghost_mode"] is not None else False,
+        "ghost_mode": bool(_flag_to_int(row["ghost_mode"])) if row["ghost_mode"] is not None else False,
     }
 
 
@@ -1093,7 +1122,9 @@ class AdminDisablePayload(BaseModel):
 
 @app.post("/admin/users/disable")
 def admin_disable_user(payload: AdminDisablePayload, admin: sqlite3.Row = Depends(require_admin)):
-    _db_exec("UPDATE users SET is_disabled=? WHERE id=?", (1 if payload.disabled else 0, int(payload.user_id)))
+    disabled_is_bool = _is_bool_column("users", "is_disabled")
+    disabled_value = bool(payload.disabled) if disabled_is_bool else (1 if payload.disabled else 0)
+    _db_exec("UPDATE users SET is_disabled=? WHERE id=?", (disabled_value, int(payload.user_id)))
     return {"ok": True}
 
 
