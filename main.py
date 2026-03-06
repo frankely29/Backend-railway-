@@ -972,7 +972,7 @@ def presence_all(
         FROM presence p
         LEFT JOIN users u ON u.id = p.user_id
         WHERE p.updated_at >= ?
-          AND lower(CAST(COALESCE(u.ghost_mode, 0) AS TEXT)) NOT IN ('1', 't', 'true')
+          AND NOT CAST(COALESCE(u.ghost_mode, 0) AS BOOLEAN)
         """,
         (cutoff,),
     )
