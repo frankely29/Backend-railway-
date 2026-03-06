@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from main import _clean_display_name, _db, _db_lock, _db_query_all, require_user
+from core import _clean_display_name, _db, _db_lock, _db_query_all, require_user
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
