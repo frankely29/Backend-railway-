@@ -1000,7 +1000,7 @@ def _voice_ext_for_mime(mime: str) -> str:
     }
     ext = mapping.get((mime or "").lower())
     if not ext:
-        raise HTTPException(status_code=400, detail="Unsupported audio mime type")
+        raise HTTPException(status_code=415, detail="Unsupported audio type")
     return ext
 
 
@@ -1114,7 +1114,7 @@ async def chat_send_voice(
             break
         size += len(chunk)
         if size > MAX_VOICE_BYTES:
-            raise HTTPException(status_code=413, detail="Audio exceeds max upload size")
+            raise HTTPException(status_code=413, detail="Voice too large")
         chunks.append(chunk)
     body = b"".join(chunks)
     if not body:
