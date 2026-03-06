@@ -712,9 +712,12 @@ def auth_login(payload: LoginPayload):
     if int(row["is_disabled"]) == 1:
         raise HTTPException(status_code=403, detail="Account disabled")
 
-    salt = row["pass_salt"]
+    # Trim any whitespace/newlines on stored salt and hash; some databases
+    # (notably Postgres) may store trailing spaces, causing a mismatch.
+    salt = (row["pass_salt"] or "").strip()
+    stored_hash = (row["pass_hash"] or "").strip()
     _, check = _hash_password(payload.password, salt_b64=salt)
-    if not hmac.compare_digest(check, row["pass_hash"]):
+    if not hmac.compare_digest(check, stored_hash):
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
     # ensure display_name exists (in case older row)
