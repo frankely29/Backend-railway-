@@ -18,7 +18,7 @@ DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 COMMUNITY_DB_PATH = Path(os.environ.get("COMMUNITY_DB", str(DATA_DIR / "community.db")))
 JWT_SECRET = os.environ.get("JWT_SECRET", "")
 
-_db_lock = threading.RLock()
+_db_lock = threading.Lock()
 
 
 def _db() -> sqlite3.Connection:
@@ -102,7 +102,7 @@ def _verify_token(token: str) -> Dict[str, Any]:
 def _auth_user_from_request(req: Request) -> sqlite3.Row:
     auth = req.headers.get("authorization", "")
     if not auth.lower().startswith("bearer "):
-        raise HTTPException(status_code=401, detail="Unauthorized")
+        raise HTTPException(status_code=401, detail="Missing Bearer token")
     token = auth.split(" ", 1)[1].strip()
     payload = _verify_token(token)
     uid = int(payload.get("uid", 0))
