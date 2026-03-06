@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import sqlite3
@@ -14,24 +15,19 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from build_hotspot import ensure_zones_geojson, build_hotspots_frames
-
 from core import (
-    JWT_SECRET,
+    _auth_user_from_request,
     _clean_display_name,
     _db,
     _db_exec,
-    _db_init,
     _db_lock,
     _db_query_all,
     _db_query_one,
     _hash_password,
     _make_token,
-    _parse_token,
     _require_jwt_secret,
-    _verify_password,
     require_user,
 )
-from chat import router as chat_router
 
 # =========================================================
 # Paths (Railway volume)
@@ -45,8 +41,6 @@ DEFAULT_MIN_TRIPS_PER_WINDOW = int(os.environ.get("DEFAULT_MIN_TRIPS_PER_WINDOW"
 
 LOCK_PATH = DATA_DIR / ".generate.lock"
 
-# Community DB (SQLite on Railway Volume)
-COMMUNITY_DB_PATH = Path(os.environ.get("COMMUNITY_DB", str(DATA_DIR / "community.db")))
 
 # Auth / Admin config
 JWT_SECRET = os.environ.get("JWT_SECRET", "")  # REQUIRED (set in Railway)
@@ -87,8 +81,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-app.include_router(chat_router)
 
 # =========================================================
 # Utilities: frames
@@ -219,20 +211,105 @@ def start_generate(bin_minutes: int, min_trips_per_window: int) -> Dict[str, Any
 
 
 # =========================================================
-# Auth/Admin local helpers
+# Community DB (SQLite)
+# =========================================================
+def _try_alter(sql: str) -> None:
+    """SQLite: ALTER TABLE ADD COLUMN has no IF NOT EXISTS. This keeps startup safe."""
+    with _db_lock:
+        conn = _db()
+        try:
+            try:
+                conn.execute(sql)
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass
+        finally:
+            conn.close()
+
+
+def _db_init() -> None:
+    _db_exec(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          email TEXT NOT NULL UNIQUE,
+          pass_salt TEXT NOT NULL,
+          pass_hash TEXT NOT NULL,
+          is_admin INTEGER NOT NULL DEFAULT 0,
+          is_disabled INTEGER NOT NULL DEFAULT 0,
+          created_at INTEGER NOT NULL,
+          trial_expires_at INTEGER NOT NULL
+        );
+        """
+    )
+
+    _try_alter("ALTER TABLE users ADD COLUMN display_name TEXT;")
+    _try_alter("ALTER TABLE users ADD COLUMN ghost_mode INTEGER NOT NULL DEFAULT 0;")
+
+    _db_exec(
+        """
+        UPDATE users
+        SET display_name = COALESCE(display_name, substr(email, 1, instr(email, '@')-1))
+        WHERE display_name IS NULL OR trim(display_name) = '';
+        """
+    )
+
+    _db_exec(
+        """
+        CREATE TABLE IF NOT EXISTS presence (
+          user_id INTEGER PRIMARY KEY,
+          lat REAL NOT NULL,
+          lng REAL NOT NULL,
+          heading REAL,
+          accuracy REAL,
+          updated_at INTEGER NOT NULL,
+          FOREIGN KEY(user_id) REFERENCES users(id)
+        );
+        """
+    )
+    _db_exec(
+        """
+        CREATE TABLE IF NOT EXISTS events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          type TEXT NOT NULL,
+          user_id INTEGER NOT NULL,
+          lat REAL NOT NULL,
+          lng REAL NOT NULL,
+          text TEXT,
+          zone_id INTEGER,
+          created_at INTEGER NOT NULL,
+          expires_at INTEGER NOT NULL,
+          FOREIGN KEY(user_id) REFERENCES users(id)
+        );
+        """
+    )
+    _db_exec("CREATE INDEX IF NOT EXISTS idx_events_type_time ON events(type, created_at);")
+    _db_exec("CREATE INDEX IF NOT EXISTS idx_events_expires ON events(expires_at);")
+
+    _db_exec(
+        """
+        CREATE TABLE IF NOT EXISTS chat_messages (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          room TEXT NOT NULL DEFAULT 'global',
+          user_id INTEGER NOT NULL,
+          display_name TEXT,
+          message TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          FOREIGN KEY(user_id) REFERENCES users(id)
+        );
+        """
+    )
+    _try_alter("ALTER TABLE chat_messages ADD COLUMN room TEXT NOT NULL DEFAULT 'global';")
+    _db_exec("UPDATE chat_messages SET room='global' WHERE room IS NULL OR trim(room)='';")
+    _db_exec("CREATE INDEX IF NOT EXISTS idx_chat_messages_id ON chat_messages(id);")
+    _db_exec("CREATE INDEX IF NOT EXISTS idx_chat_messages_room_id ON chat_messages(room, id);")
+
+
+# =========================================================
+# Auth helpers (no external deps)
 # =========================================================
 def require_admin(req: Request) -> sqlite3.Row:
-    auth = req.headers.get("authorization", "")
-    if not auth.lower().startswith("bearer "):
-        raise HTTPException(status_code=401, detail="Missing Bearer token")
-    token = auth.split(" ", 1)[1].strip()
-    payload = _parse_token(token)
-    uid = int(payload.get("uid", 0))
-    user = _db_query_one("SELECT * FROM users WHERE id=? LIMIT 1", (uid,))
-    if not user:
-        raise HTTPException(status_code=401, detail="User not found")
-    if int(user["is_disabled"]) == 1:
-        raise HTTPException(status_code=403, detail="Account disabled")
+    user = _auth_user_from_request(req)
     if int(user["is_admin"]) != 1:
         raise HTTPException(status_code=403, detail="Admin only")
     return user
@@ -255,6 +332,7 @@ def _ensure_admin_seed() -> None:
     if existing:
         if int(existing["is_admin"]) != 1:
             _db_exec("UPDATE users SET is_admin=1, is_disabled=0 WHERE id=?", (int(existing["id"]),))
+        # ensure display_name exists
         _db_exec(
             """
             UPDATE users
@@ -277,6 +355,10 @@ def _ensure_admin_seed() -> None:
         (ADMIN_EMAIL, salt, ph, 1, 0, now, trial_expires, display_name, 0),
     )
 
+
+from chat import router as chat_router
+
+app.include_router(chat_router)
 
 # =========================================================
 # Startup
@@ -341,6 +423,9 @@ def root():
             "/presence/all",
             "/events/police",
             "/events/pickup",
+            "/chat/send",
+            "/chat/recent",
+            "/chat/since",
             "/admin/users",
             "/admin/users/disable",
             "/admin/users/reset_password",
@@ -350,7 +435,21 @@ def root():
 
 @app.get("/status")
 def status():
-    return {"ok": True, "ts": int(time.time()), "auth_enabled": bool(JWT_SECRET and len(JWT_SECRET) >= 24)}
+    parquets = [p.name for p in _list_parquets()]
+    zones_path = DATA_DIR / "taxi_zones.geojson"
+    return {
+        "status": "ok",
+        "data_dir": str(DATA_DIR),
+        "parquets": parquets,
+        "zones_geojson": zones_path.name if zones_path.exists() else None,
+        "zones_present": zones_path.exists(),
+        "frames_dir": str(FRAMES_DIR),
+        "has_timeline": _has_frames(),
+        "generate_state": _get_state(),
+        "community_db": os.environ.get("COMMUNITY_DB", str(DATA_DIR / "community.db")),
+        "trial_days": TRIAL_DAYS,
+        "auth_enabled": bool(JWT_SECRET and len(JWT_SECRET) >= 24),
+    }
 
 
 @app.get("/generate")
@@ -477,7 +576,7 @@ def auth_signup(payload: SignupPayload):
             (email, salt, ph, is_admin, 0, now, trial_expires, display_name, 0),
         )
     except sqlite3.IntegrityError:
-        raise HTTPException(status_code=409, detail="Email already registered")
+        raise HTTPException(status_code=409, detail="Email already exists")
 
     # IMPORTANT: return token so frontend signup works immediately
     row = _db_query_one("SELECT * FROM users WHERE lower(email)=lower(?) LIMIT 1", (email,))
@@ -515,7 +614,9 @@ def auth_login(payload: LoginPayload):
     if int(row["is_disabled"]) == 1:
         raise HTTPException(status_code=403, detail="Account disabled")
 
-    if not _verify_password(payload.password, row["pass_salt"], row["pass_hash"]):
+    salt = row["pass_salt"]
+    _, check = _hash_password(payload.password, salt_b64=salt)
+    if not hmac.compare_digest(check, row["pass_hash"]):
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
     # ensure display_name exists (in case older row)
@@ -541,33 +642,6 @@ def auth_login(payload: LoginPayload):
         "trial_expires_at": int(row["trial_expires_at"]),
         "exp": exp,
     }
-
-
-class ResetPasswordPayload(BaseModel):
-    email: str
-    new_password: str
-    reset_key: str
-
-
-@app.post("/auth/reset_password")
-def auth_reset_password(payload: ResetPasswordPayload):
-    expected_key = os.environ.get("RESET_KEY", "")
-    if not expected_key or payload.reset_key != expected_key:
-        raise HTTPException(status_code=403, detail="Invalid reset key")
-
-    email = (payload.email or "").strip().lower()
-    if not email or "@" not in email:
-        raise HTTPException(status_code=400, detail="Invalid email")
-    if not payload.new_password or len(payload.new_password) < 6:
-        raise HTTPException(status_code=400, detail="Password must be at least 6 chars")
-
-    row = _db_query_one("SELECT id FROM users WHERE lower(email)=lower(?) LIMIT 1", (email,))
-    if not row:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    new_salt, new_hash = _hash_password(payload.new_password)
-    _db_exec("UPDATE users SET pass_salt=?, pass_hash=? WHERE email=?", (new_salt, new_hash, email))
-    return {"ok": True}
 
 
 @app.get("/me")
@@ -722,6 +796,77 @@ class PickupPayload(BaseModel):
     lng: float
     zone_id: Optional[int] = None
     # Frontend may send extra fields (frame_time, location_id, zone_name, borough, ts_unix) – pydantic ignores extras by default.
+
+
+class ChatSendPayload(BaseModel):
+    message: str
+
+
+def _clean_chat_message(message: str) -> str:
+    cleaned = (message or "").strip()
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="Message cannot be empty")
+    if len(cleaned) > 280:
+        raise HTTPException(status_code=400, detail="Message too long (max 280)")
+    return cleaned
+
+
+@app.post("/chat/send")
+def chat_send(payload: ChatSendPayload, user: sqlite3.Row = Depends(require_user)):
+    now = int(time.time())
+    message = _clean_chat_message(payload.message)
+    display_name = _clean_display_name(user["display_name"] or "", user["email"])
+
+    with _db_lock:
+        conn = _db()
+        try:
+            cur = conn.execute(
+                """
+                INSERT INTO chat_messages(user_id, display_name, message, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (int(user["id"]), display_name, message, now),
+            )
+            conn.commit()
+            new_id = int(cur.lastrowid)
+        finally:
+            conn.close()
+
+    return {"ok": True, "id": new_id, "created_at": now, "display_name": display_name}
+
+
+@app.get("/chat/recent")
+def chat_recent(limit: int = 50, user: sqlite3.Row = Depends(require_user)):
+    safe_limit = max(1, min(200, int(limit)))
+    rows = _db_query_all(
+        """
+        SELECT id, user_id, display_name, message, created_at
+        FROM chat_messages
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (safe_limit,),
+    )
+    items = [dict(r) for r in reversed(rows)]
+    return {"ok": True, "items": items}
+
+
+@app.get("/chat/since")
+def chat_since(after_id: int = 0, limit: int = 50, user: sqlite3.Row = Depends(require_user)):
+    safe_after_id = max(0, int(after_id))
+    safe_limit = max(1, min(200, int(limit)))
+    rows = _db_query_all(
+        """
+        SELECT id, user_id, display_name, message, created_at
+        FROM chat_messages
+        WHERE id > ?
+        ORDER BY id ASC
+        LIMIT ?
+        """,
+        (safe_after_id, safe_limit),
+    )
+    items = [dict(r) for r in rows]
+    return {"ok": True, "items": items}
 
 
 @app.post("/events/police")
