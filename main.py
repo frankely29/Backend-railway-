@@ -410,6 +410,29 @@ def _is_first_user() -> bool:
     return int(row["c"]) == 0 if row else True
 
 
+def _is_bool_column(table: str, column: str) -> bool:
+    """
+    Return True when a Postgres column is defined as boolean.
+    SQLite stores booleans as integers, so always returns False there.
+    """
+    if DB_BACKEND != "postgres":
+        return False
+    try:
+        row = _db_query_one(
+            """
+            SELECT data_type
+            FROM information_schema.columns
+            WHERE table_name=? AND column_name=?
+            LIMIT 1
+            """,
+            (table, column),
+        )
+        data_type = str(row["data_type"]).lower().strip() if row and row["data_type"] is not None else ""
+        return data_type.startswith("bool")
+    except Exception:
+        return False
+
+
 def _ensure_admin_seed() -> None:
     """
     Optional: if ADMIN_EMAIL + ADMIN_PASSWORD are set, ensure that admin exists.
@@ -421,12 +444,14 @@ def _ensure_admin_seed() -> None:
     existing = _db_query_one("SELECT * FROM users WHERE lower(email)=lower(?) LIMIT 1", (ADMIN_EMAIL,))
     if existing:
         if int(existing["is_admin"]) != 1:
-            # Update flags to match the column type. Postgres may store these as boolean,
-            # SQLite stores them as integers. We cast using SQL to whichever type is stored.
-            if DB_BACKEND == "postgres":
-                _db_exec("UPDATE users SET is_admin = TRUE, is_disabled = FALSE WHERE id=?", (int(existing["id"]),))
-            else:
-                _db_exec("UPDATE users SET is_admin = 1, is_disabled = 0 WHERE id=?", (int(existing["id"]),))
+            admin_is_bool = _is_bool_column("users", "is_admin")
+            disabled_is_bool = _is_bool_column("users", "is_disabled")
+            is_admin_val = True if admin_is_bool else 1
+            is_disabled_val = False if disabled_is_bool else 0
+            _db_exec(
+                "UPDATE users SET is_admin=?, is_disabled=? WHERE id=?",
+                (is_admin_val, is_disabled_val, int(existing["id"])),
+            )
         # ensure display_name exists: use SQLite functions for SQLite, PostgreSQL functions for Postgres
         if DB_BACKEND == "postgres":
             _db_exec(
@@ -452,11 +477,13 @@ def _ensure_admin_seed() -> None:
     trial_expires = now + TRIAL_DAYS * 86400
     salt, ph = _hash_password(ADMIN_PASSWORD)
     display_name = ADMIN_EMAIL.split("@")[0] if "@" in ADMIN_EMAIL else "Admin"
-    # Insert admin user; use booleans for Postgres, integers for SQLite.
-    is_admin_val = True if DB_BACKEND == "postgres" else 1
-    is_disabled_val = False if DB_BACKEND == "postgres" else 0
-    # ghost_mode is always stored as integer in both DB backends; do not use boolean.
-    ghost_mode_val = 0
+    # Insert admin user with values that match live column types.
+    admin_is_bool = _is_bool_column("users", "is_admin")
+    disabled_is_bool = _is_bool_column("users", "is_disabled")
+    ghost_is_bool = _is_bool_column("users", "ghost_mode")
+    is_admin_val = True if admin_is_bool else 1
+    is_disabled_val = False if disabled_is_bool else 0
+    ghost_mode_val = False if ghost_is_bool else 0
     _db_exec(
         """
         INSERT INTO users(email, pass_salt, pass_hash, is_admin, is_disabled, created_at, trial_expires_at, display_name, ghost_mode)
@@ -677,13 +704,20 @@ def auth_signup(payload: SignupPayload):
 
     salt, ph = _hash_password(payload.password)
 
+    admin_is_bool = _is_bool_column("users", "is_admin")
+    disabled_is_bool = _is_bool_column("users", "is_disabled")
+    ghost_is_bool = _is_bool_column("users", "ghost_mode")
+    is_admin_val = (True if is_admin else False) if admin_is_bool else (1 if is_admin else 0)
+    is_disabled_val = False if disabled_is_bool else 0
+    ghost_mode_val = False if ghost_is_bool else 0
+
     try:
         _db_exec(
             """
             INSERT INTO users(email, pass_salt, pass_hash, is_admin, is_disabled, created_at, trial_expires_at, display_name, ghost_mode)
             VALUES(?,?,?,?,?,?,?,?,?)
             """,
-            (email, salt, ph, is_admin, 0, now, trial_expires, display_name, 0),
+            (email, salt, ph, is_admin_val, is_disabled_val, now, trial_expires, display_name, ghost_mode_val),
         )
     except sqlite3.IntegrityError:
         raise HTTPException(status_code=409, detail="Email already exists")
