@@ -1,11 +1,8 @@
 from __future__ import annotations
 
-import base64
-import hashlib
 import hmac
 import json
 import os
-import secrets
 import sqlite3
 import threading
 import time
@@ -18,6 +15,19 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from build_hotspot import ensure_zones_geojson, build_hotspots_frames
+from core import (
+    _auth_user_from_request,
+    _clean_display_name,
+    _db,
+    _db_exec,
+    _db_lock,
+    _db_query_all,
+    _db_query_one,
+    _hash_password,
+    _make_token,
+    _require_jwt_secret,
+    require_user,
+)
 
 # =========================================================
 # Paths (Railway volume)
@@ -31,8 +41,6 @@ DEFAULT_MIN_TRIPS_PER_WINDOW = int(os.environ.get("DEFAULT_MIN_TRIPS_PER_WINDOW"
 
 LOCK_PATH = DATA_DIR / ".generate.lock"
 
-# Community DB (SQLite on Railway Volume)
-COMMUNITY_DB_PATH = Path(os.environ.get("COMMUNITY_DB", str(DATA_DIR / "community.db")))
 
 # Auth / Admin config
 JWT_SECRET = os.environ.get("JWT_SECRET", "")  # REQUIRED (set in Railway)
@@ -205,46 +213,6 @@ def start_generate(bin_minutes: int, min_trips_per_window: int) -> Dict[str, Any
 # =========================================================
 # Community DB (SQLite)
 # =========================================================
-_db_lock = threading.Lock()
-
-
-def _db() -> sqlite3.Connection:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(COMMUNITY_DB_PATH), check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def _db_exec(sql: str, params: Tuple[Any, ...] = ()) -> None:
-    with _db_lock:
-        conn = _db()
-        try:
-            conn.execute(sql, params)
-            conn.commit()
-        finally:
-            conn.close()
-
-
-def _db_query_one(sql: str, params: Tuple[Any, ...] = ()) -> Optional[sqlite3.Row]:
-    with _db_lock:
-        conn = _db()
-        try:
-            cur = conn.execute(sql, params)
-            return cur.fetchone()
-        finally:
-            conn.close()
-
-
-def _db_query_all(sql: str, params: Tuple[Any, ...] = ()) -> List[sqlite3.Row]:
-    with _db_lock:
-        conn = _db()
-        try:
-            cur = conn.execute(sql, params)
-            return list(cur.fetchall())
-        finally:
-            conn.close()
-
-
 def _try_alter(sql: str) -> None:
     """SQLite: ALTER TABLE ADD COLUMN has no IF NOT EXISTS. This keeps startup safe."""
     with _db_lock:
@@ -254,7 +222,6 @@ def _try_alter(sql: str) -> None:
                 conn.execute(sql)
                 conn.commit()
             except sqlite3.OperationalError:
-                # column likely already exists
                 pass
         finally:
             conn.close()
@@ -276,11 +243,9 @@ def _db_init() -> None:
         """
     )
 
-    # ---- MIGRATION: add username + ghost mode (safe) ----
     _try_alter("ALTER TABLE users ADD COLUMN display_name TEXT;")
     _try_alter("ALTER TABLE users ADD COLUMN ghost_mode INTEGER NOT NULL DEFAULT 0;")
 
-    # Fill missing display_name for existing users
     _db_exec(
         """
         UPDATE users
@@ -306,12 +271,12 @@ def _db_init() -> None:
         """
         CREATE TABLE IF NOT EXISTS events (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
-          type TEXT NOT NULL,               -- 'police' | 'pickup'
+          type TEXT NOT NULL,
           user_id INTEGER NOT NULL,
           lat REAL NOT NULL,
           lng REAL NOT NULL,
-          text TEXT,                        -- text only
-          zone_id INTEGER,                  -- optional (pickup)
+          text TEXT,
+          zone_id INTEGER,
           created_at INTEGER NOT NULL,
           expires_at INTEGER NOT NULL,
           FOREIGN KEY(user_id) REFERENCES users(id)
@@ -343,100 +308,11 @@ def _db_init() -> None:
 # =========================================================
 # Auth helpers (no external deps)
 # =========================================================
-def _require_jwt_secret() -> None:
-    if not JWT_SECRET or len(JWT_SECRET) < 24:
-        raise HTTPException(
-            status_code=500,
-            detail="Server misconfigured: JWT_SECRET missing/too short. Set JWT_SECRET in Railway variables (>=24 chars).",
-        )
-
-
-def _b64url(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).decode("utf-8").rstrip("=")
-
-
-def _b64url_decode(s: str) -> bytes:
-    pad = "=" * (-len(s) % 4)
-    return base64.urlsafe_b64decode((s + pad).encode("utf-8"))
-
-
-def _sign(data: bytes) -> str:
-    sig = hmac.new(JWT_SECRET.encode("utf-8"), data, hashlib.sha256).digest()
-    return _b64url(sig)
-
-
-def _make_token(payload: Dict[str, Any]) -> str:
-    _require_jwt_secret()
-    header = {"alg": "HS256", "typ": "JWT"}
-    h = _b64url(json.dumps(header, separators=(",", ":")).encode("utf-8"))
-    p = _b64url(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
-    msg = f"{h}.{p}".encode("utf-8")
-    s = _sign(msg)
-    return f"{h}.{p}.{s}"
-
-
-def _verify_token(token: str) -> Dict[str, Any]:
-    _require_jwt_secret()
-    try:
-        h, p, s = token.split(".")
-        msg = f"{h}.{p}".encode("utf-8")
-        expected = _sign(msg)
-        if not hmac.compare_digest(expected, s):
-            raise ValueError("bad signature")
-        payload = json.loads(_b64url_decode(p).decode("utf-8"))
-        exp = int(payload.get("exp", 0))
-        if exp and int(time.time()) > exp:
-            raise ValueError("expired")
-        return payload
-    except HTTPException:
-        raise
-    except Exception:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-
-def _hash_password(password: str, salt_b64: Optional[str] = None) -> Tuple[str, str]:
-    if salt_b64 is None:
-        salt = secrets.token_bytes(16)
-        salt_b64 = _b64url(salt)
-    else:
-        salt = _b64url_decode(salt_b64)
-    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 200_000)
-    return salt_b64, _b64url(dk)
-
-
-def _auth_user_from_request(req: Request) -> sqlite3.Row:
-    auth = req.headers.get("authorization", "")
-    if not auth.lower().startswith("bearer "):
-        raise HTTPException(status_code=401, detail="Missing Bearer token")
-    token = auth.split(" ", 1)[1].strip()
-    payload = _verify_token(token)
-    uid = int(payload.get("uid", 0))
-    row = _db_query_one("SELECT * FROM users WHERE id=? LIMIT 1", (uid,))
-    if not row:
-        raise HTTPException(status_code=401, detail="User not found")
-    if int(row["is_disabled"]) == 1:
-        raise HTTPException(status_code=403, detail="Account disabled")
-    return row
-
-
-def require_user(req: Request) -> sqlite3.Row:
-    user = _auth_user_from_request(req)
-    _enforce_trial_or_admin(user)
-    return user
-
-
 def require_admin(req: Request) -> sqlite3.Row:
     user = _auth_user_from_request(req)
     if int(user["is_admin"]) != 1:
         raise HTTPException(status_code=403, detail="Admin only")
     return user
-
-
-def _enforce_trial_or_admin(user: sqlite3.Row) -> None:
-    if int(user["is_admin"]) == 1:
-        return
-    if int(time.time()) > int(user["trial_expires_at"]):
-        raise HTTPException(status_code=402, detail="Trial expired")
 
 
 def _is_first_user() -> bool:
@@ -570,7 +446,7 @@ def status():
         "frames_dir": str(FRAMES_DIR),
         "has_timeline": _has_frames(),
         "generate_state": _get_state(),
-        "community_db": str(COMMUNITY_DB_PATH),
+        "community_db": os.environ.get("COMMUNITY_DB", str(DATA_DIR / "community.db")),
         "trial_days": TRIAL_DAYS,
         "auth_enabled": bool(JWT_SECRET and len(JWT_SECRET) >= 24),
     }
@@ -653,17 +529,6 @@ class SignupPayload(BaseModel):
 class LoginPayload(BaseModel):
     email: str
     password: str
-
-
-def _clean_display_name(name: str, email: str) -> str:
-    n = (name or "").strip()
-    if not n:
-        n = (email.split("@")[0] if "@" in email else "Driver")
-    # keep it simple & safe
-    n = " ".join(n.split())
-    if len(n) > 28:
-        n = n[:28]
-    return n
 
 
 def _decide_admin_for_signup(email: str, bootstrap_token: Optional[str]) -> int:
