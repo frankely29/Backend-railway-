@@ -18,7 +18,7 @@ DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 COMMUNITY_DB_PATH = Path(os.environ.get("COMMUNITY_DB", str(DATA_DIR / "community.db")))
 JWT_SECRET = os.environ.get("JWT_SECRET", "")
 
-_db_lock = threading.Lock()
+_db_lock = threading.RLock()
 
 
 def _db() -> sqlite3.Connection:
