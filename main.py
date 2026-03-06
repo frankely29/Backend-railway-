@@ -24,6 +24,8 @@ from core import (
     _db_query_all,
     _db_query_one,
     _hash_password,
+    _sql,
+    DB_BACKEND,
     _make_token,
     _require_jwt_secret,
     require_user,
@@ -213,21 +215,109 @@ def start_generate(bin_minutes: int, min_trips_per_window: int) -> Dict[str, Any
 # =========================================================
 # Community DB (SQLite)
 # =========================================================
-def _try_alter(sql: str) -> None:
-    """SQLite: ALTER TABLE ADD COLUMN has no IF NOT EXISTS. This keeps startup safe."""
+def _try_alter(sqlite_sql: str, postgres_sql: Optional[str] = None) -> None:
+    """Best-effort schema updates for SQLite and Postgres."""
+    sql = postgres_sql if DB_BACKEND == "postgres" and postgres_sql else sqlite_sql
     with _db_lock:
         conn = _db()
         try:
             try:
-                conn.execute(sql)
+                conn.cursor().execute(_sql(sql))
                 conn.commit()
-            except sqlite3.OperationalError:
-                pass
+            except Exception:
+                conn.rollback()
         finally:
             conn.close()
 
 
 def _db_init() -> None:
+    if DB_BACKEND == "postgres":
+        _db_exec(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+              id BIGSERIAL PRIMARY KEY,
+              email TEXT NOT NULL UNIQUE,
+              pass_salt TEXT NOT NULL,
+              pass_hash TEXT NOT NULL,
+              is_admin INTEGER NOT NULL DEFAULT 0,
+              is_disabled INTEGER NOT NULL DEFAULT 0,
+              created_at BIGINT NOT NULL,
+              trial_expires_at BIGINT NOT NULL
+            );
+            """
+        )
+
+        _try_alter(
+            "ALTER TABLE users ADD COLUMN display_name TEXT;",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name TEXT;",
+        )
+        _try_alter(
+            "ALTER TABLE users ADD COLUMN ghost_mode INTEGER NOT NULL DEFAULT 0;",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS ghost_mode INTEGER NOT NULL DEFAULT 0;",
+        )
+
+        _db_exec(
+            """
+            UPDATE users
+            SET display_name = COALESCE(display_name, split_part(email, '@', 1))
+            WHERE display_name IS NULL OR btrim(display_name) = '';
+            """
+        )
+
+        _db_exec(
+            """
+            CREATE TABLE IF NOT EXISTS presence (
+              user_id BIGINT PRIMARY KEY,
+              lat DOUBLE PRECISION NOT NULL,
+              lng DOUBLE PRECISION NOT NULL,
+              heading DOUBLE PRECISION,
+              accuracy DOUBLE PRECISION,
+              updated_at BIGINT NOT NULL,
+              FOREIGN KEY(user_id) REFERENCES users(id)
+            );
+            """
+        )
+        _db_exec(
+            """
+            CREATE TABLE IF NOT EXISTS events (
+              id BIGSERIAL PRIMARY KEY,
+              type TEXT NOT NULL,
+              user_id BIGINT NOT NULL,
+              lat DOUBLE PRECISION NOT NULL,
+              lng DOUBLE PRECISION NOT NULL,
+              text TEXT,
+              zone_id INTEGER,
+              created_at BIGINT NOT NULL,
+              expires_at BIGINT NOT NULL,
+              FOREIGN KEY(user_id) REFERENCES users(id)
+            );
+            """
+        )
+        _db_exec("CREATE INDEX IF NOT EXISTS idx_events_type_time ON events(type, created_at);")
+        _db_exec("CREATE INDEX IF NOT EXISTS idx_events_expires ON events(expires_at);")
+
+        _db_exec(
+            """
+            CREATE TABLE IF NOT EXISTS chat_messages (
+              id BIGSERIAL PRIMARY KEY,
+              room TEXT NOT NULL DEFAULT 'global',
+              user_id BIGINT NOT NULL,
+              display_name TEXT,
+              message TEXT NOT NULL,
+              created_at BIGINT NOT NULL,
+              FOREIGN KEY(user_id) REFERENCES users(id)
+            );
+            """
+        )
+        _try_alter(
+            "ALTER TABLE chat_messages ADD COLUMN room TEXT NOT NULL DEFAULT 'global';",
+            "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS room TEXT NOT NULL DEFAULT 'global';",
+        )
+        _db_exec("UPDATE chat_messages SET room='global' WHERE room IS NULL OR btrim(room)='';")
+        _db_exec("CREATE INDEX IF NOT EXISTS idx_chat_messages_id ON chat_messages(id);")
+        _db_exec("CREATE INDEX IF NOT EXISTS idx_chat_messages_room_id ON chat_messages(room, id);")
+        return
+
     _db_exec(
         """
         CREATE TABLE IF NOT EXISTS users (
@@ -715,6 +805,9 @@ class PresencePayload(BaseModel):
 def presence_update(payload: PresencePayload, user: sqlite3.Row = Depends(require_user)):
     now = int(time.time())
 
+    if payload.accuracy is not None and float(payload.accuracy) > 50:
+        return {"ok": True}
+
     # if ghost mode is on, we still accept updates but do not show in /presence/all
     _db_exec(
         """
@@ -820,15 +913,19 @@ def chat_send(payload: ChatSendPayload, user: sqlite3.Row = Depends(require_user
     with _db_lock:
         conn = _db()
         try:
-            cur = conn.execute(
-                """
+            cur = conn.cursor()
+            insert_sql = """
                 INSERT INTO chat_messages(user_id, display_name, message, created_at)
                 VALUES (?, ?, ?, ?)
-                """,
-                (int(user["id"]), display_name, message, now),
-            )
+            """
+            if DB_BACKEND == "postgres":
+                cur.execute(_sql(insert_sql + " RETURNING id"), (int(user["id"]), display_name, message, now))
+                row = cur.fetchone()
+                new_id = int(row["id"])
+            else:
+                cur.execute(_sql(insert_sql), (int(user["id"]), display_name, message, now))
+                new_id = int(cur.lastrowid)
             conn.commit()
-            new_id = int(cur.lastrowid)
         finally:
             conn.close()
 
