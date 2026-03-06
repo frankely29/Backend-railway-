@@ -63,6 +63,36 @@ MAX_VOICE_BYTES = int(os.environ.get("MAX_VOICE_BYTES", "1500000"))
 VOICE_RATE_LIMIT_SECONDS = int(os.environ.get("VOICE_RATE_LIMIT_SECONDS", "10"))
 CHAT_CLEANUP_INTERVAL_SECONDS = 10 * 60
 
+
+def _parse_csv_env(name: str) -> List[str]:
+    raw = os.environ.get(name, "")
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def _build_cors_origins() -> List[str]:
+    origins: List[str] = []
+
+    # Explicitly configured origins always win.
+    origins.extend(_parse_csv_env("CORS_ALLOW_ORIGINS"))
+
+    # Helpful defaults for GitHub Pages deployments.
+    gh_user = os.environ.get("GITHUB_USER", "").strip()
+    gh_repo = os.environ.get("GITHUB_REPO", "").strip()
+    if gh_user:
+        origins.append(f"https://{gh_user}.github.io")
+        if gh_repo:
+            origins.append(f"https://{gh_user}.github.io/{gh_repo}")
+
+    # De-duplicate while preserving order.
+    unique: List[str] = []
+    seen = set()
+    for origin in origins:
+        if origin in seen:
+            continue
+        seen.add(origin)
+        unique.append(origin)
+    return unique
+
 # =========================================================
 # In-memory job state (hotspot generate)
 # =========================================================
@@ -84,12 +114,14 @@ _generate_state: Dict[str, Any] = {
 # =========================================================
 app = FastAPI(title="NYC TLC Hotspot Backend", version="2.2")
 
+cors_origins = _build_cors_origins()
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # lock down later
+    allow_origins=cors_origins or ["*"],
     allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 # =========================================================
