@@ -969,6 +969,23 @@ def _normalize_chat_room(room: Optional[str]) -> str:
     return cleaned
 
 
+def _parse_since_cursor(value: Optional[str]) -> Optional[int]:
+    if value is None:
+        return None
+
+    raw = str(value).strip()
+    if not raw:
+        return None
+
+    if raw.isdigit():
+        return int(raw)
+
+    if raw.startswith("tmp_") and raw[4:].isdigit():
+        return int(raw[4:])
+
+    return None
+
+
 def _chat_expiry_unix(now: Optional[int] = None) -> int:
     ts = int(time.time()) if now is None else int(now)
     return ts + (RETENTION_HOURS * 3600)
@@ -1143,15 +1160,23 @@ async def chat_send_voice(
 
 
 @app.get("/chat/since")
-def chat_since(room: str = "global", since_id: int = 0, after_id: Optional[int] = None, limit: int = 80, user: sqlite3.Row = Depends(require_user)):
+def chat_since(
+    room: str = "global",
+    since_id: Optional[str] = None,
+    after_id: Optional[str] = None,
+    limit: int = 80,
+    user: sqlite3.Row = Depends(require_user),
+):
     _ = user
     safe_room = _normalize_chat_room(room)
-    effective_since = max(0, int(after_id if after_id is not None else since_id))
+    parsed_after_id = _parse_since_cursor(after_id)
+    parsed_since_id = _parse_since_cursor(since_id)
+    effective_since = parsed_after_id if parsed_after_id is not None else parsed_since_id
     safe_limit = max(1, min(200, int(limit)))
 
     with get_postgres_db() as conn:
         with conn.cursor() as cur:
-            if effective_since > 0:
+            if effective_since is not None:
                 cur.execute(
                     """
                     SELECT id, user_id, display_name, message, type, audio_path, audio_mime, audio_duration_sec, created_at
@@ -1179,7 +1204,8 @@ def chat_since(room: str = "global", since_id: int = 0, after_id: Optional[int] 
             rows = cur.fetchall()
 
     items = [_chat_row_to_payload(dict(r)) for r in rows]
-    return {"ok": True, "items": items, "messages": items}
+    last_id = max((int(item["id"]) for item in items), default=effective_since)
+    return {"ok": True, "items": items, "messages": items, "last_id": last_id}
 
 
 @app.get("/chat/ping")
