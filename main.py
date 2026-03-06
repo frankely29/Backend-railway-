@@ -325,6 +325,7 @@ def _db_init() -> None:
         """
         CREATE TABLE IF NOT EXISTS chat_messages (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
+          room TEXT NOT NULL DEFAULT 'global',
           user_id INTEGER NOT NULL,
           display_name TEXT,
           message TEXT NOT NULL,
@@ -333,7 +334,10 @@ def _db_init() -> None:
         );
         """
     )
+    _try_alter("ALTER TABLE chat_messages ADD COLUMN room TEXT NOT NULL DEFAULT 'global';")
+    _db_exec("UPDATE chat_messages SET room='global' WHERE room IS NULL OR trim(room)='';")
     _db_exec("CREATE INDEX IF NOT EXISTS idx_chat_messages_id ON chat_messages(id);")
+    _db_exec("CREATE INDEX IF NOT EXISTS idx_chat_messages_room_id ON chat_messages(room, id);")
 
 
 # =========================================================
@@ -475,6 +479,10 @@ def _ensure_admin_seed() -> None:
         (ADMIN_EMAIL, salt, ph, 1, 0, now, trial_expires, display_name, 0),
     )
 
+
+from chat import router as chat_router
+
+app.include_router(chat_router)
 
 # =========================================================
 # Startup
