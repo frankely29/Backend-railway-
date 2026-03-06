@@ -12,27 +12,40 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from fastapi import HTTPException, Request
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 COMMUNITY_DB_PATH = Path(os.environ.get("COMMUNITY_DB", str(DATA_DIR / "community.db")))
 JWT_SECRET = os.environ.get("JWT_SECRET", "")
+POSTGRES_URL = os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL")
+DB_BACKEND = "postgres" if POSTGRES_URL else "sqlite"
 
 _db_lock = threading.Lock()
 
 
-def _db() -> sqlite3.Connection:
+def _db():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if DB_BACKEND == "postgres":
+        return psycopg2.connect(POSTGRES_URL, cursor_factory=RealDictCursor)
+
     conn = sqlite3.connect(str(COMMUNITY_DB_PATH), check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def _sql(sql: str) -> str:
+    if DB_BACKEND == "postgres":
+        return sql.replace("?", "%s")
+    return sql
 
 
 def _db_exec(sql: str, params: Tuple[Any, ...] = ()) -> None:
     with _db_lock:
         conn = _db()
         try:
-            conn.execute(sql, params)
+            conn.cursor().execute(_sql(sql), params)
             conn.commit()
         finally:
             conn.close()
@@ -42,7 +55,8 @@ def _db_query_one(sql: str, params: Tuple[Any, ...] = ()) -> Optional[sqlite3.Ro
     with _db_lock:
         conn = _db()
         try:
-            cur = conn.execute(sql, params)
+            cur = conn.cursor()
+            cur.execute(_sql(sql), params)
             return cur.fetchone()
         finally:
             conn.close()
@@ -52,7 +66,8 @@ def _db_query_all(sql: str, params: Tuple[Any, ...] = ()) -> List[sqlite3.Row]:
     with _db_lock:
         conn = _db()
         try:
-            cur = conn.execute(sql, params)
+            cur = conn.cursor()
+            cur.execute(_sql(sql), params)
             return list(cur.fetchall())
         finally:
             conn.close()
