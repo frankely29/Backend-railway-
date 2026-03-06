@@ -956,7 +956,7 @@ def presence_all(
     viewer: sqlite3.Row = Depends(require_user),  # REQUIRE AUTH (frontend already sends token)
 ):
     cutoff = int(time.time()) - max(5, min(3600, int(max_age_sec)))
-    # Filter out ghost_mode=TRUE or '1' for both boolean (Postgres) and integer (SQLite).
+    # Filter out ghost_mode enabled users for both boolean (Postgres) and integer (SQLite).
     rows = _db_query_all(
         """
         SELECT
@@ -972,7 +972,7 @@ def presence_all(
         FROM presence p
         LEFT JOIN users u ON u.id = p.user_id
         WHERE p.updated_at >= ?
-          AND NOT CAST(COALESCE(u.ghost_mode, 0) AS BOOLEAN)
+          AND (u.ghost_mode IS NULL OR u.ghost_mode = 0 OR u.ghost_mode = FALSE)
         """,
         (cutoff,),
     )
