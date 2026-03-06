@@ -259,10 +259,14 @@ def _db_init() -> None:
         _db_exec(
             """
             ALTER TABLE users
+            -- Convert is_admin to boolean and reset default
             ALTER COLUMN is_admin TYPE BOOLEAN USING (CASE WHEN lower(is_admin::text) IN ('1', 't', 'true') THEN TRUE ELSE FALSE END),
             ALTER COLUMN is_admin SET DEFAULT FALSE,
+            -- Convert is_disabled to boolean and reset default
             ALTER COLUMN is_disabled TYPE BOOLEAN USING (CASE WHEN lower(is_disabled::text) IN ('1', 't', 'true') THEN TRUE ELSE FALSE END),
             ALTER COLUMN is_disabled SET DEFAULT FALSE,
+            -- Drop ghost_mode default before converting type
+            ALTER COLUMN ghost_mode DROP DEFAULT,
             ALTER COLUMN ghost_mode TYPE BOOLEAN USING (CASE WHEN lower(ghost_mode::text) IN ('1', 't', 'true') THEN TRUE ELSE FALSE END),
             ALTER COLUMN ghost_mode SET DEFAULT FALSE
             """
