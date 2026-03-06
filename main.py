@@ -3,6 +3,7 @@ from __future__ import annotations
 import hmac
 import json
 import os
+import secrets
 import sqlite3
 import threading
 import time
@@ -13,6 +14,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+from db import get_db as get_postgres_db
 
 from build_hotspot import ensure_zones_geojson, build_hotspots_frames
 from core import (
@@ -52,6 +55,13 @@ TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "7"))
 TOKEN_TTL_SECONDS = int(os.environ.get("TOKEN_TTL_SECONDS", str(30 * 24 * 3600)))  # 30 days
 PRESENCE_STALE_SECONDS = int(os.environ.get("PRESENCE_STALE_SECONDS", "300"))  # 5 min
 EVENT_DEFAULT_WINDOW_SECONDS = int(os.environ.get("EVENT_DEFAULT_WINDOW_SECONDS", str(24 * 3600)))  # 24h
+
+CHAT_AUDIO_DIR = Path(os.environ.get("CHAT_AUDIO_DIR", "/data/chat_audio"))
+RETENTION_HOURS = int(os.environ.get("RETENTION_HOURS", "24"))
+MAX_VOICE_SECONDS = int(os.environ.get("MAX_VOICE_SECONDS", "10"))
+MAX_VOICE_BYTES = int(os.environ.get("MAX_VOICE_BYTES", "1500000"))
+VOICE_RATE_LIMIT_SECONDS = int(os.environ.get("VOICE_RATE_LIMIT_SECONDS", "10"))
+CHAT_CLEANUP_INTERVAL_SECONDS = 10 * 60
 
 # =========================================================
 # In-memory job state (hotspot generate)
@@ -227,6 +237,47 @@ def _try_alter(sql: str) -> None:
             conn.close()
 
 
+def _run_postgres_chat_migration() -> None:
+    """Best-effort Postgres migration for Railway deployments; safe to re-run."""
+    if not os.environ.get("DATABASE_URL", "").strip():
+        return
+
+    stmts = [
+        "ALTER TABLE IF EXISTS chat_messages ADD COLUMN IF NOT EXISTS room TEXT NOT NULL DEFAULT 'global';",
+        "ALTER TABLE IF EXISTS chat_messages ADD COLUMN IF NOT EXISTS type TEXT NOT NULL DEFAULT 'text';",
+        "ALTER TABLE IF EXISTS chat_messages ADD COLUMN IF NOT EXISTS audio_path TEXT NULL;",
+        "ALTER TABLE IF EXISTS chat_messages ADD COLUMN IF NOT EXISTS audio_mime TEXT NULL;",
+        "ALTER TABLE IF EXISTS chat_messages ADD COLUMN IF NOT EXISTS audio_duration_sec INTEGER NULL;",
+        "ALTER TABLE IF EXISTS chat_messages ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '24 hours');",
+        "UPDATE chat_messages SET room='global' WHERE room IS NULL OR btrim(room)='';",
+        "UPDATE chat_messages SET type='text' WHERE type IS NULL OR btrim(type)='';",
+        "UPDATE chat_messages SET expires_at=(NOW() + INTERVAL '24 hours') WHERE expires_at IS NULL;",
+        "CREATE INDEX IF NOT EXISTS chat_messages_room_id_idx ON chat_messages(room, id);",
+        "CREATE INDEX IF NOT EXISTS chat_messages_expires_idx ON chat_messages(expires_at);",
+        "CREATE INDEX IF NOT EXISTS chat_messages_user_type_time_idx ON chat_messages(user_id, type, created_at DESC);",
+        """
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conname = 'chat_messages_type_check'
+            ) THEN
+                ALTER TABLE chat_messages
+                ADD CONSTRAINT chat_messages_type_check CHECK (type IN ('text', 'voice'));
+            END IF;
+        END $$;
+        """,
+    ]
+
+    try:
+        with get_postgres_db() as conn:
+            with conn.cursor() as cur:
+                for stmt in stmts:
+                    cur.execute(stmt)
+    except Exception:
+        traceback.print_exc()
+
+
 def _db_init() -> None:
     _db_exec(
         """
@@ -303,6 +354,15 @@ def _db_init() -> None:
     _db_exec("UPDATE chat_messages SET room='global' WHERE room IS NULL OR trim(room)='';")
     _db_exec("CREATE INDEX IF NOT EXISTS idx_chat_messages_id ON chat_messages(id);")
     _db_exec("CREATE INDEX IF NOT EXISTS idx_chat_messages_room_id ON chat_messages(room, id);")
+    _try_alter("ALTER TABLE chat_messages ADD COLUMN type TEXT NOT NULL DEFAULT 'text';")
+    _try_alter("ALTER TABLE chat_messages ADD COLUMN audio_path TEXT;")
+    _try_alter("ALTER TABLE chat_messages ADD COLUMN audio_mime TEXT;")
+    _try_alter("ALTER TABLE chat_messages ADD COLUMN audio_duration_sec INTEGER;")
+    _try_alter("ALTER TABLE chat_messages ADD COLUMN expires_at INTEGER;")
+    _db_exec("UPDATE chat_messages SET type='text' WHERE type IS NULL OR trim(type)='';")
+    _db_exec("UPDATE chat_messages SET expires_at = created_at + (? * 3600) WHERE expires_at IS NULL OR expires_at=0;", (RETENTION_HOURS,))
+    _db_exec("CREATE INDEX IF NOT EXISTS idx_chat_messages_expires ON chat_messages(expires_at);")
+    _db_exec("CREATE INDEX IF NOT EXISTS idx_chat_messages_user_type_time ON chat_messages(user_id, type, created_at DESC);")
 
 
 # =========================================================
@@ -360,6 +420,39 @@ from chat import router as chat_router
 
 app.include_router(chat_router)
 
+def _cleanup_expired_chat_messages_once() -> None:
+    now = int(time.time())
+    voice_rows = _db_query_all(
+        """
+        SELECT id, audio_path
+        FROM chat_messages
+        WHERE expires_at <= ? AND type='voice' AND audio_path IS NOT NULL
+        """,
+        (now,),
+    )
+
+    for row in voice_rows:
+        try:
+            audio_path = row["audio_path"]
+            if audio_path:
+                p = Path(str(audio_path))
+                if p.exists() and p.is_file():
+                    p.unlink()
+        except Exception:
+            traceback.print_exc()
+
+    _db_exec("DELETE FROM chat_messages WHERE expires_at <= ?", (now,))
+
+
+def _chat_cleanup_loop() -> None:
+    while True:
+        try:
+            _cleanup_expired_chat_messages_once()
+        except Exception:
+            traceback.print_exc()
+        time.sleep(CHAT_CLEANUP_INTERVAL_SECONDS)
+
+
 # =========================================================
 # Startup
 # =========================================================
@@ -367,8 +460,13 @@ app.include_router(chat_router)
 def startup():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     FRAMES_DIR.mkdir(parents=True, exist_ok=True)
+    CHAT_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
     _db_init()
+    _run_postgres_chat_migration()
     _ensure_admin_seed()
+
+    cleanup_thread = threading.Thread(target=_chat_cleanup_loop, daemon=True)
+    cleanup_thread.start()
 
     # Auto-fill generate state if frames already exist
     try:
@@ -426,6 +524,8 @@ def root():
             "/chat/send",
             "/chat/recent",
             "/chat/since",
+            "/chat/send_voice",
+            "/chat/audio/{filename}",
             "/admin/users",
             "/admin/users/disable",
             "/admin/users/reset_password",
@@ -800,6 +900,66 @@ class PickupPayload(BaseModel):
 
 class ChatSendPayload(BaseModel):
     message: str
+    room: Optional[str] = "global"
+
+
+def _normalize_chat_room(room: Optional[str]) -> str:
+    cleaned = (room or "global").strip()
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="Room is required")
+    if len(cleaned) > 64:
+        raise HTTPException(status_code=400, detail="Room too long")
+    return cleaned
+
+
+def _assert_chat_enabled_for_user(user: sqlite3.Row) -> None:
+    if "ghost_mode" in user.keys() and user["ghost_mode"] is not None and int(user["ghost_mode"]) == 1:
+        raise HTTPException(status_code=403, detail="Ghost mode enabled")
+
+
+def _chat_expiry_unix(now: Optional[int] = None) -> int:
+    ts = int(time.time()) if now is None else int(now)
+    return ts + (RETENTION_HOURS * 3600)
+
+
+def _voice_ext_for_mime(mime: str) -> str:
+    mapping = {
+        "audio/webm": "webm",
+        "audio/mp4": "mp4",
+        "audio/m4a": "m4a",
+        "audio/aac": "aac",
+    }
+    ext = mapping.get((mime or "").lower())
+    if not ext:
+        raise HTTPException(status_code=400, detail="Unsupported audio mime type")
+    return ext
+
+
+def _safe_room_for_filename(room: str) -> str:
+    chars = []
+    for ch in room.lower():
+        if ch.isalnum() or ch in ("-", "_"):
+            chars.append(ch)
+        else:
+            chars.append("_")
+    collapsed = "".join(chars).strip("_")
+    return collapsed[:32] or "global"
+
+
+def _chat_row_to_payload(row: Dict[str, Any]) -> Dict[str, Any]:
+    item: Dict[str, Any] = {
+        "id": int(row["id"]),
+        "display_name": row.get("display_name"),
+        "type": row.get("type", "text"),
+        "text": row.get("message") if row.get("type", "text") == "text" else None,
+        "created_at": int(row["created_at"]),
+    }
+    if item["type"] == "voice" and row.get("audio_path"):
+        filename = Path(str(row["audio_path"])).name
+        item["audio_url"] = f"/chat/audio/{filename}"
+        item["audio_mime"] = row.get("audio_mime")
+        item["audio_duration_sec"] = row.get("audio_duration_sec")
+    return item
 
 
 def _clean_chat_message(message: str) -> str:
@@ -811,10 +971,17 @@ def _clean_chat_message(message: str) -> str:
     return cleaned
 
 
+class _VoiceUploadResult(BaseModel):
+    ok: bool
+    id: int
+
+
 @app.post("/chat/send")
 def chat_send(payload: ChatSendPayload, user: sqlite3.Row = Depends(require_user)):
+    _assert_chat_enabled_for_user(user)
     now = int(time.time())
     message = _clean_chat_message(payload.message)
+    room = _normalize_chat_room(payload.room)
     display_name = _clean_display_name(user["display_name"] or "", user["email"])
 
     with _db_lock:
@@ -822,10 +989,10 @@ def chat_send(payload: ChatSendPayload, user: sqlite3.Row = Depends(require_user
         try:
             cur = conn.execute(
                 """
-                INSERT INTO chat_messages(user_id, display_name, message, created_at)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO chat_messages(room, user_id, display_name, message, type, created_at, expires_at)
+                VALUES (?, ?, ?, ?, 'text', ?, ?)
                 """,
-                (int(user["id"]), display_name, message, now),
+                (room, int(user["id"]), display_name, message, now, _chat_expiry_unix(now)),
             )
             conn.commit()
             new_id = int(cur.lastrowid)
@@ -836,37 +1003,127 @@ def chat_send(payload: ChatSendPayload, user: sqlite3.Row = Depends(require_user
 
 
 @app.get("/chat/recent")
-def chat_recent(limit: int = 50, user: sqlite3.Row = Depends(require_user)):
+def chat_recent(limit: int = 50, room: str = "global", user: sqlite3.Row = Depends(require_user)):
     safe_limit = max(1, min(200, int(limit)))
+    safe_room = _normalize_chat_room(room)
+    now = int(time.time())
     rows = _db_query_all(
         """
-        SELECT id, user_id, display_name, message, created_at
+        SELECT id, user_id, display_name, message, type, audio_path, audio_mime, audio_duration_sec, created_at
         FROM chat_messages
+        WHERE room = ? AND expires_at > ?
         ORDER BY id DESC
         LIMIT ?
         """,
-        (safe_limit,),
+        (safe_room, now, safe_limit),
     )
-    items = [dict(r) for r in reversed(rows)]
+    items = [_chat_row_to_payload(dict(r)) for r in reversed(rows)]
     return {"ok": True, "items": items}
+
+
+@app.post("/chat/send_voice", response_model=_VoiceUploadResult)
+async def chat_send_voice(room: str, audio: UploadFile = File(...), user: sqlite3.Row = Depends(require_user)):
+    _assert_chat_enabled_for_user(user)
+    safe_room = _normalize_chat_room(room)
+    mime = (audio.content_type or "").lower().strip()
+    ext = _voice_ext_for_mime(mime)
+
+    body = await audio.read()
+    if not body:
+        raise HTTPException(status_code=400, detail="Audio file is empty")
+    if len(body) > MAX_VOICE_BYTES:
+        raise HTTPException(status_code=413, detail="Audio exceeds max upload size")
+
+    now = int(time.time())
+    latest_voice = _db_query_one(
+        """
+        SELECT created_at FROM chat_messages
+        WHERE user_id = ? AND type = 'voice'
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        (int(user["id"]),),
+    )
+    if latest_voice and (now - int(latest_voice["created_at"])) < VOICE_RATE_LIMIT_SECONDS:
+        raise HTTPException(status_code=429, detail="Voice rate limit exceeded")
+
+    CHAT_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+    epoch_ms = int(time.time() * 1000)
+    token = secrets.token_hex(4)
+    fname = f"{_safe_room_for_filename(safe_room)}_{int(user['id'])}_{epoch_ms}_{token}.{ext}"
+    target = CHAT_AUDIO_DIR / fname
+    target.write_bytes(body)
+
+    display_name = _clean_display_name(user["display_name"] or "", user["email"])
+
+    with _db_lock:
+        conn = _db()
+        try:
+            cur = conn.execute(
+                """
+                INSERT INTO chat_messages(room, user_id, display_name, message, type, audio_path, audio_mime, audio_duration_sec, created_at, expires_at)
+                VALUES (?, ?, ?, '', 'voice', ?, ?, NULL, ?, ?)
+                """,
+                (safe_room, int(user["id"]), display_name, str(target), mime, now, _chat_expiry_unix(now)),
+            )
+            conn.commit()
+            new_id = int(cur.lastrowid)
+        finally:
+            conn.close()
+
+    return {"ok": True, "id": new_id}
 
 
 @app.get("/chat/since")
-def chat_since(after_id: int = 0, limit: int = 50, user: sqlite3.Row = Depends(require_user)):
-    safe_after_id = max(0, int(after_id))
+def chat_since(room: str = "global", since_id: int = 0, after_id: Optional[int] = None, limit: int = 80, user: sqlite3.Row = Depends(require_user)):
+    _ = user
+    safe_room = _normalize_chat_room(room)
+    effective_since = max(0, int(after_id if after_id is not None else since_id))
     safe_limit = max(1, min(200, int(limit)))
+    now = int(time.time())
     rows = _db_query_all(
         """
-        SELECT id, user_id, display_name, message, created_at
+        SELECT id, user_id, display_name, message, type, audio_path, audio_mime, audio_duration_sec, created_at
         FROM chat_messages
-        WHERE id > ?
+        WHERE room = ? AND expires_at > ? AND id > ?
         ORDER BY id ASC
         LIMIT ?
         """,
-        (safe_after_id, safe_limit),
+        (safe_room, now, effective_since, safe_limit),
     )
-    items = [dict(r) for r in rows]
+    items = [_chat_row_to_payload(dict(r)) for r in rows]
     return {"ok": True, "items": items}
+
+
+@app.get("/chat/audio/{filename}")
+def chat_audio(filename: str, user: sqlite3.Row = Depends(require_user)):
+    _ = user
+    if "/" in filename or "\\" in filename or ".." in filename:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+
+    now = int(time.time())
+    row = _db_query_one(
+        """
+        SELECT audio_path, audio_mime
+        FROM chat_messages
+        WHERE type='voice' AND expires_at > ? AND audio_path IS NOT NULL
+          AND substr(audio_path, length(audio_path) - length(?) + 1) = ?
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (now, filename, filename),
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Audio not found")
+
+    target = CHAT_AUDIO_DIR / filename
+    if not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail="Audio file missing")
+
+    from fastapi.responses import FileResponse
+
+    media_type = row["audio_mime"] if "audio_mime" in row.keys() and row["audio_mime"] else "application/octet-stream"
+    return FileResponse(path=str(target), media_type=media_type)
 
 
 @app.post("/events/police")
