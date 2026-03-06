@@ -276,8 +276,8 @@ def _try_alter(sql: str) -> None:
 def _db_repair_display_names_for_ci_unique() -> None:
     """Normalize and deduplicate display_name values before creating CI unique index."""
     with _db_lock:
-        _db_exec("UPDATE users SET display_name = COALESCE(display_name,'') WHERE display_name IS NULL;")
         _db_exec("UPDATE users SET display_name = trim(display_name);")
+        _db_exec("UPDATE users SET display_name = '' WHERE display_name IS NULL;")
         _db_exec("UPDATE users SET display_name = 'Driver_' || id WHERE display_name = '';")
 
         rows = _db_query_all(
@@ -392,10 +392,11 @@ def _db_init() -> None:
     # Safe startup path: always create helper non-unique index, and never crash on CI-unique index failure.
     _db_exec("CREATE INDEX IF NOT EXISTS idx_users_display_name_lower ON users(lower(display_name));")
     try:
+        _db_repair_display_names_for_ci_unique()
         _db_exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_display_name_unique_ci ON users(lower(display_name));")
         print("INFO: created CI unique index on users(lower(display_name))")
     except Exception as e:
-        print("WARN: could not create CI unique index (duplicates exist):", e)
+        print("WARN: CI unique index not created:", e)
 
     _db_exec(
         """
