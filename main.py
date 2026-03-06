@@ -321,6 +321,20 @@ def _db_init() -> None:
     _db_exec("CREATE INDEX IF NOT EXISTS idx_events_type_time ON events(type, created_at);")
     _db_exec("CREATE INDEX IF NOT EXISTS idx_events_expires ON events(expires_at);")
 
+    _db_exec(
+        """
+        CREATE TABLE IF NOT EXISTS chat_messages (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id INTEGER NOT NULL,
+          display_name TEXT,
+          message TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          FOREIGN KEY(user_id) REFERENCES users(id)
+        );
+        """
+    )
+    _db_exec("CREATE INDEX IF NOT EXISTS idx_chat_messages_id ON chat_messages(id);")
+
 
 # =========================================================
 # Auth helpers (no external deps)
@@ -525,6 +539,9 @@ def root():
             "/presence/all",
             "/events/police",
             "/events/pickup",
+            "/chat/send",
+            "/chat/recent",
+            "/chat/since",
             "/admin/users",
             "/admin/users/disable",
             "/admin/users/reset_password",
@@ -906,6 +923,77 @@ class PickupPayload(BaseModel):
     lng: float
     zone_id: Optional[int] = None
     # Frontend may send extra fields (frame_time, location_id, zone_name, borough, ts_unix) – pydantic ignores extras by default.
+
+
+class ChatSendPayload(BaseModel):
+    message: str
+
+
+def _clean_chat_message(message: str) -> str:
+    cleaned = (message or "").strip()
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="Message cannot be empty")
+    if len(cleaned) > 280:
+        raise HTTPException(status_code=400, detail="Message too long (max 280)")
+    return cleaned
+
+
+@app.post("/chat/send")
+def chat_send(payload: ChatSendPayload, user: sqlite3.Row = Depends(require_user)):
+    now = int(time.time())
+    message = _clean_chat_message(payload.message)
+    display_name = _clean_display_name(user["display_name"] or "", user["email"])
+
+    with _db_lock:
+        conn = _db()
+        try:
+            cur = conn.execute(
+                """
+                INSERT INTO chat_messages(user_id, display_name, message, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (int(user["id"]), display_name, message, now),
+            )
+            conn.commit()
+            new_id = int(cur.lastrowid)
+        finally:
+            conn.close()
+
+    return {"ok": True, "id": new_id, "created_at": now, "display_name": display_name}
+
+
+@app.get("/chat/recent")
+def chat_recent(limit: int = 50, user: sqlite3.Row = Depends(require_user)):
+    safe_limit = max(1, min(200, int(limit)))
+    rows = _db_query_all(
+        """
+        SELECT id, user_id, display_name, message, created_at
+        FROM chat_messages
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (safe_limit,),
+    )
+    items = [dict(r) for r in reversed(rows)]
+    return {"ok": True, "items": items}
+
+
+@app.get("/chat/since")
+def chat_since(after_id: int = 0, limit: int = 50, user: sqlite3.Row = Depends(require_user)):
+    safe_after_id = max(0, int(after_id))
+    safe_limit = max(1, min(200, int(limit)))
+    rows = _db_query_all(
+        """
+        SELECT id, user_id, display_name, message, created_at
+        FROM chat_messages
+        WHERE id > ?
+        ORDER BY id ASC
+        LIMIT ?
+        """,
+        (safe_after_id, safe_limit),
+    )
+    items = [dict(r) for r in rows]
+    return {"ok": True, "items": items}
 
 
 @app.post("/events/police")
