@@ -968,11 +968,6 @@ def _normalize_chat_room(room: Optional[str]) -> str:
     return cleaned
 
 
-def _assert_chat_enabled_for_user(user: sqlite3.Row) -> None:
-    if "ghost_mode" in user.keys() and user["ghost_mode"] is not None and int(user["ghost_mode"]) == 1:
-        raise HTTPException(status_code=403, detail="Ghost mode enabled")
-
-
 def _chat_expiry_unix(now: Optional[int] = None) -> int:
     ts = int(time.time()) if now is None else int(now)
     return ts + (RETENTION_HOURS * 3600)
@@ -1040,7 +1035,6 @@ class _VoiceUploadResult(BaseModel):
 
 @app.post("/chat/send")
 def chat_send(payload: ChatSendPayload, user: sqlite3.Row = Depends(require_user)):
-    _assert_chat_enabled_for_user(user)
     message = _clean_chat_message(payload.text)
     room = _normalize_chat_room(payload.room)
     display_name = _clean_display_name(user["display_name"] or "", user["email"])
@@ -1089,7 +1083,6 @@ async def chat_send_voice(
     audio: UploadFile = File(...),
     user: sqlite3.Row = Depends(require_user),
 ):
-    _assert_chat_enabled_for_user(user)
     safe_room = _normalize_chat_room(room)
     mime = (audio.content_type or "").lower().strip()
     ext = _voice_ext_for_mime(mime)
