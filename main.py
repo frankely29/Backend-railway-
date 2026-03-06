@@ -887,36 +887,31 @@ def me_update(payload: MeUpdatePayload, user: sqlite3.Row = Depends(require_user
 
 
 @app.post("/me/change_password")
-def change_password(payload: ChangePasswordPayload, user: sqlite3.Row = Depends(require_user)):
-    old_password = (payload.old_password or "").strip()
-    new_password = payload.new_password or ""
-    if not old_password or not new_password:
-        raise HTTPException(status_code=400, detail="old_password and new_password are required")
-
-    row = _db_query_one("SELECT pass_salt, pass_hash FROM users WHERE id=? LIMIT 1", (int(user["id"]),))
+async def change_password(payload: ChangePasswordPayload, user: dict = Depends(require_user)):
+    # Look up current salt and hash for this user
+    row = _db_query_one("SELECT pass_salt, pass_hash FROM users WHERE id=?", (user["id"],))
     if not row:
         raise HTTPException(status_code=404, detail="User not found")
-
+    # Trim stored values and verify current password
     salt = (row["pass_salt"] or "").strip()
     stored_hash = (row["pass_hash"] or "").strip()
-    _, check = _hash_password(old_password, salt_b64=salt)
+    _, check = _hash_password(payload.old_password, salt_b64=salt)
     if not hmac.compare_digest(check, stored_hash):
-        _, legacy_check = _hash_password(old_password, salt_b64=salt, iterations=100_000)
-        if not hmac.compare_digest(legacy_check, stored_hash):
-            raise HTTPException(status_code=401, detail="Incorrect current password")
-
-    new_salt, new_hash = _hash_password(new_password)
-    _db_exec("UPDATE users SET pass_salt=?, pass_hash=? WHERE id=?", (new_salt, new_hash, int(user["id"])))
+        raise HTTPException(status_code=401, detail="Incorrect current password")
+    # Update to new salt and hash
+    new_salt, new_hash = _hash_password(payload.new_password)
+    _db_exec("UPDATE users SET pass_salt=?, pass_hash=? WHERE id=?", (new_salt, new_hash, user["id"]))
     return {"ok": True}
 
 
 @app.post("/me/delete_account")
-def delete_account(user: sqlite3.Row = Depends(require_user)):
-    uid = int(user["id"])
-
+async def delete_account(user: dict = Depends(require_user)):
+    uid = user["id"]
+    # Remove related data
     _db_exec("DELETE FROM presence WHERE user_id=?", (uid,))
     _db_exec("DELETE FROM chat_messages WHERE user_id=?", (uid,))
     _db_exec("DELETE FROM events WHERE user_id=?", (uid,))
+    # Finally remove the user
     _db_exec("DELETE FROM users WHERE id=?", (uid,))
     return {"ok": True}
 
