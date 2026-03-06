@@ -11,7 +11,7 @@ import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Depends
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -243,6 +243,21 @@ def _run_postgres_chat_migration() -> None:
         return
 
     stmts = [
+        """
+        CREATE TABLE IF NOT EXISTS chat_messages (
+            id BIGSERIAL PRIMARY KEY,
+            room TEXT NOT NULL DEFAULT 'global',
+            user_id BIGINT NOT NULL,
+            display_name TEXT,
+            message TEXT NOT NULL DEFAULT '',
+            type TEXT NOT NULL DEFAULT 'text',
+            audio_path TEXT NULL,
+            audio_mime TEXT NULL,
+            audio_duration_sec INTEGER NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            expires_at TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '24 hours')
+        );
+        """,
         "ALTER TABLE IF EXISTS chat_messages ADD COLUMN IF NOT EXISTS room TEXT NOT NULL DEFAULT 'global';",
         "ALTER TABLE IF EXISTS chat_messages ADD COLUMN IF NOT EXISTS type TEXT NOT NULL DEFAULT 'text';",
         "ALTER TABLE IF EXISTS chat_messages ADD COLUMN IF NOT EXISTS audio_path TEXT NULL;",
@@ -421,27 +436,36 @@ from chat import router as chat_router
 app.include_router(chat_router)
 
 def _cleanup_expired_chat_messages_once() -> None:
-    now = int(time.time())
-    voice_rows = _db_query_all(
-        """
-        SELECT id, audio_path
-        FROM chat_messages
-        WHERE expires_at <= ? AND type='voice' AND audio_path IS NOT NULL
-        """,
-        (now,),
-    )
+    expired_paths: List[str] = []
+    try:
+        with get_postgres_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT audio_path
+                    FROM chat_messages
+                    WHERE expires_at <= NOW() AND type='voice' AND audio_path IS NOT NULL
+                    """
+                )
+                expired_paths = [str(r["audio_path"]) for r in cur.fetchall() if r.get("audio_path")]
+    except Exception:
+        traceback.print_exc()
+        return
 
-    for row in voice_rows:
+    for audio_path in expired_paths:
         try:
-            audio_path = row["audio_path"]
-            if audio_path:
-                p = Path(str(audio_path))
-                if p.exists() and p.is_file():
-                    p.unlink()
+            p = Path(audio_path)
+            if p.exists() and p.is_file():
+                p.unlink()
         except Exception:
             traceback.print_exc()
 
-    _db_exec("DELETE FROM chat_messages WHERE expires_at <= ?", (now,))
+    try:
+        with get_postgres_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM chat_messages WHERE expires_at <= NOW()")
+    except Exception:
+        traceback.print_exc()
 
 
 def _chat_cleanup_loop() -> None:
@@ -899,7 +923,7 @@ class PickupPayload(BaseModel):
 
 
 class ChatSendPayload(BaseModel):
-    message: str
+    text: str
     room: Optional[str] = "global"
 
 
@@ -947,12 +971,18 @@ def _safe_room_for_filename(room: str) -> str:
 
 
 def _chat_row_to_payload(row: Dict[str, Any]) -> Dict[str, Any]:
+    created_at = row.get("created_at")
+    if hasattr(created_at, "timestamp"):
+        created_at = int(created_at.timestamp())
+    else:
+        created_at = int(created_at)
+
     item: Dict[str, Any] = {
         "id": int(row["id"]),
         "display_name": row.get("display_name"),
         "type": row.get("type", "text"),
         "text": row.get("message") if row.get("type", "text") == "text" else None,
-        "created_at": int(row["created_at"]),
+        "created_at": created_at,
     }
     if item["type"] == "voice" and row.get("audio_path"):
         filename = Path(str(row["audio_path"])).name
@@ -979,99 +1009,110 @@ class _VoiceUploadResult(BaseModel):
 @app.post("/chat/send")
 def chat_send(payload: ChatSendPayload, user: sqlite3.Row = Depends(require_user)):
     _assert_chat_enabled_for_user(user)
-    now = int(time.time())
-    message = _clean_chat_message(payload.message)
+    message = _clean_chat_message(payload.text)
     room = _normalize_chat_room(payload.room)
     display_name = _clean_display_name(user["display_name"] or "", user["email"])
 
-    with _db_lock:
-        conn = _db()
-        try:
-            cur = conn.execute(
+    with get_postgres_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
                 """
                 INSERT INTO chat_messages(room, user_id, display_name, message, type, created_at, expires_at)
-                VALUES (?, ?, ?, ?, 'text', ?, ?)
+                VALUES (%s, %s, %s, %s, 'text', NOW(), NOW() + INTERVAL '24 hours')
+                RETURNING id
                 """,
-                (room, int(user["id"]), display_name, message, now, _chat_expiry_unix(now)),
+                (room, int(user["id"]), display_name, message),
             )
-            conn.commit()
-            new_id = int(cur.lastrowid)
-        finally:
-            conn.close()
+            row = cur.fetchone()
+    new_id = int(row["id"])
 
-    return {"ok": True, "id": new_id, "created_at": now, "display_name": display_name}
+    return {"ok": True, "id": new_id}
 
 
 @app.get("/chat/recent")
 def chat_recent(limit: int = 50, room: str = "global", user: sqlite3.Row = Depends(require_user)):
     safe_limit = max(1, min(200, int(limit)))
     safe_room = _normalize_chat_room(room)
-    now = int(time.time())
-    rows = _db_query_all(
-        """
-        SELECT id, user_id, display_name, message, type, audio_path, audio_mime, audio_duration_sec, created_at
-        FROM chat_messages
-        WHERE room = ? AND expires_at > ?
-        ORDER BY id DESC
-        LIMIT ?
-        """,
-        (safe_room, now, safe_limit),
-    )
+    with get_postgres_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, user_id, display_name, message, type, audio_path, audio_mime, audio_duration_sec, created_at
+                FROM chat_messages
+                WHERE room = %s AND expires_at > NOW()
+                ORDER BY id DESC
+                LIMIT %s
+                """,
+                (safe_room, safe_limit),
+            )
+            rows = cur.fetchall()
+
     items = [_chat_row_to_payload(dict(r)) for r in reversed(rows)]
     return {"ok": True, "items": items}
 
 
 @app.post("/chat/send_voice", response_model=_VoiceUploadResult)
-async def chat_send_voice(room: str, audio: UploadFile = File(...), user: sqlite3.Row = Depends(require_user)):
+async def chat_send_voice(
+    room: str = Form(...),
+    audio: UploadFile = File(...),
+    user: sqlite3.Row = Depends(require_user),
+):
     _assert_chat_enabled_for_user(user)
     safe_room = _normalize_chat_room(room)
     mime = (audio.content_type or "").lower().strip()
     ext = _voice_ext_for_mime(mime)
 
-    body = await audio.read()
+    size = 0
+    chunks: List[bytes] = []
+    while True:
+        chunk = await audio.read(64 * 1024)
+        if not chunk:
+            break
+        size += len(chunk)
+        if size > MAX_VOICE_BYTES:
+            raise HTTPException(status_code=413, detail="Audio exceeds max upload size")
+        chunks.append(chunk)
+    body = b"".join(chunks)
     if not body:
         raise HTTPException(status_code=400, detail="Audio file is empty")
-    if len(body) > MAX_VOICE_BYTES:
-        raise HTTPException(status_code=413, detail="Audio exceeds max upload size")
 
-    now = int(time.time())
-    latest_voice = _db_query_one(
-        """
-        SELECT created_at FROM chat_messages
-        WHERE user_id = ? AND type = 'voice'
-        ORDER BY created_at DESC
-        LIMIT 1
-        """,
-        (int(user["id"]),),
-    )
-    if latest_voice and (now - int(latest_voice["created_at"])) < VOICE_RATE_LIMIT_SECONDS:
-        raise HTTPException(status_code=429, detail="Voice rate limit exceeded")
+    with get_postgres_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT created_at FROM chat_messages
+                WHERE user_id = %s AND type = 'voice'
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (int(user["id"]),),
+            )
+            latest_voice = cur.fetchone()
+            if latest_voice:
+                created_at = latest_voice["created_at"]
+                delta = (time.time() - created_at.timestamp()) if hasattr(created_at, "timestamp") else 0
+                if delta < VOICE_RATE_LIMIT_SECONDS:
+                    raise HTTPException(status_code=429, detail="Voice rate limit exceeded")
 
-    CHAT_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
-    epoch_ms = int(time.time() * 1000)
-    token = secrets.token_hex(4)
-    fname = f"{_safe_room_for_filename(safe_room)}_{int(user['id'])}_{epoch_ms}_{token}.{ext}"
-    target = CHAT_AUDIO_DIR / fname
-    target.write_bytes(body)
+            CHAT_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+            epoch_ms = int(time.time() * 1000)
+            token = secrets.token_hex(4)
+            fname = f"{_safe_room_for_filename(safe_room)}_{int(user['id'])}_{epoch_ms}_{token}.{ext}"
+            target = CHAT_AUDIO_DIR / fname
+            target.write_bytes(body)
 
-    display_name = _clean_display_name(user["display_name"] or "", user["email"])
-
-    with _db_lock:
-        conn = _db()
-        try:
-            cur = conn.execute(
+            display_name = _clean_display_name(user["display_name"] or "", user["email"])
+            cur.execute(
                 """
                 INSERT INTO chat_messages(room, user_id, display_name, message, type, audio_path, audio_mime, audio_duration_sec, created_at, expires_at)
-                VALUES (?, ?, ?, '', 'voice', ?, ?, NULL, ?, ?)
+                VALUES (%s, %s, %s, '', 'voice', %s, %s, NULL, NOW(), NOW() + INTERVAL '24 hours')
+                RETURNING id
                 """,
-                (safe_room, int(user["id"]), display_name, str(target), mime, now, _chat_expiry_unix(now)),
+                (safe_room, int(user["id"]), display_name, str(target), mime),
             )
-            conn.commit()
-            new_id = int(cur.lastrowid)
-        finally:
-            conn.close()
+            row = cur.fetchone()
 
-    return {"ok": True, "id": new_id}
+    return {"ok": True, "id": int(row["id"])}
 
 
 @app.get("/chat/since")
@@ -1080,17 +1121,21 @@ def chat_since(room: str = "global", since_id: int = 0, after_id: Optional[int] 
     safe_room = _normalize_chat_room(room)
     effective_since = max(0, int(after_id if after_id is not None else since_id))
     safe_limit = max(1, min(200, int(limit)))
-    now = int(time.time())
-    rows = _db_query_all(
-        """
-        SELECT id, user_id, display_name, message, type, audio_path, audio_mime, audio_duration_sec, created_at
-        FROM chat_messages
-        WHERE room = ? AND expires_at > ? AND id > ?
-        ORDER BY id ASC
-        LIMIT ?
-        """,
-        (safe_room, now, effective_since, safe_limit),
-    )
+
+    with get_postgres_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, user_id, display_name, message, type, audio_path, audio_mime, audio_duration_sec, created_at
+                FROM chat_messages
+                WHERE room = %s AND expires_at > NOW() AND id > %s
+                ORDER BY id ASC
+                LIMIT %s
+                """,
+                (safe_room, effective_since, safe_limit),
+            )
+            rows = cur.fetchall()
+
     items = [_chat_row_to_payload(dict(r)) for r in rows]
     return {"ok": True, "items": items}
 
@@ -1101,18 +1146,21 @@ def chat_audio(filename: str, user: sqlite3.Row = Depends(require_user)):
     if "/" in filename or "\\" in filename or ".." in filename:
         raise HTTPException(status_code=400, detail="Invalid filename")
 
-    now = int(time.time())
-    row = _db_query_one(
-        """
-        SELECT audio_path, audio_mime
-        FROM chat_messages
-        WHERE type='voice' AND expires_at > ? AND audio_path IS NOT NULL
-          AND substr(audio_path, length(audio_path) - length(?) + 1) = ?
-        ORDER BY id DESC
-        LIMIT 1
-        """,
-        (now, filename, filename),
-    )
+    with get_postgres_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT audio_path, audio_mime
+                FROM chat_messages
+                WHERE type='voice' AND expires_at > NOW() AND audio_path IS NOT NULL
+                  AND split_part(audio_path, '/', array_length(string_to_array(audio_path, '/'), 1)) = %s
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (filename,),
+            )
+            row = cur.fetchone()
+
     if not row:
         raise HTTPException(status_code=404, detail="Audio not found")
 
@@ -1122,7 +1170,7 @@ def chat_audio(filename: str, user: sqlite3.Row = Depends(require_user)):
 
     from fastapi.responses import FileResponse
 
-    media_type = row["audio_mime"] if "audio_mime" in row.keys() and row["audio_mime"] else "application/octet-stream"
+    media_type = row.get("audio_mime") or "application/octet-stream"
     return FileResponse(path=str(target), media_type=media_type)
 
 
