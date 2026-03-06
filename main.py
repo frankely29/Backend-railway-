@@ -273,6 +273,39 @@ def _try_alter(sql: str) -> None:
             conn.close()
 
 
+def _db_repair_display_names_for_ci_unique() -> None:
+    """Normalize and deduplicate display_name values before creating CI unique index."""
+    with _db_lock:
+        _db_exec("UPDATE users SET display_name = COALESCE(display_name,'') WHERE display_name IS NULL;")
+        _db_exec("UPDATE users SET display_name = trim(display_name);")
+        _db_exec("UPDATE users SET display_name = 'Driver_' || id WHERE display_name = '';")
+
+        rows = _db_query_all(
+            """
+            SELECT lower(display_name) AS k,
+                   MIN(id) AS keep_id,
+                   group_concat(id) AS ids,
+                   COUNT(*) AS c
+            FROM users
+            GROUP BY k
+            HAVING c > 1;
+            """
+        )
+
+        for r in rows:
+            keep_id = int(r["keep_id"])
+            ids = [int(x) for x in (r["ids"] or "").split(",") if x.strip().isdigit()]
+
+            base_row = _db_query_all("SELECT display_name FROM users WHERE id=? LIMIT 1;", (keep_id,))
+            base = (base_row[0]["display_name"] if base_row else "Driver").strip() or "Driver"
+
+            for uid in ids:
+                if uid == keep_id:
+                    continue
+                new_name = f"{base}_{uid}"
+                _db_exec("UPDATE users SET display_name=? WHERE id=?;", (new_name, uid))
+
+
 def _run_postgres_chat_migration() -> None:
     """Best-effort Postgres migration for Railway deployments; safe to re-run."""
     if not os.environ.get("DATABASE_URL", "").strip():
@@ -355,7 +388,12 @@ def _db_init() -> None:
         WHERE display_name IS NULL OR trim(display_name) = '';
         """
     )
-    _db_exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_display_name_unique_ci ON users(lower(display_name));")
+    _db_exec("DROP INDEX IF EXISTS idx_users_display_name_unique_ci;")
+    _db_repair_display_names_for_ci_unique()
+    try:
+        _db_exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_display_name_unique_ci ON users(lower(display_name));")
+    except Exception as e:
+        print("WARN: display_name CI unique index create failed:", e)
 
     _db_exec(
         """
@@ -692,15 +730,11 @@ class LoginPayload(BaseModel):
     password: str
 
 
-def _decide_admin_for_signup(email: str, bootstrap_token: Optional[str]) -> int:
+def _decide_admin_for_signup(bootstrap_token: Optional[str]) -> int:
     is_admin = 0
 
     # First user is always admin (so you never lose control)
     if _is_first_user():
-        is_admin = 1
-
-    # If ADMIN_EMAIL matches, force admin
-    if ADMIN_EMAIL and email == ADMIN_EMAIL:
         is_admin = 1
 
     # Optional bootstrap token can also grant admin
@@ -723,12 +757,14 @@ def auth_signup(payload: SignupPayload):
     now = int(time.time())
     trial_expires = now + TRIAL_DAYS * 86400
 
-    is_admin = _decide_admin_for_signup(email, payload.bootstrap_token)
+    is_admin = _decide_admin_for_signup(payload.bootstrap_token)
     display_name = _clean_display_name(payload.display_name or "", email)
+    if not display_name.strip():
+        raise HTTPException(status_code=400, detail="Display name is required")
 
-    existing_name = _db_query_one("SELECT id FROM users WHERE lower(display_name)=lower(?) LIMIT 1", (display_name,))
+    existing_name = _db_query_one("SELECT 1 FROM users WHERE lower(display_name)=lower(?) LIMIT 1", (display_name,))
     if existing_name:
-        raise HTTPException(status_code=400, detail="display_name already exists")
+        raise HTTPException(status_code=400, detail="Display name already taken")
 
     salt, ph = _hash_password(payload.password)
 
@@ -836,11 +872,11 @@ def me_update(payload: MeUpdatePayload, user: sqlite3.Row = Depends(require_user
     if payload.display_name is not None:
         new_dn = _clean_display_name(payload.display_name, user["email"])
         existing_name = _db_query_one(
-            "SELECT id FROM users WHERE lower(display_name)=lower(?) AND id<>? LIMIT 1",
+            "SELECT 1 FROM users WHERE lower(display_name)=lower(?) AND id != ? LIMIT 1",
             (new_dn, int(user["id"])),
         )
         if existing_name:
-            raise HTTPException(status_code=400, detail="display_name already exists")
+            raise HTTPException(status_code=400, detail="Display name already taken")
 
     new_ghost = None
     if payload.ghost_mode is not None:
