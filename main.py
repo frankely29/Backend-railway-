@@ -421,7 +421,11 @@ def _ensure_admin_seed() -> None:
     existing = _db_query_one("SELECT * FROM users WHERE lower(email)=lower(?) LIMIT 1", (ADMIN_EMAIL,))
     if existing:
         if int(existing["is_admin"]) != 1:
-            _db_exec("UPDATE users SET is_admin=1, is_disabled=0 WHERE id=?", (int(existing["id"]),))
+            # Use booleans for Postgres, integers for SQLite
+            if DB_BACKEND == "postgres":
+                _db_exec("UPDATE users SET is_admin=true, is_disabled=false WHERE id=?", (int(existing["id"]),))
+            else:
+                _db_exec("UPDATE users SET is_admin=1, is_disabled=0 WHERE id=?", (int(existing["id"]),))
         # ensure display_name exists
         _db_exec(
             """
@@ -437,12 +441,16 @@ def _ensure_admin_seed() -> None:
     trial_expires = now + TRIAL_DAYS * 86400
     salt, ph = _hash_password(ADMIN_PASSWORD)
     display_name = ADMIN_EMAIL.split("@")[0] if "@" in ADMIN_EMAIL else "Admin"
+    # Insert admin user; use booleans for Postgres, integers for SQLite
+    is_admin_val = True if DB_BACKEND == "postgres" else 1
+    is_disabled_val = False if DB_BACKEND == "postgres" else 0
+    ghost_mode_val = False if DB_BACKEND == "postgres" else 0
     _db_exec(
         """
         INSERT INTO users(email, pass_salt, pass_hash, is_admin, is_disabled, created_at, trial_expires_at, display_name, ghost_mode)
         VALUES(?,?,?,?,?,?,?,?,?)
         """,
-        (ADMIN_EMAIL, salt, ph, 1, 0, now, trial_expires, display_name, 0),
+        (ADMIN_EMAIL, salt, ph, is_admin_val, is_disabled_val, now, trial_expires, display_name, ghost_mode_val),
     )
 
 
