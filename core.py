@@ -102,7 +102,7 @@ def _verify_token(token: str) -> Dict[str, Any]:
 def _auth_user_from_request(req: Request) -> sqlite3.Row:
     auth = req.headers.get("authorization", "")
     if not auth.lower().startswith("bearer "):
-        raise HTTPException(status_code=401, detail="Missing Bearer token")
+        raise HTTPException(status_code=401, detail="Unauthorized")
     token = auth.split(" ", 1)[1].strip()
     payload = _verify_token(token)
     uid = int(payload.get("uid", 0))
