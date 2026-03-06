@@ -444,7 +444,7 @@ def _ensure_admin_seed() -> None:
     # Insert admin user; use booleans for Postgres, integers for SQLite
     is_admin_val = True if DB_BACKEND == "postgres" else 1
     is_disabled_val = False if DB_BACKEND == "postgres" else 0
-    ghost_mode_val = False if DB_BACKEND == "postgres" else 0
+    ghost_mode_val = 0  # always store ghost_mode as integer
     _db_exec(
         """
         INSERT INTO users(email, pass_salt, pass_hash, is_admin, is_disabled, created_at, trial_expires_at, display_name, ghost_mode)
