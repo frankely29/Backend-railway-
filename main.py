@@ -388,12 +388,14 @@ def _db_init() -> None:
         WHERE display_name IS NULL OR trim(display_name) = '';
         """
     )
-    _db_exec("DROP INDEX IF EXISTS idx_users_display_name_unique_ci;")
-    _db_repair_display_names_for_ci_unique()
+
+    # Safe startup path: always create helper non-unique index, and never crash on CI-unique index failure.
+    _db_exec("CREATE INDEX IF NOT EXISTS idx_users_display_name_lower ON users(lower(display_name));")
     try:
         _db_exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_display_name_unique_ci ON users(lower(display_name));")
+        print("INFO: created CI unique index on users(lower(display_name))")
     except Exception as e:
-        print("WARN: display_name CI unique index create failed:", e)
+        print("WARN: could not create CI unique index (duplicates exist):", e)
 
     _db_exec(
         """
@@ -628,6 +630,7 @@ def root():
             "/admin/users",
             "/admin/users/disable",
             "/admin/users/reset_password",
+            "/admin/repair_display_names_ci",
         ],
     }
 
@@ -1452,4 +1455,16 @@ def admin_reset_password(payload: AdminResetPayload, admin: sqlite3.Row = Depend
         raise HTTPException(status_code=400, detail="Password must be at least 6 chars")
     salt, ph = _hash_password(payload.new_password)
     _db_exec("UPDATE users SET pass_salt=?, pass_hash=? WHERE id=?", (salt, ph, int(payload.user_id)))
+    return {"ok": True}
+
+
+@app.post("/admin/repair_display_names_ci")
+def admin_repair_display_names_ci(admin: sqlite3.Row = Depends(require_admin)):
+    _db_repair_display_names_for_ci_unique()
+    try:
+        _db_exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_display_name_unique_ci ON users(lower(display_name));")
+        print("INFO: created CI unique index on users(lower(display_name))")
+    except Exception as e:
+        print("WARN: could not create CI unique index (duplicates exist):", e)
+        raise HTTPException(status_code=409, detail="Could not create CI unique index after repair")
     return {"ok": True}
