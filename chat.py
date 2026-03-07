@@ -58,8 +58,8 @@ def _validate_text(text: str) -> str:
     cleaned = (text or "").strip()
     if not cleaned:
         raise HTTPException(status_code=400, detail="text cannot be empty")
-    if len(cleaned) > 280:
-        raise HTTPException(status_code=400, detail="text too long (max 280)")
+    if len(cleaned) > 600:
+        raise HTTPException(status_code=400, detail="text too long (max 600)")
     return cleaned
 
 
@@ -105,16 +105,32 @@ def list_room_messages(
         where.append("created_at > ?")
         params.append(int(after_value))
 
-    rows = _db_query_all(
-        f"""
-        SELECT id, room, user_id, display_name, message, created_at
-        FROM chat_messages
-        WHERE {' AND '.join(where)}
-        ORDER BY id ASC
-        LIMIT ?
-        """,
-        tuple(params + [safe_limit]),
-    )
+    if after_field is None:
+        rows = _db_query_all(
+            """
+            SELECT id, room, user_id, display_name, message, created_at
+            FROM (
+                SELECT id, room, user_id, display_name, message, created_at
+                FROM chat_messages
+                WHERE room = ?
+                ORDER BY id DESC
+                LIMIT ?
+            ) recent
+            ORDER BY id ASC
+            """,
+            (safe_room, safe_limit),
+        )
+    else:
+        rows = _db_query_all(
+            f"""
+            SELECT id, room, user_id, display_name, message, created_at
+            FROM chat_messages
+            WHERE {' AND '.join(where)}
+            ORDER BY id ASC
+            LIMIT ?
+            """,
+            tuple(params + [safe_limit]),
+        )
 
     return {"room": safe_room, "messages": [_serialize_message(dict(r)) for r in rows]}
 
