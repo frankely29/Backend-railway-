@@ -133,28 +133,16 @@ def create_room_message(room: str, payload: ChatMessagePayload, user=Depends(req
         conn = _db()
         try:
             cur = conn.cursor()
+            insert_sql = """
+                INSERT INTO chat_messages(room, user_id, display_name, message, created_at)
+                VALUES (?, ?, ?, ?, ?)
+            """
             if DB_BACKEND == "postgres":
-                cur.execute(
-                    _sql(
-                        """
-                        INSERT INTO chat_messages(room, user_id, display_name, message, created_at)
-                        VALUES (?, ?, ?, ?, ?)
-                        RETURNING id
-                        """
-                    ),
-                    (safe_room, user_id, display_name, message, now),
-                )
-                new_id = int(cur.fetchone()["id"])
+                cur.execute(_sql(insert_sql + " RETURNING id"), (safe_room, user_id, display_name, message, now))
+                row = cur.fetchone()
+                new_id = int(row["id"])
             else:
-                cur.execute(
-                    _sql(
-                        """
-                        INSERT INTO chat_messages(room, user_id, display_name, message, created_at)
-                        VALUES (?, ?, ?, ?, ?)
-                        """
-                    ),
-                    (safe_room, user_id, display_name, message, now),
-                )
+                cur.execute(_sql(insert_sql), (safe_room, user_id, display_name, message, now))
                 new_id = int(cur.lastrowid)
             conn.commit()
         finally:
