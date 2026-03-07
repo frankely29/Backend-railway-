@@ -1192,9 +1192,62 @@ def log_pickup(payload: PickupPayload, user: sqlite3.Row = Depends(require_user)
     return {"ok": True}
 
 
+
+
+def _pickup_zone_stats(zone_ids: List[int], sample_limit: int = 100) -> List[Dict[str, Any]]:
+    clean_zone_ids: List[int] = []
+    for z in zone_ids:
+        try:
+            clean_zone_ids.append(int(z))
+        except Exception:
+            continue
+
+    if not clean_zone_ids:
+        return []
+
+    safe_sample_limit = max(1, min(100, int(sample_limit)))
+    clean_zone_ids = clean_zone_ids[:256]
+    placeholders = ",".join(["?"] * len(clean_zone_ids))
+
+    sql = f"""
+        WITH ranked AS (
+            SELECT
+                zone_id,
+                zone_name,
+                borough,
+                lat,
+                lng,
+                created_at,
+                ROW_NUMBER() OVER (PARTITION BY zone_id ORDER BY created_at DESC, id DESC) AS rn
+            FROM pickup_logs
+            WHERE zone_id IN ({placeholders})
+        )
+        SELECT
+            zone_id,
+            MAX(COALESCE(zone_name, '')) AS zone_name,
+            MAX(COALESCE(borough, '')) AS borough,
+            COUNT(*) AS sample_size,
+            AVG(lat) AS avg_lat,
+            AVG(lng) AS avg_lng,
+            MAX(created_at) AS latest_created_at
+        FROM ranked
+        WHERE rn <= ?
+        GROUP BY zone_id
+    """
+
+    rows = _db_query_all(sql, tuple(clean_zone_ids + [safe_sample_limit]))
+    stats: List[Dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        item["sample_limit"] = safe_sample_limit
+        stats.append(item)
+    return stats
+
+
 @app.get("/events/pickups/recent")
 def get_recent_pickups(
-    limit: int = 50,
+    limit: int = 30,
+    zone_sample_limit: int = 100,
     zone_id: Optional[int] = None,
     min_lat: Optional[float] = None,
     min_lng: Optional[float] = None,
@@ -1203,6 +1256,7 @@ def get_recent_pickups(
     viewer: sqlite3.Row = Depends(require_user),
 ):
     safe_limit = max(1, min(200, int(limit)))
+    safe_zone_sample_limit = max(1, min(100, int(zone_sample_limit)))
     sql = """
         SELECT id, lat, lng, zone_id, zone_name, borough, frame_time, created_at
         FROM pickup_logs
@@ -1228,7 +1282,25 @@ def get_recent_pickups(
 
     rows = _db_query_all(sql, tuple(params))
     items = [dict(r) for r in rows]
-    return {"ok": True, "count": len(items), "items": items}
+
+    zone_ids_for_stats: List[int] = []
+    if zone_id is not None:
+        zone_ids_for_stats = [int(zone_id)]
+    else:
+        stats_sql = "SELECT DISTINCT zone_id FROM pickup_logs WHERE zone_id IS NOT NULL"
+        stats_params: List[Any] = []
+        if all(v is not None for v in bbox):
+            lo_lat = min(float(min_lat), float(max_lat))
+            hi_lat = max(float(min_lat), float(max_lat))
+            lo_lng = min(float(min_lng), float(max_lng))
+            hi_lng = max(float(min_lng), float(max_lng))
+            stats_sql += " AND lat BETWEEN ? AND ? AND lng BETWEEN ? AND ?"
+            stats_params.extend([lo_lat, hi_lat, lo_lng, hi_lng])
+        stats_rows = _db_query_all(stats_sql, tuple(stats_params))
+        zone_ids_for_stats = [int(dict(r)["zone_id"]) for r in stats_rows if dict(r).get("zone_id") is not None]
+
+    zone_stats = _pickup_zone_stats(zone_ids_for_stats, sample_limit=safe_zone_sample_limit)
+    return {"ok": True, "count": len(items), "items": items, "zone_stats": zone_stats}
 
 
 # =========================================================
