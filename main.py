@@ -314,6 +314,25 @@ def _db_init() -> None:
 
         _db_exec(
             """
+            CREATE TABLE IF NOT EXISTS pickup_logs (
+              id BIGSERIAL PRIMARY KEY,
+              user_id BIGINT NOT NULL,
+              lat DOUBLE PRECISION NOT NULL,
+              lng DOUBLE PRECISION NOT NULL,
+              zone_id INTEGER,
+              zone_name TEXT,
+              borough TEXT,
+              frame_time TEXT,
+              created_at BIGINT NOT NULL,
+              FOREIGN KEY(user_id) REFERENCES users(id)
+            );
+            """
+        )
+        _db_exec("CREATE INDEX IF NOT EXISTS idx_pickup_logs_created_at ON pickup_logs(created_at DESC);")
+        _db_exec("CREATE INDEX IF NOT EXISTS idx_pickup_logs_zone_time ON pickup_logs(zone_id, created_at DESC);")
+
+        _db_exec(
+            """
             CREATE TABLE IF NOT EXISTS chat_messages (
               id BIGSERIAL PRIMARY KEY,
               room TEXT NOT NULL DEFAULT 'global',
@@ -391,6 +410,25 @@ def _db_init() -> None:
     )
     _db_exec("CREATE INDEX IF NOT EXISTS idx_events_type_time ON events(type, created_at);")
     _db_exec("CREATE INDEX IF NOT EXISTS idx_events_expires ON events(expires_at);")
+
+    _db_exec(
+        """
+        CREATE TABLE IF NOT EXISTS pickup_logs (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id INTEGER NOT NULL,
+          lat REAL NOT NULL,
+          lng REAL NOT NULL,
+          zone_id INTEGER,
+          zone_name TEXT,
+          borough TEXT,
+          frame_time TEXT,
+          created_at INTEGER NOT NULL,
+          FOREIGN KEY(user_id) REFERENCES users(id)
+        );
+        """
+    )
+    _db_exec("CREATE INDEX IF NOT EXISTS idx_pickup_logs_created_at ON pickup_logs(created_at DESC);")
+    _db_exec("CREATE INDEX IF NOT EXISTS idx_pickup_logs_zone_time ON pickup_logs(zone_id, created_at DESC);")
 
     _db_exec(
         """
@@ -584,6 +622,7 @@ def root():
             "/presence/all",
             "/events/police",
             "/events/pickup",
+            "/events/pickups/recent",
             "/chat/send",
             "/chat/recent",
             "/chat/since",
@@ -1014,7 +1053,9 @@ class PickupPayload(BaseModel):
     lat: float
     lng: float
     zone_id: Optional[int] = None
-    # Frontend may send extra fields (frame_time, location_id, zone_name, borough, ts_unix) – pydantic ignores extras by default.
+    zone_name: Optional[str] = None
+    borough: Optional[str] = None
+    frame_time: Optional[str] = None
 
 
 class ChatSendPayload(BaseModel):
@@ -1129,6 +1170,18 @@ def get_police(window_sec: int = 6 * 3600):
 def log_pickup(payload: PickupPayload, user: sqlite3.Row = Depends(require_user)):
     now = int(time.time())
     expires = now + EVENT_DEFAULT_WINDOW_SECONDS
+    zone_name = (payload.zone_name or "").strip() or None
+    borough = (payload.borough or "").strip() or None
+    frame_time = (payload.frame_time or "").strip() or None
+
+    _db_exec(
+        """
+        INSERT INTO pickup_logs(user_id, lat, lng, zone_id, zone_name, borough, frame_time, created_at)
+        VALUES(?,?,?,?,?,?,?,?)
+        """,
+        (int(user["id"]), float(payload.lat), float(payload.lng), payload.zone_id, zone_name, borough, frame_time, now),
+    )
+
     _db_exec(
         """
         INSERT INTO events(type, user_id, lat, lng, text, zone_id, created_at, expires_at)
@@ -1137,6 +1190,45 @@ def log_pickup(payload: PickupPayload, user: sqlite3.Row = Depends(require_user)
         ("pickup", int(user["id"]), float(payload.lat), float(payload.lng), "", payload.zone_id, now, expires),
     )
     return {"ok": True}
+
+
+@app.get("/events/pickups/recent")
+def get_recent_pickups(
+    limit: int = 50,
+    zone_id: Optional[int] = None,
+    min_lat: Optional[float] = None,
+    min_lng: Optional[float] = None,
+    max_lat: Optional[float] = None,
+    max_lng: Optional[float] = None,
+    viewer: sqlite3.Row = Depends(require_user),
+):
+    safe_limit = max(1, min(200, int(limit)))
+    sql = """
+        SELECT id, lat, lng, zone_id, zone_name, borough, frame_time, created_at
+        FROM pickup_logs
+        WHERE 1=1
+    """
+    params: List[Any] = []
+
+    if zone_id is not None:
+        sql += " AND zone_id = ?"
+        params.append(int(zone_id))
+
+    bbox = [min_lat, min_lng, max_lat, max_lng]
+    if all(v is not None for v in bbox):
+        lo_lat = min(float(min_lat), float(max_lat))
+        hi_lat = max(float(min_lat), float(max_lat))
+        lo_lng = min(float(min_lng), float(max_lng))
+        hi_lng = max(float(min_lng), float(max_lng))
+        sql += " AND lat BETWEEN ? AND ? AND lng BETWEEN ? AND ?"
+        params.extend([lo_lat, hi_lat, lo_lng, hi_lng])
+
+    sql += " ORDER BY created_at DESC LIMIT ?"
+    params.append(safe_limit)
+
+    rows = _db_query_all(sql, tuple(params))
+    items = [dict(r) for r in rows]
+    return {"ok": True, "count": len(items), "items": items}
 
 
 # =========================================================
