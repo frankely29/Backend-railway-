@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from core import _clean_display_name, _db, _db_lock, _db_query_all, require_user
+from core import DB_BACKEND, _clean_display_name, _db, _db_lock, _db_query_all, _sql, require_user
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
@@ -132,15 +132,31 @@ def create_room_message(room: str, payload: ChatMessagePayload, user=Depends(req
     with _db_lock:
         conn = _db()
         try:
-            cur = conn.execute(
-                """
-                INSERT INTO chat_messages(room, user_id, display_name, message, created_at)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (safe_room, user_id, display_name, message, now),
-            )
+            cur = conn.cursor()
+            if DB_BACKEND == "postgres":
+                cur.execute(
+                    _sql(
+                        """
+                        INSERT INTO chat_messages(room, user_id, display_name, message, created_at)
+                        VALUES (?, ?, ?, ?, ?)
+                        RETURNING id
+                        """
+                    ),
+                    (safe_room, user_id, display_name, message, now),
+                )
+                new_id = int(cur.fetchone()["id"])
+            else:
+                cur.execute(
+                    _sql(
+                        """
+                        INSERT INTO chat_messages(room, user_id, display_name, message, created_at)
+                        VALUES (?, ?, ?, ?, ?)
+                        """
+                    ),
+                    (safe_room, user_id, display_name, message, now),
+                )
+                new_id = int(cur.lastrowid)
             conn.commit()
-            new_id = int(cur.lastrowid)
         finally:
             conn.close()
 
