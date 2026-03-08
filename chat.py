@@ -142,7 +142,7 @@ def create_room_message(room: str, payload: ChatMessagePayload, user=Depends(req
     user_id = int(user["id"])
     _enforce_rate_limit(user_id)
 
-    now = int(time.time())
+    now = datetime.now(timezone.utc) if DB_BACKEND == "postgres" else int(time.time())
     display_name = _clean_display_name(user["display_name"] or "", user["email"])
 
     with _db_lock:
@@ -170,5 +170,5 @@ def create_room_message(room: str, payload: ChatMessagePayload, user=Depends(req
         "user_id": user_id,
         "display_name": display_name,
         "text": message,
-        "created_at": _to_iso(now),
+        "created_at": now.isoformat() if isinstance(now, datetime) else _to_iso(now),
     }
