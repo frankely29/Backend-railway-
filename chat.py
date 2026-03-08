@@ -73,13 +73,20 @@ def _enforce_rate_limit(user_id: int) -> None:
 
 
 def _serialize_message(row: dict) -> dict:
+    # created_at is an int in SQLite or a datetime in Postgres. Normalize it.
+    created = row["created_at"]
+    if isinstance(created, (int, float)):
+        ts = int(created)
+    else:
+        ts = int(created.timestamp())
+
     return {
         "id": int(row["id"]),
         "room": row["room"],
         "user_id": int(row["user_id"]),
         "display_name": row["display_name"],
         "text": row["message"],
-        "created_at": _to_iso(int(row["created_at"])),
+        "created_at": _to_iso(ts),
     }
 
 
@@ -102,8 +109,12 @@ def list_room_messages(
         where.append("id > ?")
         params.append(int(after_value))
     elif after_field == "created_at":
-        where.append("created_at > ?")
-        params.append(int(after_value))
+        if DB_BACKEND == "postgres":
+            where.append("created_at > to_timestamp(?)")
+            params.append(int(after_value))
+        else:
+            where.append("created_at > ?")
+            params.append(int(after_value))
 
     if after_field is None:
         rows = _db_query_all(
@@ -142,22 +153,26 @@ def create_room_message(room: str, payload: ChatMessagePayload, user=Depends(req
     user_id = int(user["id"])
     _enforce_rate_limit(user_id)
 
-    now = datetime.now(timezone.utc) if DB_BACKEND == "postgres" else int(time.time())
+    now = int(time.time())
     display_name = _clean_display_name(user["display_name"] or "", user["email"])
 
     with _db_lock:
         conn = _db()
         try:
             cur = conn.cursor()
-            insert_sql = """
-                INSERT INTO chat_messages(room, user_id, display_name, message, created_at)
-                VALUES (?, ?, ?, ?, ?)
-            """
             if DB_BACKEND == "postgres":
+                insert_sql = """
+                    INSERT INTO chat_messages(room, user_id, display_name, message, created_at)
+                    VALUES (?, ?, ?, ?, to_timestamp(?))
+                """
                 cur.execute(_sql(insert_sql + " RETURNING id"), (safe_room, user_id, display_name, message, now))
                 row = cur.fetchone()
                 new_id = int(row["id"])
             else:
+                insert_sql = """
+                    INSERT INTO chat_messages(room, user_id, display_name, message, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                """
                 cur.execute(_sql(insert_sql), (safe_room, user_id, display_name, message, now))
                 new_id = int(cur.lastrowid)
             conn.commit()
@@ -170,5 +185,5 @@ def create_room_message(room: str, payload: ChatMessagePayload, user=Depends(req
         "user_id": user_id,
         "display_name": display_name,
         "text": message,
-        "created_at": now.isoformat() if isinstance(now, datetime) else _to_iso(now),
+        "created_at": _to_iso(now),
     }
