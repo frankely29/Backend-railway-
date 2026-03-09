@@ -54,6 +54,8 @@ TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "7"))
 TOKEN_TTL_SECONDS = int(os.environ.get("TOKEN_TTL_SECONDS", str(30 * 24 * 3600)))  # 30 days
 PRESENCE_STALE_SECONDS = int(os.environ.get("PRESENCE_STALE_SECONDS", "300"))  # 5 min
 EVENT_DEFAULT_WINDOW_SECONDS = int(os.environ.get("EVENT_DEFAULT_WINDOW_SECONDS", str(24 * 3600)))  # 24h
+MAX_AVATAR_DATA_URL_LENGTH = int(os.environ.get("MAX_AVATAR_DATA_URL_LENGTH", "20000"))
+ALLOWED_MAP_IDENTITY_MODES = {"name", "avatar"}
 
 # =========================================================
 # In-memory job state (hotspot generate)
@@ -255,6 +257,14 @@ def _db_init() -> None:
             "ALTER TABLE users ADD COLUMN ghost_mode INTEGER NOT NULL DEFAULT 0;",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS ghost_mode BOOLEAN NOT NULL DEFAULT FALSE;",
         )
+        _try_alter(
+            "ALTER TABLE users ADD COLUMN avatar_url TEXT;",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url TEXT;",
+        )
+        _try_alter(
+            "ALTER TABLE users ADD COLUMN map_identity_mode TEXT NOT NULL DEFAULT 'name';",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS map_identity_mode TEXT NOT NULL DEFAULT 'name';",
+        )
 
         _db_exec(
             """
@@ -277,6 +287,13 @@ def _db_init() -> None:
             UPDATE users
             SET display_name = COALESCE(display_name, split_part(email, '@', 1))
             WHERE display_name IS NULL OR btrim(display_name) = '';
+            """
+        )
+        _db_exec(
+            """
+            UPDATE users
+            SET map_identity_mode = 'name'
+            WHERE map_identity_mode IS NULL OR btrim(map_identity_mode) = '';
             """
         )
 
@@ -370,12 +387,21 @@ def _db_init() -> None:
 
     _try_alter("ALTER TABLE users ADD COLUMN display_name TEXT;")
     _try_alter("ALTER TABLE users ADD COLUMN ghost_mode INTEGER NOT NULL DEFAULT 0;")
+    _try_alter("ALTER TABLE users ADD COLUMN avatar_url TEXT;")
+    _try_alter("ALTER TABLE users ADD COLUMN map_identity_mode TEXT NOT NULL DEFAULT 'name';")
 
     _db_exec(
         """
         UPDATE users
         SET display_name = COALESCE(display_name, substr(email, 1, instr(email, '@')-1))
         WHERE display_name IS NULL OR trim(display_name) = '';
+        """
+    )
+    _db_exec(
+        """
+        UPDATE users
+        SET map_identity_mode = 'name'
+        WHERE map_identity_mode IS NULL OR trim(map_identity_mode) = '';
         """
     )
 
@@ -493,6 +519,28 @@ def _flag_to_int(value: Any) -> int:
     if value is None:
         return 0
     return int(value)
+
+
+def _normalize_map_identity_mode(value: Optional[str]) -> str:
+    mode = (value or "").strip().lower()
+    if mode not in ALLOWED_MAP_IDENTITY_MODES:
+        raise HTTPException(status_code=400, detail="map_identity_mode must be 'name' or 'avatar'")
+    return mode
+
+
+def _normalize_avatar_url(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    avatar = value.strip()
+    if avatar == "":
+        return None
+    if len(avatar) > MAX_AVATAR_DATA_URL_LENGTH:
+        raise HTTPException(status_code=400, detail="avatar_url is too large")
+    if not avatar.startswith("data:image/"):
+        raise HTTPException(status_code=400, detail="avatar_url must be an image data URL")
+    if "," not in avatar:
+        raise HTTPException(status_code=400, detail="avatar_url must be a valid data URL")
+    return avatar
 
 
 def _ensure_admin_seed() -> None:
@@ -868,11 +916,16 @@ def me(user: sqlite3.Row = Depends(require_user)):
     if not dn:
         dn = _clean_display_name("", user["email"])
     ghost = bool(_flag_to_int(user["ghost_mode"])) if "ghost_mode" in user.keys() and user["ghost_mode"] is not None else False
+    map_identity_mode = (user["map_identity_mode"] or "").strip().lower() if "map_identity_mode" in user.keys() and user["map_identity_mode"] is not None else "name"
+    if map_identity_mode not in ALLOWED_MAP_IDENTITY_MODES:
+        map_identity_mode = "name"
     return {
         "ok": True,
         "id": int(user["id"]),
         "email": user["email"],
         "display_name": dn,
+        "avatar_url": user["avatar_url"] if "avatar_url" in user.keys() else None,
+        "map_identity_mode": map_identity_mode,
         "ghost_mode": ghost,
         "is_admin": bool(_flag_to_int(user["is_admin"])),
         "trial_expires_at": int(user["trial_expires_at"]),
@@ -882,6 +935,8 @@ def me(user: sqlite3.Row = Depends(require_user)):
 class MeUpdatePayload(BaseModel):
     display_name: Optional[str] = None
     ghost_mode: Optional[bool] = None
+    avatar_url: Optional[str] = None
+    map_identity_mode: Optional[str] = None
 
 
 class ChangePasswordPayload(BaseModel):
@@ -901,19 +956,42 @@ def me_update(payload: MeUpdatePayload, user: sqlite3.Row = Depends(require_user
         ghost_is_bool = _is_bool_column("users", "ghost_mode")
         new_ghost = bool(payload.ghost_mode) if ghost_is_bool else (1 if bool(payload.ghost_mode) else 0)
 
-    if new_dn is None and new_ghost is None:
+    fields_set = payload.__fields_set__ if hasattr(payload, "__fields_set__") else set()
+    update_avatar = "avatar_url" in fields_set
+    new_avatar = _normalize_avatar_url(payload.avatar_url) if update_avatar else None
+
+    update_map_identity_mode = "map_identity_mode" in fields_set
+    new_map_identity_mode = _normalize_map_identity_mode(payload.map_identity_mode) if update_map_identity_mode else None
+
+    if new_dn is None and new_ghost is None and not update_avatar and not update_map_identity_mode:
         return {"ok": True, "updated": False}
 
-    if new_dn is not None and new_ghost is not None:
-        _db_exec("UPDATE users SET display_name=?, ghost_mode=? WHERE id=?", (new_dn, new_ghost, int(user["id"])))
-    elif new_dn is not None:
-        _db_exec("UPDATE users SET display_name=? WHERE id=?", (new_dn, int(user["id"])))
-    else:
-        _db_exec("UPDATE users SET ghost_mode=? WHERE id=?", (new_ghost, int(user["id"])))
+    updates: List[str] = []
+    args: List[Any] = []
+    if new_dn is not None:
+        updates.append("display_name=?")
+        args.append(new_dn)
+    if new_ghost is not None:
+        updates.append("ghost_mode=?")
+        args.append(new_ghost)
+    if update_avatar:
+        updates.append("avatar_url=?")
+        args.append(new_avatar)
+    if update_map_identity_mode:
+        updates.append("map_identity_mode=?")
+        args.append(new_map_identity_mode)
 
-    row = _db_query_one("SELECT id, email, display_name, ghost_mode, is_admin, trial_expires_at FROM users WHERE id=? LIMIT 1", (int(user["id"]),))
+    if updates:
+        args.append(int(user["id"]))
+        _db_exec(f"UPDATE users SET {', '.join(updates)} WHERE id=?", tuple(args))
+
+    row = _db_query_one("SELECT id, email, display_name, ghost_mode, avatar_url, map_identity_mode, is_admin, trial_expires_at FROM users WHERE id=? LIMIT 1", (int(user["id"]),))
     if not row:
         return {"ok": True, "updated": True}
+
+    map_identity_mode = (row["map_identity_mode"] or "").strip().lower() if row["map_identity_mode"] is not None else "name"
+    if map_identity_mode not in ALLOWED_MAP_IDENTITY_MODES:
+        map_identity_mode = "name"
 
     return {
         "ok": True,
@@ -921,6 +999,8 @@ def me_update(payload: MeUpdatePayload, user: sqlite3.Row = Depends(require_user
         "id": int(row["id"]),
         "email": row["email"],
         "display_name": (row["display_name"] or _clean_display_name("", row["email"])),
+        "avatar_url": row["avatar_url"],
+        "map_identity_mode": map_identity_mode,
         "ghost_mode": bool(_flag_to_int(row["ghost_mode"])) if row["ghost_mode"] is not None else False,
     }
 
@@ -1002,6 +1082,8 @@ def presence_all(
           p.user_id,
           u.email,
           u.display_name,
+          u.avatar_url,
+          u.map_identity_mode,
           u.ghost_mode,
           p.lat,
           p.lng,
@@ -1028,6 +1110,8 @@ def presence_all(
                 "user_id": int(r["user_id"]),
                 "email": email,
                 "display_name": dn,
+                "avatar_url": r["avatar_url"],
+                "map_identity_mode": (str(r["map_identity_mode"]).strip().lower() if r["map_identity_mode"] is not None and str(r["map_identity_mode"]).strip().lower() in ALLOWED_MAP_IDENTITY_MODES else "name"),
                 "lat": float(r["lat"]),
                 "lng": float(r["lng"]),
                 "heading": float(r["heading"]) if r["heading"] is not None else None,
