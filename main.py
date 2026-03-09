@@ -604,8 +604,13 @@ def _ensure_admin_seed() -> None:
 
 
 from chat import router as chat_router
+from leaderboard_db import init_leaderboard_schema
+from leaderboard_routes import router as leaderboard_router
+from leaderboard_scheduler import start_leaderboard_scheduler
+from leaderboard_tracker import increment_pickup_count, record_presence_heartbeat
 
 app.include_router(chat_router)
+app.include_router(leaderboard_router)
 
 # =========================================================
 # Startup
@@ -615,7 +620,9 @@ def startup():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     FRAMES_DIR.mkdir(parents=True, exist_ok=True)
     _db_init()
+    init_leaderboard_schema()
     _ensure_admin_seed()
+    start_leaderboard_scheduler()
 
     # Auto-fill generate state if frames already exist
     try:
@@ -1066,6 +1073,7 @@ def presence_update(payload: PresencePayload, user: sqlite3.Row = Depends(requir
         """,
         (int(user["id"]), float(payload.lat), float(payload.lng), payload.heading, payload.accuracy, now),
     )
+    record_presence_heartbeat(int(user["id"]), float(payload.lat), float(payload.lng), payload.heading)
     return {"ok": True}
 
 
@@ -1303,6 +1311,7 @@ def log_pickup(payload: PickupPayload, user: sqlite3.Row = Depends(require_user)
         """,
         ("pickup", int(user["id"]), float(payload.lat), float(payload.lng), "", payload.zone_id, now, expires),
     )
+    increment_pickup_count(int(user["id"]))
     return {"ok": True}
 
 
