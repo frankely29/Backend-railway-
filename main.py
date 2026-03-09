@@ -1124,6 +1124,36 @@ def presence_all(
     return {"ok": True, "count": len(items), "items": items}
 
 
+@app.get("/presence/summary")
+def presence_summary(
+    max_age_sec: int = PRESENCE_STALE_SECONDS,
+    viewer: sqlite3.Row = Depends(require_user),  # REQUIRE AUTH (same as /presence/all)
+):
+    cutoff = int(time.time()) - max(5, min(3600, int(max_age_sec)))
+
+    counts = _db_query_one(
+        """
+        SELECT
+          COUNT(*) AS online_count,
+          SUM(CASE WHEN CAST(COALESCE(u.ghost_mode, 0) AS INTEGER) = 1 THEN 1 ELSE 0 END) AS ghosted_count
+        FROM presence p
+        LEFT JOIN users u ON u.id = p.user_id
+        WHERE p.updated_at >= ?
+        """,
+        (cutoff,),
+    )
+
+    online_count = int(counts["online_count"] or 0) if counts else 0
+    ghosted_count = int(counts["ghosted_count"] or 0) if counts else 0
+
+    return {
+        "ok": True,
+        "online_count": online_count,
+        "ghosted_count": ghosted_count,
+        "visible_count": max(0, online_count - ghosted_count),
+    }
+
+
 # =========================================================
 # EVENTS
 # =========================================================
