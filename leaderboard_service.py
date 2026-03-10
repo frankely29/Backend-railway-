@@ -279,19 +279,12 @@ _PERIOD_PRIORITY = {
     LeaderboardPeriod.daily.value: 1,
 }
 
-_METRIC_PRIORITY = {
-    LeaderboardMetric.miles.value: 2,
-    LeaderboardMetric.hours.value: 1,
-}
-
-
-def _badge_priority_key(badge: Dict) -> Tuple[int, int, int, str]:
+def _badge_priority_key(badge: Dict) -> Tuple[int, int, str]:
     badge_code = _normalized_badge_code(int(badge.get("rank_position") or 0), badge.get("badge_code"))
     badge_priority = 3 if badge_code == "crown" else 2 if badge_code == "silver" else 1 if badge_code == "bronze" else 0
     return (
         badge_priority,
         _PERIOD_PRIORITY.get(str(badge.get("period") or ""), 0),
-        _METRIC_PRIORITY.get(str(badge.get("metric") or ""), 0),
         f"{badge.get('metric','')}|{badge.get('period','')}|{badge.get('period_key','')}",
     )
 
@@ -301,9 +294,9 @@ def get_best_current_badge_for_user(user_id: int) -> Dict:
         """
         SELECT metric, period, period_key, rank_position
         FROM leaderboard_badges_current
-        WHERE user_id=? AND is_current=? AND rank_position IN (1,2,3)
+        WHERE user_id=? AND is_current=? AND metric=? AND rank_position IN (1,2,3)
         """,
-        (int(user_id), _bool_db_value(True)),
+        (int(user_id), _bool_db_value(True), LeaderboardMetric.miles.value),
     )
     if not rows:
         return {"leaderboard_badge_code": None}
@@ -319,9 +312,9 @@ def get_best_current_badges_for_users(user_ids: List[int]) -> Dict[int, Dict]:
         f"""
         SELECT user_id, metric, period, period_key, rank_position
         FROM leaderboard_badges_current
-        WHERE is_current=? AND rank_position IN (1,2,3) AND user_id IN ({placeholders})
+        WHERE is_current=? AND metric=? AND rank_position IN (1,2,3) AND user_id IN ({placeholders})
         """,
-        (_bool_db_value(True), *[int(u) for u in user_ids]),
+        (_bool_db_value(True), LeaderboardMetric.miles.value, *[int(u) for u in user_ids]),
     )
 
     by_user: Dict[int, List[Dict]] = {}
