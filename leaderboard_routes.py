@@ -6,21 +6,19 @@ from fastapi import APIRouter, Depends
 
 from core import require_user
 from leaderboard_models import (
-    EmailPrefsPayload,
-    EmailPrefsResponse,
+    LeaderboardMetric,
     LeaderboardPeriod,
     LeaderboardResponse,
-    LeaderboardMetric,
     MyBadgesResponse,
     MyRankResponse,
+    OverviewResponse,
 )
 from leaderboard_service import (
     get_current_badges_for_user,
-    get_email_prefs,
     get_leaderboard,
     get_my_rank,
+    get_overview_for_user,
     refresh_current_badges,
-    update_email_prefs,
 )
 
 router = APIRouter(tags=["leaderboard"])
@@ -46,18 +44,6 @@ def leaderboard_badges_me(user: sqlite3.Row = Depends(require_user)):
     return {"ok": True, "badges": get_current_badges_for_user(int(user["id"]))}
 
 
-@router.get("/leaderboard/email_prefs", response_model=EmailPrefsResponse)
-def leaderboard_email_prefs(user: sqlite3.Row = Depends(require_user)):
-    prefs = get_email_prefs(int(user["id"]))
-    return {"ok": True, **prefs}
-
-
-@router.post("/leaderboard/email_prefs", response_model=EmailPrefsResponse)
-def leaderboard_email_prefs_update(payload: EmailPrefsPayload, user: sqlite3.Row = Depends(require_user)):
-    prefs = update_email_prefs(
-        int(user["id"]),
-        weekly_enabled=payload.weekly_enabled,
-        monthly_enabled=payload.monthly_enabled,
-        yearly_enabled=payload.yearly_enabled,
-    )
-    return {"ok": True, **prefs}
+@router.get("/leaderboard/overview/me", response_model=OverviewResponse)
+def leaderboard_overview_me(user: sqlite3.Row = Depends(require_user)):
+    return {"ok": True, **get_overview_for_user(int(user["id"]))}

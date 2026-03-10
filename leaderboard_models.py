@@ -26,6 +26,18 @@ class LeaderboardRow(BaseModel):
     badge_code: Optional[str] = None
 
 
+class MyRankRow(LeaderboardRow):
+    pass
+
+
+class BadgeRow(BaseModel):
+    metric: LeaderboardMetric
+    period: LeaderboardPeriod
+    period_key: str
+    rank_position: int
+    badge_code: str
+
+
 class LeaderboardResponse(BaseModel):
     ok: bool = True
     metric: LeaderboardMetric
@@ -39,27 +51,22 @@ class MyRankResponse(BaseModel):
     metric: LeaderboardMetric
     period: LeaderboardPeriod
     period_key: str
-    row: Optional[LeaderboardRow] = None
-
-
-class BadgeResponse(BaseModel):
-    metric: LeaderboardMetric
-    period: LeaderboardPeriod
-    period_key: str
-    rank_position: int
-    badge_code: str
+    row: Optional[MyRankRow] = None
 
 
 class MyBadgesResponse(BaseModel):
     ok: bool = True
-    badges: List[BadgeResponse]
+    badges: List[BadgeRow]
 
 
-class EmailPrefsPayload(BaseModel):
-    weekly_enabled: bool
-    monthly_enabled: bool
-    yearly_enabled: bool
+class PeriodTotals(BaseModel):
+    miles: float
+    hours: float
 
 
-class EmailPrefsResponse(EmailPrefsPayload):
+class OverviewResponse(BaseModel):
     ok: bool = True
+    daily: PeriodTotals
+    weekly: PeriodTotals
+    monthly: PeriodTotals
+    yearly: PeriodTotals
