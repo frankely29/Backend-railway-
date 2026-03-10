@@ -124,8 +124,8 @@ def get_my_rank(user_id: int, metric: LeaderboardMetric, period: LeaderboardPeri
 def refresh_current_badges() -> None:
     now = int(time.time())
     _db_exec(
-        "UPDATE leaderboard_badges_current SET is_current=? WHERE is_current=?",
-        (_bool_db_value(False), _bool_db_value(True)),
+        "DELETE FROM leaderboard_badges_current WHERE is_current=?",
+        (_bool_db_value(True),),
     )
 
     for metric in [LeaderboardMetric.miles, LeaderboardMetric.hours]:
@@ -204,11 +204,7 @@ def get_best_current_badge_for_user(user_id: int) -> Dict:
     if not badges:
         return {"leaderboard_badge_code": None}
     best = max(badges, key=_badge_priority_key)
-    return {
-        "leaderboard_badge_code": best.get("badge_code"),
-        "leaderboard_badge_period": best.get("period"),
-        "leaderboard_badge_metric": best.get("metric"),
-    }
+    return {"leaderboard_badge_code": best.get("badge_code")}
 
 
 def get_best_current_badges_for_users(user_ids: List[int]) -> Dict[int, Dict]:
@@ -234,11 +230,7 @@ def get_best_current_badges_for_users(user_ids: List[int]) -> Dict[int, Dict]:
     out: Dict[int, Dict] = {}
     for uid, badges in by_user.items():
         best = max(badges, key=_badge_priority_key)
-        out[uid] = {
-            "leaderboard_badge_code": best.get("badge_code"),
-            "leaderboard_badge_period": best.get("period"),
-            "leaderboard_badge_metric": best.get("metric"),
-        }
+        out[uid] = {"leaderboard_badge_code": best.get("badge_code")}
     return out
 
 
