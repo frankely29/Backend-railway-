@@ -606,6 +606,7 @@ def _ensure_admin_seed() -> None:
 from chat import router as chat_router
 from leaderboard_db import init_leaderboard_schema
 from leaderboard_routes import router as leaderboard_router
+from leaderboard_service import get_best_current_badge_for_user, get_best_current_badges_for_users, refresh_current_badges
 from leaderboard_tracker import increment_pickup_count, record_presence_heartbeat
 
 app.include_router(chat_router)
@@ -924,6 +925,10 @@ def me(user: sqlite3.Row = Depends(require_user)):
     map_identity_mode = (user["map_identity_mode"] or "").strip().lower() if "map_identity_mode" in user.keys() and user["map_identity_mode"] is not None else "name"
     if map_identity_mode not in ALLOWED_MAP_IDENTITY_MODES:
         map_identity_mode = "name"
+
+    refresh_current_badges()
+    best_badge = get_best_current_badge_for_user(int(user["id"]))
+
     return {
         "ok": True,
         "id": int(user["id"]),
@@ -934,6 +939,10 @@ def me(user: sqlite3.Row = Depends(require_user)):
         "ghost_mode": ghost,
         "is_admin": bool(_flag_to_int(user["is_admin"])),
         "trial_expires_at": int(user["trial_expires_at"]),
+        "leaderboard_badge_code": best_badge.get("leaderboard_badge_code"),
+        "leaderboard_has_crown": bool(best_badge.get("leaderboard_has_crown", False)),
+        "leaderboard_badge_period": best_badge.get("leaderboard_badge_period"),
+        "leaderboard_badge_metric": best_badge.get("leaderboard_badge_metric"),
     }
 
 
@@ -1104,8 +1113,12 @@ def presence_all(
         (cutoff,),
     )
 
+    refresh_current_badges()
+    badge_by_user = get_best_current_badges_for_users([int(r["user_id"]) for r in rows])
+
     items: List[Dict[str, Any]] = []
     for r in rows:
+        best_badge = badge_by_user.get(int(r["user_id"]), {})
         email = (r["email"] or "").strip()
         dn = (r["display_name"] or "").strip()
         if not dn:
@@ -1124,6 +1137,10 @@ def presence_all(
                 "accuracy": float(r["accuracy"]) if r["accuracy"] is not None else None,
                 "updated_at": int(r["updated_at"]),
                 "updated_at_unix": int(r["updated_at"]),
+                "leaderboard_badge_code": best_badge.get("leaderboard_badge_code"),
+                "leaderboard_has_crown": bool(best_badge.get("leaderboard_has_crown", False)),
+                "leaderboard_badge_period": best_badge.get("leaderboard_badge_period"),
+                "leaderboard_badge_metric": best_badge.get("leaderboard_badge_metric"),
             }
         )
 
