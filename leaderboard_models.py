@@ -24,7 +24,6 @@ class LeaderboardRow(BaseModel):
     metric_value: float
     rank_position: int
     badge_code: Optional[str] = None
-    has_crown: bool = False
 
 
 class MyRankRow(LeaderboardRow):
@@ -37,7 +36,6 @@ class BadgeRow(BaseModel):
     period_key: str
     rank_position: int
     badge_code: str
-    has_crown: bool = False
 
 
 class LeaderboardResponse(BaseModel):

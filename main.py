@@ -940,7 +940,6 @@ def me(user: sqlite3.Row = Depends(require_user)):
         "is_admin": bool(_flag_to_int(user["is_admin"])),
         "trial_expires_at": int(user["trial_expires_at"]),
         "leaderboard_badge_code": best_badge.get("leaderboard_badge_code"),
-        "leaderboard_has_crown": bool(best_badge.get("leaderboard_has_crown", False)),
         "leaderboard_badge_period": best_badge.get("leaderboard_badge_period"),
         "leaderboard_badge_metric": best_badge.get("leaderboard_badge_metric"),
     }
@@ -1138,7 +1137,6 @@ def presence_all(
                 "updated_at": int(r["updated_at"]),
                 "updated_at_unix": int(r["updated_at"]),
                 "leaderboard_badge_code": best_badge.get("leaderboard_badge_code"),
-                "leaderboard_has_crown": bool(best_badge.get("leaderboard_has_crown", False)),
                 "leaderboard_badge_period": best_badge.get("leaderboard_badge_period"),
                 "leaderboard_badge_metric": best_badge.get("leaderboard_badge_metric"),
             }
