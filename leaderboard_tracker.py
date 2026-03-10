@@ -11,6 +11,7 @@ from leaderboard_models import LeaderboardPeriod
 NYC_TZ = ZoneInfo("America/New_York")
 MAX_COUNTED_GAP_SECONDS = 300
 MAX_SPEED_MPH = 100.0
+MIN_MEANINGFUL_MOVEMENT_MILES = 0.01
 MILES_PER_METER = 0.000621371
 
 
@@ -97,14 +98,13 @@ def record_presence_heartbeat(user_id: int, lat: float, lng: float, heading: flo
                 prev_seen = int(prev["last_seen_at"])
                 if now > prev_seen:
                     raw_gap = now - prev_seen
-                    counted_seconds = min(raw_gap, MAX_COUNTED_GAP_SECONDS)
-
                     prev_lat = prev["last_lat"]
                     prev_lng = prev["last_lng"]
                     if prev_lat is not None and prev_lng is not None:
                         d = _haversine_miles(float(prev_lat), float(prev_lng), float(lat), float(lng))
                         speed_mph = d / (raw_gap / 3600.0) if raw_gap > 0 else 0.0
-                        if speed_mph <= MAX_SPEED_MPH:
+                        if speed_mph <= MAX_SPEED_MPH and d >= MIN_MEANINGFUL_MOVEMENT_MILES:
+                            counted_seconds = min(raw_gap, MAX_COUNTED_GAP_SECONDS)
                             distance_miles = d
 
             if counted_seconds > 0:
