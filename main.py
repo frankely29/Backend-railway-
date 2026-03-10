@@ -1141,7 +1141,7 @@ def presence_summary(
         """
         SELECT
           COUNT(*) AS online_count,
-          SUM(CASE WHEN CAST(COALESCE(u.ghost_mode, 0) AS INTEGER) = 1 THEN 1 ELSE 0 END) AS ghosted_count
+          SUM(CASE WHEN COALESCE(u.ghost_mode, FALSE) THEN 1 ELSE 0 END) AS ghosted_count
         FROM presence p
         LEFT JOIN users u ON u.id = p.user_id
         WHERE p.updated_at >= ?
