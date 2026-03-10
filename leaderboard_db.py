@@ -13,7 +13,6 @@ def init_leaderboard_schema() -> None:
               last_lat DOUBLE PRECISION,
               last_lng DOUBLE PRECISION,
               last_heading DOUBLE PRECISION,
-              last_nyc_date DATE,
               updated_at BIGINT NOT NULL,
               FOREIGN KEY(user_id) REFERENCES users(id)
             );
@@ -38,46 +37,21 @@ def init_leaderboard_schema() -> None:
         _db_exec(
             """
             CREATE TABLE IF NOT EXISTS leaderboard_badges_current (
-              id BIGSERIAL PRIMARY KEY,
               user_id BIGINT NOT NULL,
               metric TEXT NOT NULL,
               period TEXT NOT NULL,
+              period_key TEXT NOT NULL,
               rank_position INTEGER NOT NULL,
               badge_code TEXT NOT NULL,
-              period_key TEXT NOT NULL,
               awarded_at BIGINT NOT NULL,
               is_current BOOLEAN NOT NULL DEFAULT TRUE,
-              FOREIGN KEY(user_id) REFERENCES users(id)
-            );
-            """
-        )
-        _db_exec("CREATE INDEX IF NOT EXISTS idx_leaderboard_badges_lookup ON leaderboard_badges_current(user_id, is_current, period, metric);")
-        _db_exec(
-            """
-            CREATE TABLE IF NOT EXISTS leaderboard_email_prefs (
-              user_id BIGINT PRIMARY KEY,
-              weekly_enabled BOOLEAN NOT NULL DEFAULT TRUE,
-              monthly_enabled BOOLEAN NOT NULL DEFAULT TRUE,
-              yearly_enabled BOOLEAN NOT NULL DEFAULT TRUE,
-              created_at BIGINT NOT NULL,
-              updated_at BIGINT NOT NULL,
+              PRIMARY KEY(user_id, metric, period, period_key),
               FOREIGN KEY(user_id) REFERENCES users(id)
             );
             """
         )
         _db_exec(
-            """
-            CREATE TABLE IF NOT EXISTS leaderboard_report_log (
-              user_id BIGINT NOT NULL,
-              report_type TEXT NOT NULL,
-              period_key TEXT NOT NULL,
-              sent_at BIGINT NOT NULL,
-              status TEXT NOT NULL,
-              error_message TEXT,
-              PRIMARY KEY (user_id, report_type, period_key),
-              FOREIGN KEY(user_id) REFERENCES users(id)
-            );
-            """
+            "CREATE INDEX IF NOT EXISTS idx_leaderboard_badges_lookup ON leaderboard_badges_current(user_id, is_current, period, metric);"
         )
         return
 
@@ -89,7 +63,6 @@ def init_leaderboard_schema() -> None:
           last_lat REAL,
           last_lng REAL,
           last_heading REAL,
-          last_nyc_date TEXT,
           updated_at INTEGER NOT NULL,
           FOREIGN KEY(user_id) REFERENCES users(id)
         );
@@ -114,44 +87,19 @@ def init_leaderboard_schema() -> None:
     _db_exec(
         """
         CREATE TABLE IF NOT EXISTS leaderboard_badges_current (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
           user_id INTEGER NOT NULL,
           metric TEXT NOT NULL,
           period TEXT NOT NULL,
+          period_key TEXT NOT NULL,
           rank_position INTEGER NOT NULL,
           badge_code TEXT NOT NULL,
-          period_key TEXT NOT NULL,
           awarded_at INTEGER NOT NULL,
           is_current INTEGER NOT NULL DEFAULT 1,
-          FOREIGN KEY(user_id) REFERENCES users(id)
-        );
-        """
-    )
-    _db_exec("CREATE INDEX IF NOT EXISTS idx_leaderboard_badges_lookup ON leaderboard_badges_current(user_id, is_current, period, metric);")
-    _db_exec(
-        """
-        CREATE TABLE IF NOT EXISTS leaderboard_email_prefs (
-          user_id INTEGER PRIMARY KEY,
-          weekly_enabled INTEGER NOT NULL DEFAULT 1,
-          monthly_enabled INTEGER NOT NULL DEFAULT 1,
-          yearly_enabled INTEGER NOT NULL DEFAULT 1,
-          created_at INTEGER NOT NULL,
-          updated_at INTEGER NOT NULL,
+          PRIMARY KEY(user_id, metric, period, period_key),
           FOREIGN KEY(user_id) REFERENCES users(id)
         );
         """
     )
     _db_exec(
-        """
-        CREATE TABLE IF NOT EXISTS leaderboard_report_log (
-          user_id INTEGER NOT NULL,
-          report_type TEXT NOT NULL,
-          period_key TEXT NOT NULL,
-          sent_at INTEGER NOT NULL,
-          status TEXT NOT NULL,
-          error_message TEXT,
-          PRIMARY KEY (user_id, report_type, period_key),
-          FOREIGN KEY(user_id) REFERENCES users(id)
-        );
-        """
+        "CREATE INDEX IF NOT EXISTS idx_leaderboard_badges_lookup ON leaderboard_badges_current(user_id, is_current, period, metric);"
     )
