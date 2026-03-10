@@ -6,10 +6,16 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Dict, List, Optional
 from zoneinfo import ZoneInfo
 
-from core import _db_exec, _db_query_all, _db_query_one
+from core import DB_BACKEND, _db_exec, _db_query_all, _db_query_one
 from leaderboard_models import LeaderboardMetric, LeaderboardPeriod
 
 NYC_TZ = ZoneInfo("America/New_York")
+
+
+def _bool_db_value(flag: bool):
+    if DB_BACKEND == "postgres":
+        return bool(flag)
+    return 1 if flag else 0
 
 
 @dataclass
@@ -109,7 +115,10 @@ def get_my_rank(user_id: int, metric: LeaderboardMetric, period: LeaderboardPeri
 
 def refresh_current_badges() -> None:
     now = int(time.time())
-    _db_exec("UPDATE leaderboard_badges_current SET is_current=0 WHERE is_current=1")
+    _db_exec(
+        "UPDATE leaderboard_badges_current SET is_current=? WHERE is_current=?",
+        (_bool_db_value(False), _bool_db_value(True)),
+    )
 
     for metric in [LeaderboardMetric.miles, LeaderboardMetric.hours]:
         for period in [LeaderboardPeriod.daily, LeaderboardPeriod.weekly, LeaderboardPeriod.monthly, LeaderboardPeriod.yearly]:
@@ -135,7 +144,7 @@ def refresh_current_badges() -> None:
                         int(row["rank_position"]),
                         row["badge_code"],
                         now,
-                        1,
+                        _bool_db_value(True),
                     ),
                 )
 
@@ -145,10 +154,10 @@ def get_current_badges_for_user(user_id: int) -> List[Dict]:
         """
         SELECT metric, period, period_key, rank_position, badge_code
         FROM leaderboard_badges_current
-        WHERE user_id=? AND is_current=1
+        WHERE user_id=? AND is_current=?
         ORDER BY awarded_at DESC, metric, period
         """,
-        (int(user_id),),
+        (int(user_id), _bool_db_value(True)),
     )
     return [dict(r) for r in rows]
 
