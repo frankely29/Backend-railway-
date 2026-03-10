@@ -258,7 +258,7 @@ def get_current_badges_for_user(user_id: int) -> List[Dict]:
         """
         SELECT metric, period, period_key, rank_position, badge_code
         FROM leaderboard_badges_current
-        WHERE user_id=? AND is_current=?
+        WHERE user_id=? AND is_current=? AND rank_position IN (1,2,3)
         ORDER BY awarded_at DESC, metric, period
         """,
         (int(user_id), _bool_db_value(True)),
@@ -267,7 +267,8 @@ def get_current_badges_for_user(user_id: int) -> List[Dict]:
     for row in rows:
         item = dict(row)
         item["badge_code"] = _normalized_badge_code(int(item.get("rank_position") or 0), item.get("badge_code"))
-        normalized_rows.append(item)
+        if item["badge_code"]:
+            normalized_rows.append(item)
     return normalized_rows
 
 
