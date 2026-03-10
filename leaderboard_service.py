@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from core import DB_BACKEND, _db_exec, _db_query_all, _db_query_one
@@ -16,6 +16,10 @@ def _bool_db_value(flag: bool):
     if DB_BACKEND == "postgres":
         return bool(flag)
     return 1 if flag else 0
+
+
+def _db_flag_to_bool(value) -> bool:
+    return bool(value)
 
 
 @dataclass
@@ -54,14 +58,14 @@ def _metric_column(metric: LeaderboardMetric) -> str:
     return "miles_worked" if metric == LeaderboardMetric.miles else "hours_worked"
 
 
-def _badge_for_rank(period: LeaderboardPeriod, rank: int) -> Optional[str]:
+def _badge_for_rank(rank: int) -> Tuple[Optional[str], bool]:
     if rank == 1:
-        return "RUBY" if period in (LeaderboardPeriod.monthly, LeaderboardPeriod.yearly) else "CROWN"
+        return "gold", True
     if rank == 2:
-        return "GOLD"
+        return "silver", False
     if rank == 3:
-        return "SILVER"
-    return None
+        return "bronze", False
+    return None, False
 
 
 def _display_name(row: Dict) -> str:
@@ -89,13 +93,15 @@ def _aggregate_rows(metric: LeaderboardMetric, period: LeaderboardPeriod) -> Dic
     )
     ranked: List[Dict] = []
     for idx, row in enumerate(rows, start=1):
+        badge_code, has_crown = _badge_for_rank(idx)
         ranked.append(
             {
                 "user_id": int(row["user_id"]),
                 "display_name": _display_name(dict(row)),
                 "metric_value": round(float(row["metric_value"] or 0.0), 4),
                 "rank_position": idx,
-                "badge_code": _badge_for_rank(period, idx),
+                "badge_code": badge_code,
+                "has_crown": has_crown,
             }
         )
     return {"metric": metric, "period": period, "period_key": bounds.period_key, "rows": ranked}
@@ -128,11 +134,12 @@ def refresh_current_badges() -> None:
                     continue
                 _db_exec(
                     """
-                    INSERT INTO leaderboard_badges_current(user_id, metric, period, period_key, rank_position, badge_code, awarded_at, is_current)
-                    VALUES(?,?,?,?,?,?,?,?)
+                    INSERT INTO leaderboard_badges_current(user_id, metric, period, period_key, rank_position, badge_code, has_crown, awarded_at, is_current)
+                    VALUES(?,?,?,?,?,?,?,?,?)
                     ON CONFLICT(user_id, metric, period, period_key) DO UPDATE SET
                       rank_position=excluded.rank_position,
                       badge_code=excluded.badge_code,
+                      has_crown=excluded.has_crown,
                       awarded_at=excluded.awarded_at,
                       is_current=excluded.is_current
                     """,
@@ -143,6 +150,7 @@ def refresh_current_badges() -> None:
                         board["period_key"],
                         int(row["rank_position"]),
                         row["badge_code"],
+                        _bool_db_value(bool(row.get("has_crown", False))),
                         now,
                         _bool_db_value(True),
                     ),
@@ -152,14 +160,87 @@ def refresh_current_badges() -> None:
 def get_current_badges_for_user(user_id: int) -> List[Dict]:
     rows = _db_query_all(
         """
-        SELECT metric, period, period_key, rank_position, badge_code
+        SELECT metric, period, period_key, rank_position, badge_code, has_crown
         FROM leaderboard_badges_current
         WHERE user_id=? AND is_current=?
         ORDER BY awarded_at DESC, metric, period
         """,
         (int(user_id), _bool_db_value(True)),
     )
-    return [dict(r) for r in rows]
+    badges = [dict(r) for r in rows]
+    for badge in badges:
+        badge["has_crown"] = _db_flag_to_bool(badge.get("has_crown"))
+    return badges
+
+
+_PERIOD_PRIORITY = {
+    LeaderboardPeriod.yearly.value: 4,
+    LeaderboardPeriod.monthly.value: 3,
+    LeaderboardPeriod.weekly.value: 2,
+    LeaderboardPeriod.daily.value: 1,
+}
+
+_METRIC_PRIORITY = {
+    LeaderboardMetric.miles.value: 2,
+    LeaderboardMetric.hours.value: 1,
+}
+
+
+def _badge_priority_key(badge: Dict) -> Tuple[int, int, int, int, int, str]:
+    rank = int(badge.get("rank_position") or 999)
+    return (
+        1 if rank == 1 else 0,
+        1 if rank == 2 else 0,
+        1 if rank == 3 else 0,
+        _PERIOD_PRIORITY.get(str(badge.get("period") or ""), 0),
+        _METRIC_PRIORITY.get(str(badge.get("metric") or ""), 0),
+        f"{badge.get('metric','')}|{badge.get('period','')}|{badge.get('period_key','')}",
+    )
+
+
+def get_best_current_badge_for_user(user_id: int) -> Dict:
+    badges = [b for b in get_current_badges_for_user(user_id) if int(b.get("rank_position") or 999) in (1, 2, 3)]
+    if not badges:
+        return {"leaderboard_badge_code": None, "leaderboard_has_crown": False}
+    best = max(badges, key=_badge_priority_key)
+    return {
+        "leaderboard_badge_code": best.get("badge_code"),
+        "leaderboard_has_crown": bool(best.get("has_crown")),
+        "leaderboard_badge_period": best.get("period"),
+        "leaderboard_badge_metric": best.get("metric"),
+    }
+
+
+def get_best_current_badges_for_users(user_ids: List[int]) -> Dict[int, Dict]:
+    if not user_ids:
+        return {}
+    placeholders = ",".join(["?" for _ in user_ids])
+    rows = _db_query_all(
+        f"""
+        SELECT user_id, metric, period, period_key, rank_position, badge_code, has_crown
+        FROM leaderboard_badges_current
+        WHERE is_current=? AND rank_position IN (1,2,3) AND user_id IN ({placeholders})
+        """,
+        (_bool_db_value(True), *[int(u) for u in user_ids]),
+    )
+
+    by_user: Dict[int, List[Dict]] = {}
+    for row in rows:
+        item = dict(row)
+        item["has_crown"] = _db_flag_to_bool(item.get("has_crown"))
+        uid = int(item["user_id"])
+        by_user.setdefault(uid, []).append(item)
+
+    out: Dict[int, Dict] = {}
+    for uid, badges in by_user.items():
+        best = max(badges, key=_badge_priority_key)
+        out[uid] = {
+            "leaderboard_badge_code": best.get("badge_code"),
+            "leaderboard_has_crown": bool(best.get("has_crown")),
+            "leaderboard_badge_period": best.get("period"),
+            "leaderboard_badge_metric": best.get("metric"),
+        }
+    return out
 
 
 def _sum_for_user(user_id: int, start_date: date, end_date: date) -> Dict:
