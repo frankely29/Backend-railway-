@@ -81,6 +81,19 @@ def init_leaderboard_schema() -> None:
         _db_exec(
             "CREATE UNIQUE INDEX IF NOT EXISTS uq_leaderboard_badges_current_identity ON leaderboard_badges_current(user_id, metric, period, period_key);"
         )
+        _db_exec(
+            """
+            CREATE TABLE IF NOT EXISTS leaderboard_badges_refresh_state (
+              id INTEGER PRIMARY KEY,
+              daily_period_key TEXT NOT NULL,
+              weekly_period_key TEXT NOT NULL,
+              monthly_period_key TEXT NOT NULL,
+              yearly_period_key TEXT NOT NULL,
+              source_updated_at BIGINT NOT NULL,
+              refreshed_at BIGINT NOT NULL
+            );
+            """
+        )
         return
 
     _db_exec(
@@ -130,4 +143,17 @@ def init_leaderboard_schema() -> None:
     )
     _db_exec(
         "CREATE INDEX IF NOT EXISTS idx_leaderboard_badges_lookup ON leaderboard_badges_current(user_id, is_current, period, metric);"
+    )
+    _db_exec(
+        """
+        CREATE TABLE IF NOT EXISTS leaderboard_badges_refresh_state (
+          id INTEGER PRIMARY KEY,
+          daily_period_key TEXT NOT NULL,
+          weekly_period_key TEXT NOT NULL,
+          monthly_period_key TEXT NOT NULL,
+          yearly_period_key TEXT NOT NULL,
+          source_updated_at INTEGER NOT NULL,
+          refreshed_at INTEGER NOT NULL
+        );
+        """
     )

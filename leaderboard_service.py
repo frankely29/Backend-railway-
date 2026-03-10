@@ -116,20 +116,64 @@ def get_leaderboard(metric: LeaderboardMetric, period: LeaderboardPeriod, limit:
 
 
 def get_my_rank(user_id: int, metric: LeaderboardMetric, period: LeaderboardPeriod) -> Dict:
-    board = _aggregate_rows(metric, period)
-    my_row = next((row for row in board["rows"] if int(row["user_id"]) == int(user_id)), None)
-    return {"metric": metric, "period": period, "period_key": board["period_key"], "row": my_row}
+    bounds = current_period_bounds(period)
+    metric_col = _metric_column(metric)
+
+    my_totals = _db_query_one(
+        f"""
+        SELECT s.user_id,
+               u.display_name,
+               u.email,
+               COALESCE(SUM(s.{metric_col}), 0) AS metric_value
+        FROM driver_daily_stats s
+        JOIN users u ON u.id = s.user_id
+        WHERE s.user_id = ? AND s.nyc_date >= ? AND s.nyc_date <= ?
+        GROUP BY s.user_id, u.display_name, u.email
+        LIMIT 1
+        """,
+        (int(user_id), bounds.start_date.isoformat(), bounds.end_date.isoformat()),
+    )
+
+    if not my_totals:
+        return {"metric": metric, "period": period, "period_key": bounds.period_key, "row": None}
+
+    metric_value = float(my_totals["metric_value"] or 0.0)
+    better_count_row = _db_query_one(
+        f"""
+        SELECT COUNT(*) AS better_count
+        FROM (
+          SELECT s.user_id, COALESCE(SUM(s.{metric_col}), 0) AS metric_value
+          FROM driver_daily_stats s
+          WHERE s.nyc_date >= ? AND s.nyc_date <= ?
+          GROUP BY s.user_id
+        ) ranked
+        WHERE ranked.metric_value > ?
+           OR (ranked.metric_value = ? AND ranked.user_id < ?)
+        """,
+        (bounds.start_date.isoformat(), bounds.end_date.isoformat(), metric_value, metric_value, int(user_id)),
+    )
+    rank_position = int((better_count_row["better_count"] or 0) + 1)
+
+    row = {
+        "user_id": int(my_totals["user_id"]),
+        "display_name": _display_name(dict(my_totals)),
+        "metric_value": round(metric_value, 4),
+        "rank_position": rank_position,
+        "badge_code": _badge_for_rank(rank_position),
+    }
+    return {"metric": metric, "period": period, "period_key": bounds.period_key, "row": row}
 
 
 def refresh_current_badges() -> None:
     now = int(time.time())
-    _db_exec(
-        "DELETE FROM leaderboard_badges_current",
-    )
 
     for metric in [LeaderboardMetric.miles, LeaderboardMetric.hours]:
         for period in [LeaderboardPeriod.daily, LeaderboardPeriod.weekly, LeaderboardPeriod.monthly, LeaderboardPeriod.yearly]:
             board = _aggregate_rows(metric, period)
+            _db_exec(
+                "DELETE FROM leaderboard_badges_current WHERE metric=? AND period=?",
+                (metric.value, period.value),
+            )
             for row in board["rows"][:3]:
                 if not row["badge_code"]:
                     continue
@@ -154,6 +198,59 @@ def refresh_current_badges() -> None:
                         _bool_db_value(True),
                     ),
                 )
+
+    source_row = _db_query_one("SELECT COALESCE(MAX(updated_at), 0) AS max_updated_at FROM driver_daily_stats")
+    _db_exec(
+        """
+        INSERT INTO leaderboard_badges_refresh_state(id, daily_period_key, weekly_period_key, monthly_period_key, yearly_period_key, source_updated_at, refreshed_at)
+        VALUES(1,?,?,?,?,?,?)
+        ON CONFLICT(id) DO UPDATE SET
+          daily_period_key=excluded.daily_period_key,
+          weekly_period_key=excluded.weekly_period_key,
+          monthly_period_key=excluded.monthly_period_key,
+          yearly_period_key=excluded.yearly_period_key,
+          source_updated_at=excluded.source_updated_at,
+          refreshed_at=excluded.refreshed_at
+        """,
+        (
+            current_period_bounds(LeaderboardPeriod.daily).period_key,
+            current_period_bounds(LeaderboardPeriod.weekly).period_key,
+            current_period_bounds(LeaderboardPeriod.monthly).period_key,
+            current_period_bounds(LeaderboardPeriod.yearly).period_key,
+            int(source_row["max_updated_at"] or 0) if source_row else 0,
+            now,
+        ),
+    )
+
+
+def refresh_current_badges_if_needed(max_staleness_seconds: int = 30) -> None:
+    now = int(time.time())
+    expected_keys = {
+        "daily_period_key": current_period_bounds(LeaderboardPeriod.daily).period_key,
+        "weekly_period_key": current_period_bounds(LeaderboardPeriod.weekly).period_key,
+        "monthly_period_key": current_period_bounds(LeaderboardPeriod.monthly).period_key,
+        "yearly_period_key": current_period_bounds(LeaderboardPeriod.yearly).period_key,
+    }
+    source_row = _db_query_one("SELECT COALESCE(MAX(updated_at), 0) AS max_updated_at FROM driver_daily_stats")
+    source_updated_at = int(source_row["max_updated_at"] or 0) if source_row else 0
+
+    state = _db_query_one(
+        """
+        SELECT daily_period_key, weekly_period_key, monthly_period_key, yearly_period_key, source_updated_at, refreshed_at
+        FROM leaderboard_badges_refresh_state
+        WHERE id=1
+        LIMIT 1
+        """
+    )
+    if state:
+        state_dict = dict(state)
+        keys_match = all((state_dict.get(key) or "") == value for key, value in expected_keys.items())
+        recently_refreshed = now - int(state_dict.get("refreshed_at") or 0) <= max(1, int(max_staleness_seconds))
+        source_match = int(state_dict.get("source_updated_at") or 0) == source_updated_at
+        if keys_match and recently_refreshed and source_match:
+            return
+
+    refresh_current_badges()
 
 
 def get_current_badges_for_user(user_id: int) -> List[Dict]:

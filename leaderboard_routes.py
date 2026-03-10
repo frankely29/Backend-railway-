@@ -18,7 +18,7 @@ from leaderboard_service import (
     get_leaderboard,
     get_my_rank,
     get_overview_for_user,
-    refresh_current_badges,
+    refresh_current_badges_if_needed,
 )
 
 router = APIRouter(tags=["leaderboard"])
@@ -26,21 +26,21 @@ router = APIRouter(tags=["leaderboard"])
 
 @router.get("/leaderboard", response_model=LeaderboardResponse)
 def leaderboard(metric: LeaderboardMetric, period: LeaderboardPeriod, limit: int = 10, user: sqlite3.Row = Depends(require_user)):
-    refresh_current_badges()
+    refresh_current_badges_if_needed()
     data = get_leaderboard(metric, period, limit=limit)
     return {"ok": True, **data}
 
 
 @router.get("/leaderboard/me", response_model=MyRankResponse)
 def leaderboard_me(metric: LeaderboardMetric, period: LeaderboardPeriod, user: sqlite3.Row = Depends(require_user)):
-    refresh_current_badges()
+    refresh_current_badges_if_needed()
     data = get_my_rank(int(user["id"]), metric, period)
     return {"ok": True, **data}
 
 
 @router.get("/leaderboard/badges/me", response_model=MyBadgesResponse)
 def leaderboard_badges_me(user: sqlite3.Row = Depends(require_user)):
-    refresh_current_badges()
+    refresh_current_badges_if_needed()
     return {"ok": True, "badges": get_current_badges_for_user(int(user["id"]))}
 
 
