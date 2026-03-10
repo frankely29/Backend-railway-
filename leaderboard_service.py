@@ -65,6 +65,12 @@ def _badge_for_rank(rank: int) -> Optional[str]:
     return None
 
 
+def _normalized_badge_code(rank_position: int, badge_code: Optional[str] = None) -> Optional[str]:
+    # Always derive the podium badge from current rank position so stale legacy
+    # values can never leak crown to rank #2/#3 and non-podium ranks are null.
+    return _badge_for_rank(int(rank_position))
+
+
 def _display_name(row: Dict) -> str:
     email = (row.get("email") or "Driver").strip()
     fallback = email.split("@")[0] if "@" in email else "Driver"
@@ -130,12 +136,11 @@ def refresh_current_badges() -> None:
                     continue
                 _db_exec(
                     """
-                    INSERT INTO leaderboard_badges_current(user_id, metric, period, period_key, rank_position, badge_code, has_crown, awarded_at, is_current)
-                    VALUES(?,?,?,?,?,?,?,?,?)
+                    INSERT INTO leaderboard_badges_current(user_id, metric, period, period_key, rank_position, badge_code, awarded_at, is_current)
+                    VALUES(?,?,?,?,?,?,?,?)
                     ON CONFLICT(user_id, metric, period, period_key) DO UPDATE SET
                       rank_position=excluded.rank_position,
                       badge_code=excluded.badge_code,
-                      has_crown=excluded.has_crown,
                       awarded_at=excluded.awarded_at,
                       is_current=excluded.is_current
                     """,
@@ -145,8 +150,7 @@ def refresh_current_badges() -> None:
                         period.value,
                         board["period_key"],
                         int(row["rank_position"]),
-                        row["badge_code"],
-                        _bool_db_value(False),
+                        _normalized_badge_code(int(row["rank_position"]), row.get("badge_code")),
                         now,
                         _bool_db_value(True),
                     ),
@@ -163,7 +167,12 @@ def get_current_badges_for_user(user_id: int) -> List[Dict]:
         """,
         (int(user_id), _bool_db_value(True)),
     )
-    return [dict(r) for r in rows]
+    normalized_rows: List[Dict] = []
+    for row in rows:
+        item = dict(row)
+        item["badge_code"] = _normalized_badge_code(int(item.get("rank_position") or 0), item.get("badge_code"))
+        normalized_rows.append(item)
+    return normalized_rows
 
 
 _PERIOD_PRIORITY = {
@@ -180,7 +189,7 @@ _METRIC_PRIORITY = {
 
 
 def _badge_priority_key(badge: Dict) -> Tuple[int, int, int, str]:
-    badge_code = str(badge.get("badge_code") or "")
+    badge_code = _normalized_badge_code(int(badge.get("rank_position") or 0), badge.get("badge_code"))
     badge_priority = 3 if badge_code == "crown" else 2 if badge_code == "silver" else 1 if badge_code == "bronze" else 0
     return (
         badge_priority,
@@ -218,6 +227,7 @@ def get_best_current_badges_for_users(user_ids: List[int]) -> Dict[int, Dict]:
     by_user: Dict[int, List[Dict]] = {}
     for row in rows:
         item = dict(row)
+        item["badge_code"] = _normalized_badge_code(int(item.get("rank_position") or 0), item.get("badge_code"))
         uid = int(item["user_id"])
         by_user.setdefault(uid, []).append(item)
 

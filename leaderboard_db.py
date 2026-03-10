@@ -50,7 +50,6 @@ def init_leaderboard_schema() -> None:
               period_key TEXT NOT NULL,
               rank_position INTEGER NOT NULL,
               badge_code TEXT NOT NULL,
-              has_crown BOOLEAN NOT NULL DEFAULT FALSE,
               awarded_at BIGINT NOT NULL,
               is_current BOOLEAN NOT NULL DEFAULT TRUE,
               PRIMARY KEY(user_id, metric, period, period_key),
@@ -58,7 +57,6 @@ def init_leaderboard_schema() -> None:
             );
             """
         )
-        _try_exec("ALTER TABLE leaderboard_badges_current ADD COLUMN IF NOT EXISTS has_crown BOOLEAN NOT NULL DEFAULT FALSE;")
         _db_exec(
             "CREATE INDEX IF NOT EXISTS idx_leaderboard_badges_lookup ON leaderboard_badges_current(user_id, is_current, period, metric);"
         )
@@ -123,7 +121,6 @@ def init_leaderboard_schema() -> None:
           period_key TEXT NOT NULL,
           rank_position INTEGER NOT NULL,
           badge_code TEXT NOT NULL,
-          has_crown INTEGER NOT NULL DEFAULT 0,
           awarded_at INTEGER NOT NULL,
           is_current INTEGER NOT NULL DEFAULT 1,
           PRIMARY KEY(user_id, metric, period, period_key),
@@ -131,7 +128,6 @@ def init_leaderboard_schema() -> None:
         );
         """
     )
-    _try_exec("ALTER TABLE leaderboard_badges_current ADD COLUMN has_crown INTEGER NOT NULL DEFAULT 0;")
     _db_exec(
         "CREATE INDEX IF NOT EXISTS idx_leaderboard_badges_lookup ON leaderboard_badges_current(user_id, is_current, period, metric);"
     )
