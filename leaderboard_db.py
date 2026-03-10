@@ -53,6 +53,27 @@ def init_leaderboard_schema() -> None:
         _db_exec(
             "CREATE INDEX IF NOT EXISTS idx_leaderboard_badges_lookup ON leaderboard_badges_current(user_id, is_current, period, metric);"
         )
+        _db_exec(
+            """
+            DELETE FROM leaderboard_badges_current t
+            USING (
+              SELECT ctid
+              FROM (
+                SELECT ctid,
+                       ROW_NUMBER() OVER (
+                         PARTITION BY user_id, metric, period, period_key
+                         ORDER BY awarded_at DESC, ctid DESC
+                       ) AS rn
+                FROM leaderboard_badges_current
+              ) ranked
+              WHERE rn > 1
+            ) d
+            WHERE t.ctid = d.ctid;
+            """
+        )
+        _db_exec(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_leaderboard_badges_current_identity ON leaderboard_badges_current(user_id, metric, period, period_key);"
+        )
         return
 
     _db_exec(
