@@ -124,8 +124,7 @@ def get_my_rank(user_id: int, metric: LeaderboardMetric, period: LeaderboardPeri
 def refresh_current_badges() -> None:
     now = int(time.time())
     _db_exec(
-        "DELETE FROM leaderboard_badges_current WHERE is_current=?",
-        (_bool_db_value(True),),
+        "DELETE FROM leaderboard_badges_current",
     )
 
     for metric in [LeaderboardMetric.miles, LeaderboardMetric.hours]:
@@ -200,11 +199,18 @@ def _badge_priority_key(badge: Dict) -> Tuple[int, int, int, str]:
 
 
 def get_best_current_badge_for_user(user_id: int) -> Dict:
-    badges = [b for b in get_current_badges_for_user(user_id) if int(b.get("rank_position") or 999) in (1, 2, 3)]
-    if not badges:
+    rows = _db_query_all(
+        """
+        SELECT metric, period, period_key, rank_position
+        FROM leaderboard_badges_current
+        WHERE user_id=? AND is_current=? AND rank_position IN (1,2,3)
+        """,
+        (int(user_id), _bool_db_value(True)),
+    )
+    if not rows:
         return {"leaderboard_badge_code": None}
-    best = max(badges, key=_badge_priority_key)
-    return {"leaderboard_badge_code": best.get("badge_code")}
+    best = max((dict(row) for row in rows), key=_badge_priority_key)
+    return {"leaderboard_badge_code": _badge_for_rank(int(best.get("rank_position") or 0))}
 
 
 def get_best_current_badges_for_users(user_ids: List[int]) -> Dict[int, Dict]:
@@ -213,7 +219,7 @@ def get_best_current_badges_for_users(user_ids: List[int]) -> Dict[int, Dict]:
     placeholders = ",".join(["?" for _ in user_ids])
     rows = _db_query_all(
         f"""
-        SELECT user_id, metric, period, period_key, rank_position, badge_code
+        SELECT user_id, metric, period, period_key, rank_position
         FROM leaderboard_badges_current
         WHERE is_current=? AND rank_position IN (1,2,3) AND user_id IN ({placeholders})
         """,
@@ -223,14 +229,13 @@ def get_best_current_badges_for_users(user_ids: List[int]) -> Dict[int, Dict]:
     by_user: Dict[int, List[Dict]] = {}
     for row in rows:
         item = dict(row)
-        item["badge_code"] = _normalized_badge_code(int(item.get("rank_position") or 0), item.get("badge_code"))
         uid = int(item["user_id"])
         by_user.setdefault(uid, []).append(item)
 
     out: Dict[int, Dict] = {}
     for uid, badges in by_user.items():
         best = max(badges, key=_badge_priority_key)
-        out[uid] = {"leaderboard_badge_code": best.get("badge_code")}
+        out[uid] = {"leaderboard_badge_code": _badge_for_rank(int(best.get("rank_position") or 0))}
     return out
 
 
