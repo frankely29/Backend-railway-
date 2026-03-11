@@ -167,7 +167,13 @@ def get_my_rank(user_id: int, metric: LeaderboardMetric, period: LeaderboardPeri
 def refresh_current_badges() -> None:
     now = int(time.time())
 
-    for metric in [LeaderboardMetric.miles, LeaderboardMetric.hours]:
+    # Badges are awarded only for miles-based leaderboards.
+    _db_exec(
+        "DELETE FROM leaderboard_badges_current WHERE metric=?",
+        (LeaderboardMetric.hours.value,),
+    )
+
+    for metric in [LeaderboardMetric.miles]:
         for period in [LeaderboardPeriod.daily, LeaderboardPeriod.weekly, LeaderboardPeriod.monthly, LeaderboardPeriod.yearly]:
             board = _aggregate_rows(metric, period)
             _db_exec(
