@@ -32,7 +32,14 @@ def nyc_now() -> datetime:
 
 
 def nyc_date_from_unix(ts: int) -> str:
-    return datetime.fromtimestamp(int(ts), tz=timezone.utc).astimezone(NYC_TZ).date().isoformat()
+    """
+    Convert a UNIX timestamp to a date string (YYYY-MM-DD) in America/New_York,
+    where the “day” begins at 4 AM local time. Subtract 4 hours before
+    taking the date so that data recorded between midnight and 3:59:59 AM
+    counts toward the previous day.
+    """
+    local = datetime.fromtimestamp(int(ts), tz=timezone.utc).astimezone(NYC_TZ) - timedelta(hours=4)
+    return local.date().isoformat()
 
 
 def period_key_for_date(period: LeaderboardPeriod, d: date) -> str:
@@ -56,10 +63,16 @@ def _split_seconds_by_nyc_date(start_ts: int, end_ts: int) -> list[tuple[str, fl
     out: list[tuple[str, float]] = []
     while cursor < end_dt:
         local = cursor.astimezone(NYC_TZ)
-        next_midnight_local = datetime.combine(local.date() + timedelta(days=1), datetime.min.time(), tzinfo=NYC_TZ)
-        chunk_end = min(end_dt, next_midnight_local.astimezone(timezone.utc))
+        shifted_local = local - timedelta(hours=4)
+        next_boundary_shifted = datetime.combine(
+            shifted_local.date() + timedelta(days=1),
+            datetime.min.time(),
+            tzinfo=NYC_TZ,
+        )
+        next_boundary_local = next_boundary_shifted + timedelta(hours=4)
+        chunk_end = min(end_dt, next_boundary_local.astimezone(timezone.utc))
         sec = max(0.0, (chunk_end - cursor).total_seconds())
-        out.append((local.date().isoformat(), sec))
+        out.append((shifted_local.date().isoformat(), sec))
         cursor = chunk_end
     return out
 
