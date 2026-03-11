@@ -961,8 +961,11 @@ def driver_profile(user_id: int, viewer: sqlite3.Row = Depends(require_user)):
     target_user_id = int(target["id"])
     display_name = _clean_display_name(target["display_name"] or "", target["email"])
 
-    overview = get_overview_for_user(target_user_id)
-    daily = overview["daily"]
+    overview = get_overview_for_user(target_user_id) or {}
+    daily = overview.get("daily") or {}
+    weekly = overview.get("weekly") or {}
+    monthly = overview.get("monthly") or {}
+    yearly = overview.get("yearly") or {}
     miles_rank_data = get_my_rank(target_user_id, LeaderboardMetric.miles, LeaderboardPeriod.daily)
     hours_rank_data = get_my_rank(target_user_id, LeaderboardMetric.hours, LeaderboardPeriod.daily)
     best_badge = get_best_current_badge_for_user(target_user_id)
@@ -979,10 +982,22 @@ def driver_profile(user_id: int, viewer: sqlite3.Row = Depends(require_user)):
             "leaderboard_badge_code": best_badge.get("leaderboard_badge_code"),
         },
         "daily": {
-            "miles": daily["miles"],
-            "hours": daily["hours"],
+            "miles": daily.get("miles", 0),
+            "hours": daily.get("hours", 0),
             "miles_rank": miles_rank,
             "hours_rank": hours_rank,
+        },
+        "weekly": {
+            "miles": weekly.get("miles", 0),
+            "hours": weekly.get("hours", 0),
+        },
+        "monthly": {
+            "miles": monthly.get("miles", 0),
+            "hours": monthly.get("hours", 0),
+        },
+        "yearly": {
+            "miles": yearly.get("miles", 0),
+            "hours": yearly.get("hours", 0),
         },
     }
 
