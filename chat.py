@@ -54,6 +54,11 @@ def _normalize_room(room: str) -> str:
     return cleaned
 
 
+def _dm_room_for_users(a: int, b: int) -> str:
+    low, high = sorted((int(a), int(b)))
+    return f"dm:{low}:{high}"
+
+
 def _validate_text(text: str) -> str:
     cleaned = (text or "").strip()
     if not cleaned:
@@ -90,14 +95,20 @@ def _serialize_message(row: dict) -> dict:
     }
 
 
-@router.get("/rooms/{room}")
-def list_room_messages(
-    room: str,
-    after: str | None = None,
-    limit: int = 50,
-    user=Depends(require_user),
-):
-    _ = user
+def _ensure_dm_target_exists(other_user_id: int):
+    row = _db_query_all(
+        "SELECT id, is_disabled FROM users WHERE id=? LIMIT 1",
+        (int(other_user_id),),
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="User not found")
+    target = dict(row[0])
+    is_disabled = bool(target["is_disabled"]) if DB_BACKEND == "postgres" else int(target["is_disabled"] or 0) == 1
+    if is_disabled:
+        raise HTTPException(status_code=404, detail="User not found")
+
+
+def _list_messages_for_room(room: str, after: str | None, limit: int) -> dict:
     safe_room = _normalize_room(room)
     safe_limit = max(1, min(200, int(limit)))
     after_field, after_value = _parse_after(after)
@@ -146,8 +157,7 @@ def list_room_messages(
     return {"room": safe_room, "messages": [_serialize_message(dict(r)) for r in rows]}
 
 
-@router.post("/rooms/{room}")
-def create_room_message(room: str, payload: ChatMessagePayload, user=Depends(require_user)):
+def _create_message_for_room(room: str, payload: ChatMessagePayload, user) -> dict:
     safe_room = _normalize_room(room)
     message = _validate_text(payload.text)
     user_id = int(user["id"])
@@ -187,3 +197,44 @@ def create_room_message(room: str, payload: ChatMessagePayload, user=Depends(req
         "text": message,
         "created_at": _to_iso(now),
     }
+
+
+@router.get("/rooms/{room}")
+def list_room_messages(
+    room: str,
+    after: str | None = None,
+    limit: int = 50,
+    user=Depends(require_user),
+):
+    _ = user
+    return _list_messages_for_room(room, after, limit)
+
+
+@router.post("/rooms/{room}")
+def create_room_message(room: str, payload: ChatMessagePayload, user=Depends(require_user)):
+    return _create_message_for_room(room, payload, user)
+
+
+@router.get("/dm/{other_user_id}")
+def list_dm_messages(
+    other_user_id: int,
+    after: str | None = None,
+    limit: int = 50,
+    user=Depends(require_user),
+):
+    my_user_id = int(user["id"])
+    if int(other_user_id) == my_user_id:
+        raise HTTPException(status_code=400, detail="Cannot message yourself")
+    _ensure_dm_target_exists(int(other_user_id))
+    room = _dm_room_for_users(my_user_id, int(other_user_id))
+    return _list_messages_for_room(room, after, limit)
+
+
+@router.post("/dm/{other_user_id}")
+def create_dm_message(other_user_id: int, payload: ChatMessagePayload, user=Depends(require_user)):
+    my_user_id = int(user["id"])
+    if int(other_user_id) == my_user_id:
+        raise HTTPException(status_code=400, detail="Cannot message yourself")
+    _ensure_dm_target_exists(int(other_user_id))
+    room = _dm_room_for_users(my_user_id, int(other_user_id))
+    return _create_message_for_room(room, payload, user)
