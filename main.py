@@ -605,8 +605,14 @@ def _ensure_admin_seed() -> None:
 
 from chat import router as chat_router
 from leaderboard_db import init_leaderboard_schema
+from leaderboard_models import LeaderboardMetric, LeaderboardPeriod
 from leaderboard_routes import router as leaderboard_router
-from leaderboard_service import get_best_current_badge_for_user, get_best_current_badges_for_users
+from leaderboard_service import (
+    get_best_current_badge_for_user,
+    get_best_current_badges_for_users,
+    get_my_rank,
+    get_overview_for_user,
+)
 from leaderboard_tracker import increment_pickup_count, record_presence_heartbeat
 
 app.include_router(chat_router)
@@ -942,6 +948,45 @@ def me(user: sqlite3.Row = Depends(require_user)):
     }
 
 
+@app.get("/drivers/{user_id}/profile")
+def driver_profile(user_id: int, viewer: sqlite3.Row = Depends(require_user)):
+    _ = viewer
+    target = _db_query_one(
+        "SELECT id, email, display_name, avatar_url, is_disabled FROM users WHERE id=? LIMIT 1",
+        (int(user_id),),
+    )
+    if not target or _flag_to_int(target["is_disabled"]) == 1:
+        raise HTTPException(status_code=404, detail="Driver not found")
+
+    target_user_id = int(target["id"])
+    display_name = _clean_display_name(target["display_name"] or "", target["email"])
+
+    overview = get_overview_for_user(target_user_id)
+    daily = overview["daily"]
+    miles_rank_data = get_my_rank(target_user_id, LeaderboardMetric.miles, LeaderboardPeriod.daily)
+    hours_rank_data = get_my_rank(target_user_id, LeaderboardMetric.hours, LeaderboardPeriod.daily)
+    best_badge = get_best_current_badge_for_user(target_user_id)
+
+    miles_rank = miles_rank_data.get("row", {}).get("rank_position") if miles_rank_data.get("row") else None
+    hours_rank = hours_rank_data.get("row", {}).get("rank_position") if hours_rank_data.get("row") else None
+
+    return {
+        "ok": True,
+        "user": {
+            "id": target_user_id,
+            "display_name": display_name,
+            "avatar_url": target["avatar_url"] if target["avatar_url"] else None,
+            "leaderboard_badge_code": best_badge.get("leaderboard_badge_code"),
+        },
+        "daily": {
+            "miles": daily["miles"],
+            "hours": daily["hours"],
+            "miles_rank": miles_rank,
+            "hours_rank": hours_rank,
+        },
+    }
+
+
 class MeUpdatePayload(BaseModel):
     display_name: Optional[str] = None
     ghost_mode: Optional[bool] = None
@@ -1211,15 +1256,15 @@ def chat_send(payload: ChatSendPayload, user: sqlite3.Row = Depends(require_user
         try:
             cur = conn.cursor()
             insert_sql = """
-                INSERT INTO chat_messages(user_id, display_name, message, created_at)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO chat_messages(room, user_id, display_name, message, created_at)
+                VALUES (?, ?, ?, ?, ?)
             """
             if DB_BACKEND == "postgres":
-                cur.execute(_sql(insert_sql + " RETURNING id"), (int(user["id"]), display_name, message, now))
+                cur.execute(_sql(insert_sql + " RETURNING id"), ("global", int(user["id"]), display_name, message, now))
                 row = cur.fetchone()
                 new_id = int(row["id"])
             else:
-                cur.execute(_sql(insert_sql), (int(user["id"]), display_name, message, now))
+                cur.execute(_sql(insert_sql), ("global", int(user["id"]), display_name, message, now))
                 new_id = int(cur.lastrowid)
             conn.commit()
         finally:
@@ -1235,10 +1280,11 @@ def chat_recent(limit: int = 50, user: sqlite3.Row = Depends(require_user)):
         """
         SELECT id, user_id, display_name, message, created_at
         FROM chat_messages
+        WHERE room = ?
         ORDER BY id DESC
         LIMIT ?
         """,
-        (safe_limit,),
+        ("global", safe_limit),
     )
     items = [dict(r) for r in reversed(rows)]
     return {"ok": True, "items": items}
@@ -1252,11 +1298,11 @@ def chat_since(after_id: int = 0, limit: int = 50, user: sqlite3.Row = Depends(r
         """
         SELECT id, user_id, display_name, message, created_at
         FROM chat_messages
-        WHERE id > ?
+        WHERE room = ? AND id > ?
         ORDER BY id ASC
         LIMIT ?
         """,
-        (safe_after_id, safe_limit),
+        ("global", safe_after_id, safe_limit),
     )
     items = [dict(r) for r in rows]
     return {"ok": True, "items": items}
