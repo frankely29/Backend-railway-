@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hmac
+import hashlib
 import json
 import math
 import os
@@ -64,12 +65,15 @@ ALLOWED_MAP_IDENTITY_MODES = {"name", "avatar"}
 
 PICKUP_ZONE_HOTSPOT_MIN_POINTS = 5
 PICKUP_ZONE_HOTSPOT_MAX_POINTS = 100
-PICKUP_ZONE_HOTSPOT_CELL_SIZE_M = 110
-PICKUP_ZONE_HOTSPOT_RADIUS_M = 220
-PICKUP_ZONE_HOTSPOT_SIGMA_M = 140
+PICKUP_ZONE_HOTSPOT_CELL_SIZE_M = 135
+PICKUP_ZONE_HOTSPOT_RADIUS_M = 240
+PICKUP_ZONE_HOTSPOT_SIGMA_M = 155
+PICKUP_ZONE_HOTSPOT_SIMPLIFY_M = 18
 
 _pickup_zone_geom_cache: Optional[Dict[int, Dict[str, Any]]] = None
 _pickup_zone_geom_cache_mtime: Optional[float] = None
+_pickup_zone_hotspot_feature_cache: Dict[int, Dict[str, Any]] = {}
+_pickup_zone_hotspot_cache_lock = threading.Lock()
 _to_3857 = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
 _to_4326 = Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
 
@@ -1494,6 +1498,199 @@ def _pickup_zone_recent_points(
     return dict(grouped)
 
 
+def _pickup_zone_signature(point_rows: List[Dict[str, Any]]) -> str:
+    if not point_rows:
+        return hashlib.sha1(b"0||0").hexdigest()
+    ids: List[str] = []
+    for row in point_rows:
+        try:
+            ids.append(str(int(row.get("id"))))
+        except Exception:
+            ids.append("0")
+    latest_created_at = int(point_rows[0].get("created_at") or 0)
+    payload = f"{len(point_rows)}|{','.join(ids)}|{latest_created_at}"
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+
+def _build_pickup_zone_hotspot_feature(
+    zone_id: int, zone_meta: Dict[str, Any], point_rows: List[Dict[str, Any]]
+) -> Optional[Dict[str, Any]]:
+    if len(point_rows) < PICKUP_ZONE_HOTSPOT_MIN_POINTS:
+        return None
+
+    zone_geom = zone_meta.get("geometry")
+    if zone_geom is None or zone_geom.is_empty:
+        return None
+
+    try:
+        zone_proj = transform(_to_3857.transform, zone_geom)
+    except Exception:
+        return None
+    if zone_proj.is_empty:
+        return None
+
+    point_entries: List[Dict[str, Any]] = []
+    for idx, row in enumerate(point_rows):
+        try:
+            lng = float(row["lng"])
+            lat = float(row["lat"])
+            x, y = _to_3857.transform(lng, lat)
+        except Exception:
+            continue
+        n = len(point_rows)
+        if n <= 1:
+            recency_weight = 1.0
+        else:
+            recency_weight = 1.0 - 0.65 * (idx / (n - 1))
+        point_entries.append(
+            {
+                "x": x,
+                "y": y,
+                "lat": lat,
+                "lng": lng,
+                "weight": recency_weight,
+                "created_at": int(row.get("created_at") or 0),
+            }
+        )
+    if len(point_entries) < PICKUP_ZONE_HOTSPOT_MIN_POINTS:
+        return None
+
+    sigma = float(PICKUP_ZONE_HOTSPOT_SIGMA_M)
+    radius = float(PICKUP_ZONE_HOTSPOT_RADIUS_M)
+    radius_sq = radius * radius
+    cell_size = float(PICKUP_ZONE_HOTSPOT_CELL_SIZE_M)
+
+    minx, miny, maxx, maxy = zone_proj.bounds
+    start_x = minx + (cell_size / 2.0)
+    start_y = miny + (cell_size / 2.0)
+    cols = max(1, int(math.ceil((maxx - minx) / cell_size)))
+    rows_n = max(1, int(math.ceil((maxy - miny) / cell_size)))
+
+    cell_scores: Dict[Tuple[int, int], float] = {}
+    peak_score = 0.0
+    peak_key: Optional[Tuple[int, int]] = None
+
+    for gy in range(rows_n):
+        cy = start_y + gy * cell_size
+        for gx in range(cols):
+            cx = start_x + gx * cell_size
+            center = Point(cx, cy)
+            if not zone_proj.covers(center):
+                continue
+            score = 0.0
+            for pe in point_entries:
+                dx = cx - pe["x"]
+                dy = cy - pe["y"]
+                dist_sq = (dx * dx) + (dy * dy)
+                if dist_sq > radius_sq:
+                    continue
+                distance_weight = math.exp(-(dist_sq) / (2.0 * sigma * sigma))
+                score += pe["weight"] * distance_weight
+            if score <= 0.0:
+                continue
+            key = (gx, gy)
+            cell_scores[key] = score
+            if score > peak_score:
+                peak_score = score
+                peak_key = key
+
+    if peak_key is None or peak_score <= 0.0:
+        return None
+
+    threshold = peak_score * 0.60
+    selected = {k for k, v in cell_scores.items() if v >= threshold}
+    if peak_key not in selected:
+        selected.add(peak_key)
+
+    connected: set[Tuple[int, int]] = set()
+    q = deque([peak_key])
+    while q:
+        cur = q.popleft()
+        if cur in connected or cur not in selected:
+            continue
+        connected.add(cur)
+        cx, cy = cur
+        for nx in (cx - 1, cx, cx + 1):
+            for ny in (cy - 1, cy, cy + 1):
+                nkey = (nx, ny)
+                if nkey != cur and nkey in selected and nkey not in connected:
+                    q.append(nkey)
+
+    if not connected:
+        return None
+
+    cell_polys: List[Polygon] = []
+    half = cell_size / 2.0
+    for gx, gy in connected:
+        cx = start_x + gx * cell_size
+        cy = start_y + gy * cell_size
+        cell_polys.append(
+            Polygon(
+                [
+                    (cx - half, cy - half),
+                    (cx + half, cy - half),
+                    (cx + half, cy + half),
+                    (cx - half, cy + half),
+                ]
+            )
+        )
+
+    hotspot_proj = unary_union(cell_polys)
+    hotspot_proj = hotspot_proj.buffer(35).buffer(-18)
+    clipped_proj = hotspot_proj.intersection(zone_proj)
+
+    if clipped_proj.is_empty:
+        px = start_x + peak_key[0] * cell_size
+        py = start_y + peak_key[1] * cell_size
+        clipped_proj = Point(px, py).buffer(160).intersection(zone_proj)
+
+    if clipped_proj.is_empty:
+        return None
+
+    pre_simplified = clipped_proj
+    simplified = clipped_proj.simplify(PICKUP_ZONE_HOTSPOT_SIMPLIFY_M, preserve_topology=True)
+    if not simplified.is_empty:
+        simplified = simplified.intersection(zone_proj)
+        if not simplified.is_empty:
+            clipped_proj = simplified
+        else:
+            clipped_proj = pre_simplified
+    else:
+        clipped_proj = pre_simplified
+
+    hotspot_ll = transform(_to_4326.transform, clipped_proj)
+    if hotspot_ll.is_empty:
+        return None
+
+    sample_size = len(point_entries)
+    avg_lat = sum(p["lat"] for p in point_entries) / sample_size
+    avg_lng = sum(p["lng"] for p in point_entries) / sample_size
+    latest_created_at = max(p["created_at"] for p in point_entries)
+    intensity = min(1.0, max(0.25, peak_score / max(1.0, 0.55 * sample_size)))
+    signature = _pickup_zone_signature(point_rows)
+
+    return {
+        "type": "Feature",
+        "geometry": mapping(hotspot_ll),
+        "properties": {
+            "zone_id": zone_id,
+            "zone_name": zone_meta.get("zone_name") or (point_rows[0].get("zone_name") or ""),
+            "borough": zone_meta.get("borough") or (point_rows[0].get("borough") or ""),
+            "sample_size": sample_size,
+            "max_points_per_zone": PICKUP_ZONE_HOTSPOT_MAX_POINTS,
+            "min_points": PICKUP_ZONE_HOTSPOT_MIN_POINTS,
+            "peak_score": peak_score,
+            "threshold_score": threshold,
+            "avg_lat": avg_lat,
+            "avg_lng": avg_lng,
+            "latest_created_at": latest_created_at,
+            "intensity": intensity,
+            "hotspot_method": "recency_weighted_density_grid",
+            "signature": signature,
+        },
+    }
+
+
 def _pickup_zone_hotspots(zone_ids: List[int]) -> Dict[str, Any]:
     empty = {"type": "FeatureCollection", "features": []}
     try:
@@ -1512,173 +1709,48 @@ def _pickup_zone_hotspots(zone_ids: List[int]) -> Dict[str, Any]:
 
         zone_points = _pickup_zone_recent_points(clean_zone_ids, PICKUP_ZONE_HOTSPOT_MAX_POINTS)
         features: List[Dict[str, Any]] = []
-        sigma = float(PICKUP_ZONE_HOTSPOT_SIGMA_M)
-        radius = float(PICKUP_ZONE_HOTSPOT_RADIUS_M)
-        radius_sq = radius * radius
-        cell_size = float(PICKUP_ZONE_HOTSPOT_CELL_SIZE_M)
-
+        requested_zone_ids = set(clean_zone_ids)
         for zone_id in clean_zone_ids:
             pts = zone_points.get(zone_id, [])
             if len(pts) < PICKUP_ZONE_HOTSPOT_MIN_POINTS:
+                with _pickup_zone_hotspot_cache_lock:
+                    _pickup_zone_hotspot_feature_cache.pop(zone_id, None)
                 continue
             zone_data = zone_geoms.get(zone_id)
             if not zone_data:
                 continue
-            zone_geom = zone_data.get("geometry")
-            if zone_geom is None or zone_geom.is_empty:
+
+            signature = _pickup_zone_signature(pts)
+            with _pickup_zone_hotspot_cache_lock:
+                cached = _pickup_zone_hotspot_feature_cache.get(zone_id)
+            if cached and cached.get("signature") == signature and cached.get("feature"):
+                features.append(cached["feature"])
                 continue
 
             try:
-                zone_proj = transform(_to_3857.transform, zone_geom)
+                feature = _build_pickup_zone_hotspot_feature(zone_id, zone_data, pts)
             except Exception:
-                continue
-            if zone_proj.is_empty:
-                continue
-
-            point_entries: List[Dict[str, Any]] = []
-            for idx, row in enumerate(pts):
-                try:
-                    lng = float(row["lng"])
-                    lat = float(row["lat"])
-                    x, y = _to_3857.transform(lng, lat)
-                except Exception:
-                    continue
-                n = len(pts)
-                if n <= 1:
-                    recency_weight = 1.0
-                else:
-                    recency_weight = 1.0 - 0.65 * (idx / (n - 1))
-                point_entries.append(
-                    {
-                        "x": x,
-                        "y": y,
-                        "lat": lat,
-                        "lng": lng,
-                        "weight": recency_weight,
-                        "created_at": int(row.get("created_at") or 0),
-                    }
-                )
-            if len(point_entries) < PICKUP_ZONE_HOTSPOT_MIN_POINTS:
+                print(f"[warn] Failed to generate pickup zone hotspot for zone {zone_id}", traceback.format_exc())
                 continue
 
-            minx, miny, maxx, maxy = zone_proj.bounds
-            start_x = minx + (cell_size / 2.0)
-            start_y = miny + (cell_size / 2.0)
-            cols = max(1, int(math.ceil((maxx - minx) / cell_size)))
-            rows_n = max(1, int(math.ceil((maxy - miny) / cell_size)))
-
-            cell_scores: Dict[Tuple[int, int], float] = {}
-            peak_score = 0.0
-            peak_key: Optional[Tuple[int, int]] = None
-
-            for gy in range(rows_n):
-                cy = start_y + gy * cell_size
-                for gx in range(cols):
-                    cx = start_x + gx * cell_size
-                    center = Point(cx, cy)
-                    if not zone_proj.covers(center):
-                        continue
-                    score = 0.0
-                    for pe in point_entries:
-                        dx = cx - pe["x"]
-                        dy = cy - pe["y"]
-                        dist_sq = (dx * dx) + (dy * dy)
-                        if dist_sq > radius_sq:
-                            continue
-                        distance_weight = math.exp(-(dist_sq) / (2.0 * sigma * sigma))
-                        score += pe["weight"] * distance_weight
-                    if score <= 0.0:
-                        continue
-                    key = (gx, gy)
-                    cell_scores[key] = score
-                    if score > peak_score:
-                        peak_score = score
-                        peak_key = key
-
-            if peak_key is None or peak_score <= 0.0:
+            if not feature:
                 continue
 
-            threshold = peak_score * 0.60
-            selected = {k for k, v in cell_scores.items() if v >= threshold}
-            if peak_key not in selected:
-                selected.add(peak_key)
-
-            connected: set[Tuple[int, int]] = set()
-            q = deque([peak_key])
-            while q:
-                cur = q.popleft()
-                if cur in connected or cur not in selected:
-                    continue
-                connected.add(cur)
-                cx, cy = cur
-                for nx in (cx - 1, cx, cx + 1):
-                    for ny in (cy - 1, cy, cy + 1):
-                        nkey = (nx, ny)
-                        if nkey != cur and nkey in selected and nkey not in connected:
-                            q.append(nkey)
-
-            if not connected:
-                continue
-
-            cell_polys: List[Polygon] = []
-            half = cell_size / 2.0
-            for gx, gy in connected:
-                cx = start_x + gx * cell_size
-                cy = start_y + gy * cell_size
-                cell_polys.append(
-                    Polygon(
-                        [
-                            (cx - half, cy - half),
-                            (cx + half, cy - half),
-                            (cx + half, cy + half),
-                            (cx - half, cy + half),
-                        ]
-                    )
-                )
-
-            hotspot_proj = unary_union(cell_polys)
-            hotspot_proj = hotspot_proj.buffer(35).buffer(-18)
-            clipped_proj = hotspot_proj.intersection(zone_proj)
-
-            if clipped_proj.is_empty:
-                px = start_x + peak_key[0] * cell_size
-                py = start_y + peak_key[1] * cell_size
-                clipped_proj = Point(px, py).buffer(160).intersection(zone_proj)
-
-            if clipped_proj.is_empty:
-                continue
-
-            hotspot_ll = transform(_to_4326.transform, clipped_proj)
-            if hotspot_ll.is_empty:
-                continue
-
-            sample_size = len(point_entries)
-            avg_lat = sum(p["lat"] for p in point_entries) / sample_size
-            avg_lng = sum(p["lng"] for p in point_entries) / sample_size
-            latest_created_at = max(p["created_at"] for p in point_entries)
-            intensity = min(1.0, max(0.25, peak_score / max(1.0, 0.55 * sample_size)))
-
-            features.append(
-                {
-                    "type": "Feature",
-                    "geometry": mapping(hotspot_ll),
-                    "properties": {
-                        "zone_id": zone_id,
-                        "zone_name": zone_data.get("zone_name") or (pts[0].get("zone_name") or ""),
-                        "borough": zone_data.get("borough") or (pts[0].get("borough") or ""),
-                        "sample_size": sample_size,
-                        "max_points_per_zone": PICKUP_ZONE_HOTSPOT_MAX_POINTS,
-                        "min_points": PICKUP_ZONE_HOTSPOT_MIN_POINTS,
-                        "peak_score": peak_score,
-                        "threshold_score": threshold,
-                        "avg_lat": avg_lat,
-                        "avg_lng": avg_lng,
-                        "latest_created_at": latest_created_at,
-                        "intensity": intensity,
-                        "hotspot_method": "recency_weighted_density_grid",
-                    },
+            feature.setdefault("properties", {})["signature"] = signature
+            with _pickup_zone_hotspot_cache_lock:
+                _pickup_zone_hotspot_feature_cache[zone_id] = {
+                    "signature": signature,
+                    "feature": feature,
                 }
-            )
+            features.append(feature)
+
+        with _pickup_zone_hotspot_cache_lock:
+            stale_zone_ids = [zid for zid in list(_pickup_zone_hotspot_feature_cache.keys()) if zid not in requested_zone_ids]
+            for zid in stale_zone_ids:
+                _pickup_zone_hotspot_feature_cache.pop(zid, None)
+            for zid, rows in zone_points.items():
+                if not rows:
+                    _pickup_zone_hotspot_feature_cache.pop(zid, None)
 
         return {"type": "FeatureCollection", "features": features}
     except Exception:
