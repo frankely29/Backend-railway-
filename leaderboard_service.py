@@ -3,13 +3,117 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 from core import DB_BACKEND, _db_exec, _db_query_all, _db_query_one
 from leaderboard_models import LeaderboardMetric, LeaderboardPeriod
 
 NYC_TZ = ZoneInfo("America/New_York")
+
+# Phase 1 fixed lifetime-miles progression (authoritative thresholds for levels 1..100).
+LEVEL_MILES_THRESHOLDS = [
+    0,
+    25,
+    50,
+    75,
+    120,
+    160,
+    195,
+    230,
+    265,
+    300,
+    350,
+    400,
+    450,
+    500,
+    550,
+    620,
+    690,
+    760,
+    830,
+    900,
+    1000,
+    1100,
+    1200,
+    1300,
+    1380,
+    1464,
+    1548,
+    1632,
+    1716,
+    1800,
+    1910,
+    2020,
+    2130,
+    2240,
+    2350,
+    2460,
+    2570,
+    2680,
+    2790,
+    2900,
+    3011,
+    3122,
+    3233,
+    3344,
+    3456,
+    3567,
+    3678,
+    3789,
+    3900,
+    4050,
+    4185,
+    4320,
+    4455,
+    4590,
+    4725,
+    4860,
+    4995,
+    5130,
+    5265,
+    5400,
+    5550,
+    5700,
+    5850,
+    6000,
+    6150,
+    6300,
+    6450,
+    6600,
+    6750,
+    6900,
+    7075,
+    7250,
+    7425,
+    7600,
+    7800,
+    7920,
+    8040,
+    8160,
+    8280,
+    8400,
+    8520,
+    8640,
+    8760,
+    8880,
+    9000,
+    9070,
+    9140,
+    9210,
+    9280,
+    9350,
+    9420,
+    9490,
+    9560,
+    9630,
+    9700,
+    9762,
+    9825,
+    9888,
+    9950,
+    10000,
+]
 
 
 def _bool_db_value(flag: bool):
@@ -79,6 +183,103 @@ def _display_name(row: Dict) -> str:
     return ((row.get("display_name") or "").strip() or fallback)[:28]
 
 
+def get_level_from_lifetime_miles(lifetime_miles: float) -> int:
+    miles = max(0.0, float(lifetime_miles or 0.0))
+    if miles >= LEVEL_MILES_THRESHOLDS[-1]:
+        return 100
+    level = 1
+    for idx, threshold in enumerate(LEVEL_MILES_THRESHOLDS):
+        if miles >= threshold:
+            level = idx + 1
+        else:
+            break
+    return min(100, max(1, level))
+
+
+def get_title_from_level(level: int) -> str:
+    clamped = max(1, min(100, int(level)))
+    if clamped == 100:
+        return "Legend"
+    if clamped >= 75:
+        return "Veteran"
+    if clamped >= 50:
+        return "Pro"
+    if clamped >= 25:
+        return "Driver"
+    return "Rookie"
+
+
+def get_next_level_miles(level: int) -> Optional[int]:
+    clamped = max(1, min(100, int(level)))
+    if clamped >= 100:
+        return None
+    return int(LEVEL_MILES_THRESHOLDS[clamped])
+
+
+def get_level_progress_from_lifetime_miles(lifetime_miles: float) -> Dict[str, Any]:
+    normalized_miles = round(max(0.0, float(lifetime_miles or 0.0)), 4)
+    level = get_level_from_lifetime_miles(normalized_miles)
+    current_level_miles = int(LEVEL_MILES_THRESHOLDS[level - 1])
+    next_level_miles = get_next_level_miles(level)
+    miles_to_next_level = 0.0 if next_level_miles is None else round(max(0.0, float(next_level_miles) - normalized_miles), 4)
+    return {
+        "level": level,
+        "title": get_title_from_level(level),
+        "lifetime_miles": normalized_miles,
+        "current_level_miles": current_level_miles,
+        "next_level_miles": next_level_miles,
+        "miles_to_next_level": miles_to_next_level,
+        "max_level_reached": level == 100,
+    }
+
+
+def get_lifetime_totals_for_user(user_id: int) -> Dict[str, float]:
+    row = _db_query_one(
+        """
+        SELECT
+          COALESCE(SUM(miles_worked), 0) AS miles_worked,
+          COALESCE(SUM(hours_worked), 0) AS hours_worked
+        FROM driver_daily_stats
+        WHERE user_id=?
+        """,
+        (int(user_id),),
+    )
+    return {
+        "miles": round(float(row["miles_worked"] or 0.0), 4),
+        "hours": round(float(row["hours_worked"] or 0.0), 4),
+    }
+
+
+def get_progression_for_users(user_ids: List[int]) -> Dict[int, Dict[str, Any]]:
+    clean_user_ids = [int(uid) for uid in user_ids]
+    if not clean_user_ids:
+        return {}
+
+    placeholders = ",".join(["?" for _ in clean_user_ids])
+    rows = _db_query_all(
+        f"""
+        SELECT user_id, COALESCE(SUM(miles_worked), 0) AS lifetime_miles
+        FROM driver_daily_stats
+        WHERE user_id IN ({placeholders})
+        GROUP BY user_id
+        """,
+        tuple(clean_user_ids),
+    )
+
+    miles_by_user: Dict[int, float] = {int(row["user_id"]): float(row["lifetime_miles"] or 0.0) for row in rows}
+    return {uid: get_level_progress_from_lifetime_miles(miles_by_user.get(uid, 0.0)) for uid in clean_user_ids}
+
+
+def _enrich_rows_with_progression(rows: List[Dict]) -> None:
+    if not rows:
+        return
+    progression_by_user = get_progression_for_users([int(row["user_id"]) for row in rows])
+    for row in rows:
+        progression = progression_by_user.get(int(row["user_id"])) or {}
+        row["level"] = progression.get("level")
+        row["title"] = progression.get("title")
+
+
 def _aggregate_rows(metric: LeaderboardMetric, period: LeaderboardPeriod) -> Dict:
     bounds = current_period_bounds(period)
     metric_col = _metric_column(metric)
@@ -114,6 +315,7 @@ def _aggregate_rows(metric: LeaderboardMetric, period: LeaderboardPeriod) -> Dic
 def get_leaderboard(metric: LeaderboardMetric, period: LeaderboardPeriod, limit: int = 10) -> Dict:
     board = _aggregate_rows(metric, period)
     board["rows"] = board["rows"][: max(1, min(100, int(limit)))]
+    _enrich_rows_with_progression(board["rows"])
     return board
 
 
@@ -163,6 +365,10 @@ def get_my_rank(user_id: int, metric: LeaderboardMetric, period: LeaderboardPeri
         "rank_position": rank_position,
         "badge_code": _badge_for_rank(rank_position),
     }
+    progression = get_progression_for_users([int(my_totals["user_id"])])
+    row_progression = progression.get(int(my_totals["user_id"])) or {}
+    row["level"] = row_progression.get("level")
+    row["title"] = row_progression.get("title")
     return {"metric": metric, "period": period, "period_key": bounds.period_key, "row": row}
 
 

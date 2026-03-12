@@ -630,6 +630,8 @@ from leaderboard_routes import router as leaderboard_router
 from leaderboard_service import (
     get_best_current_badge_for_user,
     get_best_current_badges_for_users,
+    get_lifetime_totals_for_user,
+    get_level_progress_from_lifetime_miles,
     get_my_rank,
     get_overview_for_user,
 )
@@ -989,6 +991,8 @@ def driver_profile(user_id: int, viewer: sqlite3.Row = Depends(require_user)):
     miles_rank_data = get_my_rank(target_user_id, LeaderboardMetric.miles, LeaderboardPeriod.daily)
     hours_rank_data = get_my_rank(target_user_id, LeaderboardMetric.hours, LeaderboardPeriod.daily)
     best_badge = get_best_current_badge_for_user(target_user_id)
+    lifetime_totals = get_lifetime_totals_for_user(target_user_id)
+    progression = get_level_progress_from_lifetime_miles(lifetime_totals.get("miles", 0.0))
 
     miles_rank = miles_rank_data.get("row", {}).get("rank_position") if miles_rank_data.get("row") else None
     hours_rank = hours_rank_data.get("row", {}).get("rank_position") if hours_rank_data.get("row") else None
@@ -1019,6 +1023,7 @@ def driver_profile(user_id: int, viewer: sqlite3.Row = Depends(require_user)):
             "miles": yearly.get("miles", 0),
             "hours": yearly.get("hours", 0),
         },
+        "progression": progression,
     }
 
 
