@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 from core import DB_BACKEND, _db_exec, _db_query_all, _db_query_one
@@ -27,7 +27,9 @@ class PeriodBounds:
 
 
 def _today_nyc() -> date:
-    return datetime.now(timezone.utc).astimezone(NYC_TZ).date()
+    # Match leaderboard_tracker.py business-day logic:
+    # the leaderboard “day” runs from 4 AM NYC to 3:59:59 AM NYC next day.
+    return (datetime.now(timezone.utc).astimezone(NYC_TZ) - timedelta(hours=4)).date()
 
 
 def current_period_bounds(period: LeaderboardPeriod) -> PeriodBounds:
@@ -167,43 +169,43 @@ def get_my_rank(user_id: int, metric: LeaderboardMetric, period: LeaderboardPeri
 def refresh_current_badges() -> None:
     now = int(time.time())
 
-    # Badges are awarded only for miles-based leaderboards.
+    # Current badges must be DAILY miles only.
     _db_exec(
-        "DELETE FROM leaderboard_badges_current WHERE metric=?",
-        (LeaderboardMetric.hours.value,),
+        "DELETE FROM leaderboard_badges_current WHERE metric<>? OR period<>?",
+        (LeaderboardMetric.miles.value, LeaderboardPeriod.daily.value),
     )
 
-    for metric in [LeaderboardMetric.miles]:
-        for period in [LeaderboardPeriod.daily, LeaderboardPeriod.weekly, LeaderboardPeriod.monthly, LeaderboardPeriod.yearly]:
-            board = _aggregate_rows(metric, period)
-            _db_exec(
-                "DELETE FROM leaderboard_badges_current WHERE metric=? AND period=?",
-                (metric.value, period.value),
-            )
-            for row in board["rows"][:3]:
-                if not row["badge_code"]:
-                    continue
-                _db_exec(
-                    """
-                    INSERT INTO leaderboard_badges_current(user_id, metric, period, period_key, rank_position, badge_code, awarded_at, is_current)
-                    VALUES(?,?,?,?,?,?,?,?)
-                    ON CONFLICT(user_id, metric, period, period_key) DO UPDATE SET
-                      rank_position=excluded.rank_position,
-                      badge_code=excluded.badge_code,
-                      awarded_at=excluded.awarded_at,
-                      is_current=excluded.is_current
-                    """,
-                    (
-                        int(row["user_id"]),
-                        metric.value,
-                        period.value,
-                        board["period_key"],
-                        int(row["rank_position"]),
-                        _normalized_badge_code(int(row["rank_position"]), row.get("badge_code")),
-                        now,
-                        _bool_db_value(True),
-                    ),
-                )
+    board = _aggregate_rows(LeaderboardMetric.miles, LeaderboardPeriod.daily)
+
+    _db_exec(
+        "DELETE FROM leaderboard_badges_current WHERE metric=? AND period=?",
+        (LeaderboardMetric.miles.value, LeaderboardPeriod.daily.value),
+    )
+
+    for row in board["rows"][:3]:
+        if not row["badge_code"]:
+            continue
+        _db_exec(
+            """
+            INSERT INTO leaderboard_badges_current(user_id, metric, period, period_key, rank_position, badge_code, awarded_at, is_current)
+            VALUES(?,?,?,?,?,?,?,?)
+            ON CONFLICT(user_id, metric, period, period_key) DO UPDATE SET
+              rank_position=excluded.rank_position,
+              badge_code=excluded.badge_code,
+              awarded_at=excluded.awarded_at,
+              is_current=excluded.is_current
+            """,
+            (
+                int(row["user_id"]),
+                LeaderboardMetric.miles.value,
+                LeaderboardPeriod.daily.value,
+                board["period_key"],
+                int(row["rank_position"]),
+                _normalized_badge_code(int(row["rank_position"]), row.get("badge_code")),
+                now,
+                _bool_db_value(True),
+            ),
+        )
 
     source_row = _db_query_one("SELECT COALESCE(MAX(updated_at), 0) AS max_updated_at FROM driver_daily_stats")
     _db_exec(
@@ -260,14 +262,20 @@ def refresh_current_badges_if_needed(max_staleness_seconds: int = 30) -> None:
 
 
 def get_current_badges_for_user(user_id: int) -> List[Dict]:
+    refresh_current_badges_if_needed()
     rows = _db_query_all(
         """
         SELECT metric, period, period_key, rank_position, badge_code
         FROM leaderboard_badges_current
-        WHERE user_id=? AND is_current=? AND rank_position IN (1,2,3)
-        ORDER BY awarded_at DESC, metric, period
+        WHERE user_id=? AND is_current=? AND metric=? AND period=? AND rank_position IN (1,2,3)
+        ORDER BY awarded_at DESC, rank_position ASC
         """,
-        (int(user_id), _bool_db_value(True)),
+        (
+            int(user_id),
+            _bool_db_value(True),
+            LeaderboardMetric.miles.value,
+            LeaderboardPeriod.daily.value,
+        ),
     )
     normalized_rows: List[Dict] = []
     for row in rows:
@@ -278,39 +286,30 @@ def get_current_badges_for_user(user_id: int) -> List[Dict]:
     return normalized_rows
 
 
-_PERIOD_PRIORITY = {
-    LeaderboardPeriod.yearly.value: 4,
-    LeaderboardPeriod.monthly.value: 3,
-    LeaderboardPeriod.weekly.value: 2,
-    LeaderboardPeriod.daily.value: 1,
-}
-
-def _badge_priority_key(badge: Dict) -> Tuple[int, int, str]:
-    badge_code = _normalized_badge_code(int(badge.get("rank_position") or 0), badge.get("badge_code"))
-    badge_priority = 3 if badge_code == "crown" else 2 if badge_code == "silver" else 1 if badge_code == "bronze" else 0
-    return (
-        badge_priority,
-        _PERIOD_PRIORITY.get(str(badge.get("period") or ""), 0),
-        f"{badge.get('metric','')}|{badge.get('period','')}|{badge.get('period_key','')}",
-    )
-
 
 def get_best_current_badge_for_user(user_id: int) -> Dict:
+    refresh_current_badges_if_needed()
     rows = _db_query_all(
         """
-        SELECT metric, period, period_key, rank_position
+        SELECT user_id, metric, period, period_key, rank_position
         FROM leaderboard_badges_current
-        WHERE user_id=? AND is_current=? AND metric=? AND rank_position IN (1,2,3)
+        WHERE user_id=? AND is_current=? AND metric=? AND period=? AND rank_position IN (1,2,3)
         """,
-        (int(user_id), _bool_db_value(True), LeaderboardMetric.miles.value),
+        (
+            int(user_id),
+            _bool_db_value(True),
+            LeaderboardMetric.miles.value,
+            LeaderboardPeriod.daily.value,
+        ),
     )
     if not rows:
         return {"leaderboard_badge_code": None}
-    best = max((dict(row) for row in rows), key=_badge_priority_key)
+    best = min((dict(row) for row in rows), key=lambda item: int(item.get("rank_position") or 999))
     return {"leaderboard_badge_code": _badge_for_rank(int(best.get("rank_position") or 0))}
 
 
 def get_best_current_badges_for_users(user_ids: List[int]) -> Dict[int, Dict]:
+    refresh_current_badges_if_needed()
     if not user_ids:
         return {}
     placeholders = ",".join(["?" for _ in user_ids])
@@ -318,9 +317,14 @@ def get_best_current_badges_for_users(user_ids: List[int]) -> Dict[int, Dict]:
         f"""
         SELECT user_id, metric, period, period_key, rank_position
         FROM leaderboard_badges_current
-        WHERE is_current=? AND metric=? AND rank_position IN (1,2,3) AND user_id IN ({placeholders})
+        WHERE is_current=? AND metric=? AND period=? AND rank_position IN (1,2,3) AND user_id IN ({placeholders})
         """,
-        (_bool_db_value(True), LeaderboardMetric.miles.value, *[int(u) for u in user_ids]),
+        (
+            _bool_db_value(True),
+            LeaderboardMetric.miles.value,
+            LeaderboardPeriod.daily.value,
+            *[int(u) for u in user_ids],
+        ),
     )
 
     by_user: Dict[int, List[Dict]] = {}
@@ -331,7 +335,7 @@ def get_best_current_badges_for_users(user_ids: List[int]) -> Dict[int, Dict]:
 
     out: Dict[int, Dict] = {}
     for uid, badges in by_user.items():
-        best = max(badges, key=_badge_priority_key)
+        best = min(badges, key=lambda item: int(item.get("rank_position") or 999))
         out[uid] = {"leaderboard_badge_code": _badge_for_rank(int(best.get("rank_position") or 0))}
     return out
 
