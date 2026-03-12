@@ -1411,6 +1411,7 @@ def _load_pickup_zone_geometries() -> Dict[int, Dict[str, Any]]:
     try:
         mtime = zones_path.stat().st_mtime
     except Exception:
+        print("[warn] taxi_zones.geojson not available for pickup hotspots")
         _pickup_zone_geom_cache = {}
         _pickup_zone_geom_cache_mtime = None
         return {}
@@ -1748,8 +1749,8 @@ def _pickup_zone_hotspots(zone_ids: List[int]) -> Dict[str, Any]:
             stale_zone_ids = [zid for zid in list(_pickup_zone_hotspot_feature_cache.keys()) if zid not in requested_zone_ids]
             for zid in stale_zone_ids:
                 _pickup_zone_hotspot_feature_cache.pop(zid, None)
-            for zid, rows in zone_points.items():
-                if not rows:
+            for zid in requested_zone_ids:
+                if not zone_points.get(zid):
                     _pickup_zone_hotspot_feature_cache.pop(zid, None)
 
         return {"type": "FeatureCollection", "features": features}
