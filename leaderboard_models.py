@@ -24,6 +24,8 @@ class LeaderboardRow(BaseModel):
     metric_value: float
     rank_position: int
     badge_code: Optional[str] = None
+    level: Optional[int] = None
+    title: Optional[str] = None
 
 
 class MyRankRow(LeaderboardRow):
