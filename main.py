@@ -1838,6 +1838,75 @@ def _build_pickup_zone_hotspot_feature(
     }
 
 
+def _build_fallback_pickup_zone_hotspot_feature(
+    zone_id: int,
+    zone_meta: Dict[str, Any],
+    point_rows: List[Dict[str, Any]],
+    micro_payload: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if not micro_payload:
+        return None
+
+    zone_geom = zone_meta.get("geometry")
+    if zone_geom is None or zone_geom.is_empty:
+        return None
+
+    strongest = micro_payload[0] if isinstance(micro_payload[0], dict) else None
+    if not strongest:
+        return None
+
+    try:
+        center_lat = float(strongest["center_lat"])
+        center_lng = float(strongest["center_lng"])
+        raw_radius_m = float(strongest.get("radius_m") or 0.0)
+    except Exception:
+        return None
+    radius_m = min(180.0, max(80.0, raw_radius_m if raw_radius_m > 0 else 120.0))
+
+    try:
+        zone_proj = transform(_to_3857.transform, zone_geom)
+    except Exception:
+        return None
+    if zone_proj.is_empty:
+        return None
+
+    center_x, center_y = _to_3857.transform(center_lng, center_lat)
+    fallback_proj = Point(center_x, center_y).buffer(radius_m).intersection(zone_proj)
+    if fallback_proj.is_empty:
+        return None
+
+    simplified = fallback_proj.simplify(max(6.0, PICKUP_ZONE_HOTSPOT_SIMPLIFY_M / 2.0), preserve_topology=True)
+    if not simplified.is_empty:
+        simplified = simplified.intersection(zone_proj)
+        if not simplified.is_empty:
+            fallback_proj = simplified
+
+    hotspot_ll = transform(_to_4326.transform, fallback_proj)
+    if hotspot_ll.is_empty:
+        return None
+
+    latest_created_at = 0
+    if point_rows:
+        latest_created_at = max(int(r.get("created_at") or 0) for r in point_rows)
+
+    return {
+        "type": "Feature",
+        "geometry": mapping(hotspot_ll),
+        "properties": {
+            "zone_id": zone_id,
+            "zone_name": zone_meta.get("zone_name") or ((point_rows[0].get("zone_name") if point_rows else "") or ""),
+            "borough": zone_meta.get("borough") or ((point_rows[0].get("borough") if point_rows else "") or ""),
+            "sample_size": len(point_rows),
+            "max_points_per_zone": PICKUP_ZONE_HOTSPOT_MAX_POINTS,
+            "min_points": PICKUP_ZONE_HOTSPOT_MIN_POINTS,
+            "latest_created_at": latest_created_at,
+            "intensity": float(strongest.get("intensity") or 0.0),
+            "hotspot_method": "micro_hotspot_fallback_clip",
+            "signature": _pickup_zone_signature(point_rows),
+        },
+    }
+
+
 def _current_timeslot_bin(now_ts: int, bin_minutes: int = HOTSPOT_TIMESLOT_BIN_MINUTES) -> int:
     dt = time.gmtime(now_ts)
     return int((dt.tm_hour * 60 + dt.tm_min) // max(1, int(bin_minutes)))
@@ -2009,6 +2078,15 @@ def _pickup_zone_hotspots(zone_ids: List[int]) -> Dict[str, Any]:
             if not zone_data:
                 continue
 
+            micro_payload = _build_zone_micro_hotspots_payload(
+                zone_id,
+                pts,
+                historical_support.get(zone_id, 0.0),
+                same_timeslot_support.get(zone_id, 0.0),
+                density_penalty_by_zone.get(zone_id, 0.0),
+                now_ts,
+            )
+
             signature = _pickup_zone_signature(pts)
             with _pickup_zone_hotspot_cache_lock:
                 cached = _pickup_zone_hotspot_feature_cache.get(zone_id)
@@ -2023,15 +2101,10 @@ def _pickup_zone_hotspots(zone_ids: List[int]) -> Dict[str, Any]:
                     print(f"[warn] Failed to generate pickup zone hotspot for zone {zone_id}", traceback.format_exc())
                     feature = None
 
-            micro_payload = _build_zone_micro_hotspots_payload(
-                zone_id,
-                pts,
-                historical_support.get(zone_id, 0.0),
-                same_timeslot_support.get(zone_id, 0.0),
-                density_penalty_by_zone.get(zone_id, 0.0),
-                now_ts,
-            )
-
+            if not feature:
+                # Fallback hotspot polygons are for qualified zones only.
+                if len(pts) >= PICKUP_ZONE_HOTSPOT_MIN_POINTS:
+                    feature = _build_fallback_pickup_zone_hotspot_feature(zone_id, zone_data, pts, micro_payload)
             if not feature:
                 # Micro-hotspots must still surface even if polygon generation fails.
                 if micro_payload:
