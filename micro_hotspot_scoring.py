@@ -115,7 +115,7 @@ def score_micro_hotspots(
                 live_component=live_component,
                 same_timeslot_component=timeslot_component,
                 final_score=final_score,
-                recommended=bool(weighted_adj >= 0.85 and unique_count >= 1 and confidence >= 0.18 and final_score >= 0.10),
+                recommended=bool(weighted_adj >= 0.90 and unique_count >= 1 and confidence >= 0.18 and final_score >= 0.08),
                 eta_alignment=eta_alignment,
             )
         )
@@ -127,7 +127,7 @@ def score_micro_hotspots(
     if recommended:
         return recommended[:cap]
 
-    # Conservative fallback only after zone-level 5-dot qualification upstream.
+    # Low-volume bootstrap tuning only after upstream zone-level 5-dot qualification.
     fallback = [
         r
         for r in results
