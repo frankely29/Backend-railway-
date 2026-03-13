@@ -23,6 +23,7 @@ class AdminUserRow(BaseModel):
     email: str
     display_name: Optional[str] = None
     is_admin: bool
+    is_suspended: bool = False
     ghost_mode: bool
     avatar_url: Optional[str] = None
     created_at: Optional[str] = None

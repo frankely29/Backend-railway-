@@ -22,6 +22,7 @@ from shapely.ops import transform, unary_union
 
 from build_hotspot import ensure_zones_geojson, build_hotspots_frames
 from admin_routes import router as admin_router
+from admin_mutation_routes import router as admin_mutation_router
 from core import (
     _auth_user_from_request,
     _clean_display_name,
@@ -108,6 +109,7 @@ app.add_middleware(
 )
 
 app.include_router(admin_router)
+app.include_router(admin_mutation_router)
 
 # =========================================================
 # Utilities: frames
@@ -288,6 +290,10 @@ def _db_init() -> None:
             "ALTER TABLE users ADD COLUMN map_identity_mode TEXT NOT NULL DEFAULT 'name';",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS map_identity_mode TEXT NOT NULL DEFAULT 'name';",
         )
+        _try_alter(
+            "ALTER TABLE users ADD COLUMN is_suspended INTEGER NOT NULL DEFAULT 0;",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_suspended BOOLEAN NOT NULL DEFAULT FALSE;",
+        )
 
         _db_exec(
             """
@@ -301,7 +307,10 @@ def _db_init() -> None:
             -- Drop ghost_mode default before converting type
             ALTER COLUMN ghost_mode DROP DEFAULT,
             ALTER COLUMN ghost_mode TYPE BOOLEAN USING (CASE WHEN lower(ghost_mode::text) IN ('1', 't', 'true') THEN TRUE ELSE FALSE END),
-            ALTER COLUMN ghost_mode SET DEFAULT FALSE
+            ALTER COLUMN ghost_mode SET DEFAULT FALSE,
+            -- Convert is_suspended to boolean and reset default
+            ALTER COLUMN is_suspended TYPE BOOLEAN USING (CASE WHEN lower(is_suspended::text) IN ('1', 't', 'true') THEN TRUE ELSE FALSE END),
+            ALTER COLUMN is_suspended SET DEFAULT FALSE
             """
         )
 
@@ -412,6 +421,7 @@ def _db_init() -> None:
     _try_alter("ALTER TABLE users ADD COLUMN ghost_mode INTEGER NOT NULL DEFAULT 0;")
     _try_alter("ALTER TABLE users ADD COLUMN avatar_url TEXT;")
     _try_alter("ALTER TABLE users ADD COLUMN map_identity_mode TEXT NOT NULL DEFAULT 'name';")
+    _try_alter("ALTER TABLE users ADD COLUMN is_suspended INTEGER NOT NULL DEFAULT 0;")
 
     _db_exec(
         """
