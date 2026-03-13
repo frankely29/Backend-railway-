@@ -22,13 +22,11 @@ from shapely.ops import transform, unary_union
 
 from build_hotspot import ensure_zones_geojson, build_hotspots_frames
 from hotspot_experiments import (
-    log_micro_bins,
     log_recommendation_outcome,
     log_zone_bins,
     prune_experiment_tables,
 )
 from hotspot_scoring import score_zones
-from micro_hotspot_scoring import score_micro_hotspots
 from admin_routes import router as admin_router
 from admin_mutation_routes import router as admin_mutation_router
 from admin_test_routes import router as admin_test_router
@@ -1842,26 +1840,13 @@ def _build_fallback_pickup_zone_hotspot_feature(
     zone_id: int,
     zone_meta: Dict[str, Any],
     point_rows: List[Dict[str, Any]],
-    micro_payload: List[Dict[str, Any]],
 ) -> Optional[Dict[str, Any]]:
-    if not micro_payload:
+    if len(point_rows) < PICKUP_ZONE_HOTSPOT_MIN_POINTS:
         return None
 
     zone_geom = zone_meta.get("geometry")
     if zone_geom is None or zone_geom.is_empty:
         return None
-
-    strongest = micro_payload[0] if isinstance(micro_payload[0], dict) else None
-    if not strongest:
-        return None
-
-    try:
-        center_lat = float(strongest["center_lat"])
-        center_lng = float(strongest["center_lng"])
-        raw_radius_m = float(strongest.get("radius_m") or 0.0)
-    except Exception:
-        return None
-    radius_m = min(180.0, max(80.0, raw_radius_m if raw_radius_m > 0 else 120.0))
 
     try:
         zone_proj = transform(_to_3857.transform, zone_geom)
@@ -1870,8 +1855,23 @@ def _build_fallback_pickup_zone_hotspot_feature(
     if zone_proj.is_empty:
         return None
 
-    center_x, center_y = _to_3857.transform(center_lng, center_lat)
-    fallback_proj = Point(center_x, center_y).buffer(radius_m).intersection(zone_proj)
+    point_buffers: List[Any] = []
+    valid_created_at: List[int] = []
+    for row in point_rows:
+        try:
+            lng = float(row["lng"])
+            lat = float(row["lat"])
+            x, y = _to_3857.transform(lng, lat)
+            valid_created_at.append(int(row.get("created_at") or 0))
+        except Exception:
+            continue
+        point_buffers.append(Point(x, y).buffer(125.0))
+
+    if len(point_buffers) < PICKUP_ZONE_HOTSPOT_MIN_POINTS:
+        return None
+
+    fallback_proj = unary_union(point_buffers)
+    fallback_proj = fallback_proj.buffer(12.0).buffer(-8.0).intersection(zone_proj)
     if fallback_proj.is_empty:
         return None
 
@@ -1885,9 +1885,9 @@ def _build_fallback_pickup_zone_hotspot_feature(
     if hotspot_ll.is_empty:
         return None
 
-    latest_created_at = 0
-    if point_rows:
-        latest_created_at = max(int(r.get("created_at") or 0) for r in point_rows)
+    latest_created_at = max(valid_created_at) if valid_created_at else 0
+    sample_size = len(point_buffers)
+    intensity = min(1.0, max(0.35, sample_size / float(PICKUP_ZONE_HOTSPOT_MAX_POINTS)))
 
     return {
         "type": "Feature",
@@ -1896,12 +1896,12 @@ def _build_fallback_pickup_zone_hotspot_feature(
             "zone_id": zone_id,
             "zone_name": zone_meta.get("zone_name") or ((point_rows[0].get("zone_name") if point_rows else "") or ""),
             "borough": zone_meta.get("borough") or ((point_rows[0].get("borough") if point_rows else "") or ""),
-            "sample_size": len(point_rows),
+            "sample_size": sample_size,
             "max_points_per_zone": PICKUP_ZONE_HOTSPOT_MAX_POINTS,
             "min_points": PICKUP_ZONE_HOTSPOT_MIN_POINTS,
             "latest_created_at": latest_created_at,
-            "intensity": float(strongest.get("intensity") or 0.0),
-            "hotspot_method": "micro_hotspot_fallback_clip",
+            "intensity": intensity,
+            "hotspot_method": "fallback_point_buffer_union",
             "signature": _pickup_zone_signature(point_rows),
         },
     }
@@ -1995,42 +1995,73 @@ def _pickup_zone_density_penalty(zone_ids: List[int]) -> Dict[int, float]:
 
 def _build_zone_micro_hotspots_payload(
     zone_id: int,
+    zone_meta: Dict[str, Any],
     point_rows: List[Dict[str, Any]],
-    historical_support: float,
-    same_timeslot_support: float,
-    density_penalty: float,
-    now_ts: int,
 ) -> List[Dict[str, Any]]:
-    clusters = score_micro_hotspots(
-        now_ts=now_ts,
-        zone_id=zone_id,
-        point_rows=point_rows,
-        historical_zone_support=historical_support,
-        same_timeslot_support=same_timeslot_support,
-        density_penalty=density_penalty,
-        top_n=3,
-    )
-    if clusters:
-        log_micro_bins(_db_exec, bin_time=now_ts, rows=clusters)
-    payload: List[Dict[str, Any]] = []
-    for c in clusters:
-        payload.append(
+    if len(point_rows) < PICKUP_ZONE_HOTSPOT_MIN_POINTS:
+        return []
+
+    zone_geom = zone_meta.get("geometry")
+    if zone_geom is None or zone_geom.is_empty:
+        return []
+
+    try:
+        zone_proj = transform(_to_3857.transform, zone_geom)
+    except Exception:
+        return []
+    if zone_proj.is_empty:
+        return []
+
+    # Build compact micro-hotspots only for zones that pass the 5-dot minimum.
+    cell_size_m = 90.0
+    minx, miny, _, _ = zone_proj.bounds
+    buckets: Dict[Tuple[int, int], int] = defaultdict(int)
+    for row in point_rows:
+        try:
+            lng = float(row["lng"])
+            lat = float(row["lat"])
+            x, y = _to_3857.transform(lng, lat)
+        except Exception:
+            continue
+        if not zone_proj.covers(Point(x, y)):
+            continue
+        gx = int(math.floor((x - minx) / cell_size_m))
+        gy = int(math.floor((y - miny) / cell_size_m))
+        buckets[(gx, gy)] += 1
+
+    zone_name = zone_meta.get("zone_name") or ((point_rows[0].get("zone_name") if point_rows else "") or "")
+    borough = zone_meta.get("borough") or ((point_rows[0].get("borough") if point_rows else "") or "")
+
+    clusters: List[Dict[str, Any]] = []
+    for (gx, gy), event_count in buckets.items():
+        if event_count < 2:
+            continue
+        center_x = minx + ((gx + 0.5) * cell_size_m)
+        center_y = miny + ((gy + 0.5) * cell_size_m)
+        center_lng, center_lat = _to_4326.transform(center_x, center_y)
+        clusters.append(
             {
-                "cluster_id": c.cluster_id,
-                "zone_id": c.zone_id,
-                "center_lat": c.center_lat,
-                "center_lng": c.center_lng,
-                "radius_m": c.radius_m,
-                "intensity": c.intensity,
-                "confidence": c.confidence,
-                "weighted_trip_count": c.weighted_trip_count,
-                "event_count": int(getattr(c, "event_count", 0)),
-                "unique_driver_count": c.unique_driver_count,
-                "crowding_penalty": c.crowding_penalty,
-                "recommended": c.recommended,
+                "cluster_id": f"{zone_id}:{gx}:{gy}",
+                "zone_id": zone_id,
+                "center_lat": center_lat,
+                "center_lng": center_lng,
+                "radius_m": 90,
+                "intensity": round(min(1.0, event_count / 8.0), 3),
+                "confidence": round(min(0.95, 0.35 + (event_count / 12.0)), 3),
+                "event_count": event_count,
+                "recommended": False,
+                "zone_name": zone_name,
+                "borough": borough,
             }
         )
-    return payload
+
+    clusters.sort(key=lambda c: int(c.get("event_count") or 0), reverse=True)
+    compact = clusters[:3]
+    if compact:
+        strongest = int(compact[0].get("event_count") or 0)
+        for item in compact:
+            item["recommended"] = int(item.get("event_count") or 0) == strongest
+    return compact
 
 
 def _pickup_zone_hotspots(zone_ids: List[int]) -> Dict[str, Any]:
@@ -2083,6 +2114,14 @@ def _pickup_zone_hotspots(zone_ids: List[int]) -> Dict[str, Any]:
             with _pickup_zone_hotspot_cache_lock:
                 cached = _pickup_zone_hotspot_feature_cache.get(zone_id)
 
+            micro_payload: List[Dict[str, Any]] = []
+            if qualified_zone:
+                micro_payload = _build_zone_micro_hotspots_payload(
+                    zone_id,
+                    zone_data,
+                    pts,
+                )
+
             feature = None
             if cached and cached.get("signature") == signature and cached.get("feature"):
                 feature = cached["feature"]
@@ -2093,21 +2132,10 @@ def _pickup_zone_hotspots(zone_ids: List[int]) -> Dict[str, Any]:
                     print(f"[warn] Failed to generate pickup zone hotspot for zone {zone_id}", traceback.format_exc())
                     feature = None
 
-            micro_payload: List[Dict[str, Any]] = []
-            if qualified_zone:
-                micro_payload = _build_zone_micro_hotspots_payload(
-                    zone_id,
-                    pts,
-                    historical_support.get(zone_id, 0.0),
-                    same_timeslot_support.get(zone_id, 0.0),
-                    density_penalty_by_zone.get(zone_id, 0.0),
-                    now_ts,
-                )
-
             if not feature:
-                # Fallback hotspot polygons are for qualified zones only.
+                # Fallback hotspot polygons are for qualified zones so they do not stay dots-only.
                 if qualified_zone:
-                    feature = _build_fallback_pickup_zone_hotspot_feature(zone_id, zone_data, pts, micro_payload)
+                    feature = _build_fallback_pickup_zone_hotspot_feature(zone_id, zone_data, pts)
             if not feature:
                 # Micro-hotspots must still surface even if polygon generation fails.
                 if qualified_zone and micro_payload:
@@ -2212,8 +2240,7 @@ def _pickup_zone_stats(zone_ids: List[int], sample_limit: int = 100) -> List[Dic
 
 
 def _flatten_zone_micro_hotspots(zone_hotspots: Dict[str, Any]) -> List[Dict[str, Any]]:
-    # Preserve nested micro_hotspots for per-zone context while also exposing a top-level
-    # compatibility payload expected by existing frontend clients.
+    # Flatten nested and orphan micro-hotspots into one compact top-level payload.
     flattened: List[Dict[str, Any]] = []
     features = zone_hotspots.get("features") if isinstance(zone_hotspots, dict) else None
     if isinstance(features, list):
@@ -2294,22 +2321,11 @@ def get_recent_pickups(
         zone_hotspots = _pickup_zone_hotspots(hotspot_zone_ids)
     except Exception:
         print("[warn] Failed to attach pickup zone hotspots", traceback.format_exc())
-        zone_hotspots = {"type": "FeatureCollection", "features": []}
+        zone_hotspots = {"type": "FeatureCollection", "features": [], "orphan_micro_hotspots": []}
     micro_hotspots = _flatten_zone_micro_hotspots(zone_hotspots)
     zone_features = zone_hotspots.get("features") if isinstance(zone_hotspots, dict) else []
     zone_hotspot_count = len(zone_features) if isinstance(zone_features, list) else 0
-    nested_micro_hotspot_count = 0
     orphan_micro_hotspot_count = 0
-    if isinstance(zone_features, list):
-        for feature in zone_features:
-            if not isinstance(feature, dict):
-                continue
-            props = feature.get("properties")
-            if not isinstance(props, dict):
-                continue
-            nested = props.get("micro_hotspots")
-            if isinstance(nested, list):
-                nested_micro_hotspot_count += len([item for item in nested if isinstance(item, dict)])
     orphan = zone_hotspots.get("orphan_micro_hotspots") if isinstance(zone_hotspots, dict) else None
     if isinstance(orphan, list):
         orphan_micro_hotspot_count = len([item for item in orphan if isinstance(item, dict)])
@@ -2322,7 +2338,6 @@ def get_recent_pickups(
         "micro_hotspots": micro_hotspots,
         "micro_hotspot_debug": {
             "zone_hotspot_count": zone_hotspot_count,
-            "nested_micro_hotspot_count": nested_micro_hotspot_count,
             "orphan_micro_hotspot_count": orphan_micro_hotspot_count,
             "top_level_micro_hotspot_count": len(micro_hotspots),
         },
