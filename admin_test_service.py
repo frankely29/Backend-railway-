@@ -65,16 +65,76 @@ def test_timeline() -> Dict[str, Any]:
 
 def test_frame_current() -> Dict[str, Any]:
     frames_dir = Path(os.environ.get("FRAMES_DIR", str(Path(os.environ.get("DATA_DIR", "/data")) / "frames")))
-    frame_files = sorted(frames_dir.glob("*.geojson")) if frames_dir.exists() else []
-    frame_count = len(frame_files)
+    timeline_path = frames_dir / "timeline.json"
+
+    file_frames = sorted(frames_dir.glob("frame_*.json")) if frames_dir.exists() else []
+    file_frame_count = len(file_frames)
+    latest_frame_file = file_frames[-1].name if file_frames else None
+
+    timeline_ready = timeline_path.exists() and timeline_path.stat().st_size > 0 if timeline_path.exists() else False
+    frame_api_ok = False
+    frame_features_count = 0
+    frame_available = False
+
+    if timeline_ready:
+        try:
+            timeline_payload = json.loads(timeline_path.read_text(encoding="utf-8"))
+
+            timeline_items = []
+            if isinstance(timeline_payload, dict) and isinstance(timeline_payload.get("timeline"), list):
+                timeline_items = timeline_payload.get("timeline") or []
+            elif isinstance(timeline_payload, list):
+                timeline_items = timeline_payload
+
+            if timeline_items:
+                candidate_indices = [0, len(timeline_items) - 1]
+                seen_indices = set()
+                for idx in candidate_indices:
+                    if idx in seen_indices:
+                        continue
+                    seen_indices.add(idx)
+
+                    frame_path = frames_dir / f"frame_{idx:06d}.json"
+                    if not frame_path.exists() or frame_path.stat().st_size == 0:
+                        continue
+
+                    frame_payload = json.loads(frame_path.read_text(encoding="utf-8"))
+                    features = []
+                    if isinstance(frame_payload, dict):
+                        polygons = frame_payload.get("polygons")
+                        if isinstance(polygons, dict) and isinstance(polygons.get("features"), list):
+                            features = polygons.get("features") or []
+                        elif isinstance(frame_payload.get("features"), list):
+                            features = frame_payload.get("features") or []
+
+                    if isinstance(frame_payload, dict):
+                        frame_api_ok = True
+                        frame_features_count = len(features)
+                        frame_available = frame_features_count > 0
+                        if frame_available:
+                            break
+        except Exception:
+            frame_api_ok = False
+            frame_features_count = 0
+            frame_available = False
+
+    ok = frame_api_ok and frame_available
+    if ok:
+        summary = "Current frame API returned usable data"
+    else:
+        summary = "Frame endpoint is unavailable or returned unusable data"
+
     return _response(
-        frame_count > 0,
+        ok,
         "frame-current",
-        "Frame data exists" if frame_count > 0 else "No frame files found",
+        summary,
         {
-            "frame_available": frame_count > 0,
-            "frame_count": frame_count,
-            "latest_frame_file": frame_files[-1].name if frame_files else None,
+            "frame_api_ok": frame_api_ok,
+            "frame_features_count": frame_features_count,
+            "frame_available": frame_available,
+            "file_frame_count": file_frame_count,
+            "latest_frame_file": latest_frame_file,
+            "timeline_ready": timeline_ready,
         },
     )
 
