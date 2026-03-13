@@ -75,7 +75,8 @@ EVENT_DEFAULT_WINDOW_SECONDS = int(os.environ.get("EVENT_DEFAULT_WINDOW_SECONDS"
 MAX_AVATAR_DATA_URL_LENGTH = int(os.environ.get("MAX_AVATAR_DATA_URL_LENGTH", "20000"))
 ALLOWED_MAP_IDENTITY_MODES = {"name", "avatar"}
 
-PICKUP_ZONE_HOTSPOT_MIN_POINTS = 5
+# Low-volume experiment tuning: let zone hotspots form earlier while confidence/diversity gates still filter noise.
+PICKUP_ZONE_HOTSPOT_MIN_POINTS = 3
 PICKUP_ZONE_HOTSPOT_MAX_POINTS = 100
 PICKUP_ZONE_HOTSPOT_CELL_SIZE_M = 135
 PICKUP_ZONE_HOTSPOT_RADIUS_M = 240
