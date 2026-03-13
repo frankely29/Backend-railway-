@@ -21,6 +21,14 @@ from shapely.geometry import MultiPolygon, Point, Polygon, mapping, shape
 from shapely.ops import transform, unary_union
 
 from build_hotspot import ensure_zones_geojson, build_hotspots_frames
+from hotspot_experiments import (
+    log_micro_bins,
+    log_recommendation_outcome,
+    log_zone_bins,
+    prune_experiment_tables,
+)
+from hotspot_scoring import score_zones
+from micro_hotspot_scoring import score_micro_hotspots
 from admin_routes import router as admin_router
 from admin_mutation_routes import router as admin_mutation_router
 from admin_test_routes import router as admin_test_router
@@ -73,10 +81,13 @@ PICKUP_ZONE_HOTSPOT_CELL_SIZE_M = 135
 PICKUP_ZONE_HOTSPOT_RADIUS_M = 240
 PICKUP_ZONE_HOTSPOT_SIGMA_M = 155
 PICKUP_ZONE_HOTSPOT_SIMPLIFY_M = 18
+HOTSPOT_RECENT_LOOKBACK_SECONDS = 6 * 3600
+HOTSPOT_TIMESLOT_BIN_MINUTES = 20
 
 _pickup_zone_geom_cache: Optional[Dict[int, Dict[str, Any]]] = None
 _pickup_zone_geom_cache_mtime: Optional[float] = None
 _pickup_zone_hotspot_feature_cache: Dict[int, Dict[str, Any]] = {}
+_pickup_zone_score_cache: Dict[int, float] = {}
 _pickup_zone_hotspot_cache_lock = threading.Lock()
 _to_3857 = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
 _to_4326 = Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
@@ -386,6 +397,62 @@ def _db_init() -> None:
 
         _db_exec(
             """
+            CREATE TABLE IF NOT EXISTS hotspot_experiment_bins (
+              id BIGSERIAL PRIMARY KEY,
+              bin_time BIGINT NOT NULL,
+              zone_id INTEGER NOT NULL,
+              final_score DOUBLE PRECISION NOT NULL,
+              confidence DOUBLE PRECISION NOT NULL,
+              historical_component DOUBLE PRECISION NOT NULL,
+              live_component DOUBLE PRECISION NOT NULL,
+              same_timeslot_component DOUBLE PRECISION NOT NULL,
+              density_penalty DOUBLE PRECISION NOT NULL,
+              weighted_trip_count DOUBLE PRECISION NOT NULL,
+              unique_driver_count INTEGER NOT NULL,
+              recommended BOOLEAN NOT NULL DEFAULT FALSE
+            );
+            """
+        )
+        _db_exec("CREATE INDEX IF NOT EXISTS idx_hotspot_experiment_bins_time ON hotspot_experiment_bins(bin_time DESC);")
+        _db_exec("CREATE INDEX IF NOT EXISTS idx_hotspot_experiment_bins_zone_time ON hotspot_experiment_bins(zone_id, bin_time DESC);")
+
+        _db_exec(
+            """
+            CREATE TABLE IF NOT EXISTS micro_hotspot_experiment_bins (
+              id BIGSERIAL PRIMARY KEY,
+              bin_time BIGINT NOT NULL,
+              zone_id INTEGER NOT NULL,
+              cluster_id TEXT NOT NULL,
+              final_score DOUBLE PRECISION NOT NULL,
+              confidence DOUBLE PRECISION NOT NULL,
+              weighted_trip_count DOUBLE PRECISION NOT NULL,
+              unique_driver_count INTEGER NOT NULL,
+              crowding_penalty DOUBLE PRECISION NOT NULL,
+              recommended BOOLEAN NOT NULL DEFAULT FALSE
+            );
+            """
+        )
+        _db_exec("CREATE INDEX IF NOT EXISTS idx_micro_hotspot_experiment_bins_time ON micro_hotspot_experiment_bins(bin_time DESC);")
+
+        _db_exec(
+            """
+            CREATE TABLE IF NOT EXISTS recommendation_outcomes (
+              id BIGSERIAL PRIMARY KEY,
+              user_id BIGINT,
+              recommended_at BIGINT NOT NULL,
+              zone_id INTEGER NOT NULL,
+              cluster_id TEXT,
+              score DOUBLE PRECISION NOT NULL,
+              confidence DOUBLE PRECISION NOT NULL,
+              converted_to_trip BOOLEAN,
+              minutes_to_trip DOUBLE PRECISION
+            );
+            """
+        )
+        _db_exec("CREATE INDEX IF NOT EXISTS idx_recommendation_outcomes_time ON recommendation_outcomes(recommended_at DESC);")
+
+        _db_exec(
+            """
             CREATE TABLE IF NOT EXISTS chat_messages (
               id BIGSERIAL PRIMARY KEY,
               room TEXT NOT NULL DEFAULT 'global',
@@ -492,6 +559,62 @@ def _db_init() -> None:
     )
     _db_exec("CREATE INDEX IF NOT EXISTS idx_pickup_logs_created_at ON pickup_logs(created_at DESC);")
     _db_exec("CREATE INDEX IF NOT EXISTS idx_pickup_logs_zone_time ON pickup_logs(zone_id, created_at DESC);")
+
+    _db_exec(
+        """
+        CREATE TABLE IF NOT EXISTS hotspot_experiment_bins (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          bin_time INTEGER NOT NULL,
+          zone_id INTEGER NOT NULL,
+          final_score REAL NOT NULL,
+          confidence REAL NOT NULL,
+          historical_component REAL NOT NULL,
+          live_component REAL NOT NULL,
+          same_timeslot_component REAL NOT NULL,
+          density_penalty REAL NOT NULL,
+          weighted_trip_count REAL NOT NULL,
+          unique_driver_count INTEGER NOT NULL,
+          recommended INTEGER NOT NULL DEFAULT 0
+        );
+        """
+    )
+    _db_exec("CREATE INDEX IF NOT EXISTS idx_hotspot_experiment_bins_time ON hotspot_experiment_bins(bin_time DESC);")
+    _db_exec("CREATE INDEX IF NOT EXISTS idx_hotspot_experiment_bins_zone_time ON hotspot_experiment_bins(zone_id, bin_time DESC);")
+
+    _db_exec(
+        """
+        CREATE TABLE IF NOT EXISTS micro_hotspot_experiment_bins (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          bin_time INTEGER NOT NULL,
+          zone_id INTEGER NOT NULL,
+          cluster_id TEXT NOT NULL,
+          final_score REAL NOT NULL,
+          confidence REAL NOT NULL,
+          weighted_trip_count REAL NOT NULL,
+          unique_driver_count INTEGER NOT NULL,
+          crowding_penalty REAL NOT NULL,
+          recommended INTEGER NOT NULL DEFAULT 0
+        );
+        """
+    )
+    _db_exec("CREATE INDEX IF NOT EXISTS idx_micro_hotspot_experiment_bins_time ON micro_hotspot_experiment_bins(bin_time DESC);")
+
+    _db_exec(
+        """
+        CREATE TABLE IF NOT EXISTS recommendation_outcomes (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id INTEGER,
+          recommended_at INTEGER NOT NULL,
+          zone_id INTEGER NOT NULL,
+          cluster_id TEXT,
+          score REAL NOT NULL,
+          confidence REAL NOT NULL,
+          converted_to_trip INTEGER,
+          minutes_to_trip REAL
+        );
+        """
+    )
+    _db_exec("CREATE INDEX IF NOT EXISTS idx_recommendation_outcomes_time ON recommendation_outcomes(recommended_at DESC);")
 
     _db_exec(
         """
@@ -1498,6 +1621,7 @@ def _pickup_zone_recent_points(
                 zone_id,
                 zone_name,
                 borough,
+                user_id,
                 lat,
                 lng,
                 created_at,
@@ -1505,7 +1629,7 @@ def _pickup_zone_recent_points(
             FROM pickup_logs
             WHERE zone_id IN ({placeholders})
         )
-        SELECT id, zone_id, zone_name, borough, lat, lng, created_at
+        SELECT id, zone_id, zone_name, borough, user_id, lat, lng, created_at
         FROM ranked
         WHERE rn <= ?
         ORDER BY zone_id ASC, created_at DESC, id DESC
@@ -1714,9 +1838,135 @@ def _build_pickup_zone_hotspot_feature(
     }
 
 
+def _current_timeslot_bin(now_ts: int, bin_minutes: int = HOTSPOT_TIMESLOT_BIN_MINUTES) -> int:
+    dt = time.gmtime(now_ts)
+    return int((dt.tm_hour * 60 + dt.tm_min) // max(1, int(bin_minutes)))
+
+
+def _active_visible_driver_count() -> int:
+    cutoff = int(time.time()) - max(30, PRESENCE_STALE_SECONDS)
+    row = _db_query_one(
+        """
+        SELECT COUNT(*) AS c
+        FROM presence p
+        LEFT JOIN users u ON u.id = p.user_id
+        WHERE p.updated_at >= ?
+          AND (u.ghost_mode IS NULL OR CAST(u.ghost_mode AS INTEGER) = 0)
+        """,
+        (cutoff,),
+    )
+    return int(row["c"] or 0) if row else 0
+
+
+def _pickup_zone_same_timeslot_support(zone_ids: List[int], now_ts: int) -> Dict[int, float]:
+    if not zone_ids:
+        return {}
+    slot = _current_timeslot_bin(now_ts)
+    lookback = now_ts - (14 * 24 * 3600)
+    placeholders = ",".join(["?"] * len(zone_ids))
+    sql = f"""
+        SELECT zone_id, COUNT(*) AS c
+        FROM pickup_logs
+        WHERE zone_id IN ({placeholders})
+          AND created_at >= ?
+          AND CAST(((created_at % 86400) / 60) / ? AS INTEGER) = ?
+        GROUP BY zone_id
+    """
+    params = tuple(list(zone_ids) + [lookback, HOTSPOT_TIMESLOT_BIN_MINUTES, slot])
+    rows = _db_query_all(sql, params)
+    out: Dict[int, float] = {int(z): 0.0 for z in zone_ids}
+    for r in rows:
+        out[int(r["zone_id"])] = float(r["c"])
+    return out
+
+
+def _pickup_zone_historical_support(zone_ids: List[int], now_ts: int) -> Dict[int, float]:
+    if not zone_ids:
+        return {}
+    lookback = now_ts - (14 * 24 * 3600)
+    placeholders = ",".join(["?"] * len(zone_ids))
+    rows = _db_query_all(
+        f"""
+        SELECT zone_id, COUNT(*) AS c
+        FROM pickup_logs
+        WHERE zone_id IN ({placeholders})
+          AND created_at >= ?
+        GROUP BY zone_id
+        """,
+        tuple(list(zone_ids) + [lookback]),
+    )
+    out: Dict[int, float] = {int(z): 0.0 for z in zone_ids}
+    for r in rows:
+        out[int(r["zone_id"])] = float(r["c"])
+    return out
+
+
+def _pickup_zone_density_penalty(zone_ids: List[int]) -> Dict[int, float]:
+    if not zone_ids:
+        return {}
+    cutoff = int(time.time()) - max(30, PRESENCE_STALE_SECONDS)
+    placeholders = ",".join(["?"] * len(zone_ids))
+    rows = _db_query_all(
+        f"""
+        SELECT pl.zone_id, COUNT(DISTINCT p.user_id) AS c
+        FROM presence p
+        LEFT JOIN pickup_logs pl ON pl.user_id = p.user_id
+        WHERE p.updated_at >= ?
+          AND pl.zone_id IN ({placeholders})
+          AND pl.created_at >= ?
+        GROUP BY pl.zone_id
+        """,
+        tuple([cutoff] + list(zone_ids) + [cutoff - 3600]),
+    )
+    out: Dict[int, float] = {int(z): 0.0 for z in zone_ids}
+    for r in rows:
+        out[int(r["zone_id"])] = float(r["c"])
+    return out
+
+
+def _build_zone_micro_hotspots_payload(
+    zone_id: int,
+    point_rows: List[Dict[str, Any]],
+    historical_support: float,
+    same_timeslot_support: float,
+    density_penalty: float,
+    now_ts: int,
+) -> List[Dict[str, Any]]:
+    clusters = score_micro_hotspots(
+        now_ts=now_ts,
+        zone_id=zone_id,
+        point_rows=point_rows,
+        historical_zone_support=historical_support,
+        same_timeslot_support=same_timeslot_support,
+        density_penalty=density_penalty,
+        top_n=3,
+    )
+    if clusters:
+        log_micro_bins(_db_exec, bin_time=now_ts, rows=clusters)
+    payload: List[Dict[str, Any]] = []
+    for c in clusters:
+        payload.append(
+            {
+                "cluster_id": c.cluster_id,
+                "zone_id": c.zone_id,
+                "center_lat": c.center_lat,
+                "center_lng": c.center_lng,
+                "radius_m": c.radius_m,
+                "intensity": c.intensity,
+                "confidence": c.confidence,
+                "weighted_trip_count": c.weighted_trip_count,
+                "unique_driver_count": c.unique_driver_count,
+                "crowding_penalty": c.crowding_penalty,
+                "recommended": c.recommended,
+            }
+        )
+    return payload
+
+
 def _pickup_zone_hotspots(zone_ids: List[int]) -> Dict[str, Any]:
     empty = {"type": "FeatureCollection", "features": []}
     try:
+        now_ts = int(time.time())
         clean_zone_ids: List[int] = []
         for z in zone_ids:
             try:
@@ -1731,14 +1981,28 @@ def _pickup_zone_hotspots(zone_ids: List[int]) -> Dict[str, Any]:
             return empty
 
         zone_points = _pickup_zone_recent_points(clean_zone_ids, PICKUP_ZONE_HOTSPOT_MAX_POINTS)
+        historical_support = _pickup_zone_historical_support(clean_zone_ids, now_ts)
+        same_timeslot_support = _pickup_zone_same_timeslot_support(clean_zone_ids, now_ts)
+        density_penalty_by_zone = _pickup_zone_density_penalty(clean_zone_ids)
+        active_driver_count = _active_visible_driver_count()
+
+        zone_scores = score_zones(
+            now_ts=now_ts,
+            zone_points=zone_points,
+            historical_by_zone=historical_support,
+            same_timeslot_by_zone=same_timeslot_support,
+            density_by_zone=density_penalty_by_zone,
+            active_driver_count=active_driver_count,
+            previous_scores=_pickup_zone_score_cache,
+        )
+
+        log_zone_bins(_db_exec, bin_time=now_ts, rows=zone_scores.values())
+        prune_experiment_tables(_db_exec, now_ts=now_ts)
+
         features: List[Dict[str, Any]] = []
         requested_zone_ids = set(clean_zone_ids)
         for zone_id in clean_zone_ids:
             pts = zone_points.get(zone_id, [])
-            if len(pts) < PICKUP_ZONE_HOTSPOT_MIN_POINTS:
-                with _pickup_zone_hotspot_cache_lock:
-                    _pickup_zone_hotspot_feature_cache.pop(zone_id, None)
-                continue
             zone_data = zone_geoms.get(zone_id)
             if not zone_data:
                 continue
@@ -1746,20 +2010,55 @@ def _pickup_zone_hotspots(zone_ids: List[int]) -> Dict[str, Any]:
             signature = _pickup_zone_signature(pts)
             with _pickup_zone_hotspot_cache_lock:
                 cached = _pickup_zone_hotspot_feature_cache.get(zone_id)
-            if cached and cached.get("signature") == signature and cached.get("feature"):
-                features.append(cached["feature"])
-                continue
 
-            try:
-                feature = _build_pickup_zone_hotspot_feature(zone_id, zone_data, pts)
-            except Exception:
-                print(f"[warn] Failed to generate pickup zone hotspot for zone {zone_id}", traceback.format_exc())
-                continue
+            feature = None
+            if cached and cached.get("signature") == signature and cached.get("feature"):
+                feature = cached["feature"]
+            elif len(pts) >= PICKUP_ZONE_HOTSPOT_MIN_POINTS:
+                try:
+                    feature = _build_pickup_zone_hotspot_feature(zone_id, zone_data, pts)
+                except Exception:
+                    print(f"[warn] Failed to generate pickup zone hotspot for zone {zone_id}", traceback.format_exc())
+                    feature = None
 
             if not feature:
+                with _pickup_zone_hotspot_cache_lock:
+                    _pickup_zone_hotspot_feature_cache.pop(zone_id, None)
                 continue
 
-            feature.setdefault("properties", {})["signature"] = signature
+            score = zone_scores.get(zone_id)
+            micro_payload = _build_zone_micro_hotspots_payload(
+                zone_id,
+                pts,
+                historical_support.get(zone_id, 0.0),
+                same_timeslot_support.get(zone_id, 0.0),
+                density_penalty_by_zone.get(zone_id, 0.0),
+                now_ts,
+            )
+
+            props = feature.setdefault("properties", {})
+            props["signature"] = signature
+            if score is not None:
+                _pickup_zone_score_cache[zone_id] = score.final_score
+                props["hotspot_score"] = score.final_score
+                props["final_score"] = score.final_score
+                props["confidence"] = score.confidence
+                props["live_strength"] = score.live_strength
+                props["density_penalty"] = score.density_penalty
+                props["weighted_trip_count"] = score.weighted_trip_count
+                props["unique_driver_count"] = score.unique_driver_count
+                props["recommended"] = score.recommended
+                if score.recommended:
+                    log_recommendation_outcome(
+                        _db_exec,
+                        recommended_at=now_ts,
+                        zone_id=zone_id,
+                        score=score.final_score,
+                        confidence=score.confidence,
+                        cluster_id=None,
+                    )
+            props["micro_hotspots"] = micro_payload
+
             with _pickup_zone_hotspot_cache_lock:
                 _pickup_zone_hotspot_feature_cache[zone_id] = {
                     "signature": signature,
@@ -1771,9 +2070,6 @@ def _pickup_zone_hotspots(zone_ids: List[int]) -> Dict[str, Any]:
             stale_zone_ids = [zid for zid in list(_pickup_zone_hotspot_feature_cache.keys()) if zid not in requested_zone_ids]
             for zid in stale_zone_ids:
                 _pickup_zone_hotspot_feature_cache.pop(zid, None)
-            for zid in requested_zone_ids:
-                if not zone_points.get(zid):
-                    _pickup_zone_hotspot_feature_cache.pop(zid, None)
 
         return {"type": "FeatureCollection", "features": features}
     except Exception:
@@ -1802,6 +2098,7 @@ def _pickup_zone_stats(zone_ids: List[int], sample_limit: int = 100) -> List[Dic
                 zone_id,
                 zone_name,
                 borough,
+                user_id,
                 lat,
                 lng,
                 created_at,
