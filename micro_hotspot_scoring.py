@@ -121,4 +121,16 @@ def score_micro_hotspots(
         )
 
     results.sort(key=lambda r: r.final_score, reverse=True)
-    return [r for r in results if r.recommended][: max(1, min(3, int(top_n)))]
+    cap = max(1, min(3, int(top_n)))
+    recommended = [r for r in results if r.recommended]
+    if recommended:
+        return recommended[:cap]
+
+    # Conservative low-volume fallback: only surface near-threshold clusters when
+    # strict recommendation would otherwise produce empty experimental output.
+    fallback = [
+        r
+        for r in results
+        if r.unique_driver_count >= 1 and r.confidence >= 0.20 and r.final_score >= 0.12
+    ]
+    return fallback[:cap]
