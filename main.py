@@ -2078,14 +2078,17 @@ def _pickup_zone_hotspots(zone_ids: List[int]) -> Dict[str, Any]:
             if not zone_data:
                 continue
 
-            micro_payload = _build_zone_micro_hotspots_payload(
-                zone_id,
-                pts,
-                historical_support.get(zone_id, 0.0),
-                same_timeslot_support.get(zone_id, 0.0),
-                density_penalty_by_zone.get(zone_id, 0.0),
-                now_ts,
-            )
+            qualified_zone = len(pts) >= PICKUP_ZONE_HOTSPOT_MIN_POINTS  # Keep 5-dot minimum to avoid pickup noise.
+            micro_payload: List[Dict[str, Any]] = []
+            if qualified_zone:
+                micro_payload = _build_zone_micro_hotspots_payload(
+                    zone_id,
+                    pts,
+                    historical_support.get(zone_id, 0.0),
+                    same_timeslot_support.get(zone_id, 0.0),
+                    density_penalty_by_zone.get(zone_id, 0.0),
+                    now_ts,
+                )
 
             signature = _pickup_zone_signature(pts)
             with _pickup_zone_hotspot_cache_lock:
@@ -2094,7 +2097,7 @@ def _pickup_zone_hotspots(zone_ids: List[int]) -> Dict[str, Any]:
             feature = None
             if cached and cached.get("signature") == signature and cached.get("feature"):
                 feature = cached["feature"]
-            elif len(pts) >= PICKUP_ZONE_HOTSPOT_MIN_POINTS:
+            elif qualified_zone:
                 try:
                     feature = _build_pickup_zone_hotspot_feature(zone_id, zone_data, pts)
                 except Exception:
@@ -2103,11 +2106,11 @@ def _pickup_zone_hotspots(zone_ids: List[int]) -> Dict[str, Any]:
 
             if not feature:
                 # Fallback hotspot polygons are for qualified zones only.
-                if len(pts) >= PICKUP_ZONE_HOTSPOT_MIN_POINTS:
+                if qualified_zone:
                     feature = _build_fallback_pickup_zone_hotspot_feature(zone_id, zone_data, pts, micro_payload)
             if not feature:
                 # Micro-hotspots must still surface even if polygon generation fails.
-                if micro_payload:
+                if qualified_zone and micro_payload:
                     orphan_micro_hotspots.extend([item for item in micro_payload if isinstance(item, dict)])
                 with _pickup_zone_hotspot_cache_lock:
                     _pickup_zone_hotspot_feature_cache.pop(zone_id, None)
