@@ -75,7 +75,7 @@ EVENT_DEFAULT_WINDOW_SECONDS = int(os.environ.get("EVENT_DEFAULT_WINDOW_SECONDS"
 MAX_AVATAR_DATA_URL_LENGTH = int(os.environ.get("MAX_AVATAR_DATA_URL_LENGTH", "20000"))
 ALLOWED_MAP_IDENTITY_MODES = {"name", "avatar"}
 
-PICKUP_ZONE_HOTSPOT_MIN_POINTS = 3  # Low-volume bootstrap tuning so hotspots surface earlier in live rollout.
+PICKUP_ZONE_HOTSPOT_MIN_POINTS = 5  # Keep 5-dot minimum to avoid pickup noise.
 PICKUP_ZONE_HOTSPOT_MAX_POINTS = 100
 PICKUP_ZONE_HOTSPOT_CELL_SIZE_M = 135
 PICKUP_ZONE_HOTSPOT_RADIUS_M = 240
@@ -1955,6 +1955,7 @@ def _build_zone_micro_hotspots_payload(
                 "intensity": c.intensity,
                 "confidence": c.confidence,
                 "weighted_trip_count": c.weighted_trip_count,
+                "event_count": int(getattr(c, "event_count", 0)),
                 "unique_driver_count": c.unique_driver_count,
                 "crowding_penalty": c.crowding_penalty,
                 "recommended": c.recommended,

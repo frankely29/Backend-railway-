@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
-from typing import Any, Dict, List, Mapping, Tuple
+from typing import Any, Dict, List, Mapping, Tuple, cast
 
 from pyproj import Transformer
 
@@ -115,11 +115,11 @@ def score_micro_hotspots(
                 live_component=live_component,
                 same_timeslot_component=timeslot_component,
                 final_score=final_score,
-                # Low-volume experiment tuning: surface micro-hotspots earlier while confidence/diversity logic still guards noise.
-                recommended=bool(weighted_adj >= 0.85 and unique_count >= 1 and confidence >= 0.18 and final_score >= 0.10),  # Low-volume bootstrap tuning for earlier live surfacing.
+                recommended=bool(weighted_adj >= 0.85 and unique_count >= 1 and confidence >= 0.18 and final_score >= 0.10),
                 eta_alignment=eta_alignment,
             )
         )
+        setattr(results[-1], "event_count", len(points))
 
     results.sort(key=lambda r: r.final_score, reverse=True)
     cap = max(1, min(3, int(top_n)))
@@ -127,11 +127,13 @@ def score_micro_hotspots(
     if recommended:
         return recommended[:cap]
 
-    # Conservative low-volume fallback: only surface near-threshold clusters when
-    # strict recommendation would otherwise produce empty experimental output.
+    # Conservative fallback only after zone-level 5-dot qualification upstream.
     fallback = [
         r
         for r in results
-        if r.unique_driver_count >= 1 and r.confidence >= 0.10 and r.final_score >= 0.06  # Low-volume bootstrap fallback.
+        if cast(int, getattr(r, "event_count", 0)) >= 2
+        and r.unique_driver_count >= 1
+        and r.confidence >= 0.08
+        and r.final_score >= 0.03
     ]
     return fallback[:cap]
