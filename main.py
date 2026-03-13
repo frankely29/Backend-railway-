@@ -75,8 +75,7 @@ EVENT_DEFAULT_WINDOW_SECONDS = int(os.environ.get("EVENT_DEFAULT_WINDOW_SECONDS"
 MAX_AVATAR_DATA_URL_LENGTH = int(os.environ.get("MAX_AVATAR_DATA_URL_LENGTH", "20000"))
 ALLOWED_MAP_IDENTITY_MODES = {"name", "avatar"}
 
-# Low-volume experiment tuning: let zone hotspots form earlier while confidence/diversity gates still filter noise.
-PICKUP_ZONE_HOTSPOT_MIN_POINTS = 3
+PICKUP_ZONE_HOTSPOT_MIN_POINTS = 3  # Low-volume bootstrap tuning so hotspots surface earlier in live rollout.
 PICKUP_ZONE_HOTSPOT_MAX_POINTS = 100
 PICKUP_ZONE_HOTSPOT_CELL_SIZE_M = 135
 PICKUP_ZONE_HOTSPOT_RADIUS_M = 240
@@ -2212,6 +2211,19 @@ def get_recent_pickups(
         print("[warn] Failed to attach pickup zone hotspots", traceback.format_exc())
         zone_hotspots = {"type": "FeatureCollection", "features": []}
     micro_hotspots = _flatten_zone_micro_hotspots(zone_hotspots)
+    zone_features = zone_hotspots.get("features") if isinstance(zone_hotspots, dict) else []
+    zone_hotspot_count = len(zone_features) if isinstance(zone_features, list) else 0
+    nested_micro_hotspot_count = 0
+    if isinstance(zone_features, list):
+        for feature in zone_features:
+            if not isinstance(feature, dict):
+                continue
+            props = feature.get("properties")
+            if not isinstance(props, dict):
+                continue
+            nested = props.get("micro_hotspots")
+            if isinstance(nested, list):
+                nested_micro_hotspot_count += len([item for item in nested if isinstance(item, dict)])
     return {
         "ok": True,
         "count": len(items),
@@ -2219,6 +2231,11 @@ def get_recent_pickups(
         "zone_stats": zone_stats,
         "zone_hotspots": zone_hotspots,
         "micro_hotspots": micro_hotspots,
+        "micro_hotspot_debug": {
+            "zone_hotspot_count": zone_hotspot_count,
+            "nested_micro_hotspot_count": nested_micro_hotspot_count,
+            "top_level_micro_hotspot_count": len(micro_hotspots),
+        },
     }
 
 
