@@ -273,6 +273,12 @@ def _try_alter(sqlite_sql: str, postgres_sql: Optional[str] = None) -> None:
             conn.close()
 
 
+def _ghost_visible_sql(column_name: str) -> str:
+    if DB_BACKEND == "postgres":
+        return f"({column_name} IS NULL OR {column_name} = FALSE)"
+    return f"({column_name} IS NULL OR CAST({column_name} AS INTEGER) = 0)"
+
+
 def _db_init() -> None:
     if DB_BACKEND == "postgres":
         _db_exec(
@@ -1313,27 +1319,32 @@ def presence_all(
 ):
     cutoff = int(time.time()) - max(5, min(3600, int(max_age_sec)))
     # Filter out ghost_mode enabled users.
-    rows = _db_query_all(
-        """
-        SELECT
-          p.user_id,
-          u.email,
-          u.display_name,
-          u.avatar_url,
-          u.map_identity_mode,
-          u.ghost_mode,
-          p.lat,
-          p.lng,
-          p.heading,
-          p.accuracy,
-          p.updated_at
-        FROM presence p
-        LEFT JOIN users u ON u.id = p.user_id
-        WHERE p.updated_at >= ?
-          AND (u.ghost_mode IS NULL OR CAST(u.ghost_mode AS INTEGER) = 0)
-        """,
-        (cutoff,),
-    )
+    ghost_visible = _ghost_visible_sql("u.ghost_mode")
+    try:
+        rows = _db_query_all(
+            f"""
+            SELECT
+              p.user_id,
+              u.email,
+              u.display_name,
+              u.avatar_url,
+              u.map_identity_mode,
+              u.ghost_mode,
+              p.lat,
+              p.lng,
+              p.heading,
+              p.accuracy,
+              p.updated_at
+            FROM presence p
+            LEFT JOIN users u ON u.id = p.user_id
+            WHERE p.updated_at >= ?
+              AND {ghost_visible}
+            """,
+            (cutoff,),
+        )
+    except Exception:
+        print(f"[warn] /presence/all failed user_id={int(viewer['id'])} err=1")
+        raise
 
     badge_by_user = get_best_current_badges_for_users([int(r["user_id"]) for r in rows])
 
@@ -1362,6 +1373,7 @@ def presence_all(
             }
         )
 
+    print(f"[info] /presence/all ok=1 user_id={int(viewer['id'])} count={len(items)}")
     return {"ok": True, "count": len(items), "items": items}
 
 
@@ -2201,13 +2213,14 @@ def _current_timeslot_bin(now_ts: int, bin_minutes: int = HOTSPOT_TIMESLOT_BIN_M
 
 def _active_visible_driver_count() -> int:
     cutoff = int(time.time()) - max(30, PRESENCE_STALE_SECONDS)
+    ghost_visible = _ghost_visible_sql("u.ghost_mode")
     row = _db_query_one(
-        """
+        f"""
         SELECT COUNT(*) AS c
         FROM presence p
         LEFT JOIN users u ON u.id = p.user_id
         WHERE p.updated_at >= ?
-          AND (u.ghost_mode IS NULL OR CAST(u.ghost_mode AS INTEGER) = 0)
+          AND {ghost_visible}
         """,
         (cutoff,),
     )
@@ -2666,7 +2679,11 @@ def get_recent_pickups(
     sql += " ORDER BY created_at DESC LIMIT ?"
     params.append(safe_limit)
 
-    rows = _db_query_all(sql, tuple(params))
+    try:
+        rows = _db_query_all(sql, tuple(params))
+    except Exception:
+        print(f"[warn] /events/pickups/recent ok=0 user_id={int(viewer['id'])} count=0 hotspot_count=0")
+        raise
     items = [dict(r) for r in rows]
 
     zone_ids_for_stats: List[int] = []
@@ -2691,6 +2708,9 @@ def get_recent_pickups(
     try:
         zone_hotspots, pickup_hotspot_debug = _pickup_zone_hotspots_with_debug(hotspot_zone_ids)
     except Exception:
+        print(
+            f"[warn] /events/pickups/recent ok=0 user_id={int(viewer['id'])} count={len(items)} hotspot_count=0"
+        )
         print("[warn] Failed to attach pickup zone hotspots", traceback.format_exc())
         zone_hotspots = {"type": "FeatureCollection", "features": []}
         pickup_hotspot_debug = {
@@ -2723,6 +2743,9 @@ def get_recent_pickups(
     }
     if int(debug) == 1 and _flag_to_int(viewer["is_admin"]) == 1:
         response["pickup_hotspot_debug"] = pickup_hotspot_debug
+    print(
+        f"[info] /events/pickups/recent ok=1 user_id={int(viewer['id'])} count={len(items)} hotspot_count={zone_hotspot_count}"
+    )
     return response
 
 
