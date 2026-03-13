@@ -2078,15 +2078,6 @@ def _pickup_zone_hotspots(zone_ids: List[int]) -> Dict[str, Any]:
             if not zone_data:
                 continue
 
-            micro_payload = _build_zone_micro_hotspots_payload(
-                zone_id,
-                pts,
-                historical_support.get(zone_id, 0.0),
-                same_timeslot_support.get(zone_id, 0.0),
-                density_penalty_by_zone.get(zone_id, 0.0),
-                now_ts,
-            )
-
             signature = _pickup_zone_signature(pts)
             with _pickup_zone_hotspot_cache_lock:
                 cached = _pickup_zone_hotspot_feature_cache.get(zone_id)
@@ -2100,6 +2091,15 @@ def _pickup_zone_hotspots(zone_ids: List[int]) -> Dict[str, Any]:
                 except Exception:
                     print(f"[warn] Failed to generate pickup zone hotspot for zone {zone_id}", traceback.format_exc())
                     feature = None
+
+            micro_payload = _build_zone_micro_hotspots_payload(
+                zone_id,
+                pts,
+                historical_support.get(zone_id, 0.0),
+                same_timeslot_support.get(zone_id, 0.0),
+                density_penalty_by_zone.get(zone_id, 0.0),
+                now_ts,
+            )
 
             if not feature:
                 # Fallback hotspot polygons are for qualified zones only.
