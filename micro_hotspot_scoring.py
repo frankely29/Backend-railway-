@@ -115,7 +115,8 @@ def score_micro_hotspots(
                 live_component=live_component,
                 same_timeslot_component=timeslot_component,
                 final_score=final_score,
-                recommended=bool(weighted_adj >= 1.2 and unique_count >= 2 and confidence >= 0.35 and final_score >= 0.18),
+                # Low-volume experiment tuning: surface micro-hotspots earlier while confidence/diversity logic still guards noise.
+                recommended=bool(weighted_adj >= 0.85 and unique_count >= 1 and confidence >= 0.18 and final_score >= 0.10),
                 eta_alignment=eta_alignment,
             )
         )
@@ -131,6 +132,6 @@ def score_micro_hotspots(
     fallback = [
         r
         for r in results
-        if r.unique_driver_count >= 1 and r.confidence >= 0.20 and r.final_score >= 0.12
+        if r.unique_driver_count >= 1 and r.confidence >= 0.10 and r.final_score >= 0.06
     ]
     return fallback[:cap]
