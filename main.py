@@ -2325,6 +2325,18 @@ def get_recent_pickups(
     micro_hotspots = _flatten_zone_micro_hotspots(zone_hotspots)
     zone_features = zone_hotspots.get("features") if isinstance(zone_hotspots, dict) else []
     zone_hotspot_count = len(zone_features) if isinstance(zone_features, list) else 0
+    nested_micro_hotspot_count = 0
+    if isinstance(zone_features, list):
+        for feature in zone_features:
+            if not isinstance(feature, dict):
+                continue
+            props = feature.get("properties")
+            if not isinstance(props, dict):
+                continue
+            micro_items = props.get("micro_hotspots")
+            if not isinstance(micro_items, list):
+                continue
+            nested_micro_hotspot_count += len([item for item in micro_items if isinstance(item, dict)])
     orphan_micro_hotspot_count = 0
     orphan = zone_hotspots.get("orphan_micro_hotspots") if isinstance(zone_hotspots, dict) else None
     if isinstance(orphan, list):
@@ -2338,6 +2350,7 @@ def get_recent_pickups(
         "micro_hotspots": micro_hotspots,
         "micro_hotspot_debug": {
             "zone_hotspot_count": zone_hotspot_count,
+            "nested_micro_hotspot_count": nested_micro_hotspot_count,
             "orphan_micro_hotspot_count": orphan_micro_hotspot_count,
             "top_level_micro_hotspot_count": len(micro_hotspots),
         },
