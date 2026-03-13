@@ -23,6 +23,8 @@ from shapely.ops import transform, unary_union
 from build_hotspot import ensure_zones_geojson, build_hotspots_frames
 from admin_routes import router as admin_router
 from admin_mutation_routes import router as admin_mutation_router
+from admin_test_routes import router as admin_test_router
+from admin_trips_routes import router as admin_trips_router
 from core import (
     _auth_user_from_request,
     _clean_display_name,
@@ -110,6 +112,8 @@ app.add_middleware(
 
 app.include_router(admin_router)
 app.include_router(admin_mutation_router)
+app.include_router(admin_trips_router)
+app.include_router(admin_test_router)
 
 # =========================================================
 # Utilities: frames
