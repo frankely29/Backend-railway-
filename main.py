@@ -21,6 +21,7 @@ from shapely.geometry import MultiPolygon, Point, Polygon, mapping, shape
 from shapely.ops import transform, unary_union
 
 from build_hotspot import ensure_zones_geojson, build_hotspots_frames
+from admin_routes import router as admin_router
 from core import (
     _auth_user_from_request,
     _clean_display_name,
@@ -105,6 +106,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(admin_router)
 
 # =========================================================
 # Utilities: frames
@@ -1888,19 +1891,6 @@ def get_recent_pickups(
 # =========================================================
 # ADMIN (manage all accounts)
 # =========================================================
-@app.get("/admin/users")
-def admin_users(admin: sqlite3.Row = Depends(require_admin)):
-    rows = _db_query_all(
-        """
-        SELECT id, email, display_name, ghost_mode, is_admin, is_disabled, created_at, trial_expires_at
-        FROM users
-        ORDER BY created_at ASC
-        """
-    )
-    items = [dict(r) for r in rows]
-    return {"ok": True, "count": len(items), "items": items}
-
-
 class AdminDisablePayload(BaseModel):
     user_id: int
     disabled: bool
