@@ -2128,6 +2128,26 @@ def _pickup_zone_stats(zone_ids: List[int], sample_limit: int = 100) -> List[Dic
     return stats
 
 
+def _flatten_zone_micro_hotspots(zone_hotspots: Dict[str, Any]) -> List[Dict[str, Any]]:
+    # Preserve nested micro_hotspots for per-zone context while also exposing a top-level
+    # compatibility payload expected by existing frontend clients.
+    flattened: List[Dict[str, Any]] = []
+    features = zone_hotspots.get("features") if isinstance(zone_hotspots, dict) else None
+    if not isinstance(features, list):
+        return flattened
+    for feature in features:
+        if not isinstance(feature, dict):
+            continue
+        props = feature.get("properties")
+        if not isinstance(props, dict):
+            continue
+        micro_hotspots = props.get("micro_hotspots")
+        if not isinstance(micro_hotspots, list):
+            continue
+        flattened.extend([item for item in micro_hotspots if isinstance(item, dict)])
+    return flattened
+
+
 @app.get("/events/pickups/recent")
 def get_recent_pickups(
     limit: int = 30,
@@ -2190,12 +2210,14 @@ def get_recent_pickups(
     except Exception:
         print("[warn] Failed to attach pickup zone hotspots", traceback.format_exc())
         zone_hotspots = {"type": "FeatureCollection", "features": []}
+    micro_hotspots = _flatten_zone_micro_hotspots(zone_hotspots)
     return {
         "ok": True,
         "count": len(items),
         "items": items,
         "zone_stats": zone_stats,
         "zone_hotspots": zone_hotspots,
+        "micro_hotspots": micro_hotspots,
     }
 
 
