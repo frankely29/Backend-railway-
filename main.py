@@ -1965,7 +1965,13 @@ def _build_zone_micro_hotspots_payload(
 
 
 def _pickup_zone_hotspots(zone_ids: List[int]) -> Dict[str, Any]:
-    empty = {"type": "FeatureCollection", "features": []}
+    empty = {
+        "type": "FeatureCollection",
+        "features": [],
+        "orphan_micro_hotspots": [],
+        "zone_ids_with_enough_points": 0,
+        "zones_with_micro_payload": 0,
+    }
     try:
         now_ts = int(time.time())
         clean_zone_ids: List[int] = []
@@ -2001,33 +2007,17 @@ def _pickup_zone_hotspots(zone_ids: List[int]) -> Dict[str, Any]:
         prune_experiment_tables(_db_exec, now_ts=now_ts)
 
         features: List[Dict[str, Any]] = []
+        orphan_micro_hotspots: List[Dict[str, Any]] = []
+        zone_ids_with_enough_points = 0
+        zones_with_micro_payload = 0
         requested_zone_ids = set(clean_zone_ids)
         for zone_id in clean_zone_ids:
             pts = zone_points.get(zone_id, [])
-            zone_data = zone_geoms.get(zone_id)
-            if not zone_data:
+            if len(pts) < PICKUP_ZONE_HOTSPOT_MIN_POINTS:
+                # Keep 5-dot minimum to avoid hotspot noise.
                 continue
+            zone_ids_with_enough_points += 1
 
-            signature = _pickup_zone_signature(pts)
-            with _pickup_zone_hotspot_cache_lock:
-                cached = _pickup_zone_hotspot_feature_cache.get(zone_id)
-
-            feature = None
-            if cached and cached.get("signature") == signature and cached.get("feature"):
-                feature = cached["feature"]
-            elif len(pts) >= PICKUP_ZONE_HOTSPOT_MIN_POINTS:
-                try:
-                    feature = _build_pickup_zone_hotspot_feature(zone_id, zone_data, pts)
-                except Exception:
-                    print(f"[warn] Failed to generate pickup zone hotspot for zone {zone_id}", traceback.format_exc())
-                    feature = None
-
-            if not feature:
-                with _pickup_zone_hotspot_cache_lock:
-                    _pickup_zone_hotspot_feature_cache.pop(zone_id, None)
-                continue
-
-            score = zone_scores.get(zone_id)
             micro_payload = _build_zone_micro_hotspots_payload(
                 zone_id,
                 pts,
@@ -2036,6 +2026,33 @@ def _pickup_zone_hotspots(zone_ids: List[int]) -> Dict[str, Any]:
                 density_penalty_by_zone.get(zone_id, 0.0),
                 now_ts,
             )
+            if micro_payload:
+                zones_with_micro_payload += 1
+
+            zone_data = zone_geoms.get(zone_id)
+
+            signature = _pickup_zone_signature(pts)
+            with _pickup_zone_hotspot_cache_lock:
+                cached = _pickup_zone_hotspot_feature_cache.get(zone_id)
+
+            feature = None
+            if cached and cached.get("signature") == signature and cached.get("feature"):
+                feature = cached["feature"]
+            elif zone_data:
+                try:
+                    feature = _build_pickup_zone_hotspot_feature(zone_id, zone_data, pts)
+                except Exception:
+                    print(f"[warn] Failed to generate pickup zone hotspot for zone {zone_id}", traceback.format_exc())
+                    feature = None
+
+            if not feature:
+                # Still surface micro-hotspots for qualified zones even if polygon build fails.
+                orphan_micro_hotspots.extend(micro_payload)
+                with _pickup_zone_hotspot_cache_lock:
+                    _pickup_zone_hotspot_feature_cache.pop(zone_id, None)
+                continue
+
+            score = zone_scores.get(zone_id)
 
             props = feature.setdefault("properties", {})
             props["signature"] = signature
@@ -2072,7 +2089,13 @@ def _pickup_zone_hotspots(zone_ids: List[int]) -> Dict[str, Any]:
             for zid in stale_zone_ids:
                 _pickup_zone_hotspot_feature_cache.pop(zid, None)
 
-        return {"type": "FeatureCollection", "features": features}
+        return {
+            "type": "FeatureCollection",
+            "features": features,
+            "orphan_micro_hotspots": orphan_micro_hotspots,
+            "zone_ids_with_enough_points": zone_ids_with_enough_points,
+            "zones_with_micro_payload": zones_with_micro_payload,
+        }
     except Exception:
         print("[warn] Failed to generate pickup zone hotspots", traceback.format_exc())
         return empty
@@ -2146,6 +2169,9 @@ def _flatten_zone_micro_hotspots(zone_hotspots: Dict[str, Any]) -> List[Dict[str
         if not isinstance(micro_hotspots, list):
             continue
         flattened.extend([item for item in micro_hotspots if isinstance(item, dict)])
+    orphan = zone_hotspots.get("orphan_micro_hotspots") if isinstance(zone_hotspots, dict) else None
+    if isinstance(orphan, list):
+        flattened.extend([item for item in orphan if isinstance(item, dict)])
     return flattened
 
 
@@ -2213,18 +2239,9 @@ def get_recent_pickups(
         zone_hotspots = {"type": "FeatureCollection", "features": []}
     micro_hotspots = _flatten_zone_micro_hotspots(zone_hotspots)
     zone_features = zone_hotspots.get("features") if isinstance(zone_hotspots, dict) else []
-    zone_hotspot_count = len(zone_features) if isinstance(zone_features, list) else 0
-    nested_micro_hotspot_count = 0
-    if isinstance(zone_features, list):
-        for feature in zone_features:
-            if not isinstance(feature, dict):
-                continue
-            props = feature.get("properties")
-            if not isinstance(props, dict):
-                continue
-            nested = props.get("micro_hotspots")
-            if isinstance(nested, list):
-                nested_micro_hotspot_count += len([item for item in nested if isinstance(item, dict)])
+    zone_hotspot_feature_count = len(zone_features) if isinstance(zone_features, list) else 0
+    zone_ids_with_enough_points = int(zone_hotspots.get("zone_ids_with_enough_points", 0)) if isinstance(zone_hotspots, dict) else 0
+    zones_with_micro_payload = int(zone_hotspots.get("zones_with_micro_payload", 0)) if isinstance(zone_hotspots, dict) else 0
     return {
         "ok": True,
         "count": len(items),
@@ -2233,8 +2250,9 @@ def get_recent_pickups(
         "zone_hotspots": zone_hotspots,
         "micro_hotspots": micro_hotspots,
         "micro_hotspot_debug": {
-            "zone_hotspot_count": zone_hotspot_count,
-            "nested_micro_hotspot_count": nested_micro_hotspot_count,
+            "zone_hotspot_feature_count": zone_hotspot_feature_count,
+            "zone_ids_with_enough_points": zone_ids_with_enough_points,
+            "zones_with_micro_payload": zones_with_micro_payload,
             "top_level_micro_hotspot_count": len(micro_hotspots),
         },
     }
