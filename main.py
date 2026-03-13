@@ -2339,6 +2339,22 @@ def _pickup_zone_stats(zone_ids: List[int], sample_limit: int = 100) -> List[Dic
 def _flatten_zone_micro_hotspots(zone_hotspots: Dict[str, Any]) -> List[Dict[str, Any]]:
     # Flatten nested and orphan micro-hotspots into one compact top-level payload.
     flattened: List[Dict[str, Any]] = []
+
+    def _normalize_micro_hotspot(item: Dict[str, Any], fallback_zone_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
+        if not isinstance(item, dict):
+            return None
+        normalized = dict(item)
+        zone_val = normalized.get("zone_id")
+        if zone_val is None and fallback_zone_id is not None:
+            zone_val = fallback_zone_id
+        try:
+            normalized["zone_id"] = int(zone_val) if zone_val is not None else None
+        except Exception:
+            return None
+        if normalized.get("zone_id") is None:
+            return None
+        return normalized
+
     features = zone_hotspots.get("features") if isinstance(zone_hotspots, dict) else None
     if isinstance(features, list):
         for feature in features:
@@ -2347,13 +2363,25 @@ def _flatten_zone_micro_hotspots(zone_hotspots: Dict[str, Any]) -> List[Dict[str
             props = feature.get("properties")
             if not isinstance(props, dict):
                 continue
+            fallback_zone_id: Optional[int] = None
+            try:
+                if props.get("zone_id") is not None:
+                    fallback_zone_id = int(props.get("zone_id"))
+            except Exception:
+                fallback_zone_id = None
             micro_hotspots = props.get("micro_hotspots")
             if not isinstance(micro_hotspots, list):
                 continue
-            flattened.extend([item for item in micro_hotspots if isinstance(item, dict)])
+            for item in micro_hotspots:
+                normalized = _normalize_micro_hotspot(item, fallback_zone_id)
+                if normalized is not None:
+                    flattened.append(normalized)
     orphan = zone_hotspots.get("orphan_micro_hotspots") if isinstance(zone_hotspots, dict) else None
     if isinstance(orphan, list):
-        flattened.extend([item for item in orphan if isinstance(item, dict)])
+        for item in orphan:
+            normalized = _normalize_micro_hotspot(item)
+            if normalized is not None:
+                flattened.append(normalized)
     return flattened
 
 
