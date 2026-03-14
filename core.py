@@ -22,6 +22,7 @@ JWT_SECRET = os.environ.get("JWT_SECRET", "")
 POSTGRES_URL = os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL")
 DB_BACKEND = "postgres" if POSTGRES_URL else "sqlite"
 TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "7"))
+ENFORCE_TRIAL = str(os.environ.get("ENFORCE_TRIAL", "0")).strip().lower() in ("1", "true", "yes", "on")
 
 _db_lock = threading.Lock()
 
@@ -131,6 +132,8 @@ def _auth_user_from_request(req: Request) -> sqlite3.Row:
 
 
 def _enforce_trial_or_admin(user: sqlite3.Row) -> None:
+    if not ENFORCE_TRIAL:
+        return
     if int(user["is_admin"]) == 1:
         return
     trial_expires_at_raw = user["trial_expires_at"] if "trial_expires_at" in user.keys() else None
