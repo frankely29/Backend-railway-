@@ -44,6 +44,7 @@ from core import (
     DB_BACKEND,
     _make_token,
     _require_jwt_secret,
+    ENFORCE_TRIAL,
     require_user,
 )
 
@@ -954,6 +955,7 @@ def status():
         "generate_state": _get_state(),
         "community_db": os.environ.get("COMMUNITY_DB", str(DATA_DIR / "community.db")),
         "trial_days": TRIAL_DAYS,
+        "trial_enforced": ENFORCE_TRIAL,
         "auth_enabled": bool(JWT_SECRET and len(JWT_SECRET) >= 24),
     }
 
