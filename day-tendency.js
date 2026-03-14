@@ -132,7 +132,7 @@
       root.setAttribute('role', 'status');
       root.setAttribute('aria-live', 'polite');
       root.innerHTML = `
-        <div class="dayTendencyTitle">Day Tendency</div>
+        <div class="dayTendencyTitle">Time Tendency</div>
         <div class="dayTendencySub">Expected</div>
         <div class="dayTendencyBarWrap">
           <div class="dayTendencyScale">
@@ -240,7 +240,7 @@
     root.title = `${label} • Score ${numericScore}/100 • Confidence ${confidencePct}%${explain}`;
     root.setAttribute(
       'aria-label',
-      `Day tendency expected ${String(label).toLowerCase()}, score ${roundedScore} out of 100, confidence ${confidencePct} percent`
+      `Current time-slot tendency expected ${String(label).toLowerCase()}, score ${roundedScore} out of 100, confidence ${confidencePct} percent`
     );
     root.hidden = false;
     positionDayTendencyRoot();
