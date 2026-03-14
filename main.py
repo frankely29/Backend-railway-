@@ -238,7 +238,6 @@ def _resolve_day_tendency_payload(target_date: date) -> Dict[str, Any]:
             "generated_at": generated_at,
         }
 
-    chosen = primary or fallback
     if primary and (int(primary.get("sample_days", 0)) >= 8 or not fallback):
         chosen = primary
         score_raw = float(chosen.get("score_raw", 0.5))
@@ -275,16 +274,52 @@ def _resolve_day_tendency_payload(target_date: date) -> Dict[str, Any]:
             "generated_at": generated_at,
         }
 
-    primary_days = int(primary.get("sample_days", 0)) if primary else 0
+    if not primary and fallback:
+        score_raw = float(fallback.get("score_raw", fallback.get("score", 0.5)))
+        score = int(max(0, min(100, round(score_raw * 100))))
+        band = _band_from_score(score)
+        print(f"[info] day_tendency fallback-only used for date={target_date.isoformat()} weekday={weekday}")
+        return {
+            "version": DAY_TENDENCY_VERSION,
+            "basis": "historical_expected_day",
+            "tz": "America/New_York",
+            "date": target_date.isoformat(),
+            "weekday": weekday,
+            "weekday_name": weekday_name,
+            "month": month,
+            "score": score,
+            "band": band,
+            "meter_pct": round(score / 100.0, 4),
+            "label": _label_from_band(band),
+            "confidence": float(fallback.get("confidence", 0.0)),
+            "sample_days": int(fallback.get("sample_days", 0)),
+            "cohort_type": "weekday_only",
+            "components": {
+                "pickup_strength": float(fallback.get("pickup_strength", 0.5)),
+                "pay_strength": float(fallback.get("pay_strength", 0.5)),
+                "breadth_strength": float(fallback.get("breadth_strength", 0.5)),
+                "peak_strength": float(fallback.get("peak_strength", 0.5)),
+            },
+            "cohort_medians": {
+                "daily_pickups": int(fallback.get("daily_pickups_median", 0)),
+                "avg_driver_pay": float(fallback.get("avg_driver_pay_median", 0.0)),
+                "active_zones": int(fallback.get("active_zones_median", 0)),
+                "peak_20m_pickups": int(fallback.get("peak_20m_pickups_median", 0)),
+            },
+            "explain": str(fallback.get("explain", "")),
+            "generated_at": generated_at,
+        }
+
+    primary_days = int(primary.get("sample_days", 0))
     w = min(1.0, primary_days / 8.0)
 
-    p_score_raw = float(primary.get("score_raw", 0.5)) if primary else 0.5
-    f_score_raw = float(fallback.get("score_raw", 0.5)) if fallback else 0.5
+    p_score_raw = float(primary.get("score_raw", 0.5))
+    f_score_raw = float(fallback.get("score_raw", 0.5))
     final_score_raw = w * p_score_raw + (1.0 - w) * f_score_raw
 
     def blend(a: str) -> float:
-        pv = float(primary.get(a, 0.5)) if primary else 0.5
-        fv = float(fallback.get(a, 0.5)) if fallback else 0.5
+        pv = float(primary.get(a, 0.5))
+        fv = float(fallback.get(a, 0.5))
         return round(w * pv + (1.0 - w) * fv, 4)
 
     score = int(max(0, min(100, round(final_score_raw * 100))))
@@ -318,7 +353,7 @@ def _resolve_day_tendency_payload(target_date: date) -> Dict[str, Any]:
             "active_zones": int(primary.get("active_zones_median", fallback.get("active_zones_median", 0))),
             "peak_20m_pickups": int(primary.get("peak_20m_pickups_median", fallback.get("peak_20m_pickups_median", 0))),
         },
-        "explain": str(primary.get("explain") if primary else fallback.get("explain", "")),
+        "explain": str(primary.get("explain", fallback.get("explain", ""))),
         "generated_at": generated_at,
     }
 
