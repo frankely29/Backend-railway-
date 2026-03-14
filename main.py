@@ -210,7 +210,7 @@ def _bin_label(bin_index: int, bin_minutes: int = 20) -> str:
 
 def _resolve_day_tendency_payload(target_date: date) -> Dict[str, Any]:
     model = _read_day_tendency_model()
-    print("[debug] day_tendency model keys:", list(model.keys()))
+    print("[debug] model keys:", list(model.keys()))
     generated_at = model.get("generated_at") or datetime.now(timezone.utc).isoformat()
     bin_minutes = int(model.get("bin_minutes") or 20)
 
@@ -231,19 +231,20 @@ def _resolve_day_tendency_payload(target_date: date) -> Dict[str, Any]:
         }
 
     if model.get("status") == "insufficient_data":
-        print("[debug] day_tendency path=insufficient_data")
+        print("[debug] using path=insufficient_data")
         return insufficient()
 
     now_nyc = datetime.now(NYC_TZ)
     bin_index = _current_bin_index_from_dt(now_nyc, bin_minutes=bin_minutes)
 
-    month = target_date.month
     weekday = target_date.weekday()
     weekday_name = _weekday_name_from_mon0(weekday)
     bin_label = _bin_label(bin_index, bin_minutes=bin_minutes)
 
-    primary_key = f"{weekday}-{bin_index}"
-    fallback_key = f"{bin_index}"
+    weekday_bin_key = f"{weekday}-{bin_index}"
+    bin_only_key = f"{bin_index}"
+    print("[debug] weekday_bin key:", weekday_bin_key)
+    print("[debug] bin_only key:", bin_only_key)
 
     weekday_bin = model.get("weekday_bin") or {}
     bin_only = model.get("bin_only") or {}
@@ -257,12 +258,12 @@ def _resolve_day_tendency_payload(target_date: date) -> Dict[str, Any]:
         },
     )
 
-    primary = weekday_bin.get(primary_key)
-    fallback = bin_only.get(fallback_key)
+    primary = weekday_bin.get(weekday_bin_key)
+    fallback = bin_only.get(bin_only_key)
     baseline = global_baseline if isinstance(global_baseline, dict) and global_baseline else None
 
     if not primary and not fallback and not baseline:
-        print("[debug] day_tendency path=insufficient_data")
+        print("[debug] using path=insufficient_data")
         return insufficient()
 
     def from_item(item: Dict[str, Any], fallback_cohort_type: str | None = None) -> Dict[str, Any]:
@@ -275,7 +276,6 @@ def _resolve_day_tendency_payload(target_date: date) -> Dict[str, Any]:
             "date": target_date.isoformat(),
             "weekday": weekday,
             "weekday_name": weekday_name,
-            "month": month,
             "bin_index": bin_index,
             "bin_minutes": bin_minutes,
             "local_time_label": str(item.get("bin_label") or bin_label),
@@ -301,16 +301,16 @@ def _resolve_day_tendency_payload(target_date: date) -> Dict[str, Any]:
         }
 
     if primary:
-        print("[debug] day_tendency path=weekday_bin")
+        print("[debug] using path=weekday_bin")
         return from_item(primary, fallback_cohort_type="weekday_bin")
     if fallback:
-        print("[debug] day_tendency path=bin_only")
+        print("[debug] using path=bin_only")
         return from_item(fallback, fallback_cohort_type="bin_only")
     if baseline:
-        print("[debug] day_tendency path=global_baseline")
+        print("[debug] using path=global_baseline")
         return from_item(baseline, fallback_cohort_type="global_baseline")
 
-    print("[debug] day_tendency path=insufficient_data")
+    print("[debug] using path=insufficient_data")
     return insufficient()
 
 
