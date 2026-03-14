@@ -167,6 +167,24 @@ def _read_day_tendency_model() -> Dict[str, Any]:
     return _read_json(DAY_TENDENCY_MODEL_PATH)
 
 
+def _day_tendency_model_is_current() -> bool:
+    try:
+        if not _has_day_tendency_model():
+            return False
+        model = _read_day_tendency_model()
+        if str(model.get("version")) != "time_tendency_v1":
+            return False
+        if "weekday_bin" not in model:
+            return False
+        if "bin_only" not in model:
+            return False
+        if "global_baseline" not in model:
+            return False
+        return True
+    except Exception:
+        return False
+
+
 def _weekday_name_from_mon0(dow: int) -> str:
     names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
     idx = max(0, min(6, int(dow)))
@@ -1069,7 +1087,7 @@ def startup():
     # Auto-fill generate state if frames/day tendency already exist
     try:
         frames_ready = _has_frames()
-        day_tendency_ready = _has_day_tendency_model()
+        day_tendency_ready = _day_tendency_model_is_current()
         zones_ok = (DATA_DIR / "taxi_zones.geojson").exists()
         parquets_ok = len(_list_parquets()) > 0
 
@@ -1099,6 +1117,7 @@ def startup():
             return
 
         if frames_ready and not day_tendency_ready:
+            print("[warn] day tendency model missing or stale; rebuilding at startup")
             if parquets_ok:
                 try:
                     _build_day_tendency_only(DEFAULT_BIN_MINUTES)
