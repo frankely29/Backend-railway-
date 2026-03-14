@@ -5,13 +5,16 @@ import hashlib
 import json
 import math
 import os
+import re
 import sqlite3
 import threading
 import time
 import traceback
 from collections import defaultdict, deque
+from datetime import datetime, date, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,6 +24,7 @@ from shapely.geometry import MultiPolygon, Point, Polygon, mapping, shape
 from shapely.ops import transform, unary_union
 
 from build_hotspot import ensure_zones_geojson, build_hotspots_frames
+from build_day_tendency import build_day_tendency_model
 from hotspot_experiments import (
     log_recommendation_outcome,
     log_zone_bins,
@@ -54,6 +58,10 @@ from core import (
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 FRAMES_DIR = Path(os.environ.get("FRAMES_DIR", str(DATA_DIR / "frames")))
 TIMELINE_PATH = FRAMES_DIR / "timeline.json"
+DAY_TENDENCY_DIR = DATA_DIR / "day_tendency"
+DAY_TENDENCY_MODEL_PATH = DAY_TENDENCY_DIR / "model.json"
+NYC_TZ = ZoneInfo("America/New_York")
+DAY_TENDENCY_VERSION = "day_tendency_v1"
 
 DEFAULT_BIN_MINUTES = int(os.environ.get("DEFAULT_BIN_MINUTES", "20"))
 DEFAULT_MIN_TRIPS_PER_WINDOW = int(os.environ.get("DEFAULT_MIN_TRIPS_PER_WINDOW", "25"))
@@ -148,6 +156,173 @@ def _read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _has_day_tendency_model() -> bool:
+    try:
+        return DAY_TENDENCY_MODEL_PATH.exists() and DAY_TENDENCY_MODEL_PATH.stat().st_size > 0
+    except Exception:
+        return False
+
+
+def _read_day_tendency_model() -> Dict[str, Any]:
+    return _read_json(DAY_TENDENCY_MODEL_PATH)
+
+
+def _weekday_name_from_mon0(dow: int) -> str:
+    names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    idx = max(0, min(6, int(dow)))
+    return names[idx]
+
+
+def _band_from_score(score: int) -> str:
+    s = max(0, min(100, int(score)))
+    if s <= 34:
+        return "low"
+    if s <= 64:
+        return "normal"
+    return "high"
+
+
+def _label_from_band(band: str) -> str:
+    if band == "low":
+        return "Low"
+    if band == "high":
+        return "High"
+    return "Normal"
+
+
+def _resolve_day_tendency_payload(target_date: date) -> Dict[str, Any]:
+    model = _read_day_tendency_model()
+    generated_at = model.get("generated_at") or datetime.now(timezone.utc).isoformat()
+
+    if model.get("status") == "insufficient_data":
+        return {
+            "version": DAY_TENDENCY_VERSION,
+            "basis": "historical_expected_day",
+            "tz": "America/New_York",
+            "date": target_date.isoformat(),
+            "status": "insufficient_data",
+            "score": None,
+            "band": None,
+            "meter_pct": None,
+            "label": "No data",
+            "confidence": 0.0,
+            "sample_days": 0,
+            "generated_at": generated_at,
+        }
+
+    month = target_date.month
+    weekday = target_date.weekday()
+    weekday_name = _weekday_name_from_mon0(weekday)
+    primary_key = f"{month}-{weekday}"
+    fallback_key = f"{weekday}"
+
+    month_weekday = model.get("month_weekday") or {}
+    weekday_only = model.get("weekday_only") or {}
+
+    primary = month_weekday.get(primary_key)
+    fallback = weekday_only.get(fallback_key)
+
+    if not primary and not fallback:
+        return {
+            "version": DAY_TENDENCY_VERSION,
+            "basis": "historical_expected_day",
+            "tz": "America/New_York",
+            "date": target_date.isoformat(),
+            "status": "insufficient_data",
+            "score": None,
+            "band": None,
+            "meter_pct": None,
+            "label": "No data",
+            "confidence": 0.0,
+            "sample_days": 0,
+            "generated_at": generated_at,
+        }
+
+    chosen = primary or fallback
+    if primary and (int(primary.get("sample_days", 0)) >= 8 or not fallback):
+        chosen = primary
+        score_raw = float(chosen.get("score_raw", 0.5))
+        score = int(max(0, min(100, round(score_raw * 100))))
+        band = _band_from_score(score)
+        return {
+            "version": DAY_TENDENCY_VERSION,
+            "basis": "historical_expected_day",
+            "tz": "America/New_York",
+            "date": target_date.isoformat(),
+            "weekday": weekday,
+            "weekday_name": weekday_name,
+            "month": month,
+            "score": score,
+            "band": band,
+            "meter_pct": round(score / 100.0, 4),
+            "label": _label_from_band(band),
+            "confidence": float(chosen.get("confidence", 0.0)),
+            "sample_days": int(chosen.get("sample_days", 0)),
+            "cohort_type": str(chosen.get("cohort_type", "same_month_same_weekday")),
+            "components": {
+                "pickup_strength": float(chosen.get("pickup_strength", 0.5)),
+                "pay_strength": float(chosen.get("pay_strength", 0.5)),
+                "breadth_strength": float(chosen.get("breadth_strength", 0.5)),
+                "peak_strength": float(chosen.get("peak_strength", 0.5)),
+            },
+            "cohort_medians": {
+                "daily_pickups": int(chosen.get("daily_pickups_median", 0)),
+                "avg_driver_pay": float(chosen.get("avg_driver_pay_median", 0.0)),
+                "active_zones": int(chosen.get("active_zones_median", 0)),
+                "peak_20m_pickups": int(chosen.get("peak_20m_pickups_median", 0)),
+            },
+            "explain": str(chosen.get("explain", "")),
+            "generated_at": generated_at,
+        }
+
+    primary_days = int(primary.get("sample_days", 0)) if primary else 0
+    w = min(1.0, primary_days / 8.0)
+
+    p_score_raw = float(primary.get("score_raw", 0.5)) if primary else 0.5
+    f_score_raw = float(fallback.get("score_raw", 0.5)) if fallback else 0.5
+    final_score_raw = w * p_score_raw + (1.0 - w) * f_score_raw
+
+    def blend(a: str) -> float:
+        pv = float(primary.get(a, 0.5)) if primary else 0.5
+        fv = float(fallback.get(a, 0.5)) if fallback else 0.5
+        return round(w * pv + (1.0 - w) * fv, 4)
+
+    score = int(max(0, min(100, round(final_score_raw * 100))))
+    band = _band_from_score(score)
+    confidence = round(min(1.0, ((w * primary_days) + ((1.0 - w) * int(fallback.get("sample_days", 0)))) / 12.0), 2)
+
+    return {
+        "version": DAY_TENDENCY_VERSION,
+        "basis": "historical_expected_day",
+        "tz": "America/New_York",
+        "date": target_date.isoformat(),
+        "weekday": weekday,
+        "weekday_name": weekday_name,
+        "month": month,
+        "score": score,
+        "band": band,
+        "meter_pct": round(score / 100.0, 4),
+        "label": _label_from_band(band),
+        "confidence": confidence,
+        "sample_days": primary_days,
+        "cohort_type": "blended_month_weekday_with_weekday_fallback",
+        "components": {
+            "pickup_strength": blend("pickup_strength"),
+            "pay_strength": blend("pay_strength"),
+            "breadth_strength": blend("breadth_strength"),
+            "peak_strength": blend("peak_strength"),
+        },
+        "cohort_medians": {
+            "daily_pickups": int(primary.get("daily_pickups_median", fallback.get("daily_pickups_median", 0))),
+            "avg_driver_pay": float(primary.get("avg_driver_pay_median", fallback.get("avg_driver_pay_median", 0.0))),
+            "active_zones": int(primary.get("active_zones_median", fallback.get("active_zones_median", 0))),
+            "peak_20m_pickups": int(primary.get("peak_20m_pickups_median", fallback.get("peak_20m_pickups_median", 0))),
+        },
+        "explain": str(primary.get("explain") if primary else fallback.get("explain", "")),
+        "generated_at": generated_at,
+    }
+
+
 def _write_lock() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     LOCK_PATH.write_text(str(int(time.time())), encoding="utf-8")
@@ -199,13 +374,22 @@ def _generate_worker(bin_minutes: int, min_trips_per_window: int) -> None:
         if not parquets:
             raise RuntimeError("No .parquet files found in /data. Upload via POST /upload_parquet.")
 
-        result = build_hotspots_frames(
+        frames_result = build_hotspots_frames(
             parquet_files=parquets,
             zones_geojson_path=zones_path,
             out_dir=FRAMES_DIR,
             bin_minutes=bin_minutes,
             min_trips_per_window=min_trips_per_window,
         )
+        day_tendency_result = build_day_tendency_model(
+            parquet_files=parquets,
+            out_dir=DAY_TENDENCY_DIR,
+            bin_minutes=bin_minutes,
+        )
+        result = {
+            "frames": frames_result,
+            "day_tendency": day_tendency_result,
+        }
 
         end = time.time()
         _set_state(
@@ -919,6 +1103,8 @@ def root():
             "/status",
             "/generate",
             "/generate_status",
+            "/day_tendency/today",
+            "/day_tendency/date/{ymd}",
             "/timeline",
             "/frame/{idx}",
             "/auth/signup",
@@ -968,6 +1154,28 @@ def generate_get(bin_minutes: int = DEFAULT_BIN_MINUTES, min_trips_per_window: i
 @app.get("/generate_status")
 def generate_status():
     return _get_state()
+
+
+@app.get("/day_tendency/today")
+def day_tendency_today():
+    if not _has_day_tendency_model():
+        raise HTTPException(status_code=409, detail="day tendency not ready. Call /generate first.")
+    target_date = datetime.now(timezone.utc).astimezone(NYC_TZ).date()
+    return _resolve_day_tendency_payload(target_date)
+
+
+@app.get("/day_tendency/date/{ymd}")
+def day_tendency_for_date(ymd: str):
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", ymd or ""):
+        raise HTTPException(status_code=400, detail="ymd must be YYYY-MM-DD")
+    try:
+        parsed_date = date.fromisoformat(ymd)
+    except Exception:
+        raise HTTPException(status_code=400, detail="ymd must be YYYY-MM-DD")
+
+    if not _has_day_tendency_model():
+        raise HTTPException(status_code=409, detail="day tendency not ready. Call /generate first.")
+    return _resolve_day_tendency_payload(parsed_date)
 
 
 @app.get("/timeline")
