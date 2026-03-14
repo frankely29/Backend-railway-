@@ -1088,14 +1088,27 @@ def startup():
                     state="done",
                     bin_minutes=DEFAULT_BIN_MINUTES,
                     min_trips_per_window=DEFAULT_MIN_TRIPS_PER_WINDOW,
-                    result={"ok": True, "count": tl.get("count")},
+                    result={
+                        "ok": True,
+                        "count": tl.get("count"),
+                        "day_tendency": {
+                            "ok": True,
+                            "built_at_startup": False,
+                        },
+                    },
                 )
             except Exception:
                 _set_state(
                     state="done",
                     bin_minutes=DEFAULT_BIN_MINUTES,
                     min_trips_per_window=DEFAULT_MIN_TRIPS_PER_WINDOW,
-                    result={"ok": True},
+                    result={
+                        "ok": True,
+                        "day_tendency": {
+                            "ok": True,
+                            "built_at_startup": False,
+                        },
+                    },
                 )
             return
 
