@@ -197,7 +197,7 @@ def build_day_tendency_model(
     rows = con.execute(sql).fetchall()
     con.close()
 
-    if len(rows) < 3:
+    if len(rows) < 1:
         payload = _insufficient_payload(usable_dates=0)
         model_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         return {
