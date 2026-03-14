@@ -21,6 +21,7 @@ COMMUNITY_DB_PATH = Path(os.environ.get("COMMUNITY_DB", str(DATA_DIR / "communit
 JWT_SECRET = os.environ.get("JWT_SECRET", "")
 POSTGRES_URL = os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL")
 DB_BACKEND = "postgres" if POSTGRES_URL else "sqlite"
+TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "7"))
 
 _db_lock = threading.Lock()
 
@@ -132,7 +133,25 @@ def _auth_user_from_request(req: Request) -> sqlite3.Row:
 def _enforce_trial_or_admin(user: sqlite3.Row) -> None:
     if int(user["is_admin"]) == 1:
         return
-    if int(time.time()) > int(user["trial_expires_at"]):
+    trial_expires_at_raw = user["trial_expires_at"] if "trial_expires_at" in user.keys() else None
+    trial_expires_at: Optional[int]
+    try:
+        trial_expires_at = int(trial_expires_at_raw) if trial_expires_at_raw is not None else None
+    except Exception:
+        trial_expires_at = None
+
+    # Backward-compatibility/self-healing:
+    # some legacy rows can have null/0/invalid trial timestamps after migrations.
+    # Treat those as an uninitialized trial and initialize from "now".
+    if trial_expires_at is None or trial_expires_at <= 0:
+        trial_expires_at = int(time.time()) + max(1, TRIAL_DAYS) * 86400
+        try:
+            _db_exec("UPDATE users SET trial_expires_at=? WHERE id=?", (trial_expires_at, int(user["id"])))
+        except Exception:
+            # If persistence fails, we still allow this request rather than logging users out.
+            return
+
+    if int(time.time()) > trial_expires_at:
         raise HTTPException(status_code=402, detail="Trial expired")
 
 
