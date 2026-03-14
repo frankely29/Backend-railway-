@@ -21,6 +21,12 @@ from shapely.geometry import MultiPolygon, Point, Polygon, mapping, shape
 from shapely.ops import transform, unary_union
 
 from build_hotspot import ensure_zones_geojson, build_hotspots_frames
+from hotspot_experiments import (
+    log_recommendation_outcome,
+    log_zone_bins,
+    prune_experiment_tables,
+)
+from hotspot_scoring import score_zones
 from admin_routes import router as admin_router
 from admin_mutation_routes import router as admin_mutation_router
 from admin_test_routes import router as admin_test_router
@@ -67,16 +73,22 @@ EVENT_DEFAULT_WINDOW_SECONDS = int(os.environ.get("EVENT_DEFAULT_WINDOW_SECONDS"
 MAX_AVATAR_DATA_URL_LENGTH = int(os.environ.get("MAX_AVATAR_DATA_URL_LENGTH", "20000"))
 ALLOWED_MAP_IDENTITY_MODES = {"name", "avatar"}
 
-PICKUP_ZONE_HOTSPOT_MIN_POINTS = 5
+PICKUP_ZONE_HOTSPOT_MIN_POINTS = 5  # Keep 5-dot minimum to avoid pickup noise.
 PICKUP_ZONE_HOTSPOT_MAX_POINTS = 100
 PICKUP_ZONE_HOTSPOT_CELL_SIZE_M = 135
 PICKUP_ZONE_HOTSPOT_RADIUS_M = 240
 PICKUP_ZONE_HOTSPOT_SIGMA_M = 155
 PICKUP_ZONE_HOTSPOT_SIMPLIFY_M = 18
+PICKUP_ZONE_SECOND_HOTSPOT_MIN_POINTS = 8
+PICKUP_ZONE_SECOND_COMPONENT_MIN_POINTS = 3
+PICKUP_ZONE_SECOND_COMPONENT_MIN_SCORE_RATIO = 0.45
+HOTSPOT_RECENT_LOOKBACK_SECONDS = 6 * 3600
+HOTSPOT_TIMESLOT_BIN_MINUTES = 20
 
 _pickup_zone_geom_cache: Optional[Dict[int, Dict[str, Any]]] = None
 _pickup_zone_geom_cache_mtime: Optional[float] = None
 _pickup_zone_hotspot_feature_cache: Dict[int, Dict[str, Any]] = {}
+_pickup_zone_score_cache: Dict[int, float] = {}
 _pickup_zone_hotspot_cache_lock = threading.Lock()
 _to_3857 = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
 _to_4326 = Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
@@ -261,6 +273,89 @@ def _try_alter(sqlite_sql: str, postgres_sql: Optional[str] = None) -> None:
             conn.close()
 
 
+def _ghost_visible_sql(column_name: str) -> str:
+    if DB_BACKEND == "postgres":
+        return f"({column_name} IS NULL OR {column_name} = FALSE)"
+    return f"({column_name} IS NULL OR CAST({column_name} AS INTEGER) = 0)"
+
+
+def _presence_visibility_snapshot(max_age_sec: int) -> Dict[str, Any]:
+    cutoff = int(time.time()) - max(5, min(3600, int(max_age_sec)))
+    ghost_visible = _ghost_visible_sql("u.ghost_mode")
+    sql_mode = "postgres_boolean" if DB_BACKEND == "postgres" else "sqlite_cast_integer"
+    try:
+        visible_count_row = _db_query_one(
+            f"""
+            SELECT COUNT(*) AS c
+            FROM presence p
+            LEFT JOIN users u ON u.id = p.user_id
+            WHERE p.updated_at >= ?
+              AND {ghost_visible}
+            """,
+            (cutoff,),
+        )
+        visible_count = int(visible_count_row["c"] or 0) if visible_count_row else 0
+        sample_rows = _db_query_all(
+            f"""
+            SELECT p.user_id, u.email, u.display_name
+            FROM presence p
+            LEFT JOIN users u ON u.id = p.user_id
+            WHERE p.updated_at >= ?
+              AND {ghost_visible}
+            ORDER BY p.updated_at DESC
+            LIMIT 5
+            """,
+            (cutoff,),
+        )
+        counts = _db_query_one(
+            """
+            SELECT
+              COUNT(*) AS online_count,
+              SUM(CASE WHEN COALESCE(u.ghost_mode, FALSE) THEN 1 ELSE 0 END) AS ghosted_count
+            FROM presence p
+            LEFT JOIN users u ON u.id = p.user_id
+            WHERE p.updated_at >= ?
+            """,
+            (cutoff,),
+        )
+    except Exception as exc:
+        return {
+            "db_backend": DB_BACKEND,
+            "visible_count": 0,
+            "online_count": 0,
+            "ghosted_count": 0,
+            "sample_user_ids": [],
+            "sample_display_names": [],
+            "sql_mode": sql_mode,
+            "ok": False,
+            "error": str(exc),
+        }
+
+    sample_user_ids: List[int] = []
+    sample_display_names: List[str] = []
+    for row in sample_rows:
+        uid = row["user_id"]
+        if uid is None:
+            continue
+        email = (row["email"] or "").strip()
+        dn = (row["display_name"] or "").strip() or _clean_display_name("", email or "Driver")
+        sample_user_ids.append(int(uid))
+        sample_display_names.append(dn)
+
+    online_count = int(counts["online_count"] or 0) if counts else 0
+    ghosted_count = int(counts["ghosted_count"] or 0) if counts else 0
+    return {
+        "db_backend": DB_BACKEND,
+        "visible_count": visible_count,
+        "online_count": online_count,
+        "ghosted_count": ghosted_count,
+        "sample_user_ids": sample_user_ids,
+        "sample_display_names": sample_display_names,
+        "sql_mode": sql_mode,
+        "ok": True,
+    }
+
+
 def _db_init() -> None:
     if DB_BACKEND == "postgres":
         _db_exec(
@@ -386,6 +481,62 @@ def _db_init() -> None:
 
         _db_exec(
             """
+            CREATE TABLE IF NOT EXISTS hotspot_experiment_bins (
+              id BIGSERIAL PRIMARY KEY,
+              bin_time BIGINT NOT NULL,
+              zone_id INTEGER NOT NULL,
+              final_score DOUBLE PRECISION NOT NULL,
+              confidence DOUBLE PRECISION NOT NULL,
+              historical_component DOUBLE PRECISION NOT NULL,
+              live_component DOUBLE PRECISION NOT NULL,
+              same_timeslot_component DOUBLE PRECISION NOT NULL,
+              density_penalty DOUBLE PRECISION NOT NULL,
+              weighted_trip_count DOUBLE PRECISION NOT NULL,
+              unique_driver_count INTEGER NOT NULL,
+              recommended BOOLEAN NOT NULL DEFAULT FALSE
+            );
+            """
+        )
+        _db_exec("CREATE INDEX IF NOT EXISTS idx_hotspot_experiment_bins_time ON hotspot_experiment_bins(bin_time DESC);")
+        _db_exec("CREATE INDEX IF NOT EXISTS idx_hotspot_experiment_bins_zone_time ON hotspot_experiment_bins(zone_id, bin_time DESC);")
+
+        _db_exec(
+            """
+            CREATE TABLE IF NOT EXISTS micro_hotspot_experiment_bins (
+              id BIGSERIAL PRIMARY KEY,
+              bin_time BIGINT NOT NULL,
+              zone_id INTEGER NOT NULL,
+              cluster_id TEXT NOT NULL,
+              final_score DOUBLE PRECISION NOT NULL,
+              confidence DOUBLE PRECISION NOT NULL,
+              weighted_trip_count DOUBLE PRECISION NOT NULL,
+              unique_driver_count INTEGER NOT NULL,
+              crowding_penalty DOUBLE PRECISION NOT NULL,
+              recommended BOOLEAN NOT NULL DEFAULT FALSE
+            );
+            """
+        )
+        _db_exec("CREATE INDEX IF NOT EXISTS idx_micro_hotspot_experiment_bins_time ON micro_hotspot_experiment_bins(bin_time DESC);")
+
+        _db_exec(
+            """
+            CREATE TABLE IF NOT EXISTS recommendation_outcomes (
+              id BIGSERIAL PRIMARY KEY,
+              user_id BIGINT,
+              recommended_at BIGINT NOT NULL,
+              zone_id INTEGER NOT NULL,
+              cluster_id TEXT,
+              score DOUBLE PRECISION NOT NULL,
+              confidence DOUBLE PRECISION NOT NULL,
+              converted_to_trip BOOLEAN,
+              minutes_to_trip DOUBLE PRECISION
+            );
+            """
+        )
+        _db_exec("CREATE INDEX IF NOT EXISTS idx_recommendation_outcomes_time ON recommendation_outcomes(recommended_at DESC);")
+
+        _db_exec(
+            """
             CREATE TABLE IF NOT EXISTS chat_messages (
               id BIGSERIAL PRIMARY KEY,
               room TEXT NOT NULL DEFAULT 'global',
@@ -492,6 +643,62 @@ def _db_init() -> None:
     )
     _db_exec("CREATE INDEX IF NOT EXISTS idx_pickup_logs_created_at ON pickup_logs(created_at DESC);")
     _db_exec("CREATE INDEX IF NOT EXISTS idx_pickup_logs_zone_time ON pickup_logs(zone_id, created_at DESC);")
+
+    _db_exec(
+        """
+        CREATE TABLE IF NOT EXISTS hotspot_experiment_bins (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          bin_time INTEGER NOT NULL,
+          zone_id INTEGER NOT NULL,
+          final_score REAL NOT NULL,
+          confidence REAL NOT NULL,
+          historical_component REAL NOT NULL,
+          live_component REAL NOT NULL,
+          same_timeslot_component REAL NOT NULL,
+          density_penalty REAL NOT NULL,
+          weighted_trip_count REAL NOT NULL,
+          unique_driver_count INTEGER NOT NULL,
+          recommended INTEGER NOT NULL DEFAULT 0
+        );
+        """
+    )
+    _db_exec("CREATE INDEX IF NOT EXISTS idx_hotspot_experiment_bins_time ON hotspot_experiment_bins(bin_time DESC);")
+    _db_exec("CREATE INDEX IF NOT EXISTS idx_hotspot_experiment_bins_zone_time ON hotspot_experiment_bins(zone_id, bin_time DESC);")
+
+    _db_exec(
+        """
+        CREATE TABLE IF NOT EXISTS micro_hotspot_experiment_bins (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          bin_time INTEGER NOT NULL,
+          zone_id INTEGER NOT NULL,
+          cluster_id TEXT NOT NULL,
+          final_score REAL NOT NULL,
+          confidence REAL NOT NULL,
+          weighted_trip_count REAL NOT NULL,
+          unique_driver_count INTEGER NOT NULL,
+          crowding_penalty REAL NOT NULL,
+          recommended INTEGER NOT NULL DEFAULT 0
+        );
+        """
+    )
+    _db_exec("CREATE INDEX IF NOT EXISTS idx_micro_hotspot_experiment_bins_time ON micro_hotspot_experiment_bins(bin_time DESC);")
+
+    _db_exec(
+        """
+        CREATE TABLE IF NOT EXISTS recommendation_outcomes (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id INTEGER,
+          recommended_at INTEGER NOT NULL,
+          zone_id INTEGER NOT NULL,
+          cluster_id TEXT,
+          score REAL NOT NULL,
+          confidence REAL NOT NULL,
+          converted_to_trip INTEGER,
+          minutes_to_trip REAL
+        );
+        """
+    )
+    _db_exec("CREATE INDEX IF NOT EXISTS idx_recommendation_outcomes_time ON recommendation_outcomes(recommended_at DESC);")
 
     _db_exec(
         """
@@ -1189,27 +1396,32 @@ def presence_all(
 ):
     cutoff = int(time.time()) - max(5, min(3600, int(max_age_sec)))
     # Filter out ghost_mode enabled users.
-    rows = _db_query_all(
-        """
-        SELECT
-          p.user_id,
-          u.email,
-          u.display_name,
-          u.avatar_url,
-          u.map_identity_mode,
-          u.ghost_mode,
-          p.lat,
-          p.lng,
-          p.heading,
-          p.accuracy,
-          p.updated_at
-        FROM presence p
-        LEFT JOIN users u ON u.id = p.user_id
-        WHERE p.updated_at >= ?
-          AND (u.ghost_mode IS NULL OR CAST(u.ghost_mode AS INTEGER) = 0)
-        """,
-        (cutoff,),
-    )
+    ghost_visible = _ghost_visible_sql("u.ghost_mode")
+    try:
+        rows = _db_query_all(
+            f"""
+            SELECT
+              p.user_id,
+              u.email,
+              u.display_name,
+              u.avatar_url,
+              u.map_identity_mode,
+              u.ghost_mode,
+              p.lat,
+              p.lng,
+              p.heading,
+              p.accuracy,
+              p.updated_at
+            FROM presence p
+            LEFT JOIN users u ON u.id = p.user_id
+            WHERE p.updated_at >= ?
+              AND {ghost_visible}
+            """,
+            (cutoff,),
+        )
+    except Exception:
+        print(f"[warn] /presence/all ok=0 user_id={int(viewer['id'])} count=0 db_backend={DB_BACKEND}")
+        raise
 
     badge_by_user = get_best_current_badges_for_users([int(r["user_id"]) for r in rows])
 
@@ -1238,6 +1450,9 @@ def presence_all(
             }
         )
 
+    print(
+        f"[info] /presence/all ok=1 user_id={int(viewer['id'])} count={len(items)} db_backend={DB_BACKEND}"
+    )
     return {"ok": True, "count": len(items), "items": items}
 
 
@@ -1246,28 +1461,18 @@ def presence_summary(
     max_age_sec: int = PRESENCE_STALE_SECONDS,
     viewer: sqlite3.Row = Depends(require_user),  # REQUIRE AUTH (same as /presence/all)
 ):
-    cutoff = int(time.time()) - max(5, min(3600, int(max_age_sec)))
-
-    counts = _db_query_one(
-        """
-        SELECT
-          COUNT(*) AS online_count,
-          SUM(CASE WHEN COALESCE(u.ghost_mode, FALSE) THEN 1 ELSE 0 END) AS ghosted_count
-        FROM presence p
-        LEFT JOIN users u ON u.id = p.user_id
-        WHERE p.updated_at >= ?
-        """,
-        (cutoff,),
-    )
-
-    online_count = int(counts["online_count"] or 0) if counts else 0
-    ghosted_count = int(counts["ghosted_count"] or 0) if counts else 0
+    snapshot = _presence_visibility_snapshot(max_age_sec)
+    if not snapshot.get("ok"):
+        raise HTTPException(status_code=500, detail="Presence visibility snapshot failed")
+    online_count = int(snapshot.get("online_count") or 0)
+    ghosted_count = int(snapshot.get("ghosted_count") or 0)
+    visible_count = int(snapshot.get("visible_count") or 0)
 
     return {
         "ok": True,
         "online_count": online_count,
         "ghosted_count": ghosted_count,
-        "visible_count": max(0, online_count - ghosted_count),
+        "visible_count": max(0, visible_count),
     }
 
 
@@ -1498,6 +1703,7 @@ def _pickup_zone_recent_points(
                 zone_id,
                 zone_name,
                 borough,
+                user_id,
                 lat,
                 lng,
                 created_at,
@@ -1505,7 +1711,7 @@ def _pickup_zone_recent_points(
             FROM pickup_logs
             WHERE zone_id IN ({placeholders})
         )
-        SELECT id, zone_id, zone_name, borough, lat, lng, created_at
+        SELECT id, zone_id, zone_name, borough, user_id, lat, lng, created_at
         FROM ranked
         WHERE rn <= ?
         ORDER BY zone_id ASC, created_at DESC, id DESC
@@ -1535,24 +1741,9 @@ def _pickup_zone_signature(point_rows: List[Dict[str, Any]]) -> str:
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()
 
 
-def _build_pickup_zone_hotspot_feature(
-    zone_id: int, zone_meta: Dict[str, Any], point_rows: List[Dict[str, Any]]
-) -> Optional[Dict[str, Any]]:
-    if len(point_rows) < PICKUP_ZONE_HOTSPOT_MIN_POINTS:
-        return None
-
-    zone_geom = zone_meta.get("geometry")
-    if zone_geom is None or zone_geom.is_empty:
-        return None
-
-    try:
-        zone_proj = transform(_to_3857.transform, zone_geom)
-    except Exception:
-        return None
-    if zone_proj.is_empty:
-        return None
-
+def _normalize_pickup_zone_point_entries(point_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     point_entries: List[Dict[str, Any]] = []
+    n = len(point_rows)
     for idx, row in enumerate(point_rows):
         try:
             lng = float(row["lng"])
@@ -1560,7 +1751,6 @@ def _build_pickup_zone_hotspot_feature(
             x, y = _to_3857.transform(lng, lat)
         except Exception:
             continue
-        n = len(point_rows)
         if n <= 1:
             recency_weight = 1.0
         else:
@@ -1575,9 +1765,14 @@ def _build_pickup_zone_hotspot_feature(
                 "created_at": int(row.get("created_at") or 0),
             }
         )
-    if len(point_entries) < PICKUP_ZONE_HOTSPOT_MIN_POINTS:
-        return None
+    return point_entries
 
+
+def _build_density_components(
+    zone_proj: Any,
+    point_entries: List[Dict[str, Any]],
+    threshold_ratio: float = 0.48,
+) -> Dict[str, Any]:
     sigma = float(PICKUP_ZONE_HOTSPOT_SIGMA_M)
     radius = float(PICKUP_ZONE_HOTSPOT_RADIUS_M)
     radius_sq = radius * radius
@@ -1597,8 +1792,7 @@ def _build_pickup_zone_hotspot_feature(
         cy = start_y + gy * cell_size
         for gx in range(cols):
             cx = start_x + gx * cell_size
-            center = Point(cx, cy)
-            if not zone_proj.covers(center):
+            if not zone_proj.covers(Point(cx, cy)):
                 continue
             score = 0.0
             for pe in point_entries:
@@ -1607,8 +1801,7 @@ def _build_pickup_zone_hotspot_feature(
                 dist_sq = (dx * dx) + (dy * dy)
                 if dist_sq > radius_sq:
                     continue
-                distance_weight = math.exp(-(dist_sq) / (2.0 * sigma * sigma))
-                score += pe["weight"] * distance_weight
+                score += pe["weight"] * math.exp(-(dist_sq) / (2.0 * sigma * sigma))
             if score <= 0.0:
                 continue
             key = (gx, gy)
@@ -1618,167 +1811,787 @@ def _build_pickup_zone_hotspot_feature(
                 peak_key = key
 
     if peak_key is None or peak_score <= 0.0:
-        return None
+        return {
+            "components": [],
+            "cell_scores": cell_scores,
+            "peak_score": 0.0,
+            "selected": set(),
+            "start_x": start_x,
+            "start_y": start_y,
+            "cell_size": cell_size,
+        }
 
-    threshold = peak_score * 0.60
+    threshold = peak_score * float(threshold_ratio)
     selected = {k for k, v in cell_scores.items() if v >= threshold}
-    if peak_key not in selected:
-        selected.add(peak_key)
+    selected.add(peak_key)
 
-    connected: set[Tuple[int, int]] = set()
-    q = deque([peak_key])
-    while q:
-        cur = q.popleft()
-        if cur in connected or cur not in selected:
+    visited: set[Tuple[int, int]] = set()
+    raw_components: List[set[Tuple[int, int]]] = []
+    for seed in selected:
+        if seed in visited:
             continue
-        connected.add(cur)
-        cx, cy = cur
-        for nx in (cx - 1, cx, cx + 1):
-            for ny in (cy - 1, cy, cy + 1):
-                nkey = (nx, ny)
-                if nkey != cur and nkey in selected and nkey not in connected:
-                    q.append(nkey)
+        q = deque([seed])
+        comp: set[Tuple[int, int]] = set()
+        while q:
+            cur = q.popleft()
+            if cur in visited or cur not in selected:
+                continue
+            visited.add(cur)
+            comp.add(cur)
+            cx, cy = cur
+            for nx in (cx - 1, cx, cx + 1):
+                for ny in (cy - 1, cy, cy + 1):
+                    nkey = (nx, ny)
+                    if nkey != cur and nkey in selected and nkey not in visited:
+                        q.append(nkey)
+        if comp:
+            raw_components.append(comp)
 
-    if not connected:
-        return None
-
-    cell_polys: List[Polygon] = []
+    components: List[Dict[str, Any]] = []
     half = cell_size / 2.0
-    for gx, gy in connected:
-        cx = start_x + gx * cell_size
-        cy = start_y + gy * cell_size
-        cell_polys.append(
-            Polygon(
-                [
-                    (cx - half, cy - half),
-                    (cx + half, cy - half),
-                    (cx + half, cy + half),
-                    (cx - half, cy + half),
-                ]
+    for comp in raw_components:
+        comp_score = sum(cell_scores.get(k, 0.0) for k in comp)
+        comp_peak = max((cell_scores.get(k, 0.0) for k in comp), default=0.0)
+        cell_polys: List[Polygon] = []
+        for gx, gy in comp:
+            cx = start_x + gx * cell_size
+            cy = start_y + gy * cell_size
+            cell_polys.append(
+                Polygon(
+                    [
+                        (cx - half, cy - half),
+                        (cx + half, cy - half),
+                        (cx + half, cy + half),
+                        (cx - half, cy + half),
+                    ]
+                )
             )
+        if not cell_polys:
+            continue
+        comp_geom = unary_union(cell_polys)
+        support_points = 0
+        for pe in point_entries:
+            pt = Point(pe["x"], pe["y"])
+            if comp_geom.buffer(max(35.0, cell_size * 0.5)).covers(pt):
+                support_points += 1
+        components.append(
+            {
+                "cells": comp,
+                "component_score": comp_score,
+                "peak_score": comp_peak,
+                "point_count": support_points,
+                "geometry": comp_geom,
+            }
         )
 
-    hotspot_proj = unary_union(cell_polys)
-    hotspot_proj = hotspot_proj.buffer(35).buffer(-18)
-    clipped_proj = hotspot_proj.intersection(zone_proj)
-
-    if clipped_proj.is_empty:
-        px = start_x + peak_key[0] * cell_size
-        py = start_y + peak_key[1] * cell_size
-        clipped_proj = Point(px, py).buffer(160).intersection(zone_proj)
-
-    if clipped_proj.is_empty:
-        return None
-
-    pre_simplified = clipped_proj
-    simplified = clipped_proj.simplify(PICKUP_ZONE_HOTSPOT_SIMPLIFY_M, preserve_topology=True)
-    if not simplified.is_empty:
-        simplified = simplified.intersection(zone_proj)
-        if not simplified.is_empty:
-            clipped_proj = simplified
-        else:
-            clipped_proj = pre_simplified
-    else:
-        clipped_proj = pre_simplified
-
-    hotspot_ll = transform(_to_4326.transform, clipped_proj)
-    if hotspot_ll.is_empty:
-        return None
-
-    sample_size = len(point_entries)
-    avg_lat = sum(p["lat"] for p in point_entries) / sample_size
-    avg_lng = sum(p["lng"] for p in point_entries) / sample_size
-    latest_created_at = max(p["created_at"] for p in point_entries)
-    intensity = min(1.0, max(0.25, peak_score / max(1.0, 0.55 * sample_size)))
-    signature = _pickup_zone_signature(point_rows)
-
+    components.sort(
+        key=lambda c: (float(c.get("component_score") or 0.0), float(c.get("peak_score") or 0.0), int(c.get("point_count") or 0)),
+        reverse=True,
+    )
     return {
-        "type": "Feature",
-        "geometry": mapping(hotspot_ll),
-        "properties": {
-            "zone_id": zone_id,
-            "zone_name": zone_meta.get("zone_name") or (point_rows[0].get("zone_name") or ""),
-            "borough": zone_meta.get("borough") or (point_rows[0].get("borough") or ""),
-            "sample_size": sample_size,
-            "max_points_per_zone": PICKUP_ZONE_HOTSPOT_MAX_POINTS,
-            "min_points": PICKUP_ZONE_HOTSPOT_MIN_POINTS,
-            "peak_score": peak_score,
-            "threshold_score": threshold,
-            "avg_lat": avg_lat,
-            "avg_lng": avg_lng,
-            "latest_created_at": latest_created_at,
-            "intensity": intensity,
-            "hotspot_method": "recency_weighted_density_grid",
-            "signature": signature,
-        },
+        "components": components,
+        "cell_scores": cell_scores,
+        "peak_score": peak_score,
+        "threshold": threshold,
+        "selected": selected,
+        "start_x": start_x,
+        "start_y": start_y,
+        "cell_size": cell_size,
     }
 
 
-def _pickup_zone_hotspots(zone_ids: List[int]) -> Dict[str, Any]:
-    empty = {"type": "FeatureCollection", "features": []}
+def _shape_hotspot_component(component: Dict[str, Any], zone_proj: Any) -> Optional[Any]:
+    base_geom = component.get("geometry")
+    if base_geom is None or base_geom.is_empty:
+        return None
+    point_count = max(1, int(component.get("point_count") or 1))
+    comp_score = max(0.1, float(component.get("component_score") or 0.1))
+    comp_peak = max(0.1, float(component.get("peak_score") or 0.1))
+    area = max(1.0, float(base_geom.area))
+
+    intensity_factor = max(0.6, min(1.6, comp_peak / max(0.25, math.sqrt(point_count))))
+    spread_factor = max(0.8, min(1.8, math.sqrt(area) / 120.0))
+    point_factor = max(0.8, min(1.7, 0.75 + (point_count / 9.0)))
+    score_factor = max(0.75, min(1.4, math.sqrt(comp_score) / 2.2))
+
+    expand = 38.0 * point_factor * spread_factor
+    smooth = 17.0 * intensity_factor * score_factor
+    contract = min(expand * 0.55, smooth * 0.65)
+
+    shaped = base_geom.buffer(expand).buffer(smooth).buffer(-contract)
+    if shaped.is_empty:
+        return None
+    clipped = shaped.intersection(zone_proj)
+    if clipped.is_empty:
+        return None
+
+    simplified = clipped.simplify(PICKUP_ZONE_HOTSPOT_SIMPLIFY_M, preserve_topology=True)
+    if not simplified.is_empty:
+        clipped2 = simplified.intersection(zone_proj)
+        if not clipped2.is_empty:
+            clipped = clipped2
+    return clipped
+
+
+def _hotspot_merge_decision(candidate_components: List[Dict[str, Any]], selected_cells: set[Tuple[int, int]]) -> Tuple[bool, str]:
+    if len(candidate_components) < 2:
+        return False, "single_candidate"
+
+    a = candidate_components[0]
+    b = candidate_components[1]
+    ga = a.get("polygon")
+    gb = b.get("polygon")
+    if ga is None or gb is None:
+        return False, "missing_polygon"
+
+    area_scale = max(40.0, math.sqrt(max(ga.area, 1.0)), math.sqrt(max(gb.area, 1.0)))
+    merge_buffer = max(24.0, min(130.0, area_scale * 0.32))
+    if ga.buffer(merge_buffer).intersects(gb.buffer(merge_buffer)):
+        return True, "buffer_intersection"
+
+    ca = ga.centroid
+    cb = gb.centroid
+    centroid_distance = ca.distance(cb)
+    size_threshold = max(120.0, min(420.0, area_scale * 1.75))
+    if centroid_distance <= size_threshold:
+        return True, "centroid_proximity"
+
+    cells_a = a.get("cells") or set()
+    cells_b = b.get("cells") or set()
+    for gx, gy in cells_a:
+        for nx in (gx - 1, gx, gx + 1):
+            for ny in (gy - 1, gy, gy + 1):
+                k = (nx, ny)
+                if k in cells_b:
+                    return True, "cell_corridor"
+                if k in selected_cells:
+                    for bx in (nx - 1, nx, nx + 1):
+                        for by in (ny - 1, ny, ny + 1):
+                            if (bx, by) in cells_b:
+                                return True, "density_bridge"
+    return False, "separate"
+
+
+def _build_zone_hotspot_components(
+    zone_id: int,
+    zone_meta: Dict[str, Any],
+    point_rows: List[Dict[str, Any]],
+    fallback: bool = False,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    debug: Dict[str, Any] = {
+        "candidate_component_count": 0,
+        "emitted_hotspot_count": 0,
+        "merged": False,
+        "merge_reason": "none",
+        "hotspot_ids": [],
+        "component_point_counts": [],
+        "second_hotspot_qualified": False,
+        "second_hotspot_rejected_reason": "",
+    }
+    if len(point_rows) < PICKUP_ZONE_HOTSPOT_MIN_POINTS:
+        debug["second_hotspot_rejected_reason"] = "zone_below_min_points"
+        return [], debug
+
+    zone_geom = zone_meta.get("geometry")
+    if zone_geom is None or zone_geom.is_empty:
+        debug["second_hotspot_rejected_reason"] = "zone_geometry_missing"
+        return [], debug
+
     try:
-        clean_zone_ids: List[int] = []
-        for z in zone_ids:
-            try:
-                clean_zone_ids.append(int(z))
-            except Exception:
-                continue
-        if not clean_zone_ids:
-            return empty
+        zone_proj = transform(_to_3857.transform, zone_geom)
+    except Exception:
+        debug["second_hotspot_rejected_reason"] = "zone_projection_failed"
+        return [], debug
+    if zone_proj.is_empty:
+        debug["second_hotspot_rejected_reason"] = "zone_projection_empty"
+        return [], debug
 
-        zone_geoms = _load_pickup_zone_geometries()
-        if not zone_geoms:
-            return empty
+    point_entries = _normalize_pickup_zone_point_entries(point_rows)
+    if len(point_entries) < PICKUP_ZONE_HOTSPOT_MIN_POINTS:
+        debug["second_hotspot_rejected_reason"] = "not_enough_valid_points"
+        return [], debug
 
-        zone_points = _pickup_zone_recent_points(clean_zone_ids, PICKUP_ZONE_HOTSPOT_MAX_POINTS)
-        features: List[Dict[str, Any]] = []
-        requested_zone_ids = set(clean_zone_ids)
-        for zone_id in clean_zone_ids:
-            pts = zone_points.get(zone_id, [])
-            if len(pts) < PICKUP_ZONE_HOTSPOT_MIN_POINTS:
-                with _pickup_zone_hotspot_cache_lock:
-                    _pickup_zone_hotspot_feature_cache.pop(zone_id, None)
-                continue
-            zone_data = zone_geoms.get(zone_id)
-            if not zone_data:
-                continue
+    build = _build_density_components(zone_proj, point_entries, threshold_ratio=0.48)
+    components = build.get("components") or []
+    selected_cells = build.get("selected") or set()
+    if fallback or not components:
+        fallback_groups: List[Dict[str, Any]] = []
+        by_cell: Dict[Tuple[int, int], List[Dict[str, Any]]] = defaultdict(list)
+        cell_size = max(90.0, float(PICKUP_ZONE_HOTSPOT_CELL_SIZE_M))
+        minx, miny, _, _ = zone_proj.bounds
+        for pe in point_entries:
+            gx = int(math.floor((pe["x"] - minx) / cell_size))
+            gy = int(math.floor((pe["y"] - miny) / cell_size))
+            by_cell[(gx, gy)].append(pe)
+        if by_cell:
+            seeds = sorted(by_cell.items(), key=lambda kv: len(kv[1]), reverse=True)[:2]
+            for _, seed_points in seeds:
+                sx = sum(p["x"] for p in seed_points) / len(seed_points)
+                sy = sum(p["y"] for p in seed_points) / len(seed_points)
+                members: List[Dict[str, Any]] = []
+                for pe in point_entries:
+                    if Point(pe["x"], pe["y"]).distance(Point(sx, sy)) <= 320.0:
+                        members.append(pe)
+                if not members:
+                    continue
+                geom = unary_union([Point(p["x"], p["y"]).buffer(max(115.0, 75.0 + 12.0 * len(members))) for p in members]).intersection(zone_proj)
+                if geom.is_empty:
+                    continue
+                fallback_groups.append(
+                    {
+                        "cells": set(),
+                        "component_score": float(sum(p["weight"] for p in members)),
+                        "peak_score": float(max((p["weight"] for p in members), default=0.0)),
+                        "point_count": len(members),
+                        "geometry": geom,
+                    }
+                )
+        components = sorted(
+            fallback_groups,
+            key=lambda c: (float(c.get("component_score") or 0.0), int(c.get("point_count") or 0)),
+            reverse=True,
+        )
+        selected_cells = set()
 
-            signature = _pickup_zone_signature(pts)
-            with _pickup_zone_hotspot_cache_lock:
-                cached = _pickup_zone_hotspot_feature_cache.get(zone_id)
-            if cached and cached.get("signature") == signature and cached.get("feature"):
-                features.append(cached["feature"])
-                continue
+    if not components:
+        debug["second_hotspot_rejected_reason"] = "no_components"
+        return [], debug
 
-            try:
-                feature = _build_pickup_zone_hotspot_feature(zone_id, zone_data, pts)
-            except Exception:
-                print(f"[warn] Failed to generate pickup zone hotspot for zone {zone_id}", traceback.format_exc())
-                continue
+    debug["candidate_component_count"] = len(components)
+    debug["component_point_counts"] = [int(c.get("point_count") or 0) for c in components[:2]]
 
-            if not feature:
-                continue
+    strongest = components[0]
+    top_components: List[Dict[str, Any]] = [strongest]
+    if len(components) > 1:
+        second = components[1]
+        second_ok = True
+        second_reason = ""
+        if len(point_entries) < PICKUP_ZONE_SECOND_HOTSPOT_MIN_POINTS:
+            second_ok = False
+            second_reason = "zone_points_below_second_threshold"
+        elif int(second.get("point_count") or 0) < PICKUP_ZONE_SECOND_COMPONENT_MIN_POINTS:
+            second_ok = False
+            second_reason = "second_component_low_point_count"
+        else:
+            s0 = max(0.0001, float(strongest.get("component_score") or 0.0001))
+            s1 = float(second.get("component_score") or 0.0)
+            if (s1 / s0) < PICKUP_ZONE_SECOND_COMPONENT_MIN_SCORE_RATIO:
+                second_ok = False
+                second_reason = "second_component_low_strength"
+        if second_ok:
+            debug["second_hotspot_qualified"] = True
+            top_components.append(second)
+        else:
+            debug["second_hotspot_rejected_reason"] = second_reason
 
-            feature.setdefault("properties", {})["signature"] = signature
-            with _pickup_zone_hotspot_cache_lock:
-                _pickup_zone_hotspot_feature_cache[zone_id] = {
+    shaped_candidates: List[Dict[str, Any]] = []
+    for rank, comp in enumerate(top_components):
+        shaped = _shape_hotspot_component(comp, zone_proj)
+        if shaped is None or shaped.is_empty:
+            continue
+        shaped_candidates.append({**comp, "polygon": shaped, "component_rank": rank})
+
+    if not shaped_candidates:
+        debug["second_hotspot_rejected_reason"] = "component_shaping_failed"
+        return [], debug
+
+    merged, merge_reason = _hotspot_merge_decision(shaped_candidates, selected_cells)
+    debug["merged"] = merged
+    debug["merge_reason"] = merge_reason
+
+    final_components: List[Dict[str, Any]] = []
+    if merged and len(shaped_candidates) > 1:
+        merged_geom = unary_union([c["polygon"] for c in shaped_candidates]).intersection(zone_proj)
+        if not merged_geom.is_empty:
+            merged_component = {
+                "polygon": merged_geom,
+                "component_score": sum(float(c.get("component_score") or 0.0) for c in shaped_candidates),
+                "peak_score": max(float(c.get("peak_score") or 0.0) for c in shaped_candidates),
+                "point_count": sum(int(c.get("point_count") or 0) for c in shaped_candidates),
+                "component_rank": 0,
+                "merged_from_count": len(shaped_candidates),
+                "cells": set().union(*[c.get("cells") or set() for c in shaped_candidates]),
+            }
+            final_components = [merged_component]
+    if not final_components:
+        for c in shaped_candidates[:2]:
+            final_components.append({**c, "merged_from_count": 1})
+
+    latest_created_at = max((int(p.get("created_at") or 0) for p in point_entries), default=0)
+    sample_size = len(point_entries)
+    zone_name = zone_meta.get("zone_name") or ((point_rows[0].get("zone_name") if point_rows else "") or "")
+    borough = zone_meta.get("borough") or ((point_rows[0].get("borough") if point_rows else "") or "")
+    signature = _pickup_zone_signature(point_rows)
+
+    emitted: List[Dict[str, Any]] = []
+    for hotspot_index, comp in enumerate(final_components[:2]):
+        polygon = comp.get("polygon")
+        if polygon is None or polygon.is_empty:
+            continue
+        hotspot_ll = transform(_to_4326.transform, polygon)
+        if hotspot_ll.is_empty:
+            continue
+        component_score = float(comp.get("component_score") or 0.0)
+        peak_score = max(0.0001, float(comp.get("peak_score") or 0.0001))
+        intensity = min(1.0, max(0.22, peak_score / max(0.75, 0.45 * sample_size)))
+        hotspot_id = f"{zone_id}:{signature[:12]}:{hotspot_index}"
+        emitted.append(
+            {
+                "type": "Feature",
+                "geometry": mapping(hotspot_ll),
+                "properties": {
+                    "zone_id": zone_id,
+                    "zone_name": zone_name,
+                    "borough": borough,
+                    "hotspot_index": hotspot_index,
+                    "hotspot_id": hotspot_id,
+                    "hotspot_method": "fallback_multi_cluster" if fallback else "recency_weighted_density_components",
+                    "sample_size": sample_size,
+                    "component_point_count": int(comp.get("point_count") or 0),
+                    "latest_created_at": latest_created_at,
+                    "intensity": intensity,
                     "signature": signature,
-                    "feature": feature,
-                }
+                    "component_rank": int(comp.get("component_rank") or 0),
+                    "merged_from_count": int(comp.get("merged_from_count") or 1),
+                    "peak_score": peak_score,
+                    "component_score": component_score,
+                    "max_points_per_zone": PICKUP_ZONE_HOTSPOT_MAX_POINTS,
+                    "min_points": PICKUP_ZONE_HOTSPOT_MIN_POINTS,
+                    "micro_hotspots": [],
+                },
+                "_hotspot_proj": polygon,
+                "_component_cells": comp.get("cells") or set(),
+            }
+        )
+        debug["hotspot_ids"].append(hotspot_id)
+
+    debug["emitted_hotspot_count"] = len(emitted)
+    return emitted, debug
+
+
+def _build_pickup_zone_hotspot_feature(
+    zone_id: int, zone_meta: Dict[str, Any], point_rows: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    components, _ = _build_zone_hotspot_components(zone_id, zone_meta, point_rows, fallback=False)
+    return components
+
+
+def _build_fallback_pickup_zone_hotspot_feature(
+    zone_id: int,
+    zone_meta: Dict[str, Any],
+    point_rows: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    components, _ = _build_zone_hotspot_components(zone_id, zone_meta, point_rows, fallback=True)
+    return components
+
+
+def _build_zone_micro_hotspots_payload(
+    zone_id: int,
+    zone_meta: Dict[str, Any],
+    point_rows: List[Dict[str, Any]],
+    hotspot_feature: Optional[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    if len(point_rows) < PICKUP_ZONE_HOTSPOT_MIN_POINTS or not isinstance(hotspot_feature, dict):
+        return []
+
+    props = hotspot_feature.get("properties") or {}
+    hotspot_id = props.get("hotspot_id")
+    hotspot_index = props.get("hotspot_index")
+    if hotspot_id is None or hotspot_index is None:
+        return []
+
+    zone_geom = zone_meta.get("geometry")
+    if zone_geom is None or zone_geom.is_empty:
+        return []
+    try:
+        zone_proj = transform(_to_3857.transform, zone_geom)
+    except Exception:
+        return []
+    if zone_proj.is_empty:
+        return []
+
+    hotspot_proj = hotspot_feature.get("_hotspot_proj")
+    if hotspot_proj is None:
+        try:
+            hotspot_proj = transform(_to_3857.transform, shape(hotspot_feature.get("geometry"))).intersection(zone_proj)
+        except Exception:
+            return []
+    if hotspot_proj is None or hotspot_proj.is_empty:
+        return []
+
+    cell_size_m = 70.0
+    minx, miny, _, _ = zone_proj.bounds
+    weighted_buckets: Dict[Tuple[int, int], float] = defaultdict(float)
+    raw_counts: Dict[Tuple[int, int], int] = defaultdict(int)
+
+    for idx, row in enumerate(point_rows):
+        try:
+            lng = float(row["lng"])
+            lat = float(row["lat"])
+            x, y = _to_3857.transform(lng, lat)
+        except Exception:
+            continue
+        pt = Point(x, y)
+        if not hotspot_proj.covers(pt):
+            continue
+        n = len(point_rows)
+        weight = 1.0 if n <= 1 else (1.0 - 0.65 * (idx / (n - 1)))
+        gx = int(math.floor((x - minx) / cell_size_m))
+        gy = int(math.floor((y - miny) / cell_size_m))
+        weighted_buckets[(gx, gy)] += weight
+        raw_counts[(gx, gy)] += 1
+
+    if not weighted_buckets:
+        return []
+
+    best_cell = max(weighted_buckets.items(), key=lambda kv: kv[1])[0]
+    gx, gy = best_cell
+    center_x = minx + ((gx + 0.5) * cell_size_m)
+    center_y = miny + ((gy + 0.5) * cell_size_m)
+    center_lng, center_lat = _to_4326.transform(center_x, center_y)
+    event_count = int(raw_counts.get(best_cell, 0))
+    intensity = round(min(1.0, max(0.2, weighted_buckets[best_cell] / 7.5)), 3)
+    confidence = round(min(0.98, 0.5 + (weighted_buckets[best_cell] / 12.0)), 3)
+
+    zone_name = zone_meta.get("zone_name") or ((point_rows[0].get("zone_name") if point_rows else "") or "")
+    borough = zone_meta.get("borough") or ((point_rows[0].get("borough") if point_rows else "") or "")
+
+    micro = {
+        "cluster_id": f"{hotspot_id}:{gx}:{gy}",
+        "zone_id": zone_id,
+        "hotspot_id": hotspot_id,
+        "hotspot_index": int(hotspot_index),
+        "center_lat": center_lat,
+        "center_lng": center_lng,
+        "radius_m": 42,
+        "intensity": intensity,
+        "confidence": confidence,
+        "event_count": event_count,
+        "recommended": True,
+        "zone_name": zone_name,
+        "borough": borough,
+        "micro_method": "densest_cell_inside_hotspot",
+    }
+    return [micro]
+
+
+def _current_timeslot_bin(now_ts: int, bin_minutes: int = HOTSPOT_TIMESLOT_BIN_MINUTES) -> int:
+    dt = time.gmtime(now_ts)
+    return int((dt.tm_hour * 60 + dt.tm_min) // max(1, int(bin_minutes)))
+
+
+def _active_visible_driver_count() -> int:
+    cutoff = int(time.time()) - max(30, PRESENCE_STALE_SECONDS)
+    ghost_visible = _ghost_visible_sql("u.ghost_mode")
+    row = _db_query_one(
+        f"""
+        SELECT COUNT(*) AS c
+        FROM presence p
+        LEFT JOIN users u ON u.id = p.user_id
+        WHERE p.updated_at >= ?
+          AND {ghost_visible}
+        """,
+        (cutoff,),
+    )
+    return int(row["c"] or 0) if row else 0
+
+
+def _pickup_zone_same_timeslot_support(zone_ids: List[int], now_ts: int) -> Dict[int, float]:
+    if not zone_ids:
+        return {}
+    slot = _current_timeslot_bin(now_ts)
+    lookback = now_ts - (14 * 24 * 3600)
+    placeholders = ",".join(["?"] * len(zone_ids))
+    sql = f"""
+        SELECT zone_id, COUNT(*) AS c
+        FROM pickup_logs
+        WHERE zone_id IN ({placeholders})
+          AND created_at >= ?
+          AND CAST(((created_at % 86400) / 60) / ? AS INTEGER) = ?
+        GROUP BY zone_id
+    """
+    params = tuple(list(zone_ids) + [lookback, HOTSPOT_TIMESLOT_BIN_MINUTES, slot])
+    rows = _db_query_all(sql, params)
+    out: Dict[int, float] = {int(z): 0.0 for z in zone_ids}
+    for r in rows:
+        out[int(r["zone_id"])] = float(r["c"])
+    return out
+
+
+def _pickup_zone_historical_support(zone_ids: List[int], now_ts: int) -> Dict[int, float]:
+    if not zone_ids:
+        return {}
+    lookback = now_ts - (14 * 24 * 3600)
+    placeholders = ",".join(["?"] * len(zone_ids))
+    rows = _db_query_all(
+        f"""
+        SELECT zone_id, COUNT(*) AS c
+        FROM pickup_logs
+        WHERE zone_id IN ({placeholders})
+          AND created_at >= ?
+        GROUP BY zone_id
+        """,
+        tuple(list(zone_ids) + [lookback]),
+    )
+    out: Dict[int, float] = {int(z): 0.0 for z in zone_ids}
+    for r in rows:
+        out[int(r["zone_id"])] = float(r["c"])
+    return out
+
+
+def _pickup_zone_density_penalty(zone_ids: List[int]) -> Dict[int, float]:
+    if not zone_ids:
+        return {}
+    cutoff = int(time.time()) - max(30, PRESENCE_STALE_SECONDS)
+    placeholders = ",".join(["?"] * len(zone_ids))
+    rows = _db_query_all(
+        f"""
+        SELECT pl.zone_id, COUNT(DISTINCT p.user_id) AS c
+        FROM presence p
+        LEFT JOIN pickup_logs pl ON pl.user_id = p.user_id
+        WHERE p.updated_at >= ?
+          AND pl.zone_id IN ({placeholders})
+          AND pl.created_at >= ?
+        GROUP BY pl.zone_id
+        """,
+        tuple([cutoff] + list(zone_ids) + [cutoff - 3600]),
+    )
+    out: Dict[int, float] = {int(z): 0.0 for z in zone_ids}
+    for r in rows:
+        out[int(r["zone_id"])] = float(r["c"])
+    return out
+
+
+def _pickup_zone_hotspots_with_debug(zone_ids: List[int]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    empty = {"type": "FeatureCollection", "features": []}
+    clean_zone_ids: List[int] = []
+    for z in zone_ids:
+        try:
+            clean_zone_ids.append(int(z))
+        except Exception:
+            continue
+
+    debug: Dict[str, Any] = {
+        "min_points_threshold": PICKUP_ZONE_HOTSPOT_MIN_POINTS,
+        "requested_zone_ids": clean_zone_ids,
+        "zone_hotspot_count": 0,
+        "orphan_micro_hotspot_count": 0,
+        "top_level_micro_hotspot_count": 0,
+        "qualified_zone_ids": [],
+        "rendered_zone_ids": [],
+        "global_errors": [],
+        "zones": [],
+    }
+    if not clean_zone_ids:
+        return empty, debug
+
+    now_ts = int(time.time())
+    try:
+        zone_geoms = _load_pickup_zone_geometries()
+    except Exception:
+        zone_geoms = {}
+        debug["global_errors"].append("zone_geometry_load_failed")
+    if not zone_geoms:
+        if "zone_geometry_load_failed" not in debug["global_errors"]:
+            debug["global_errors"].append("zone_geometry_missing")
+        return empty, debug
+
+    try:
+        zone_points = _pickup_zone_recent_points(clean_zone_ids, PICKUP_ZONE_HOTSPOT_MAX_POINTS)
+    except Exception:
+        zone_points = {}
+        debug["global_errors"].append("recent_points_load_failed")
+
+    zone_scores: Dict[int, Any] = {}
+    try:
+        historical_support = _pickup_zone_historical_support(clean_zone_ids, now_ts)
+        same_timeslot_support = _pickup_zone_same_timeslot_support(clean_zone_ids, now_ts)
+        density_penalty_by_zone = _pickup_zone_density_penalty(clean_zone_ids)
+        active_driver_count = 0
+        try:
+            active_driver_count = _active_visible_driver_count()
+        except Exception:
+            debug["global_errors"].append("active_visible_driver_count_failed")
+            print("[warn] Failed to read active visible driver count", traceback.format_exc())
+        zone_scores = score_zones(
+            now_ts=now_ts,
+            zone_points=zone_points,
+            historical_by_zone=historical_support,
+            same_timeslot_by_zone=same_timeslot_support,
+            density_by_zone=density_penalty_by_zone,
+            active_driver_count=active_driver_count,
+            previous_scores=_pickup_zone_score_cache,
+        )
+    except Exception:
+        debug["global_errors"].append("score_zones_failed")
+        print("[warn] Failed to score pickup zones", traceback.format_exc())
+
+    try:
+        log_zone_bins(_db_exec, bin_time=now_ts, rows=zone_scores.values())
+    except Exception:
+        debug["global_errors"].append("log_zone_bins_failed")
+        print("[warn] Failed to log pickup zone bins", traceback.format_exc())
+
+    try:
+        prune_experiment_tables(_db_exec, now_ts=now_ts)
+    except Exception:
+        debug["global_errors"].append("prune_experiment_tables_failed")
+        print("[warn] Failed to prune pickup hotspot experiment tables", traceback.format_exc())
+
+    features: List[Dict[str, Any]] = []
+    requested_zone_ids = set(clean_zone_ids)
+    for zone_id in clean_zone_ids:
+        pts = zone_points.get(zone_id, [])
+        zone_data = zone_geoms.get(zone_id)
+        zone_debug: Dict[str, Any] = {
+            "zone_id": zone_id,
+            "zone_name": "",
+            "borough": "",
+            "point_count": len(pts),
+            "qualified": len(pts) >= PICKUP_ZONE_HOTSPOT_MIN_POINTS,
+            "geometry_found": bool(zone_data),
+            "cached_hit": False,
+            "primary_attempted": False,
+            "primary_ok": False,
+            "fallback_attempted": False,
+            "fallback_ok": False,
+            "feature_emitted": False,
+            "micro_hotspot_count": 0,
+            "hotspot_method": "none",
+            "signature": "",
+            "errors": [],
+        }
+
+        if zone_data:
+            zone_debug["zone_name"] = zone_data.get("zone_name") or ""
+            zone_debug["borough"] = zone_data.get("borough") or ""
+        elif pts:
+            zone_debug["zone_name"] = (pts[0].get("zone_name") if isinstance(pts[0], dict) else "") or ""
+            zone_debug["borough"] = (pts[0].get("borough") if isinstance(pts[0], dict) else "") or ""
+
+        if zone_debug["qualified"]:
+            debug["qualified_zone_ids"].append(zone_id)
+
+        if not zone_data:
+            zone_debug["errors"].append("geometry_missing")
+            debug["zones"].append(zone_debug)
+            continue
+
+        signature = _pickup_zone_signature(pts)
+        zone_debug["signature"] = signature
+        with _pickup_zone_hotspot_cache_lock:
+            cached = _pickup_zone_hotspot_feature_cache.get(zone_id)
+        if cached and cached.get("signature") == signature and cached.get("features"):
+            zone_debug["cached_hit"] = True
+
+        zone_features: List[Dict[str, Any]] = []
+        zone_component_debug: Dict[str, Any] = {}
+        if zone_debug["cached_hit"]:
+            zone_features = list(cached["features"])
+            zone_debug["hotspot_method"] = "cache"
+        elif zone_debug["qualified"]:
+            zone_debug["primary_attempted"] = True
+            try:
+                zone_features, zone_component_debug = _build_zone_hotspot_components(zone_id, zone_data, pts, fallback=False)
+                zone_debug["primary_ok"] = bool(zone_features)
+                if zone_features:
+                    zone_debug["hotspot_method"] = "primary"
+            except Exception:
+                zone_debug["errors"].append("primary_hotspot_build_failed")
+                print(f"[warn] Failed to generate pickup zone hotspot for zone {zone_id}", traceback.format_exc())
+
+        if not zone_features and zone_debug["qualified"]:
+            zone_debug["fallback_attempted"] = True
+            try:
+                zone_features, zone_component_debug = _build_zone_hotspot_components(zone_id, zone_data, pts, fallback=True)
+                zone_debug["fallback_ok"] = bool(zone_features)
+                if zone_features:
+                    zone_debug["hotspot_method"] = "fallback"
+            except Exception:
+                zone_debug["errors"].append("fallback_hotspot_build_failed")
+                print(f"[warn] Failed to generate fallback pickup zone hotspot for zone {zone_id}", traceback.format_exc())
+
+        if zone_component_debug:
+            zone_debug.update(zone_component_debug)
+
+        if not zone_features:
+            with _pickup_zone_hotspot_cache_lock:
+                _pickup_zone_hotspot_feature_cache.pop(zone_id, None)
+            debug["zones"].append(zone_debug)
+            continue
+
+        score = zone_scores.get(zone_id)
+        zone_micro_total = 0
+        for feature in zone_features:
+            props = feature.setdefault("properties", {})
+            props["signature"] = signature
+            if score is not None:
+                _pickup_zone_score_cache[zone_id] = score.final_score
+                props["hotspot_score"] = score.final_score
+                props["final_score"] = score.final_score
+                props["confidence"] = score.confidence
+                props["live_strength"] = score.live_strength
+                props["density_penalty"] = score.density_penalty
+                props["weighted_trip_count"] = score.weighted_trip_count
+                props["unique_driver_count"] = score.unique_driver_count
+                props["recommended"] = score.recommended
+                if score.recommended:
+                    try:
+                        log_recommendation_outcome(
+                            _db_exec,
+                            recommended_at=now_ts,
+                            zone_id=zone_id,
+                            score=score.final_score,
+                            confidence=score.confidence,
+                            cluster_id=None,
+                        )
+                    except Exception:
+                        zone_debug["errors"].append("log_recommendation_outcome_failed")
+                        print(f"[warn] Failed to log recommendation outcome for zone {zone_id}", traceback.format_exc())
+
+            micro_payload: List[Dict[str, Any]] = []
+            try:
+                micro_payload = _build_zone_micro_hotspots_payload(zone_id, zone_data, pts, feature)
+            except Exception:
+                zone_debug["errors"].append("micro_hotspot_build_failed")
+                print(f"[warn] Failed to build pickup micro-hotspots for zone {zone_id}", traceback.format_exc())
+            props["micro_hotspots"] = [item for item in micro_payload if isinstance(item, dict)][:1]
+            zone_micro_total += len(props["micro_hotspots"])
+
+            feature.pop("_hotspot_proj", None)
+            feature.pop("_component_cells", None)
             features.append(feature)
 
-        with _pickup_zone_hotspot_cache_lock:
-            stale_zone_ids = [zid for zid in list(_pickup_zone_hotspot_feature_cache.keys()) if zid not in requested_zone_ids]
-            for zid in stale_zone_ids:
-                _pickup_zone_hotspot_feature_cache.pop(zid, None)
-            for zid in requested_zone_ids:
-                if not zone_points.get(zid):
-                    _pickup_zone_hotspot_feature_cache.pop(zid, None)
+        zone_debug["micro_hotspot_count"] = zone_micro_total
 
-        return {"type": "FeatureCollection", "features": features}
+        with _pickup_zone_hotspot_cache_lock:
+            _pickup_zone_hotspot_feature_cache[zone_id] = {
+                "signature": signature,
+                "features": zone_features,
+            }
+        zone_debug["feature_emitted"] = bool(zone_features)
+        debug["rendered_zone_ids"].append(zone_id)
+        debug["zones"].append(zone_debug)
+
+    with _pickup_zone_hotspot_cache_lock:
+        stale_zone_ids = [zid for zid in list(_pickup_zone_hotspot_feature_cache.keys()) if zid not in requested_zone_ids]
+        for zid in stale_zone_ids:
+            _pickup_zone_hotspot_feature_cache.pop(zid, None)
+
+    payload = {"type": "FeatureCollection", "features": features}
+    debug["zone_hotspot_count"] = len(features)
+    debug["orphan_micro_hotspot_count"] = 0
+    debug["top_level_micro_hotspot_count"] = len(_flatten_zone_micro_hotspots(payload))
+    return payload, debug
+
+
+def _pickup_zone_hotspots(zone_ids: List[int]) -> Dict[str, Any]:
+    try:
+        payload, _ = _pickup_zone_hotspots_with_debug(zone_ids)
+        return payload
     except Exception:
         print("[warn] Failed to generate pickup zone hotspots", traceback.format_exc())
-        return empty
+        return {"type": "FeatureCollection", "features": []}
 
 
 def _pickup_zone_stats(zone_ids: List[int], sample_limit: int = 100) -> List[Dict[str, Any]]:
@@ -1802,6 +2615,7 @@ def _pickup_zone_stats(zone_ids: List[int], sample_limit: int = 100) -> List[Dic
                 zone_id,
                 zone_name,
                 borough,
+                user_id,
                 lat,
                 lng,
                 created_at,
@@ -1831,17 +2645,90 @@ def _pickup_zone_stats(zone_ids: List[int], sample_limit: int = 100) -> List[Dic
     return stats
 
 
-@app.get("/events/pickups/recent")
-def get_recent_pickups(
+def _flatten_zone_micro_hotspots(zone_hotspots: Dict[str, Any]) -> List[Dict[str, Any]]:
+    # Flatten only micro-hotspots attached to emitted hotspot features.
+    flattened: List[Dict[str, Any]] = []
+
+    def _normalize_micro_hotspot(
+        item: Dict[str, Any],
+        fallback_zone_id: Optional[int] = None,
+        fallback_hotspot_id: Optional[str] = None,
+        fallback_hotspot_index: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
+        if not isinstance(item, dict):
+            return None
+        normalized = dict(item)
+        zone_val = normalized.get("zone_id")
+        if zone_val is None and fallback_zone_id is not None:
+            zone_val = fallback_zone_id
+        try:
+            normalized["zone_id"] = int(zone_val) if zone_val is not None else None
+        except Exception:
+            return None
+        if normalized.get("zone_id") is None:
+            return None
+
+        if normalized.get("hotspot_id") is None:
+            normalized["hotspot_id"] = fallback_hotspot_id
+        if normalized.get("hotspot_index") is None and fallback_hotspot_index is not None:
+            normalized["hotspot_index"] = fallback_hotspot_index
+        if normalized.get("hotspot_id") is None or normalized.get("hotspot_index") is None:
+            return None
+        try:
+            normalized["hotspot_index"] = int(normalized.get("hotspot_index"))
+        except Exception:
+            return None
+        return normalized
+
+    features = zone_hotspots.get("features") if isinstance(zone_hotspots, dict) else None
+    if isinstance(features, list):
+        for feature in features:
+            if not isinstance(feature, dict):
+                continue
+            props = feature.get("properties")
+            if not isinstance(props, dict):
+                continue
+            fallback_zone_id: Optional[int] = None
+            try:
+                if props.get("zone_id") is not None:
+                    fallback_zone_id = int(props.get("zone_id"))
+            except Exception:
+                fallback_zone_id = None
+            fallback_hotspot_id = props.get("hotspot_id") if props.get("hotspot_id") is not None else None
+            fallback_hotspot_index: Optional[int] = None
+            try:
+                if props.get("hotspot_index") is not None:
+                    fallback_hotspot_index = int(props.get("hotspot_index"))
+            except Exception:
+                fallback_hotspot_index = None
+            micro_hotspots = props.get("micro_hotspots")
+            if not isinstance(micro_hotspots, list):
+                continue
+            for item in micro_hotspots:
+                normalized = _normalize_micro_hotspot(
+                    item,
+                    fallback_zone_id,
+                    fallback_hotspot_id,
+                    fallback_hotspot_index,
+                )
+                if normalized is not None:
+                    flattened.append(normalized)
+    return flattened
+
+
+def _recent_pickups_payload(
     limit: int = 30,
     zone_sample_limit: int = 100,
+    debug: int = 0,
     zone_id: Optional[int] = None,
     min_lat: Optional[float] = None,
     min_lng: Optional[float] = None,
     max_lat: Optional[float] = None,
     max_lng: Optional[float] = None,
-    viewer: sqlite3.Row = Depends(require_user),
-):
+    viewer: Optional[sqlite3.Row] = None,
+) -> Dict[str, Any]:
+    viewer_id = int(viewer["id"]) if viewer is not None and viewer["id"] is not None else -1
+    viewer_is_admin = bool(viewer is not None and _flag_to_int(viewer["is_admin"]) == 1)
     safe_limit = max(1, min(200, int(limit)))
     safe_zone_sample_limit = max(1, min(100, int(zone_sample_limit)))
     sql = """
@@ -1867,7 +2754,13 @@ def get_recent_pickups(
     sql += " ORDER BY created_at DESC LIMIT ?"
     params.append(safe_limit)
 
-    rows = _db_query_all(sql, tuple(params))
+    try:
+        rows = _db_query_all(sql, tuple(params))
+    except Exception:
+        print(
+            f"[warn] /events/pickups/recent ok=0 user_id={viewer_id} item_count=0 zone_hotspot_count=0 micro_hotspot_count=0"
+        )
+        raise
     items = [dict(r) for r in rows]
 
     zone_ids_for_stats: List[int] = []
@@ -1888,18 +2781,74 @@ def get_recent_pickups(
 
     zone_stats = _pickup_zone_stats(zone_ids_for_stats, sample_limit=safe_zone_sample_limit)
     hotspot_zone_ids = [int(z.get("zone_id")) for z in zone_stats if z.get("zone_id") is not None]
+    pickup_hotspot_debug: Dict[str, Any] = {}
     try:
-        zone_hotspots = _pickup_zone_hotspots(hotspot_zone_ids)
+        zone_hotspots, pickup_hotspot_debug = _pickup_zone_hotspots_with_debug(hotspot_zone_ids)
     except Exception:
+        print(
+            f"[warn] /events/pickups/recent ok=0 user_id={viewer_id} item_count={len(items)} zone_hotspot_count=0 micro_hotspot_count=0"
+        )
         print("[warn] Failed to attach pickup zone hotspots", traceback.format_exc())
         zone_hotspots = {"type": "FeatureCollection", "features": []}
-    return {
+        pickup_hotspot_debug = {
+            "min_points_threshold": PICKUP_ZONE_HOTSPOT_MIN_POINTS,
+            "requested_zone_ids": hotspot_zone_ids,
+            "zone_hotspot_count": 0,
+            "orphan_micro_hotspot_count": 0,
+            "top_level_micro_hotspot_count": 0,
+            "qualified_zone_ids": [],
+            "rendered_zone_ids": [],
+            "global_errors": ["pickup_zone_hotspots_with_debug_failed"],
+            "zones": [],
+        }
+    # Return top-level micro-hotspots so frontend can render compact clusters directly.
+    micro_hotspots = _flatten_zone_micro_hotspots(zone_hotspots)
+    zone_features = zone_hotspots.get("features") if isinstance(zone_hotspots, dict) else []
+    zone_hotspot_count = len(zone_features) if isinstance(zone_features, list) else 0
+    response = {
         "ok": True,
         "count": len(items),
         "items": items,
         "zone_stats": zone_stats,
         "zone_hotspots": zone_hotspots,
+        "micro_hotspots": micro_hotspots,
+        "micro_hotspot_debug": {
+            "zone_hotspot_count": zone_hotspot_count,
+            "orphan_micro_hotspot_count": 0,
+            "top_level_micro_hotspot_count": len(micro_hotspots),
+        },
     }
+    if int(debug) == 1 and viewer_is_admin:
+        response["pickup_hotspot_debug"] = pickup_hotspot_debug
+    print(
+        f"[info] /events/pickups/recent ok=1 user_id={viewer_id} item_count={len(items)} zone_hotspot_count={zone_hotspot_count} micro_hotspot_count={len(micro_hotspots)}"
+    )
+    return response
+
+
+@app.get("/events/pickups/recent")
+def get_recent_pickups(
+    limit: int = 30,
+    zone_sample_limit: int = 100,
+    debug: int = 0,
+    zone_id: Optional[int] = None,
+    min_lat: Optional[float] = None,
+    min_lng: Optional[float] = None,
+    max_lat: Optional[float] = None,
+    max_lng: Optional[float] = None,
+    viewer: sqlite3.Row = Depends(require_user),
+):
+    return _recent_pickups_payload(
+        limit=limit,
+        zone_sample_limit=zone_sample_limit,
+        debug=debug,
+        zone_id=zone_id,
+        min_lat=min_lat,
+        min_lng=min_lng,
+        max_lat=max_lat,
+        max_lng=max_lng,
+        viewer=viewer,
+    )
 
 
 # =========================================================
