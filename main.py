@@ -323,6 +323,21 @@ def _resolve_day_tendency_payload(target_date: date) -> Dict[str, Any]:
     }
 
 
+def _build_day_tendency_only(bin_minutes: int = DEFAULT_BIN_MINUTES) -> Dict[str, Any]:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    DAY_TENDENCY_DIR.mkdir(parents=True, exist_ok=True)
+
+    parquets = _list_parquets()
+    if not parquets:
+        raise RuntimeError("No .parquet files found in /data. Cannot build day tendency model.")
+
+    return build_day_tendency_model(
+        parquet_files=parquets,
+        out_dir=DAY_TENDENCY_DIR,
+        bin_minutes=bin_minutes,
+    )
+
+
 def _write_lock() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     LOCK_PATH.write_text(str(int(time.time())), encoding="utf-8")
@@ -348,21 +363,6 @@ def _set_state(**kwargs):
 def _get_state() -> Dict[str, Any]:
     with _state_lock:
         return dict(_generate_state)
-
-
-def _build_day_tendency_only(bin_minutes: int = DEFAULT_BIN_MINUTES) -> Dict[str, Any]:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    DAY_TENDENCY_DIR.mkdir(parents=True, exist_ok=True)
-
-    parquets = _list_parquets()
-    if not parquets:
-        raise RuntimeError("No .parquet files found in /data. Cannot build day tendency model.")
-
-    return build_day_tendency_model(
-        parquet_files=parquets,
-        out_dir=DAY_TENDENCY_DIR,
-        bin_minutes=bin_minutes,
-    )
 
 
 def _generate_worker(bin_minutes: int, min_trips_per_window: int) -> None:
@@ -1075,6 +1075,7 @@ def startup():
     init_leaderboard_schema()
     _ensure_admin_seed()
 
+    # Auto-fill generate state if frames/day tendency already exist
     try:
         frames_ready = _has_frames()
         day_tendency_ready = _has_day_tendency_model()
@@ -1091,10 +1092,7 @@ def startup():
                     result={
                         "ok": True,
                         "count": tl.get("count"),
-                        "day_tendency": {
-                            "ok": True,
-                            "built_at_startup": False,
-                        },
+                        "day_tendency": {"ok": True, "built_at_startup": False},
                     },
                 )
             except Exception:
@@ -1104,10 +1102,7 @@ def startup():
                     min_trips_per_window=DEFAULT_MIN_TRIPS_PER_WINDOW,
                     result={
                         "ok": True,
-                        "day_tendency": {
-                            "ok": True,
-                            "built_at_startup": False,
-                        },
+                        "day_tendency": {"ok": True, "built_at_startup": False},
                     },
                 )
             return
@@ -1119,31 +1114,34 @@ def startup():
                 except Exception:
                     print("[warn] startup day tendency backfill failed")
                     print(traceback.format_exc())
-
             try:
                 tl = _read_json(TIMELINE_PATH)
-                result: Dict[str, Any] = {"ok": True, "count": tl.get("count")}
+                _set_state(
+                    state="done",
+                    bin_minutes=DEFAULT_BIN_MINUTES,
+                    min_trips_per_window=DEFAULT_MIN_TRIPS_PER_WINDOW,
+                    result={
+                        "ok": True,
+                        "count": tl.get("count"),
+                        "day_tendency": {"ok": _has_day_tendency_model(), "built_at_startup": True},
+                    },
+                )
             except Exception:
-                result = {"ok": True}
-
-            result["day_tendency"] = {
-                "ok": _has_day_tendency_model(),
-                "built_at_startup": True,
-            }
-
-            _set_state(
-                state="done",
-                bin_minutes=DEFAULT_BIN_MINUTES,
-                min_trips_per_window=DEFAULT_MIN_TRIPS_PER_WINDOW,
-                result=result,
-            )
+                _set_state(
+                    state="done",
+                    bin_minutes=DEFAULT_BIN_MINUTES,
+                    min_trips_per_window=DEFAULT_MIN_TRIPS_PER_WINDOW,
+                    result={
+                        "ok": True,
+                        "day_tendency": {"ok": _has_day_tendency_model(), "built_at_startup": True},
+                    },
+                )
             return
 
-        if not frames_ready:
-            if zones_ok and parquets_ok:
-                start_generate(DEFAULT_BIN_MINUTES, DEFAULT_MIN_TRIPS_PER_WINDOW)
-            else:
-                _set_state(state="idle")
+        if zones_ok and parquets_ok:
+            start_generate(DEFAULT_BIN_MINUTES, DEFAULT_MIN_TRIPS_PER_WINDOW)
+        else:
+            _set_state(state="idle")
     except Exception:
         _set_state(state="idle")
 
