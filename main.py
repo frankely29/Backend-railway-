@@ -279,6 +279,83 @@ def _ghost_visible_sql(column_name: str) -> str:
     return f"({column_name} IS NULL OR CAST({column_name} AS INTEGER) = 0)"
 
 
+def _presence_visibility_snapshot(max_age_sec: int) -> Dict[str, Any]:
+    cutoff = int(time.time()) - max(5, min(3600, int(max_age_sec)))
+    ghost_visible = _ghost_visible_sql("u.ghost_mode")
+    sql_mode = "postgres_boolean" if DB_BACKEND == "postgres" else "sqlite_cast_integer"
+    try:
+        visible_count_row = _db_query_one(
+            f"""
+            SELECT COUNT(*) AS c
+            FROM presence p
+            LEFT JOIN users u ON u.id = p.user_id
+            WHERE p.updated_at >= ?
+              AND {ghost_visible}
+            """,
+            (cutoff,),
+        )
+        visible_count = int(visible_count_row["c"] or 0) if visible_count_row else 0
+        sample_rows = _db_query_all(
+            f"""
+            SELECT p.user_id, u.email, u.display_name
+            FROM presence p
+            LEFT JOIN users u ON u.id = p.user_id
+            WHERE p.updated_at >= ?
+              AND {ghost_visible}
+            ORDER BY p.updated_at DESC
+            LIMIT 5
+            """,
+            (cutoff,),
+        )
+        counts = _db_query_one(
+            """
+            SELECT
+              COUNT(*) AS online_count,
+              SUM(CASE WHEN COALESCE(u.ghost_mode, FALSE) THEN 1 ELSE 0 END) AS ghosted_count
+            FROM presence p
+            LEFT JOIN users u ON u.id = p.user_id
+            WHERE p.updated_at >= ?
+            """,
+            (cutoff,),
+        )
+    except Exception as exc:
+        return {
+            "db_backend": DB_BACKEND,
+            "visible_count": 0,
+            "online_count": 0,
+            "ghosted_count": 0,
+            "sample_user_ids": [],
+            "sample_display_names": [],
+            "sql_mode": sql_mode,
+            "ok": False,
+            "error": str(exc),
+        }
+
+    sample_user_ids: List[int] = []
+    sample_display_names: List[str] = []
+    for row in sample_rows:
+        uid = row["user_id"]
+        if uid is None:
+            continue
+        email = (row["email"] or "").strip()
+        dn = (row["display_name"] or "").strip() or _clean_display_name("", email or "Driver")
+        sample_user_ids.append(int(uid))
+        sample_display_names.append(dn)
+
+    online_count = int(counts["online_count"] or 0) if counts else 0
+    ghosted_count = int(counts["ghosted_count"] or 0) if counts else 0
+    return {
+        "db_backend": DB_BACKEND,
+        "visible_count": visible_count,
+        "online_count": online_count,
+        "ghosted_count": ghosted_count,
+        "sample_user_ids": sample_user_ids,
+        "sample_display_names": sample_display_names,
+        "sql_mode": sql_mode,
+        "ok": True,
+    }
+
+
 def _db_init() -> None:
     if DB_BACKEND == "postgres":
         _db_exec(
@@ -1343,7 +1420,7 @@ def presence_all(
             (cutoff,),
         )
     except Exception:
-        print(f"[warn] /presence/all failed user_id={int(viewer['id'])} err=1")
+        print(f"[warn] /presence/all ok=0 user_id={int(viewer['id'])} count=0 db_backend={DB_BACKEND}")
         raise
 
     badge_by_user = get_best_current_badges_for_users([int(r["user_id"]) for r in rows])
@@ -1373,7 +1450,9 @@ def presence_all(
             }
         )
 
-    print(f"[info] /presence/all ok=1 user_id={int(viewer['id'])} count={len(items)}")
+    print(
+        f"[info] /presence/all ok=1 user_id={int(viewer['id'])} count={len(items)} db_backend={DB_BACKEND}"
+    )
     return {"ok": True, "count": len(items), "items": items}
 
 
@@ -1382,28 +1461,18 @@ def presence_summary(
     max_age_sec: int = PRESENCE_STALE_SECONDS,
     viewer: sqlite3.Row = Depends(require_user),  # REQUIRE AUTH (same as /presence/all)
 ):
-    cutoff = int(time.time()) - max(5, min(3600, int(max_age_sec)))
-
-    counts = _db_query_one(
-        """
-        SELECT
-          COUNT(*) AS online_count,
-          SUM(CASE WHEN COALESCE(u.ghost_mode, FALSE) THEN 1 ELSE 0 END) AS ghosted_count
-        FROM presence p
-        LEFT JOIN users u ON u.id = p.user_id
-        WHERE p.updated_at >= ?
-        """,
-        (cutoff,),
-    )
-
-    online_count = int(counts["online_count"] or 0) if counts else 0
-    ghosted_count = int(counts["ghosted_count"] or 0) if counts else 0
+    snapshot = _presence_visibility_snapshot(max_age_sec)
+    if not snapshot.get("ok"):
+        raise HTTPException(status_code=500, detail="Presence visibility snapshot failed")
+    online_count = int(snapshot.get("online_count") or 0)
+    ghosted_count = int(snapshot.get("ghosted_count") or 0)
+    visible_count = int(snapshot.get("visible_count") or 0)
 
     return {
         "ok": True,
         "online_count": online_count,
         "ghosted_count": ghosted_count,
-        "visible_count": max(0, online_count - ghosted_count),
+        "visible_count": max(0, visible_count),
     }
 
 
@@ -2338,7 +2407,12 @@ def _pickup_zone_hotspots_with_debug(zone_ids: List[int]) -> Tuple[Dict[str, Any
         historical_support = _pickup_zone_historical_support(clean_zone_ids, now_ts)
         same_timeslot_support = _pickup_zone_same_timeslot_support(clean_zone_ids, now_ts)
         density_penalty_by_zone = _pickup_zone_density_penalty(clean_zone_ids)
-        active_driver_count = _active_visible_driver_count()
+        active_driver_count = 0
+        try:
+            active_driver_count = _active_visible_driver_count()
+        except Exception:
+            debug["global_errors"].append("active_visible_driver_count_failed")
+            print("[warn] Failed to read active visible driver count", traceback.format_exc())
         zone_scores = score_zones(
             now_ts=now_ts,
             zone_points=zone_points,
@@ -2642,8 +2716,7 @@ def _flatten_zone_micro_hotspots(zone_hotspots: Dict[str, Any]) -> List[Dict[str
     return flattened
 
 
-@app.get("/events/pickups/recent")
-def get_recent_pickups(
+def _recent_pickups_payload(
     limit: int = 30,
     zone_sample_limit: int = 100,
     debug: int = 0,
@@ -2652,8 +2725,10 @@ def get_recent_pickups(
     min_lng: Optional[float] = None,
     max_lat: Optional[float] = None,
     max_lng: Optional[float] = None,
-    viewer: sqlite3.Row = Depends(require_user),
-):
+    viewer: Optional[sqlite3.Row] = None,
+) -> Dict[str, Any]:
+    viewer_id = int(viewer["id"]) if viewer is not None and viewer["id"] is not None else -1
+    viewer_is_admin = bool(viewer is not None and _flag_to_int(viewer["is_admin"]) == 1)
     safe_limit = max(1, min(200, int(limit)))
     safe_zone_sample_limit = max(1, min(100, int(zone_sample_limit)))
     sql = """
@@ -2682,7 +2757,9 @@ def get_recent_pickups(
     try:
         rows = _db_query_all(sql, tuple(params))
     except Exception:
-        print(f"[warn] /events/pickups/recent ok=0 user_id={int(viewer['id'])} count=0 hotspot_count=0")
+        print(
+            f"[warn] /events/pickups/recent ok=0 user_id={viewer_id} item_count=0 zone_hotspot_count=0 micro_hotspot_count=0"
+        )
         raise
     items = [dict(r) for r in rows]
 
@@ -2709,7 +2786,7 @@ def get_recent_pickups(
         zone_hotspots, pickup_hotspot_debug = _pickup_zone_hotspots_with_debug(hotspot_zone_ids)
     except Exception:
         print(
-            f"[warn] /events/pickups/recent ok=0 user_id={int(viewer['id'])} count={len(items)} hotspot_count=0"
+            f"[warn] /events/pickups/recent ok=0 user_id={viewer_id} item_count={len(items)} zone_hotspot_count=0 micro_hotspot_count=0"
         )
         print("[warn] Failed to attach pickup zone hotspots", traceback.format_exc())
         zone_hotspots = {"type": "FeatureCollection", "features": []}
@@ -2741,12 +2818,37 @@ def get_recent_pickups(
             "top_level_micro_hotspot_count": len(micro_hotspots),
         },
     }
-    if int(debug) == 1 and _flag_to_int(viewer["is_admin"]) == 1:
+    if int(debug) == 1 and viewer_is_admin:
         response["pickup_hotspot_debug"] = pickup_hotspot_debug
     print(
-        f"[info] /events/pickups/recent ok=1 user_id={int(viewer['id'])} count={len(items)} hotspot_count={zone_hotspot_count}"
+        f"[info] /events/pickups/recent ok=1 user_id={viewer_id} item_count={len(items)} zone_hotspot_count={zone_hotspot_count} micro_hotspot_count={len(micro_hotspots)}"
     )
     return response
+
+
+@app.get("/events/pickups/recent")
+def get_recent_pickups(
+    limit: int = 30,
+    zone_sample_limit: int = 100,
+    debug: int = 0,
+    zone_id: Optional[int] = None,
+    min_lat: Optional[float] = None,
+    min_lng: Optional[float] = None,
+    max_lat: Optional[float] = None,
+    max_lng: Optional[float] = None,
+    viewer: sqlite3.Row = Depends(require_user),
+):
+    return _recent_pickups_payload(
+        limit=limit,
+        zone_sample_limit=zone_sample_limit,
+        debug=debug,
+        zone_id=zone_id,
+        min_lat=min_lat,
+        min_lng=min_lng,
+        max_lat=max_lat,
+        max_lng=max_lng,
+        viewer=viewer,
+    )
 
 
 # =========================================================
