@@ -10,22 +10,6 @@ import duckdb
 
 
 WEEKDAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-MONTH_NAMES = [
-    "January",
-    "February",
-    "March",
-    "April",
-    "May",
-    "June",
-    "July",
-    "August",
-    "September",
-    "October",
-    "November",
-    "December",
-]
-
-
 def percentile_rank(sorted_values: List[float], value: float) -> float:
     if not sorted_values:
         return 0.5
@@ -88,6 +72,16 @@ def _strength_explain(score_raw: float, weekday_name: str | None, bin_label: str
     return f"Typical {weekday_name}s around {bin_label} are {relation}."
 
 
+def _global_explain(score_raw: float) -> str:
+    if score_raw >= 0.65:
+        relation = "stronger than most time blocks in this dataset"
+    elif score_raw <= 0.34:
+        relation = "weaker than most time blocks in this dataset"
+    else:
+        relation = "near the middle"
+    return f"Typical time blocks in this dataset are {relation}."
+
+
 def _insufficient_payload(first_date: str | None = None, last_date: str | None = None, usable_dates: int = 0) -> Dict[str, Any]:
     return {
         "version": "time_tendency_v1",
@@ -117,7 +111,6 @@ def build_day_tendency_model(
             "ok": True,
             "model_path": str(model_path),
             "usable_dates": 0,
-            "month_weekday_bin_cohorts": 0,
             "weekday_bin_cohorts": 0,
             "bin_only_cohorts": 0,
         }
@@ -201,7 +194,6 @@ def build_day_tendency_model(
             "ok": True,
             "model_path": str(model_path),
             "usable_dates": 0,
-            "month_weekday_bin_cohorts": 0,
             "weekday_bin_cohorts": 0,
             "bin_only_cohorts": 0,
         }
@@ -222,7 +214,6 @@ def build_day_tendency_model(
             "ok": True,
             "model_path": str(model_path),
             "usable_dates": 0,
-            "month_weekday_bin_cohorts": 0,
             "weekday_bin_cohorts": 0,
             "bin_only_cohorts": 0,
         }
@@ -252,7 +243,6 @@ def build_day_tendency_model(
             "ok": True,
             "model_path": str(model_path),
             "usable_dates": len(usable_dates),
-            "month_weekday_bin_cohorts": 0,
             "weekday_bin_cohorts": 0,
             "bin_only_cohorts": 0,
         }
@@ -265,7 +255,6 @@ def build_day_tendency_model(
 
         cohorts: Dict[str, Dict[str, Any]] = {}
         for key, g in grouped.items():
-            month_i = int(g[0][1])
             dow_m = int(g[0][2])
             bin_idx = int(g[0][3])
             pickups_bin_median = _median([float(x[4]) for x in g])
@@ -281,18 +270,11 @@ def build_day_tendency_model(
                 "active_zones_bin_median": int(round(active_zones_bin_median)),
                 "cohort_type": cohort_type,
             }
-            if cohort_type == "same_month_same_weekday_same_bin":
-                item.update({"month": month_i, "weekday": dow_m, "weekday_name": WEEKDAY_NAMES[dow_m]})
-            elif cohort_type == "weekday_bin":
+            if cohort_type == "weekday_bin":
                 item.update({"weekday": dow_m, "weekday_name": WEEKDAY_NAMES[dow_m]})
             cohorts[key] = item
         return cohorts
 
-    month_weekday_bin = build_cohorts(
-        usable_rows,
-        key_fn=lambda r: f"{int(r[1])}-{int(r[2])}-{int(r[3])}",
-        cohort_type="same_month_same_weekday_same_bin",
-    )
     weekday_bin = build_cohorts(
         usable_rows,
         key_fn=lambda r: f"{int(r[2])}-{int(r[3])}",
@@ -304,7 +286,7 @@ def build_day_tendency_model(
         cohort_type="bin_only",
     )
 
-    def score_cohorts(cohorts: Dict[str, Dict[str, Any]]) -> None:
+    def score_cohorts(cohorts: Dict[str, Dict[str, Any]], explain_weekday: bool) -> None:
         pickup_values = sorted([float(v["pickups_bin_median"]) for v in cohorts.values()])
         pay_values = sorted([float(v["avg_driver_pay_bin_median"]) for v in cohorts.values()])
         breadth_values = sorted([float(v["active_zones_bin_median"]) for v in cohorts.values()])
@@ -327,15 +309,54 @@ def build_day_tendency_model(
             v["band"] = band
             v["label"] = _label_from_band(band)
             v["confidence"] = round(min(1.0, float(v["sample_bins"]) / 16.0), 2)
-            v["explain"] = _strength_explain(
-                score_raw=score_raw,
-                weekday_name=str(v["weekday_name"]) if v.get("weekday_name") else None,
-                bin_label=str(v["bin_label"]),
-            )
+            if explain_weekday:
+                v["explain"] = _strength_explain(
+                    score_raw=score_raw,
+                    weekday_name=str(v["weekday_name"]) if v.get("weekday_name") else None,
+                    bin_label=str(v["bin_label"]),
+                )
+            else:
+                v["explain"] = _strength_explain(
+                    score_raw=score_raw,
+                    weekday_name=None,
+                    bin_label=str(v["bin_label"]),
+                )
 
-    score_cohorts(month_weekday_bin)
-    score_cohorts(weekday_bin)
-    score_cohorts(bin_only)
+    score_cohorts(weekday_bin, explain_weekday=True)
+    score_cohorts(bin_only, explain_weekday=False)
+
+    bin_pickup_values = sorted([float(v["pickups_bin_median"]) for v in bin_only.values()])
+    bin_pay_values = sorted([float(v["avg_driver_pay_bin_median"]) for v in bin_only.values()])
+    bin_breadth_values = sorted([float(v["active_zones_bin_median"]) for v in bin_only.values()])
+
+    global_pickups_median = _median([float(r[4]) for r in usable_rows])
+    global_pay_median = _median([float(r[5]) if r[5] is not None else 0.0 for r in usable_rows])
+    global_breadth_median = _median([float(r[6]) for r in usable_rows])
+
+    global_pickup_strength = percentile_rank(bin_pickup_values, global_pickups_median) if bin_pickup_values else 0.5
+    global_pay_strength = percentile_rank(bin_pay_values, global_pay_median) if bin_pay_values else 0.5
+    global_breadth_strength = percentile_rank(bin_breadth_values, global_breadth_median) if bin_breadth_values else 0.5
+    global_score_raw = 0.70 * global_pickup_strength + 0.15 * global_pay_strength + 0.15 * global_breadth_strength
+    global_score = int(round(100 * global_score_raw))
+    global_score = max(0, min(100, global_score))
+    global_band = _band_from_score(global_score)
+
+    global_baseline = {
+        "sample_bins": len(usable_rows),
+        "pickups_bin_median": int(round(global_pickups_median)),
+        "avg_driver_pay_bin_median": round(global_pay_median, 2),
+        "active_zones_bin_median": int(round(global_breadth_median)),
+        "pickup_strength": round(global_pickup_strength, 4),
+        "pay_strength": round(global_pay_strength, 4),
+        "breadth_strength": round(global_breadth_strength, 4),
+        "score_raw": round(global_score_raw, 4),
+        "score": global_score,
+        "band": global_band,
+        "label": _label_from_band(global_band),
+        "confidence": round(min(1.0, len(usable_rows) / 16.0), 2),
+        "cohort_type": "global_baseline",
+        "explain": _global_explain(global_score_raw),
+    }
 
     payload = {
         "version": "time_tendency_v1",
@@ -348,9 +369,9 @@ def build_day_tendency_model(
             "min_daily_pickups_ratio": 0.2,
             "dropped_low_sample_dates": dropped_low_sample_dates,
         },
-        "month_weekday_bin": month_weekday_bin,
         "weekday_bin": weekday_bin,
         "bin_only": bin_only,
+        "global_baseline": global_baseline,
         "dataset": {
             "usable_dates": len(usable_dates),
             "first_date": first_date,
@@ -364,7 +385,6 @@ def build_day_tendency_model(
         "ok": True,
         "model_path": str(model_path),
         "usable_dates": len(usable_dates),
-        "month_weekday_bin_cohorts": len(month_weekday_bin),
         "weekday_bin_cohorts": len(weekday_bin),
         "bin_only_cohorts": len(bin_only),
     }

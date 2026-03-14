@@ -240,19 +240,18 @@ def _resolve_day_tendency_payload(target_date: date) -> Dict[str, Any]:
     weekday_name = _weekday_name_from_mon0(weekday)
     bin_label = _bin_label(bin_index, bin_minutes=bin_minutes)
 
-    primary_key = f"{month}-{weekday}-{bin_index}"
-    fallback1_key = f"{weekday}-{bin_index}"
-    fallback2_key = f"{bin_index}"
+    primary_key = f"{weekday}-{bin_index}"
+    fallback_key = f"{bin_index}"
 
-    month_weekday_bin = model.get("month_weekday_bin") or {}
     weekday_bin = model.get("weekday_bin") or {}
     bin_only = model.get("bin_only") or {}
+    global_baseline = model.get("global_baseline") or {}
 
-    primary = month_weekday_bin.get(primary_key)
-    fallback1 = weekday_bin.get(fallback1_key)
-    fallback2 = bin_only.get(fallback2_key)
+    primary = weekday_bin.get(primary_key)
+    fallback = bin_only.get(fallback_key)
+    baseline = global_baseline if isinstance(global_baseline, dict) and global_baseline else None
 
-    if not primary and not fallback1 and not fallback2:
+    if not primary and not fallback and not baseline:
         return insufficient()
 
     def from_item(item: Dict[str, Any], fallback_cohort_type: str | None = None) -> Dict[str, Any]:
@@ -290,62 +289,12 @@ def _resolve_day_tendency_payload(target_date: date) -> Dict[str, Any]:
             "generated_at": generated_at,
         }
 
-    primary_sample_bins = int(primary.get("sample_bins", 0)) if primary else 0
-
-    if primary and primary_sample_bins >= 8:
-        return from_item(primary)
-    if not primary and fallback1:
-        return from_item(fallback1, fallback_cohort_type="weekday_bin")
-    if not primary and not fallback1 and fallback2:
-        return from_item(fallback2, fallback_cohort_type="bin_only")
-
-    if primary and primary_sample_bins < 8:
-        fallback_item = fallback1 if fallback1 else fallback2
-        if fallback_item:
-            w = min(1.0, primary_sample_bins / 8.0)
-            p_score_raw = float(primary.get("score_raw", 0.5))
-            f_score_raw = float(fallback_item.get("score_raw", 0.5))
-            final_score_raw = (w * p_score_raw) + ((1.0 - w) * f_score_raw)
-
-            def blend(name: str) -> float:
-                return round((w * float(primary.get(name, 0.5))) + ((1.0 - w) * float(fallback_item.get(name, 0.5))), 4)
-
-            score = int(max(0, min(100, round(final_score_raw * 100))))
-            band = _band_from_score(score)
-            return {
-                "version": DAY_TENDENCY_VERSION,
-                "basis": "historical_expected_timeslot",
-                "tz": "America/New_York",
-                "date": target_date.isoformat(),
-                "weekday": weekday,
-                "weekday_name": weekday_name,
-                "month": month,
-                "bin_index": bin_index,
-                "bin_minutes": bin_minutes,
-                "local_time_label": str(primary.get("bin_label") or fallback_item.get("bin_label") or bin_label),
-                "score": score,
-                "band": band,
-                "meter_pct": round(score / 100.0, 4),
-                "label": _label_from_band(band),
-                "confidence": round((w * float(primary.get("confidence", 0.0))) + ((1.0 - w) * float(fallback_item.get("confidence", 0.0))), 2),
-                "sample_bins": primary_sample_bins,
-                "cohort_type": str(primary.get("cohort_type", "same_month_same_weekday_same_bin")),
-                "components": {
-                    "pickup_strength": blend("pickup_strength"),
-                    "pay_strength": blend("pay_strength"),
-                    "breadth_strength": blend("breadth_strength"),
-                },
-                "cohort_medians": {
-                    "pickups_bin": int(round((w * float(primary.get("pickups_bin_median", 0))) + ((1.0 - w) * float(fallback_item.get("pickups_bin_median", 0))))),
-                    "avg_driver_pay_bin": round((w * float(primary.get("avg_driver_pay_bin_median", 0.0))) + ((1.0 - w) * float(fallback_item.get("avg_driver_pay_bin_median", 0.0))), 2),
-                    "active_zones_bin": int(round((w * float(primary.get("active_zones_bin_median", 0))) + ((1.0 - w) * float(fallback_item.get("active_zones_bin_median", 0))))),
-                },
-                "explain": str(primary.get("explain") or fallback_item.get("explain") or ""),
-                "generated_at": generated_at,
-            }
-
-    if fallback2:
-        return from_item(fallback2, fallback_cohort_type="bin_only")
+    if primary:
+        return from_item(primary, fallback_cohort_type="weekday_bin")
+    if fallback:
+        return from_item(fallback, fallback_cohort_type="bin_only")
+    if baseline:
+        return from_item(baseline, fallback_cohort_type="global_baseline")
 
     return insufficient()
 
