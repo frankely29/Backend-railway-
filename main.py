@@ -61,7 +61,7 @@ TIMELINE_PATH = FRAMES_DIR / "timeline.json"
 DAY_TENDENCY_DIR = DATA_DIR / "day_tendency"
 DAY_TENDENCY_MODEL_PATH = DAY_TENDENCY_DIR / "model.json"
 NYC_TZ = ZoneInfo("America/New_York")
-DAY_TENDENCY_VERSION = "day_tendency_v1"
+DAY_TENDENCY_VERSION = "time_tendency_v1"
 
 DEFAULT_BIN_MINUTES = int(os.environ.get("DEFAULT_BIN_MINUTES", "20"))
 DEFAULT_MIN_TRIPS_PER_WINDOW = int(os.environ.get("DEFAULT_MIN_TRIPS_PER_WINDOW", "25"))
@@ -190,14 +190,33 @@ def _label_from_band(band: str) -> str:
     return "Normal"
 
 
+
+
+def _current_bin_index_from_dt(dt: datetime, bin_minutes: int = 20) -> int:
+    total_min = dt.hour * 60 + dt.minute
+    return int(total_min // bin_minutes)
+
+
+def _bin_label(bin_index: int, bin_minutes: int = 20) -> str:
+    minute_of_day = int(bin_index) * int(bin_minutes)
+    hour24 = (minute_of_day // 60) % 24
+    minute = minute_of_day % 60
+    ampm = "AM" if hour24 < 12 else "PM"
+    hour12 = hour24 % 12
+    if hour12 == 0:
+        hour12 = 12
+    return f"{hour12}:{minute:02d} {ampm}"
+
+
 def _resolve_day_tendency_payload(target_date: date) -> Dict[str, Any]:
     model = _read_day_tendency_model()
     generated_at = model.get("generated_at") or datetime.now(timezone.utc).isoformat()
+    bin_minutes = int(model.get("bin_minutes") or 20)
 
-    if model.get("status") == "insufficient_data":
+    def insufficient() -> Dict[str, Any]:
         return {
             "version": DAY_TENDENCY_VERSION,
-            "basis": "historical_expected_day",
+            "basis": "historical_expected_timeslot",
             "tz": "America/New_York",
             "date": target_date.isoformat(),
             "status": "insufficient_data",
@@ -206,156 +225,129 @@ def _resolve_day_tendency_payload(target_date: date) -> Dict[str, Any]:
             "meter_pct": None,
             "label": "No data",
             "confidence": 0.0,
-            "sample_days": 0,
+            "sample_bins": 0,
             "generated_at": generated_at,
         }
+
+    if model.get("status") == "insufficient_data":
+        return insufficient()
+
+    now_nyc = datetime.now(NYC_TZ)
+    bin_index = _current_bin_index_from_dt(now_nyc, bin_minutes=bin_minutes)
 
     month = target_date.month
     weekday = target_date.weekday()
     weekday_name = _weekday_name_from_mon0(weekday)
-    primary_key = f"{month}-{weekday}"
-    fallback_key = f"{weekday}"
+    bin_label = _bin_label(bin_index, bin_minutes=bin_minutes)
 
-    month_weekday = model.get("month_weekday") or {}
-    weekday_only = model.get("weekday_only") or {}
+    primary_key = f"{month}-{weekday}-{bin_index}"
+    fallback1_key = f"{weekday}-{bin_index}"
+    fallback2_key = f"{bin_index}"
 
-    primary = month_weekday.get(primary_key)
-    fallback = weekday_only.get(fallback_key)
+    month_weekday_bin = model.get("month_weekday_bin") or {}
+    weekday_bin = model.get("weekday_bin") or {}
+    bin_only = model.get("bin_only") or {}
 
-    if not primary and not fallback:
-        return {
-            "version": DAY_TENDENCY_VERSION,
-            "basis": "historical_expected_day",
-            "tz": "America/New_York",
-            "date": target_date.isoformat(),
-            "status": "insufficient_data",
-            "score": None,
-            "band": None,
-            "meter_pct": None,
-            "label": "No data",
-            "confidence": 0.0,
-            "sample_days": 0,
-            "generated_at": generated_at,
-        }
+    primary = month_weekday_bin.get(primary_key)
+    fallback1 = weekday_bin.get(fallback1_key)
+    fallback2 = bin_only.get(fallback2_key)
 
-    if primary and (int(primary.get("sample_days", 0)) >= 8 or not fallback):
-        chosen = primary
-        score_raw = float(chosen.get("score_raw", 0.5))
-        score = int(max(0, min(100, round(score_raw * 100))))
+    if not primary and not fallback1 and not fallback2:
+        return insufficient()
+
+    def from_item(item: Dict[str, Any], fallback_cohort_type: str | None = None) -> Dict[str, Any]:
+        score = int(max(0, min(100, int(item.get("score", round(float(item.get("score_raw", 0.5)) * 100))))))
         band = _band_from_score(score)
         return {
             "version": DAY_TENDENCY_VERSION,
-            "basis": "historical_expected_day",
+            "basis": "historical_expected_timeslot",
             "tz": "America/New_York",
             "date": target_date.isoformat(),
             "weekday": weekday,
             "weekday_name": weekday_name,
             "month": month,
+            "bin_index": bin_index,
+            "bin_minutes": bin_minutes,
+            "local_time_label": str(item.get("bin_label") or bin_label),
             "score": score,
             "band": band,
             "meter_pct": round(score / 100.0, 4),
             "label": _label_from_band(band),
-            "confidence": float(chosen.get("confidence", 0.0)),
-            "sample_days": int(chosen.get("sample_days", 0)),
-            "cohort_type": str(chosen.get("cohort_type", "same_month_same_weekday")),
+            "confidence": float(item.get("confidence", 0.0)),
+            "sample_bins": int(item.get("sample_bins", 0)),
+            "cohort_type": str(item.get("cohort_type") or fallback_cohort_type or "bin_only"),
             "components": {
-                "pickup_strength": float(chosen.get("pickup_strength", 0.5)),
-                "pay_strength": float(chosen.get("pay_strength", 0.5)),
-                "breadth_strength": float(chosen.get("breadth_strength", 0.5)),
-                "peak_strength": float(chosen.get("peak_strength", 0.5)),
+                "pickup_strength": float(item.get("pickup_strength", 0.5)),
+                "pay_strength": float(item.get("pay_strength", 0.5)),
+                "breadth_strength": float(item.get("breadth_strength", 0.5)),
             },
             "cohort_medians": {
-                "daily_pickups": int(chosen.get("daily_pickups_median", 0)),
-                "avg_driver_pay": float(chosen.get("avg_driver_pay_median", 0.0)),
-                "active_zones": int(chosen.get("active_zones_median", 0)),
-                "peak_20m_pickups": int(chosen.get("peak_20m_pickups_median", 0)),
+                "pickups_bin": int(item.get("pickups_bin_median", 0)),
+                "avg_driver_pay_bin": float(item.get("avg_driver_pay_bin_median", 0.0)),
+                "active_zones_bin": int(item.get("active_zones_bin_median", 0)),
             },
-            "explain": str(chosen.get("explain", "")),
+            "explain": str(item.get("explain", "")),
             "generated_at": generated_at,
         }
 
-    if not primary and fallback:
-        score_raw = float(fallback.get("score_raw", fallback.get("score", 0.5)))
-        score = int(max(0, min(100, round(score_raw * 100))))
-        band = _band_from_score(score)
-        print(f"[info] day_tendency fallback-only used for date={target_date.isoformat()} weekday={weekday}")
-        return {
-            "version": DAY_TENDENCY_VERSION,
-            "basis": "historical_expected_day",
-            "tz": "America/New_York",
-            "date": target_date.isoformat(),
-            "weekday": weekday,
-            "weekday_name": weekday_name,
-            "month": month,
-            "score": score,
-            "band": band,
-            "meter_pct": round(score / 100.0, 4),
-            "label": _label_from_band(band),
-            "confidence": float(fallback.get("confidence", 0.0)),
-            "sample_days": int(fallback.get("sample_days", 0)),
-            "cohort_type": "weekday_only",
-            "components": {
-                "pickup_strength": float(fallback.get("pickup_strength", 0.5)),
-                "pay_strength": float(fallback.get("pay_strength", 0.5)),
-                "breadth_strength": float(fallback.get("breadth_strength", 0.5)),
-                "peak_strength": float(fallback.get("peak_strength", 0.5)),
-            },
-            "cohort_medians": {
-                "daily_pickups": int(fallback.get("daily_pickups_median", 0)),
-                "avg_driver_pay": float(fallback.get("avg_driver_pay_median", 0.0)),
-                "active_zones": int(fallback.get("active_zones_median", 0)),
-                "peak_20m_pickups": int(fallback.get("peak_20m_pickups_median", 0)),
-            },
-            "explain": str(fallback.get("explain", "")),
-            "generated_at": generated_at,
-        }
+    primary_sample_bins = int(primary.get("sample_bins", 0)) if primary else 0
 
-    primary_days = int(primary.get("sample_days", 0))
-    w = min(1.0, primary_days / 8.0)
+    if primary and primary_sample_bins >= 8:
+        return from_item(primary)
+    if not primary and fallback1:
+        return from_item(fallback1, fallback_cohort_type="weekday_bin")
+    if not primary and not fallback1 and fallback2:
+        return from_item(fallback2, fallback_cohort_type="bin_only")
 
-    p_score_raw = float(primary.get("score_raw", 0.5))
-    f_score_raw = float(fallback.get("score_raw", 0.5))
-    final_score_raw = w * p_score_raw + (1.0 - w) * f_score_raw
+    if primary and primary_sample_bins < 8:
+        fallback_item = fallback1 if fallback1 else fallback2
+        if fallback_item:
+            w = min(1.0, primary_sample_bins / 8.0)
+            p_score_raw = float(primary.get("score_raw", 0.5))
+            f_score_raw = float(fallback_item.get("score_raw", 0.5))
+            final_score_raw = (w * p_score_raw) + ((1.0 - w) * f_score_raw)
 
-    def blend(a: str) -> float:
-        pv = float(primary.get(a, 0.5))
-        fv = float(fallback.get(a, 0.5))
-        return round(w * pv + (1.0 - w) * fv, 4)
+            def blend(name: str) -> float:
+                return round((w * float(primary.get(name, 0.5))) + ((1.0 - w) * float(fallback_item.get(name, 0.5))), 4)
 
-    score = int(max(0, min(100, round(final_score_raw * 100))))
-    band = _band_from_score(score)
-    confidence = round(min(1.0, ((w * primary_days) + ((1.0 - w) * int(fallback.get("sample_days", 0)))) / 12.0), 2)
+            score = int(max(0, min(100, round(final_score_raw * 100))))
+            band = _band_from_score(score)
+            return {
+                "version": DAY_TENDENCY_VERSION,
+                "basis": "historical_expected_timeslot",
+                "tz": "America/New_York",
+                "date": target_date.isoformat(),
+                "weekday": weekday,
+                "weekday_name": weekday_name,
+                "month": month,
+                "bin_index": bin_index,
+                "bin_minutes": bin_minutes,
+                "local_time_label": str(primary.get("bin_label") or fallback_item.get("bin_label") or bin_label),
+                "score": score,
+                "band": band,
+                "meter_pct": round(score / 100.0, 4),
+                "label": _label_from_band(band),
+                "confidence": round((w * float(primary.get("confidence", 0.0))) + ((1.0 - w) * float(fallback_item.get("confidence", 0.0))), 2),
+                "sample_bins": primary_sample_bins,
+                "cohort_type": str(primary.get("cohort_type", "same_month_same_weekday_same_bin")),
+                "components": {
+                    "pickup_strength": blend("pickup_strength"),
+                    "pay_strength": blend("pay_strength"),
+                    "breadth_strength": blend("breadth_strength"),
+                },
+                "cohort_medians": {
+                    "pickups_bin": int(round((w * float(primary.get("pickups_bin_median", 0))) + ((1.0 - w) * float(fallback_item.get("pickups_bin_median", 0))))),
+                    "avg_driver_pay_bin": round((w * float(primary.get("avg_driver_pay_bin_median", 0.0))) + ((1.0 - w) * float(fallback_item.get("avg_driver_pay_bin_median", 0.0))), 2),
+                    "active_zones_bin": int(round((w * float(primary.get("active_zones_bin_median", 0))) + ((1.0 - w) * float(fallback_item.get("active_zones_bin_median", 0))))),
+                },
+                "explain": str(primary.get("explain") or fallback_item.get("explain") or ""),
+                "generated_at": generated_at,
+            }
 
-    return {
-        "version": DAY_TENDENCY_VERSION,
-        "basis": "historical_expected_day",
-        "tz": "America/New_York",
-        "date": target_date.isoformat(),
-        "weekday": weekday,
-        "weekday_name": weekday_name,
-        "month": month,
-        "score": score,
-        "band": band,
-        "meter_pct": round(score / 100.0, 4),
-        "label": _label_from_band(band),
-        "confidence": confidence,
-        "sample_days": primary_days,
-        "cohort_type": "blended_month_weekday_with_weekday_fallback",
-        "components": {
-            "pickup_strength": blend("pickup_strength"),
-            "pay_strength": blend("pay_strength"),
-            "breadth_strength": blend("breadth_strength"),
-            "peak_strength": blend("peak_strength"),
-        },
-        "cohort_medians": {
-            "daily_pickups": int(primary.get("daily_pickups_median", fallback.get("daily_pickups_median", 0))),
-            "avg_driver_pay": float(primary.get("avg_driver_pay_median", fallback.get("avg_driver_pay_median", 0.0))),
-            "active_zones": int(primary.get("active_zones_median", fallback.get("active_zones_median", 0))),
-            "peak_20m_pickups": int(primary.get("peak_20m_pickups_median", fallback.get("peak_20m_pickups_median", 0))),
-        },
-        "explain": str(primary.get("explain", fallback.get("explain", ""))),
-        "generated_at": generated_at,
-    }
+    if fallback2:
+        return from_item(fallback2, fallback_cohort_type="bin_only")
+
+    return insufficient()
 
 
 def _build_day_tendency_only(bin_minutes: int = DEFAULT_BIN_MINUTES) -> Dict[str, Any]:
