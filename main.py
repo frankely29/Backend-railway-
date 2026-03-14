@@ -1113,14 +1113,12 @@ def startup():
             return
 
         if frames_ready and not day_tendency_ready:
-            day_tendency_built = False
             if parquets_ok:
                 try:
                     _build_day_tendency_only(DEFAULT_BIN_MINUTES)
-                    day_tendency_built = True
                 except Exception:
                     print("[warn] startup day tendency backfill failed")
-                    traceback.print_exc()
+                    print(traceback.format_exc())
 
             try:
                 tl = _read_json(TIMELINE_PATH)
@@ -1128,11 +1126,10 @@ def startup():
             except Exception:
                 result = {"ok": True}
 
-            if day_tendency_built:
-                result["day_tendency"] = {
-                    "ok": True,
-                    "built_at_startup": True,
-                }
+            result["day_tendency"] = {
+                "ok": _has_day_tendency_model(),
+                "built_at_startup": True,
+            }
 
             _set_state(
                 state="done",
@@ -1142,10 +1139,11 @@ def startup():
             )
             return
 
-        if zones_ok and parquets_ok:
-            start_generate(DEFAULT_BIN_MINUTES, DEFAULT_MIN_TRIPS_PER_WINDOW)
-        else:
-            _set_state(state="idle")
+        if not frames_ready:
+            if zones_ok and parquets_ok:
+                start_generate(DEFAULT_BIN_MINUTES, DEFAULT_MIN_TRIPS_PER_WINDOW)
+            else:
+                _set_state(state="idle")
     except Exception:
         _set_state(state="idle")
 
