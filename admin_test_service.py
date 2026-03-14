@@ -221,3 +221,60 @@ def test_pickup_reports() -> Dict[str, Any]:
         return _response(True, "pickup-reports", "Pickup reports query succeeded", {"count": len(items)})
     except Exception as exc:
         return _response(False, "pickup-reports", "Pickup reports query failed", {"error": str(exc)})
+
+
+def test_presence_endpoint() -> Dict[str, Any]:
+    from main import _presence_visibility_snapshot
+
+    snapshot = _presence_visibility_snapshot(max_age_sec=300)
+    details = {
+        "db_backend": snapshot.get("db_backend"),
+        "visible_count": int(snapshot.get("visible_count") or 0),
+        "online_count": int(snapshot.get("online_count") or 0),
+        "ghosted_count": int(snapshot.get("ghosted_count") or 0),
+        "sample_user_ids": snapshot.get("sample_user_ids") or [],
+        "sample_display_names": snapshot.get("sample_display_names") or [],
+        "sql_mode": snapshot.get("sql_mode"),
+    }
+    if snapshot.get("ok"):
+        return _response(True, "presence-endpoint", "Presence visibility query succeeded", details)
+    details["error"] = snapshot.get("error")
+    return _response(False, "presence-endpoint", "Presence visibility query failed", details)
+
+
+def test_pickup_overlay_endpoint(admin_user: Any) -> Dict[str, Any]:
+    from main import _recent_pickups_payload
+
+    try:
+        payload = _recent_pickups_payload(limit=30, zone_sample_limit=100, debug=1, viewer=admin_user)
+        zone_stats = payload.get("zone_stats") if isinstance(payload, dict) else []
+        zone_hotspots = payload.get("zone_hotspots") if isinstance(payload, dict) else {}
+        zone_features = zone_hotspots.get("features") if isinstance(zone_hotspots, dict) else []
+        micro_hotspots = payload.get("micro_hotspots") if isinstance(payload, dict) else []
+        sampled_zone_ids = [
+            int(item.get("zone_id"))
+            for item in (zone_stats if isinstance(zone_stats, list) else [])[:5]
+            if isinstance(item, dict) and item.get("zone_id") is not None
+        ]
+        details = {
+            "item_count": int(payload.get("count") or 0),
+            "zone_stats_count": len(zone_stats) if isinstance(zone_stats, list) else 0,
+            "zone_hotspot_count": len(zone_features) if isinstance(zone_features, list) else 0,
+            "micro_hotspot_count": len(micro_hotspots) if isinstance(micro_hotspots, list) else 0,
+            "sampled_zone_ids": sampled_zone_ids,
+        }
+        return _response(True, "pickup-overlay-endpoint", "Pickup overlay query succeeded", details)
+    except Exception as exc:
+        return _response(
+            False,
+            "pickup-overlay-endpoint",
+            "Pickup overlay query failed",
+            {
+                "item_count": 0,
+                "zone_stats_count": 0,
+                "zone_hotspot_count": 0,
+                "micro_hotspot_count": 0,
+                "sampled_zone_ids": [],
+                "error": str(exc),
+            },
+        )

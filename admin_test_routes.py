@@ -12,6 +12,8 @@ from admin_test_service import (
     test_frame_current,
     test_me,
     test_pickup_reports,
+    test_pickup_overlay_endpoint,
+    test_presence_endpoint,
     test_police_reports,
     test_presence_live,
     test_presence_summary,
@@ -85,3 +87,14 @@ def admin_test_police_reports(admin: sqlite3.Row = Depends(require_admin_user)):
 def admin_test_pickup_reports(admin: sqlite3.Row = Depends(require_admin_user)):
     _ = admin
     return test_pickup_reports()
+
+
+@router.get("/presence-endpoint", response_model=AdminDiagnosticResponse)
+def admin_test_presence_endpoint(admin: sqlite3.Row = Depends(require_admin_user)):
+    _ = admin
+    return test_presence_endpoint()
+
+
+@router.get("/pickup-overlay-endpoint", response_model=AdminDiagnosticResponse)
+def admin_test_pickup_overlay_endpoint(admin: sqlite3.Row = Depends(require_admin_user)):
+    return test_pickup_overlay_endpoint(admin)
