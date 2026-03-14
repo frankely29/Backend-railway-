@@ -248,6 +248,14 @@ def _resolve_day_tendency_payload(target_date: date) -> Dict[str, Any]:
     weekday_bin = model.get("weekday_bin") or {}
     bin_only = model.get("bin_only") or {}
     global_baseline = model.get("global_baseline") or {}
+    print(
+        "[debug] day_tendency cohort sizes:",
+        {
+            "weekday_bin": len(weekday_bin) if isinstance(weekday_bin, dict) else 0,
+            "bin_only": len(bin_only) if isinstance(bin_only, dict) else 0,
+            "has_global_baseline": bool(global_baseline),
+        },
+    )
 
     primary = weekday_bin.get(primary_key)
     fallback = bin_only.get(fallback_key)

@@ -98,9 +98,9 @@ def _insufficient_payload(first_date: str | None = None, last_date: str | None =
             "last_date": last_date,
         },
         "filters": {
-            "dropped_first_last_dates": True,
-            "min_daily_pickups_floor": 200,
-            "min_daily_pickups_ratio": 0.2,
+            "dropped_first_last_dates": False,
+            "min_daily_pickups_floor": 0,
+            "min_daily_pickups_ratio": 0.0,
             "dropped_low_sample_dates": 0,
         },
     }
@@ -211,51 +211,10 @@ def build_day_tendency_model(
     dates = [r[0] for r in rows]
     first_date = str(min(dates)) if dates else None
     last_date = str(max(dates)) if dates else None
-    edge_excluded_dates = set()
-    if dates:
-        edge_excluded_dates.add(min(dates))
-        edge_excluded_dates.add(max(dates))
 
-    filtered = [r for r in rows if r[0] not in edge_excluded_dates]
-    if not filtered:
-        payload = _insufficient_payload(first_date=first_date, last_date=last_date, usable_dates=0)
-        model_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        return {
-            "ok": True,
-            "model_path": str(model_path),
-            "usable_dates": 0,
-            "weekday_bin_cohorts": 0,
-            "bin_only_cohorts": 0,
-        }
-
-    daily_pickups_by_date: Dict[Any, float] = {}
-    for r in filtered:
-        d = r[0]
-        daily_pickups_by_date[d] = daily_pickups_by_date.get(d, 0.0) + float(r[4])
-
-    global_median_daily_pickups = _median(list(daily_pickups_by_date.values()))
-    min_daily_pickups = max(200.0, 0.20 * global_median_daily_pickups)
-
-    usable_dates = {d for d, daily_pickups in daily_pickups_by_date.items() if daily_pickups >= min_daily_pickups}
-    usable_rows = [r for r in filtered if r[0] in usable_dates]
-    dropped_low_sample_dates = len(daily_pickups_by_date) - len(usable_dates)
-
-    if len(usable_rows) < 1:
-        payload = _insufficient_payload(first_date=first_date, last_date=last_date, usable_dates=len(usable_dates))
-        payload["filters"] = {
-            "dropped_first_last_dates": True,
-            "min_daily_pickups_floor": 200,
-            "min_daily_pickups_ratio": 0.2,
-            "dropped_low_sample_dates": dropped_low_sample_dates,
-        }
-        model_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        return {
-            "ok": True,
-            "model_path": str(model_path),
-            "usable_dates": len(usable_dates),
-            "weekday_bin_cohorts": 0,
-            "bin_only_cohorts": 0,
-        }
+    usable_rows = rows
+    usable_dates = {r[0] for r in usable_rows}
+    dropped_low_sample_dates = 0
 
     def build_cohorts(source_rows: List[Any], key_fn, cohort_type: str) -> Dict[str, Dict[str, Any]]:
         grouped: Dict[str, List[Any]] = {}
@@ -318,7 +277,7 @@ def build_day_tendency_model(
             v["score"] = score
             v["band"] = band
             v["label"] = _label_from_band(band)
-            v["confidence"] = round(min(1.0, float(v["sample_bins"]) / 16.0), 2)
+            v["confidence"] = round(min(1.0, float(v["sample_bins"]) / 12.0), 2)
             if explain_weekday:
                 v["explain"] = _strength_explain(
                     score_raw=score_raw,
@@ -363,7 +322,7 @@ def build_day_tendency_model(
         "score": global_score,
         "band": global_band,
         "label": _label_from_band(global_band),
-        "confidence": round(min(1.0, len(usable_rows) / 16.0), 2),
+        "confidence": round(min(1.0, len(usable_rows) / 12.0), 2),
         "cohort_type": "global_baseline",
         "explain": _global_explain(global_score_raw),
     }
@@ -374,9 +333,9 @@ def build_day_tendency_model(
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "bin_minutes": int(bin_minutes),
         "filters": {
-            "dropped_first_last_dates": True,
-            "min_daily_pickups_floor": 200,
-            "min_daily_pickups_ratio": 0.2,
+            "dropped_first_last_dates": False,
+            "min_daily_pickups_floor": 0,
+            "min_daily_pickups_ratio": 0.0,
             "dropped_low_sample_dates": dropped_low_sample_dates,
         },
         "weekday_bin": weekday_bin,
