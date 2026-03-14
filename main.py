@@ -350,6 +350,21 @@ def _get_state() -> Dict[str, Any]:
         return dict(_generate_state)
 
 
+def _build_day_tendency_only(bin_minutes: int = DEFAULT_BIN_MINUTES) -> Dict[str, Any]:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    DAY_TENDENCY_DIR.mkdir(parents=True, exist_ok=True)
+
+    parquets = _list_parquets()
+    if not parquets:
+        raise RuntimeError("No .parquet files found in /data. Cannot build day tendency model.")
+
+    return build_day_tendency_model(
+        parquet_files=parquets,
+        out_dir=DAY_TENDENCY_DIR,
+        bin_minutes=bin_minutes,
+    )
+
+
 def _generate_worker(bin_minutes: int, min_trips_per_window: int) -> None:
     start = time.time()
     _set_state(
@@ -1060,9 +1075,13 @@ def startup():
     init_leaderboard_schema()
     _ensure_admin_seed()
 
-    # Auto-fill generate state if frames already exist
     try:
-        if _has_frames():
+        frames_ready = _has_frames()
+        day_tendency_ready = _has_day_tendency_model()
+        zones_ok = (DATA_DIR / "taxi_zones.geojson").exists()
+        parquets_ok = len(_list_parquets()) > 0
+
+        if frames_ready and day_tendency_ready:
             try:
                 tl = _read_json(TIMELINE_PATH)
                 _set_state(
@@ -1080,8 +1099,35 @@ def startup():
                 )
             return
 
-        zones_ok = (DATA_DIR / "taxi_zones.geojson").exists()
-        parquets_ok = len(_list_parquets()) > 0
+        if frames_ready and not day_tendency_ready:
+            day_tendency_built = False
+            if parquets_ok:
+                try:
+                    _build_day_tendency_only(DEFAULT_BIN_MINUTES)
+                    day_tendency_built = True
+                except Exception:
+                    print("[warn] startup day tendency backfill failed")
+                    traceback.print_exc()
+
+            try:
+                tl = _read_json(TIMELINE_PATH)
+                result: Dict[str, Any] = {"ok": True, "count": tl.get("count")}
+            except Exception:
+                result = {"ok": True}
+
+            if day_tendency_built:
+                result["day_tendency"] = {
+                    "ok": True,
+                    "built_at_startup": True,
+                }
+
+            _set_state(
+                state="done",
+                bin_minutes=DEFAULT_BIN_MINUTES,
+                min_trips_per_window=DEFAULT_MIN_TRIPS_PER_WINDOW,
+                result=result,
+            )
+            return
 
         if zones_ok and parquets_ok:
             start_generate(DEFAULT_BIN_MINUTES, DEFAULT_MIN_TRIPS_PER_WINDOW)
@@ -1159,6 +1205,7 @@ def generate_status():
 @app.get("/day_tendency/today")
 def day_tendency_today():
     if not _has_day_tendency_model():
+        print("[warn] day tendency model missing; call /generate or allow startup backfill")
         raise HTTPException(status_code=409, detail="day tendency not ready. Call /generate first.")
     target_date = datetime.now(timezone.utc).astimezone(NYC_TZ).date()
     return _resolve_day_tendency_payload(target_date)
@@ -1174,6 +1221,7 @@ def day_tendency_for_date(ymd: str):
         raise HTTPException(status_code=400, detail="ymd must be YYYY-MM-DD")
 
     if not _has_day_tendency_model():
+        print("[warn] day tendency model missing; call /generate or allow startup backfill")
         raise HTTPException(status_code=409, detail="day tendency not ready. Call /generate first.")
     return _resolve_day_tendency_payload(parsed_date)
 
