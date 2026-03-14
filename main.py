@@ -61,7 +61,7 @@ TIMELINE_PATH = FRAMES_DIR / "timeline.json"
 DAY_TENDENCY_DIR = DATA_DIR / "day_tendency"
 DAY_TENDENCY_MODEL_PATH = DAY_TENDENCY_DIR / "model.json"
 NYC_TZ = ZoneInfo("America/New_York")
-DAY_TENDENCY_VERSION = "time_tendency_v1"
+DAY_TENDENCY_VERSION = "borough_tendency_v1"
 
 DEFAULT_BIN_MINUTES = int(os.environ.get("DEFAULT_BIN_MINUTES", "20"))
 DEFAULT_MIN_TRIPS_PER_WINDOW = int(os.environ.get("DEFAULT_MIN_TRIPS_PER_WINDOW", "25"))
@@ -172,11 +172,15 @@ def _day_tendency_model_is_current() -> bool:
         if not _has_day_tendency_model():
             return False
         model = _read_day_tendency_model()
-        if str(model.get("version")) != "time_tendency_v1":
+        if str(model.get("version")) != "borough_tendency_v1":
             return False
-        if "weekday_bin" not in model:
+        if "borough_weekday_bin" not in model:
             return False
-        if "bin_only" not in model:
+        if "borough_bin" not in model:
+            return False
+        if "borough_baseline" not in model:
+            return False
+        if "global_bin" not in model:
             return False
         if "global_baseline" not in model:
             return False
@@ -226,16 +230,55 @@ def _bin_label(bin_index: int, bin_minutes: int = 20) -> str:
     return f"{hour12}:{minute:02d} {ampm}"
 
 
-def _resolve_day_tendency_payload(target_date: date) -> Dict[str, Any]:
+def _normalize_borough(name: str) -> Tuple[str, str]:
+    raw = (name or "").strip().lower().replace("-", " ").replace("_", " ")
+    if raw == "manhattan":
+        return "Manhattan", "manhattan"
+    if raw == "brooklyn":
+        return "Brooklyn", "brooklyn"
+    if raw == "queens":
+        return "Queens", "queens"
+    if raw == "bronx":
+        return "Bronx", "bronx"
+    if raw in {"staten island", "statenisland"}:
+        return "Staten Island", "staten_island"
+    if raw in {"newark airport", "newarkairport", "newark", "ewr"}:
+        return "Newark Airport", "newark_airport"
+    return "Unknown", "unknown"
+
+
+def _resolve_borough_from_lat_lng(lat: float, lng: float) -> Optional[Dict[str, str]]:
+    zones = _load_pickup_zone_geometries()
+    if not zones:
+        return None
+    point = Point(float(lng), float(lat))
+    for zone in zones.values():
+        geom = zone.get("geometry")
+        if geom is None:
+            continue
+        try:
+            if geom.contains(point) or geom.touches(point):
+                borough, borough_key = _normalize_borough(str(zone.get("borough") or ""))
+                return {"borough": borough, "borough_key": borough_key}
+        except Exception:
+            continue
+    return None
+
+
+def _resolve_day_tendency_payload(target_date: date, lat: Optional[float] = None, lng: Optional[float] = None) -> Dict[str, Any]:
     model = _read_day_tendency_model()
     print("[debug] model keys:", list(model.keys()))
     generated_at = model.get("generated_at") or datetime.now(timezone.utc).isoformat()
     bin_minutes = int(model.get("bin_minutes") or 20)
+    borough_context = None
+    if lat is not None and lng is not None:
+        borough_context = _resolve_borough_from_lat_lng(lat=float(lat), lng=float(lng))
+    print("[debug] resolved borough:", borough_context)
 
     def insufficient() -> Dict[str, Any]:
         return {
             "version": DAY_TENDENCY_VERSION,
-            "basis": "historical_expected_timeslot",
+            "basis": "historical_expected_borough_timeslot",
             "tz": "America/New_York",
             "date": target_date.isoformat(),
             "status": "insufficient_data",
@@ -258,42 +301,40 @@ def _resolve_day_tendency_payload(target_date: date) -> Dict[str, Any]:
     weekday = target_date.weekday()
     weekday_name = _weekday_name_from_mon0(weekday)
     bin_label = _bin_label(bin_index, bin_minutes=bin_minutes)
+    month = int(target_date.month)
 
-    weekday_bin_key = f"{weekday}-{bin_index}"
-    bin_only_key = f"{bin_index}"
-    print("[debug] weekday_bin key:", weekday_bin_key)
-    print("[debug] bin_only key:", bin_only_key)
-
-    weekday_bin = model.get("weekday_bin") or {}
-    bin_only = model.get("bin_only") or {}
+    borough_weekday_bin = model.get("borough_weekday_bin") or {}
+    borough_bin = model.get("borough_bin") or {}
+    borough_baseline = model.get("borough_baseline") or {}
+    global_bin = model.get("global_bin") or {}
     global_baseline = model.get("global_baseline") or {}
-    print(
-        "[debug] day_tendency cohort sizes:",
-        {
-            "weekday_bin": len(weekday_bin) if isinstance(weekday_bin, dict) else 0,
-            "bin_only": len(bin_only) if isinstance(bin_only, dict) else 0,
-            "has_global_baseline": bool(global_baseline),
-        },
-    )
 
-    primary = weekday_bin.get(weekday_bin_key)
-    fallback = bin_only.get(bin_only_key)
-    baseline = global_baseline if isinstance(global_baseline, dict) and global_baseline else None
+    print("[debug] day_tendency cohort sizes:", {
+        "borough_weekday_bin": len(borough_weekday_bin) if isinstance(borough_weekday_bin, dict) else 0,
+        "borough_bin": len(borough_bin) if isinstance(borough_bin, dict) else 0,
+        "borough_baseline": len(borough_baseline) if isinstance(borough_baseline, dict) else 0,
+        "global_bin": len(global_bin) if isinstance(global_bin, dict) else 0,
+        "has_global_baseline": bool(global_baseline),
+    })
 
-    if not primary and not fallback and not baseline:
-        print("[debug] using path=insufficient_data")
-        return insufficient()
-
-    def from_item(item: Dict[str, Any], fallback_cohort_type: str | None = None) -> Dict[str, Any]:
+    def from_item(item: Dict[str, Any], fallback_cohort_type: str | None = None, resolved: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
         score = int(max(0, min(100, int(item.get("score", round(float(item.get("score_raw", 0.5)) * 100))))))
         band = _band_from_score(score)
+        borough_name = item.get("borough")
+        borough_key = item.get("borough_key")
+        if resolved and not borough_name:
+            borough_name = resolved.get("borough")
+            borough_key = resolved.get("borough_key")
         return {
             "version": DAY_TENDENCY_VERSION,
-            "basis": "historical_expected_timeslot",
+            "basis": "historical_expected_borough_timeslot",
             "tz": "America/New_York",
             "date": target_date.isoformat(),
+            "borough": borough_name,
+            "borough_key": borough_key,
             "weekday": weekday,
             "weekday_name": weekday_name,
+            "month": month,
             "bin_index": bin_index,
             "bin_minutes": bin_minutes,
             "local_time_label": str(item.get("bin_label") or bin_label),
@@ -310,23 +351,36 @@ def _resolve_day_tendency_payload(target_date: date) -> Dict[str, Any]:
                 "breadth_strength": float(item.get("breadth_strength", 0.5)),
             },
             "cohort_medians": {
-                "pickups_bin": int(item.get("pickups_bin_median", 0)),
-                "avg_driver_pay_bin": float(item.get("avg_driver_pay_bin_median", 0.0)),
-                "active_zones_bin": int(item.get("active_zones_bin_median", 0)),
+                "pickups_bin": float(item.get("pickups_bin_avg", 0.0)),
+                "avg_driver_pay_bin": float(item.get("avg_driver_pay_bin_avg", 0.0)),
+                "active_zones_bin": float(item.get("active_zones_bin_avg", 0.0)),
             },
             "explain": str(item.get("explain", "")),
             "generated_at": generated_at,
         }
 
-    if primary:
-        print("[debug] using path=weekday_bin")
-        return from_item(primary, fallback_cohort_type="weekday_bin")
-    if fallback:
-        print("[debug] using path=bin_only")
-        return from_item(fallback, fallback_cohort_type="bin_only")
-    if baseline:
+    if borough_context:
+        borough_key = str(borough_context["borough_key"])
+        key_weekday = f"{borough_key}|{weekday}|{bin_index}"
+        key_bin = f"{borough_key}|{bin_index}"
+        key_borough = borough_key
+        if isinstance(borough_weekday_bin, dict) and key_weekday in borough_weekday_bin:
+            print("[debug] using path=borough_weekday_bin")
+            return from_item(borough_weekday_bin[key_weekday], fallback_cohort_type="borough_weekday_bin", resolved=borough_context)
+        if isinstance(borough_bin, dict) and key_bin in borough_bin:
+            print("[debug] using path=borough_bin")
+            return from_item(borough_bin[key_bin], fallback_cohort_type="borough_bin", resolved=borough_context)
+        if isinstance(borough_baseline, dict) and key_borough in borough_baseline:
+            print("[debug] using path=borough_baseline")
+            return from_item(borough_baseline[key_borough], fallback_cohort_type="borough_baseline", resolved=borough_context)
+
+    key_global_bin = f"{bin_index}"
+    if isinstance(global_bin, dict) and key_global_bin in global_bin:
+        print("[debug] using path=global_bin")
+        return from_item(global_bin[key_global_bin], fallback_cohort_type="global_bin", resolved=borough_context)
+    if isinstance(global_baseline, dict) and global_baseline:
         print("[debug] using path=global_baseline")
-        return from_item(baseline, fallback_cohort_type="global_baseline")
+        return from_item(global_baseline, fallback_cohort_type="global_baseline", resolved=borough_context)
 
     print("[debug] using path=insufficient_data")
     return insufficient()
@@ -339,10 +393,12 @@ def _build_day_tendency_only(bin_minutes: int = DEFAULT_BIN_MINUTES) -> Dict[str
     parquets = _list_parquets()
     if not parquets:
         raise RuntimeError("No .parquet files found in /data. Cannot build day tendency model.")
+    zones_path = ensure_zones_geojson(DATA_DIR, force=False)
 
     return build_day_tendency_model(
         parquet_files=parquets,
         out_dir=DAY_TENDENCY_DIR,
+        zones_geojson_path=zones_path,
         bin_minutes=bin_minutes,
     )
 
@@ -408,6 +464,7 @@ def _generate_worker(bin_minutes: int, min_trips_per_window: int) -> None:
         day_tendency_result = build_day_tendency_model(
             parquet_files=parquets,
             out_dir=DAY_TENDENCY_DIR,
+            zones_geojson_path=zones_path,
             bin_minutes=bin_minutes,
         )
         result = {
@@ -1222,18 +1279,18 @@ def generate_status():
 
 
 @app.get("/day_tendency/today")
-def day_tendency_today():
+def day_tendency_today(lat: Optional[float] = None, lng: Optional[float] = None):
     if not _has_day_tendency_model():
         print("[warn] day tendency model missing; call /generate or allow startup backfill")
         raise HTTPException(status_code=409, detail="day tendency not ready. Call /generate first.")
     target_date = datetime.now(timezone.utc).astimezone(NYC_TZ).date()
-    payload = _resolve_day_tendency_payload(target_date)
+    payload = _resolve_day_tendency_payload(target_date, lat=lat, lng=lng)
     print("[debug] day_tendency_today payload:", payload)
     return payload
 
 
 @app.get("/day_tendency/date/{ymd}")
-def day_tendency_for_date(ymd: str):
+def day_tendency_for_date(ymd: str, lat: Optional[float] = None, lng: Optional[float] = None):
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", ymd or ""):
         raise HTTPException(status_code=400, detail="ymd must be YYYY-MM-DD")
     try:
@@ -1244,7 +1301,9 @@ def day_tendency_for_date(ymd: str):
     if not _has_day_tendency_model():
         print("[warn] day tendency model missing; call /generate or allow startup backfill")
         raise HTTPException(status_code=409, detail="day tendency not ready. Call /generate first.")
-    return _resolve_day_tendency_payload(parsed_date)
+    payload = _resolve_day_tendency_payload(parsed_date, lat=lat, lng=lng)
+    print("[debug] day_tendency_for_date payload:", payload)
+    return payload
 
 
 @app.get("/timeline")
