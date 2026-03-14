@@ -86,12 +86,22 @@ def _insufficient_payload(first_date: str | None = None, last_date: str | None =
     return {
         "version": "time_tendency_v1",
         "basis": "historical_expected_timeslot",
+        "bin_minutes": 20,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "status": "insufficient_data",
+        "weekday_bin": {},
+        "bin_only": {},
+        "global_baseline": {},
         "dataset": {
             "usable_dates": int(usable_dates),
             "first_date": first_date,
             "last_date": last_date,
+        },
+        "filters": {
+            "dropped_first_last_dates": True,
+            "min_daily_pickups_floor": 200,
+            "min_daily_pickups_ratio": 0.2,
+            "dropped_low_sample_dates": 0,
         },
     }
 
@@ -230,7 +240,7 @@ def build_day_tendency_model(
     usable_rows = [r for r in filtered if r[0] in usable_dates]
     dropped_low_sample_dates = len(daily_pickups_by_date) - len(usable_dates)
 
-    if len(usable_rows) < 7:
+    if len(usable_rows) < 1:
         payload = _insufficient_payload(first_date=first_date, last_date=last_date, usable_dates=len(usable_dates))
         payload["filters"] = {
             "dropped_first_last_dates": True,

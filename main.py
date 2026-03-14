@@ -210,6 +210,7 @@ def _bin_label(bin_index: int, bin_minutes: int = 20) -> str:
 
 def _resolve_day_tendency_payload(target_date: date) -> Dict[str, Any]:
     model = _read_day_tendency_model()
+    print("[debug] day_tendency model keys:", list(model.keys()))
     generated_at = model.get("generated_at") or datetime.now(timezone.utc).isoformat()
     bin_minutes = int(model.get("bin_minutes") or 20)
 
@@ -230,6 +231,7 @@ def _resolve_day_tendency_payload(target_date: date) -> Dict[str, Any]:
         }
 
     if model.get("status") == "insufficient_data":
+        print("[debug] day_tendency path=insufficient_data")
         return insufficient()
 
     now_nyc = datetime.now(NYC_TZ)
@@ -252,6 +254,7 @@ def _resolve_day_tendency_payload(target_date: date) -> Dict[str, Any]:
     baseline = global_baseline if isinstance(global_baseline, dict) and global_baseline else None
 
     if not primary and not fallback and not baseline:
+        print("[debug] day_tendency path=insufficient_data")
         return insufficient()
 
     def from_item(item: Dict[str, Any], fallback_cohort_type: str | None = None) -> Dict[str, Any]:
@@ -290,12 +293,16 @@ def _resolve_day_tendency_payload(target_date: date) -> Dict[str, Any]:
         }
 
     if primary:
+        print("[debug] day_tendency path=weekday_bin")
         return from_item(primary, fallback_cohort_type="weekday_bin")
     if fallback:
+        print("[debug] day_tendency path=bin_only")
         return from_item(fallback, fallback_cohort_type="bin_only")
     if baseline:
+        print("[debug] day_tendency path=global_baseline")
         return from_item(baseline, fallback_cohort_type="global_baseline")
 
+    print("[debug] day_tendency path=insufficient_data")
     return insufficient()
 
 
@@ -1193,7 +1200,9 @@ def day_tendency_today():
         print("[warn] day tendency model missing; call /generate or allow startup backfill")
         raise HTTPException(status_code=409, detail="day tendency not ready. Call /generate first.")
     target_date = datetime.now(timezone.utc).astimezone(NYC_TZ).date()
-    return _resolve_day_tendency_payload(target_date)
+    payload = _resolve_day_tendency_payload(target_date)
+    print("[debug] day_tendency_today payload:", payload)
+    return payload
 
 
 @app.get("/day_tendency/date/{ymd}")
