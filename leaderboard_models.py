@@ -25,6 +25,8 @@ class LeaderboardRow(BaseModel):
     rank_position: int
     badge_code: Optional[str] = None
     level: Optional[int] = None
+    rank_name: Optional[str] = None
+    rank_icon_key: Optional[str] = None
     title: Optional[str] = None
 
 
@@ -64,6 +66,7 @@ class MyBadgesResponse(BaseModel):
 class PeriodTotals(BaseModel):
     miles: float
     hours: float
+    pickups: int = 0
 
 
 class OverviewResponse(BaseModel):
@@ -72,3 +75,29 @@ class OverviewResponse(BaseModel):
     weekly: PeriodTotals
     monthly: PeriodTotals
     yearly: PeriodTotals
+
+
+class ProgressionXpBreakdown(BaseModel):
+    miles_xp: int
+    hours_xp: int
+    report_xp: int
+
+
+class ProgressionPayload(BaseModel):
+    level: int
+    rank_name: str
+    rank_icon_key: str
+    total_xp: int
+    current_level_xp: int
+    next_level_xp: Optional[int] = None
+    xp_to_next_level: int
+    max_level_reached: bool
+    lifetime_miles: float
+    lifetime_hours: float
+    lifetime_pickups_recorded: int
+    xp_breakdown: ProgressionXpBreakdown
+
+
+class MyProgressionResponse(BaseModel):
+    ok: bool = True
+    progression: ProgressionPayload

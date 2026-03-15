@@ -1248,8 +1248,7 @@ from leaderboard_routes import router as leaderboard_router
 from leaderboard_service import (
     get_best_current_badge_for_user,
     get_best_current_badges_for_users,
-    get_lifetime_totals_for_user,
-    get_level_progress_from_lifetime_miles,
+    get_progression_for_user,
     get_my_rank,
     get_overview_for_user,
 )
@@ -1712,8 +1711,7 @@ def driver_profile(user_id: int, viewer: sqlite3.Row = Depends(require_user)):
     miles_rank_data = get_my_rank(target_user_id, LeaderboardMetric.miles, LeaderboardPeriod.daily)
     hours_rank_data = get_my_rank(target_user_id, LeaderboardMetric.hours, LeaderboardPeriod.daily)
     best_badge = get_best_current_badge_for_user(target_user_id)
-    lifetime_totals = get_lifetime_totals_for_user(target_user_id)
-    progression = get_level_progress_from_lifetime_miles(lifetime_totals.get("miles", 0.0))
+    progression = get_progression_for_user(target_user_id)
 
     miles_rank = miles_rank_data.get("row", {}).get("rank_position") if miles_rank_data.get("row") else None
     hours_rank = hours_rank_data.get("row", {}).get("rank_position") if hours_rank_data.get("row") else None
@@ -1729,20 +1727,24 @@ def driver_profile(user_id: int, viewer: sqlite3.Row = Depends(require_user)):
         "daily": {
             "miles": daily.get("miles", 0),
             "hours": daily.get("hours", 0),
+            "pickups": daily.get("pickups", 0),
             "miles_rank": miles_rank,
             "hours_rank": hours_rank,
         },
         "weekly": {
             "miles": weekly.get("miles", 0),
             "hours": weekly.get("hours", 0),
+            "pickups": weekly.get("pickups", 0),
         },
         "monthly": {
             "miles": monthly.get("miles", 0),
             "hours": monthly.get("hours", 0),
+            "pickups": monthly.get("pickups", 0),
         },
         "yearly": {
             "miles": yearly.get("miles", 0),
             "hours": yearly.get("hours", 0),
+            "pickups": yearly.get("pickups", 0),
         },
         "progression": progression,
     }
@@ -2123,8 +2125,17 @@ def log_pickup(payload: PickupPayload, user: sqlite3.Row = Depends(require_user)
         """,
         ("pickup", int(user["id"]), float(payload.lat), float(payload.lng), "", payload.zone_id, now, expires),
     )
+    progression_before = get_progression_for_user(int(user["id"]))
     increment_pickup_count(int(user["id"]))
-    return {"ok": True}
+    progression_after = get_progression_for_user(int(user["id"]))
+    return {
+        "ok": True,
+        "xp_awarded": int(progression_after.get("total_xp", 0)) - int(progression_before.get("total_xp", 0)),
+        "leveled_up": int(progression_after.get("level", 1)) > int(progression_before.get("level", 1)),
+        "previous_level": int(progression_before.get("level", 1)),
+        "new_level": int(progression_after.get("level", 1)),
+        "progression": progression_after,
+    }
 
 
 
