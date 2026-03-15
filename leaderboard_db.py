@@ -20,21 +20,11 @@ def init_leaderboard_schema() -> None:
               last_lat DOUBLE PRECISION,
               last_lng DOUBLE PRECISION,
               last_heading DOUBLE PRECISION,
-              previous_session_end_at BIGINT,
-              previous_session_end_lat DOUBLE PRECISION,
-              previous_session_end_lng DOUBLE PRECISION,
-              movement_streak_started_at BIGINT,
-              last_meaningful_motion_at BIGINT,
               updated_at BIGINT NOT NULL,
               FOREIGN KEY(user_id) REFERENCES users(id)
             );
             """
         )
-        _try_exec("ALTER TABLE driver_work_state ADD COLUMN previous_session_end_at BIGINT")
-        _try_exec("ALTER TABLE driver_work_state ADD COLUMN previous_session_end_lat DOUBLE PRECISION")
-        _try_exec("ALTER TABLE driver_work_state ADD COLUMN previous_session_end_lng DOUBLE PRECISION")
-        _try_exec("ALTER TABLE driver_work_state ADD COLUMN movement_streak_started_at BIGINT")
-        _try_exec("ALTER TABLE driver_work_state ADD COLUMN last_meaningful_motion_at BIGINT")
         _db_exec(
             """
             CREATE TABLE IF NOT EXISTS driver_daily_stats (
@@ -114,21 +104,11 @@ def init_leaderboard_schema() -> None:
           last_lat REAL,
           last_lng REAL,
           last_heading REAL,
-          previous_session_end_at INTEGER,
-          previous_session_end_lat REAL,
-          previous_session_end_lng REAL,
-          movement_streak_started_at INTEGER,
-          last_meaningful_motion_at INTEGER,
           updated_at INTEGER NOT NULL,
           FOREIGN KEY(user_id) REFERENCES users(id)
         );
         """
     )
-    _try_exec("ALTER TABLE driver_work_state ADD COLUMN previous_session_end_at INTEGER")
-    _try_exec("ALTER TABLE driver_work_state ADD COLUMN previous_session_end_lat REAL")
-    _try_exec("ALTER TABLE driver_work_state ADD COLUMN previous_session_end_lng REAL")
-    _try_exec("ALTER TABLE driver_work_state ADD COLUMN movement_streak_started_at INTEGER")
-    _try_exec("ALTER TABLE driver_work_state ADD COLUMN last_meaningful_motion_at INTEGER")
     _db_exec(
         """
         CREATE TABLE IF NOT EXISTS driver_daily_stats (
