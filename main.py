@@ -61,7 +61,7 @@ TIMELINE_PATH = FRAMES_DIR / "timeline.json"
 DAY_TENDENCY_DIR = DATA_DIR / "day_tendency"
 DAY_TENDENCY_MODEL_PATH = DAY_TENDENCY_DIR / "model.json"
 NYC_TZ = ZoneInfo("America/New_York")
-DAY_TENDENCY_VERSION = "borough_tendency_v1"
+DAY_TENDENCY_VERSION = "borough_tendency_v2"
 
 DEFAULT_BIN_MINUTES = int(os.environ.get("DEFAULT_BIN_MINUTES", "20"))
 DEFAULT_MIN_TRIPS_PER_WINDOW = int(os.environ.get("DEFAULT_MIN_TRIPS_PER_WINDOW", "25"))
@@ -172,7 +172,7 @@ def _day_tendency_model_is_current() -> bool:
         if not _has_day_tendency_model():
             return False
         model = _read_day_tendency_model()
-        if str(model.get("version")) != "borough_tendency_v1":
+        if str(model.get("version")) != DAY_TENDENCY_VERSION:
             return False
         if "borough_weekday_bin" not in model:
             return False
@@ -265,15 +265,111 @@ def _resolve_borough_from_lat_lng(lat: float, lng: float) -> Optional[Dict[str, 
     return None
 
 
-def _resolve_day_tendency_payload(target_date: date, lat: Optional[float] = None, lng: Optional[float] = None) -> Dict[str, Any]:
+def _mode_flag_enabled(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return int(value) != 0
+    s = str(value).strip().lower()
+    return s in {"1", "true", "yes", "on"}
+
+
+def _scope_label(scope: str) -> str:
+    return {
+        "citywide": "Citywide",
+        "manhattan_mode": "Manhattan Mode",
+        "staten_island_mode": "Staten Island Mode",
+        "bronx_wash_heights_mode": "Bronx / Washington Heights Mode",
+        "queens_mode": "Queens Mode",
+        "brooklyn_mode": "Brooklyn Mode",
+        "manhattan": "Manhattan",
+        "staten_island": "Staten Island",
+        "bronx": "Bronx",
+        "bronx_wash_heights": "Bronx / Washington Heights",
+        "queens": "Queens",
+        "brooklyn": "Brooklyn",
+    }.get(scope, "Citywide")
+
+
+def _source_mode_for_scope(scope: str) -> str:
+    if scope.endswith("_mode"):
+        return scope
+    return "real_location"
+
+
+def resolve_tendency_scope(lat: Optional[float], lng: Optional[float], mode_flags: Dict[str, Any]) -> Dict[str, Any]:
+    if lat is None or lng is None:
+        return {"ready": False, "reason": "waiting_for_location"}
+    try:
+        lat_f = float(lat)
+        lng_f = float(lng)
+    except Exception:
+        return {"ready": False, "reason": "invalid_location"}
+
+    if not (-90.0 <= lat_f <= 90.0 and -180.0 <= lng_f <= 180.0):
+        return {"ready": False, "reason": "invalid_location"}
+
+    borough_context = _resolve_borough_from_lat_lng(lat=lat_f, lng=lng_f)
+    if not borough_context:
+        return {"ready": False, "reason": "location_unresolved"}
+
+    borough_key = str(borough_context.get("borough_key") or "")
+    in_manhattan_core = borough_key == "manhattan" and lat_f < 40.82
+    in_bronx_wash_heights = borough_key == "bronx" or (borough_key == "manhattan" and lat_f >= 40.82)
+
+    if in_manhattan_core and _mode_flag_enabled(mode_flags.get("manhattan_mode")):
+        scope = "manhattan_mode"
+    elif borough_key == "staten_island" and _mode_flag_enabled(mode_flags.get("staten_island_mode")):
+        scope = "staten_island_mode"
+    elif in_bronx_wash_heights and _mode_flag_enabled(mode_flags.get("bronx_wash_heights_mode")):
+        scope = "bronx_wash_heights_mode"
+    elif borough_key == "queens" and _mode_flag_enabled(mode_flags.get("queens_mode")):
+        scope = "queens_mode"
+    elif borough_key == "brooklyn" and _mode_flag_enabled(mode_flags.get("brooklyn_mode")):
+        scope = "brooklyn_mode"
+    elif borough_key == "manhattan":
+        scope = "manhattan"
+    elif borough_key == "staten_island":
+        scope = "staten_island"
+    elif borough_key == "bronx":
+        scope = "bronx_wash_heights"
+    elif borough_key == "queens":
+        scope = "queens"
+    elif borough_key == "brooklyn":
+        scope = "brooklyn"
+    else:
+        scope = "citywide"
+
+    return {
+        "ready": True,
+        "scope": scope,
+        "scope_label": _scope_label(scope),
+        "borough": borough_context.get("borough"),
+        "borough_key": borough_key,
+        "source_mode": _source_mode_for_scope(scope),
+    }
+
+
+def _resolve_day_tendency_payload(
+    target_date: date,
+    lat: Optional[float] = None,
+    lng: Optional[float] = None,
+    mode_flags: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     model = _read_day_tendency_model()
     print("[debug] model keys:", list(model.keys()))
     generated_at = model.get("generated_at") or datetime.now(timezone.utc).isoformat()
     bin_minutes = int(model.get("bin_minutes") or 20)
+    resolved_scope = resolve_tendency_scope(lat=lat, lng=lng, mode_flags=mode_flags or {})
     borough_context = None
-    if lat is not None and lng is not None:
-        borough_context = _resolve_borough_from_lat_lng(lat=float(lat), lng=float(lng))
-    print("[debug] resolved borough:", borough_context)
+    if resolved_scope.get("ready"):
+        borough_context = {
+            "borough": resolved_scope.get("borough"),
+            "borough_key": resolved_scope.get("borough_key"),
+        }
+    print("[debug] resolved scope:", resolved_scope)
 
     def insufficient() -> Dict[str, Any]:
         return {
@@ -288,6 +384,31 @@ def _resolve_day_tendency_payload(target_date: date, lat: Optional[float] = None
             "label": "No data",
             "confidence": 0.0,
             "sample_bins": 0,
+            "scope": resolved_scope.get("scope") if resolved_scope.get("ready") else None,
+            "scope_label": resolved_scope.get("scope_label") if resolved_scope.get("ready") else "Waiting for location",
+            "source_borough": resolved_scope.get("borough") if resolved_scope.get("ready") else None,
+            "source_mode": resolved_scope.get("source_mode") if resolved_scope.get("ready") else None,
+            "generated_at": generated_at,
+        }
+
+    if not resolved_scope.get("ready"):
+        return {
+            "version": DAY_TENDENCY_VERSION,
+            "basis": "historical_expected_borough_timeslot",
+            "tz": "America/New_York",
+            "date": target_date.isoformat(),
+            "status": "waiting_for_location",
+            "score": None,
+            "band": None,
+            "meter_pct": None,
+            "label": "Waiting",
+            "confidence": 0.0,
+            "sample_bins": 0,
+            "scope": None,
+            "scope_label": "Waiting for location",
+            "source_borough": None,
+            "source_mode": None,
+            "explain": "Waiting for valid GPS location.",
             "generated_at": generated_at,
         }
 
@@ -303,11 +424,14 @@ def _resolve_day_tendency_payload(target_date: date, lat: Optional[float] = None
     bin_label = _bin_label(bin_index, bin_minutes=bin_minutes)
     month = int(target_date.month)
 
-    borough_weekday_bin = model.get("borough_weekday_bin") or {}
-    borough_bin = model.get("borough_bin") or {}
-    borough_baseline = model.get("borough_baseline") or {}
-    global_bin = model.get("global_bin") or {}
-    global_baseline = model.get("global_baseline") or {}
+    scope_name = str(resolved_scope.get("scope") or "citywide")
+    scopes = model.get("scopes") or {}
+    scoped_model = scopes.get(scope_name) if isinstance(scopes, dict) else None
+    borough_weekday_bin = (scoped_model or {}).get("borough_weekday_bin") or model.get("borough_weekday_bin") or {}
+    borough_bin = (scoped_model or {}).get("borough_bin") or model.get("borough_bin") or {}
+    borough_baseline = (scoped_model or {}).get("borough_baseline") or model.get("borough_baseline") or {}
+    global_bin = (scoped_model or {}).get("global_bin") or model.get("global_bin") or {}
+    global_baseline = (scoped_model or {}).get("global_baseline") or model.get("global_baseline") or {}
 
     print("[debug] day_tendency cohort sizes:", {
         "borough_weekday_bin": len(borough_weekday_bin) if isinstance(borough_weekday_bin, dict) else 0,
@@ -357,6 +481,10 @@ def _resolve_day_tendency_payload(target_date: date, lat: Optional[float] = None
             },
             "explain": str(item.get("explain", "")),
             "generated_at": generated_at,
+            "scope": scope_name,
+            "scope_label": _scope_label(scope_name),
+            "source_borough": resolved_scope.get("borough"),
+            "source_mode": resolved_scope.get("source_mode"),
         }
 
     if borough_context:
@@ -1279,18 +1407,42 @@ def generate_status():
 
 
 @app.get("/day_tendency/today")
-def day_tendency_today(lat: Optional[float] = None, lng: Optional[float] = None):
+def day_tendency_today(
+    lat: Optional[float] = None,
+    lng: Optional[float] = None,
+    manhattan_mode: Optional[int] = None,
+    staten_island_mode: Optional[int] = None,
+    bronx_wash_heights_mode: Optional[int] = None,
+    queens_mode: Optional[int] = None,
+    brooklyn_mode: Optional[int] = None,
+):
     if not _has_day_tendency_model():
         print("[warn] day tendency model missing; call /generate or allow startup backfill")
         raise HTTPException(status_code=409, detail="day tendency not ready. Call /generate first.")
     target_date = datetime.now(timezone.utc).astimezone(NYC_TZ).date()
-    payload = _resolve_day_tendency_payload(target_date, lat=lat, lng=lng)
+    mode_flags = {
+        "manhattan_mode": manhattan_mode,
+        "staten_island_mode": staten_island_mode,
+        "bronx_wash_heights_mode": bronx_wash_heights_mode,
+        "queens_mode": queens_mode,
+        "brooklyn_mode": brooklyn_mode,
+    }
+    payload = _resolve_day_tendency_payload(target_date, lat=lat, lng=lng, mode_flags=mode_flags)
     print("[debug] day_tendency_today payload:", payload)
     return payload
 
 
 @app.get("/day_tendency/date/{ymd}")
-def day_tendency_for_date(ymd: str, lat: Optional[float] = None, lng: Optional[float] = None):
+def day_tendency_for_date(
+    ymd: str,
+    lat: Optional[float] = None,
+    lng: Optional[float] = None,
+    manhattan_mode: Optional[int] = None,
+    staten_island_mode: Optional[int] = None,
+    bronx_wash_heights_mode: Optional[int] = None,
+    queens_mode: Optional[int] = None,
+    brooklyn_mode: Optional[int] = None,
+):
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", ymd or ""):
         raise HTTPException(status_code=400, detail="ymd must be YYYY-MM-DD")
     try:
@@ -1301,7 +1453,14 @@ def day_tendency_for_date(ymd: str, lat: Optional[float] = None, lng: Optional[f
     if not _has_day_tendency_model():
         print("[warn] day tendency model missing; call /generate or allow startup backfill")
         raise HTTPException(status_code=409, detail="day tendency not ready. Call /generate first.")
-    payload = _resolve_day_tendency_payload(parsed_date, lat=lat, lng=lng)
+    mode_flags = {
+        "manhattan_mode": manhattan_mode,
+        "staten_island_mode": staten_island_mode,
+        "bronx_wash_heights_mode": bronx_wash_heights_mode,
+        "queens_mode": queens_mode,
+        "brooklyn_mode": brooklyn_mode,
+    }
+    payload = _resolve_day_tendency_payload(parsed_date, lat=lat, lng=lng, mode_flags=mode_flags)
     print("[debug] day_tendency_for_date payload:", payload)
     return payload
 

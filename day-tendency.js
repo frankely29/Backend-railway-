@@ -13,6 +13,7 @@
     mutationObserver: null,
     positionPollTimer: null,
     isRefreshing: false,
+    lastCoords: null,
   };
 
   function apiBase() {
@@ -46,7 +47,7 @@
       .dayTendencyMeter {
         position: fixed;
         top: 56px;
-        left: 12px;
+        left: 6px;
         width: 76px;
         padding: 8px 8px 9px;
         border-radius: 12px;
@@ -61,10 +62,13 @@
         user-select: none;
       }
       .dayTendencyTitle {
+        writing-mode: vertical-lr;
+        text-orientation: mixed;
         font-size: 11px;
         line-height: 1.1;
         font-weight: 800;
         letter-spacing: 0.01em;
+        margin-right: 2px;
       }
       .dayTendencySub {
         margin-top: 2px;
@@ -76,7 +80,7 @@
       .dayTendencyBarWrap {
         margin-top: 6px;
         display: flex;
-        align-items: flex-end;
+        align-items: stretch;
         gap: 7px;
       }
       .dayTendencyScale {
@@ -101,7 +105,7 @@
         min-height: 120px;
         display: flex;
         flex-direction: column;
-        justify-content: flex-end;
+        justify-content: flex-start;
         align-items: flex-start;
         gap: 2px;
       }
@@ -132,15 +136,19 @@
       root.setAttribute('role', 'status');
       root.setAttribute('aria-live', 'polite');
       root.innerHTML = `
-        <div class="dayTendencyTitle">Time Tendency</div>
-        <div class="dayTendencySub">Expected</div>
         <div class="dayTendencyBarWrap">
-          <div class="dayTendencyScale">
-            <div class="dayTendencyMarker"></div>
-          </div>
-          <div class="dayTendencyLabels">
-            <div class="dayTendencyScore">--</div>
-            <div class="dayTendencyBand">--</div>
+          <div class="dayTendencyTitle">Time Tendency</div>
+          <div>
+            <div class="dayTendencySub">Expected</div>
+            <div class="dayTendencyBarWrap">
+              <div class="dayTendencyScale">
+                <div class="dayTendencyMarker"></div>
+              </div>
+              <div class="dayTendencyLabels">
+                <div class="dayTendencyBand">--</div>
+                <div class="dayTendencyScore">--</div>
+              </div>
+            </div>
           </div>
         </div>
       `;
@@ -267,7 +275,25 @@
     try {
       const base = apiBase();
       if (!base) throw new Error('API base missing');
-      payload = await fetchJSONWithTimeout(`${base}/day_tendency/today`, 10000);
+
+      const params = new URLSearchParams();
+      if (STATE.lastCoords?.lat != null && STATE.lastCoords?.lng != null) {
+        params.set('lat', String(STATE.lastCoords.lat));
+        params.set('lng', String(STATE.lastCoords.lng));
+      }
+      const modeFlags = [
+        'manhattan_mode',
+        'staten_island_mode',
+        'bronx_wash_heights_mode',
+        'queens_mode',
+        'brooklyn_mode',
+      ];
+      for (const k of modeFlags) {
+        const val = window[k] ?? window?.APP_MODE_FLAGS?.[k] ?? 0;
+        params.set(k, String(val ? 1 : 0));
+      }
+
+      payload = await fetchJSONWithTimeout(`${base}/day_tendency/today?${params.toString()}`, 10000);
       applyDayTendencyPayload(payload);
     } catch (_) {
       hadError = true;
@@ -309,6 +335,24 @@
         refreshDayTendencyMeter();
       }
     });
+
+    if (navigator.geolocation) {
+      navigator.geolocation.watchPosition(
+        (pos) => {
+          STATE.lastCoords = {
+            lat: pos.coords.latitude,
+            lng: pos.coords.longitude,
+          };
+          refreshDayTendencyMeter();
+        },
+        () => {},
+        {
+          enableHighAccuracy: true,
+          maximumAge: 15000,
+          timeout: 10000,
+        }
+      );
+    }
 
     STATE.positionPollTimer = window.setInterval(positionDayTendencyRoot, 5000);
     STATE.refreshTimer = window.setInterval(refreshDayTendencyMeter, DAY_TENDENCY_REFRESH_MS);
