@@ -2186,17 +2186,17 @@ def _pickup_zone_recent_points(
     sql = f"""
         WITH ranked AS (
             SELECT
-                id,
-                zone_id,
-                zone_name,
-                borough,
-                user_id,
-                lat,
-                lng,
-                created_at,
-                ROW_NUMBER() OVER (PARTITION BY zone_id ORDER BY created_at DESC, id DESC) AS rn
+                pl.id,
+                pl.zone_id,
+                pl.zone_name,
+                pl.borough,
+                pl.user_id,
+                pl.lat,
+                pl.lng,
+                pl.created_at,
+                ROW_NUMBER() OVER (PARTITION BY pl.zone_id ORDER BY pl.created_at DESC, pl.id DESC) AS rn
             FROM pickup_logs pl
-            WHERE zone_id IN ({placeholders})
+            WHERE pl.zone_id IN ({placeholders})
               AND {pickup_log_not_voided_sql("pl")}
         )
         SELECT id, zone_id, zone_name, borough, user_id, lat, lng, created_at
@@ -2790,15 +2790,18 @@ def _pickup_zone_same_timeslot_support(zone_ids: List[int], now_ts: int) -> Dict
     slot = _current_timeslot_bin(now_ts)
     lookback = now_ts - (14 * 24 * 3600)
     placeholders = ",".join(["?"] * len(zone_ids))
-    timeslot_expr = "CAST(((MOD(created_at, 86400) / 60) / ? ) AS INTEGER)" if DB_BACKEND == "postgres" else "CAST(((created_at % 86400) / 60) / ? AS INTEGER)"
+    if DB_BACKEND == "postgres":
+        timeslot_expr = "CAST((MOD(pl.created_at, 86400) / 60) / ? AS INTEGER)"
+    else:
+        timeslot_expr = "CAST(((pl.created_at % 86400) / 60) / ? AS INTEGER)"
     sql = f"""
-        SELECT zone_id, COUNT(*) AS c
+        SELECT pl.zone_id, COUNT(*) AS c
         FROM pickup_logs pl
-        WHERE zone_id IN ({placeholders})
-          AND created_at >= ?
+        WHERE pl.zone_id IN ({placeholders})
           AND {pickup_log_not_voided_sql('pl')}
+          AND pl.created_at >= ?
           AND {timeslot_expr} = ?
-        GROUP BY zone_id
+        GROUP BY pl.zone_id
     """
     params = tuple(list(zone_ids) + [lookback, HOTSPOT_TIMESLOT_BIN_MINUTES, slot])
     rows = _db_query_all(sql, params)
@@ -2815,12 +2818,12 @@ def _pickup_zone_historical_support(zone_ids: List[int], now_ts: int) -> Dict[in
     placeholders = ",".join(["?"] * len(zone_ids))
     rows = _db_query_all(
         f"""
-        SELECT zone_id, COUNT(*) AS c
+        SELECT pl.zone_id, COUNT(*) AS c
         FROM pickup_logs pl
-        WHERE zone_id IN ({placeholders})
-          AND created_at >= ?
+        WHERE pl.zone_id IN ({placeholders})
           AND {pickup_log_not_voided_sql("pl")}
-        GROUP BY zone_id
+          AND pl.created_at >= ?
+        GROUP BY pl.zone_id
         """,
         tuple(list(zone_ids) + [lookback]),
     )
@@ -3103,16 +3106,16 @@ def _pickup_zone_stats(zone_ids: List[int], sample_limit: int = 100) -> List[Dic
     sql = f"""
         WITH ranked AS (
             SELECT
-                zone_id,
-                zone_name,
-                borough,
-                user_id,
-                lat,
-                lng,
-                created_at,
-                ROW_NUMBER() OVER (PARTITION BY zone_id ORDER BY created_at DESC, id DESC) AS rn
+                pl.zone_id,
+                pl.zone_name,
+                pl.borough,
+                pl.user_id,
+                pl.lat,
+                pl.lng,
+                pl.created_at,
+                ROW_NUMBER() OVER (PARTITION BY pl.zone_id ORDER BY pl.created_at DESC, pl.id DESC) AS rn
             FROM pickup_logs pl
-            WHERE zone_id IN ({placeholders})
+            WHERE pl.zone_id IN ({placeholders})
               AND {pickup_log_not_voided_sql("pl")}
         )
         SELECT
@@ -3223,7 +3226,7 @@ def _recent_pickups_payload(
     viewer_is_admin = bool(viewer is not None and _flag_to_int(viewer["is_admin"]) == 1)
     safe_limit = max(1, min(200, int(limit)))
     safe_zone_sample_limit = max(1, min(100, int(zone_sample_limit)))
-    sql = """
+    sql = f"""
         SELECT id, lat, lng, zone_id, zone_name, borough, frame_time, created_at
         FROM pickup_logs pl
         WHERE 1=1
@@ -3232,7 +3235,7 @@ def _recent_pickups_payload(
     params: List[Any] = []
 
     if zone_id is not None:
-        sql += " AND zone_id = ?"
+        sql += " AND pl.zone_id = ?"
         params.append(int(zone_id))
 
     bbox = [min_lat, min_lng, max_lat, max_lng]
@@ -3241,10 +3244,10 @@ def _recent_pickups_payload(
         hi_lat = max(float(min_lat), float(max_lat))
         lo_lng = min(float(min_lng), float(max_lng))
         hi_lng = max(float(min_lng), float(max_lng))
-        sql += " AND lat BETWEEN ? AND ? AND lng BETWEEN ? AND ?"
+        sql += " AND pl.lat BETWEEN ? AND ? AND pl.lng BETWEEN ? AND ?"
         params.extend([lo_lat, hi_lat, lo_lng, hi_lng])
 
-    sql += " ORDER BY created_at DESC LIMIT ?"
+    sql += " ORDER BY pl.created_at DESC LIMIT ?"
     params.append(safe_limit)
 
     try:
@@ -3260,14 +3263,14 @@ def _recent_pickups_payload(
     if zone_id is not None:
         zone_ids_for_stats = [int(zone_id)]
     else:
-        stats_sql = f"SELECT DISTINCT zone_id FROM pickup_logs pl WHERE zone_id IS NOT NULL AND {pickup_log_not_voided_sql('pl')}"
+        stats_sql = f"SELECT DISTINCT pl.zone_id FROM pickup_logs pl WHERE pl.zone_id IS NOT NULL AND {pickup_log_not_voided_sql('pl')}"
         stats_params: List[Any] = []
         if all(v is not None for v in bbox):
             lo_lat = min(float(min_lat), float(max_lat))
             hi_lat = max(float(min_lat), float(max_lat))
             lo_lng = min(float(min_lng), float(max_lng))
             hi_lng = max(float(min_lng), float(max_lng))
-            stats_sql += " AND lat BETWEEN ? AND ? AND lng BETWEEN ? AND ?"
+            stats_sql += " AND pl.lat BETWEEN ? AND ? AND pl.lng BETWEEN ? AND ?"
             stats_params.extend([lo_lat, hi_lat, lo_lng, hi_lng])
         stats_rows = _db_query_all(stats_sql, tuple(stats_params))
         zone_ids_for_stats = [int(dict(r)["zone_id"]) for r in stats_rows if dict(r).get("zone_id") is not None]
