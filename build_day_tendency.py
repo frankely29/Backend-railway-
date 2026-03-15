@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 from datetime import datetime, timezone
 import bisect
 import json
@@ -145,11 +145,12 @@ def _explain(cohort_type: str, item: Dict[str, Any]) -> str:
 
 def _insufficient_payload(first_date: str | None = None, last_date: str | None = None, usable_dates: int = 0) -> Dict[str, Any]:
     return {
-        "version": "borough_tendency_v1",
+        "version": "borough_tendency_v2",
         "basis": "historical_expected_borough_timeslot",
         "bin_minutes": 20,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "status": "insufficient_data",
+        "scopes": {},
         "borough_weekday_bin": {},
         "borough_bin": {},
         "borough_baseline": {},
@@ -349,6 +350,20 @@ def build_day_tendency_model(
             out[key] = item
         return out
 
+    def _score_raw_for_scope(scope_name: str, pickup_strength: float, pay_strength: float, breadth_strength: float) -> float:
+        persistence_proxy = min(pickup_strength, breadth_strength)
+        if scope_name == "manhattan_mode":
+            return 0.57 * pickup_strength + 0.22 * breadth_strength + 0.09 * pay_strength + 0.12 * persistence_proxy
+        if scope_name == "staten_island_mode":
+            return 0.58 * pickup_strength + 0.24 * pay_strength + 0.18 * breadth_strength
+        if scope_name == "bronx_wash_heights_mode":
+            return 0.72 * pickup_strength + 0.12 * pay_strength + 0.16 * breadth_strength
+        if scope_name == "queens_mode":
+            return 0.67 * pickup_strength + 0.22 * breadth_strength + 0.11 * pay_strength
+        if scope_name == "brooklyn_mode":
+            return 0.80 * pickup_strength + 0.10 * pay_strength + 0.10 * breadth_strength
+        return 0.70 * pickup_strength + 0.15 * pay_strength + 0.15 * breadth_strength
+
     borough_weekday_bin = build_cohorts(
         usable_rows,
         key_fn=lambda r: f"{str(r[4])}|{int(r[1])}|{int(r[2])}",
@@ -370,7 +385,7 @@ def build_day_tendency_model(
         cohort_type="global_bin",
     )
 
-    def score_family(cohorts: Dict[str, Dict[str, Any]], cohort_type: str) -> None:
+    def score_family(cohorts: Dict[str, Dict[str, Any]], cohort_type: str, scope_name: Optional[str] = None) -> None:
         pickup_values = sorted(float(v["pickups_bin_avg"]) for v in cohorts.values())
         pay_values = sorted(float(v["avg_driver_pay_bin_avg"]) for v in cohorts.values())
         breadth_values = sorted(float(v["active_zones_bin_avg"]) for v in cohorts.values())
@@ -379,7 +394,7 @@ def build_day_tendency_model(
             pickup_strength = percentile_rank(pickup_values, float(v["pickups_bin_avg"]))
             pay_strength = percentile_rank(pay_values, float(v["avg_driver_pay_bin_avg"]))
             breadth_strength = percentile_rank(breadth_values, float(v["active_zones_bin_avg"]))
-            score_raw = 0.70 * pickup_strength + 0.15 * pay_strength + 0.15 * breadth_strength
+            score_raw = _score_raw_for_scope(str(scope_name or "citywide"), pickup_strength, pay_strength, breadth_strength)
             score = max(0, min(100, int(round(100 * score_raw))))
             band = _band_from_score(score)
 
@@ -393,10 +408,10 @@ def build_day_tendency_model(
             v["confidence"] = round(min(1.0, float(v.get("sample_bins", 0)) / 12.0), 2)
             v["explain"] = _explain(cohort_type, v)
 
-    score_family(borough_weekday_bin, "borough_weekday_bin")
-    score_family(borough_bin, "borough_bin")
-    score_family(borough_baseline, "borough_baseline")
-    score_family(global_bin, "global_bin")
+    score_family(borough_weekday_bin, "borough_weekday_bin", scope_name="citywide")
+    score_family(borough_bin, "borough_bin", scope_name="citywide")
+    score_family(borough_baseline, "borough_baseline", scope_name="citywide")
+    score_family(global_bin, "global_bin", scope_name="citywide")
 
     global_pickups_avg = _mean([float(r[5]) for r in usable_rows])
     global_pay_avg = _mean([float(r[6]) if r[6] is not None else 0.0 for r in usable_rows])
@@ -409,7 +424,7 @@ def build_day_tendency_model(
     pickup_strength = percentile_rank(global_bin_pickup_values, global_pickups_avg) if global_bin_pickup_values else 0.5
     pay_strength = percentile_rank(global_bin_pay_values, global_pay_avg) if global_bin_pay_values else 0.5
     breadth_strength = percentile_rank(global_bin_breadth_values, global_breadth_avg) if global_bin_breadth_values else 0.5
-    score_raw = 0.70 * pickup_strength + 0.15 * pay_strength + 0.15 * breadth_strength
+    score_raw = _score_raw_for_scope("citywide", pickup_strength, pay_strength, breadth_strength)
     score = max(0, min(100, int(round(100 * score_raw))))
     band = _band_from_score(score)
 
@@ -430,8 +445,100 @@ def build_day_tendency_model(
     }
     global_baseline["explain"] = _explain("global_baseline", global_baseline)
 
+    scope_filters: Dict[str, set[str]] = {
+        "citywide": {"manhattan", "brooklyn", "queens", "bronx", "staten_island"},
+        "manhattan_mode": {"manhattan"},
+        "staten_island_mode": {"staten_island"},
+        "bronx_wash_heights_mode": {"bronx", "manhattan"},
+        "queens_mode": {"queens"},
+        "brooklyn_mode": {"brooklyn"},
+        "manhattan": {"manhattan"},
+        "staten_island": {"staten_island"},
+        "queens": {"queens"},
+        "brooklyn": {"brooklyn"},
+        "bronx": {"bronx"},
+        "bronx_wash_heights": {"bronx", "manhattan"},
+    }
+
+    def _build_scope_payload(scope_name: str, borough_keys: set[str]) -> Dict[str, Any]:
+        scoped_rows = [r for r in usable_rows if str(r[4]) in borough_keys]
+        if not scoped_rows:
+            return {
+                "borough_weekday_bin": {},
+                "borough_bin": {},
+                "borough_baseline": {},
+                "global_bin": {},
+                "global_baseline": {},
+            }
+
+        scoped_borough_weekday_bin = build_cohorts(
+            scoped_rows,
+            key_fn=lambda r: f"{str(r[4])}|{int(r[1])}|{int(r[2])}",
+            cohort_type="borough_weekday_bin",
+        )
+        scoped_borough_bin = build_cohorts(
+            scoped_rows,
+            key_fn=lambda r: f"{str(r[4])}|{int(r[2])}",
+            cohort_type="borough_bin",
+        )
+        scoped_borough_baseline = build_cohorts(
+            scoped_rows,
+            key_fn=lambda r: f"{str(r[4])}",
+            cohort_type="borough_baseline",
+        )
+        scoped_global_bin = build_cohorts(
+            scoped_rows,
+            key_fn=lambda r: f"{int(r[2])}",
+            cohort_type="global_bin",
+        )
+
+        score_family(scoped_borough_weekday_bin, "borough_weekday_bin", scope_name=scope_name)
+        score_family(scoped_borough_bin, "borough_bin", scope_name=scope_name)
+        score_family(scoped_borough_baseline, "borough_baseline", scope_name=scope_name)
+        score_family(scoped_global_bin, "global_bin", scope_name=scope_name)
+
+        scoped_pickups_avg = _mean([float(r[5]) for r in scoped_rows])
+        scoped_pay_avg = _mean([float(r[6]) if r[6] is not None else 0.0 for r in scoped_rows])
+        scoped_breadth_avg = _mean([float(r[7]) for r in scoped_rows])
+        scoped_global_bin_pickup_values = sorted(float(v["pickups_bin_avg"]) for v in scoped_global_bin.values())
+        scoped_global_bin_pay_values = sorted(float(v["avg_driver_pay_bin_avg"]) for v in scoped_global_bin.values())
+        scoped_global_bin_breadth_values = sorted(float(v["active_zones_bin_avg"]) for v in scoped_global_bin.values())
+
+        scoped_pickup_strength = percentile_rank(scoped_global_bin_pickup_values, scoped_pickups_avg) if scoped_global_bin_pickup_values else 0.5
+        scoped_pay_strength = percentile_rank(scoped_global_bin_pay_values, scoped_pay_avg) if scoped_global_bin_pay_values else 0.5
+        scoped_breadth_strength = percentile_rank(scoped_global_bin_breadth_values, scoped_breadth_avg) if scoped_global_bin_breadth_values else 0.5
+        scoped_score_raw = _score_raw_for_scope(scope_name, scoped_pickup_strength, scoped_pay_strength, scoped_breadth_strength)
+        scoped_score = max(0, min(100, int(round(100 * scoped_score_raw))))
+        scoped_band = _band_from_score(scoped_score)
+        scoped_global_baseline: Dict[str, Any] = {
+            "sample_bins": len(scoped_rows),
+            "pickups_bin_avg": round(scoped_pickups_avg, 2),
+            "avg_driver_pay_bin_avg": round(scoped_pay_avg, 2),
+            "active_zones_bin_avg": round(scoped_breadth_avg, 2),
+            "pickup_strength": round(scoped_pickup_strength, 4),
+            "pay_strength": round(scoped_pay_strength, 4),
+            "breadth_strength": round(scoped_breadth_strength, 4),
+            "score_raw": round(scoped_score_raw, 4),
+            "score": scoped_score,
+            "band": scoped_band,
+            "label": _label_from_band(scoped_band),
+            "confidence": round(min(1.0, len(scoped_rows) / 12.0), 2),
+            "cohort_type": "global_baseline",
+        }
+        scoped_global_baseline["explain"] = _explain("global_baseline", scoped_global_baseline)
+
+        return {
+            "borough_weekday_bin": scoped_borough_weekday_bin,
+            "borough_bin": scoped_borough_bin,
+            "borough_baseline": scoped_borough_baseline,
+            "global_bin": scoped_global_bin,
+            "global_baseline": scoped_global_baseline,
+        }
+
+    scopes = {scope_name: _build_scope_payload(scope_name, borough_keys) for scope_name, borough_keys in scope_filters.items()}
+
     payload = {
-        "version": "borough_tendency_v1",
+        "version": "borough_tendency_v2",
         "basis": "historical_expected_borough_timeslot",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "bin_minutes": int(bin_minutes),
@@ -446,6 +553,7 @@ def build_day_tendency_model(
         "borough_baseline": borough_baseline,
         "global_bin": global_bin,
         "global_baseline": global_baseline,
+        "scopes": scopes,
         "dataset": {
             "usable_dates": len(usable_dates),
             "first_date": first_date,
