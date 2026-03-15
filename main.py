@@ -1310,9 +1310,29 @@ app.include_router(leaderboard_router)
 def startup():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     FRAMES_DIR.mkdir(parents=True, exist_ok=True)
-    _db_init()
-    init_leaderboard_schema()
-    _ensure_admin_seed()
+
+    startup_failures: List[str] = []
+
+    try:
+        _db_init()
+    except Exception as exc:
+        startup_failures.append(f"_db_init failed: {exc}")
+        print("[warn] startup: _db_init failed; continuing for read-only endpoints")
+        print(traceback.format_exc())
+
+    try:
+        init_leaderboard_schema()
+    except Exception as exc:
+        startup_failures.append(f"init_leaderboard_schema failed: {exc}")
+        print("[warn] startup: init_leaderboard_schema failed; continuing for read-only endpoints")
+        print(traceback.format_exc())
+
+    try:
+        _ensure_admin_seed()
+    except Exception as exc:
+        startup_failures.append(f"_ensure_admin_seed failed: {exc}")
+        print("[warn] startup: _ensure_admin_seed failed; continuing for read-only endpoints")
+        print(traceback.format_exc())
 
     # Auto-fill generate state if frames/day tendency already exist
     try:
@@ -1332,6 +1352,7 @@ def startup():
                         "ok": True,
                         "count": tl.get("count"),
                         "day_tendency": {"ok": True, "built_at_startup": False},
+                        "startup_failures": startup_failures,
                     },
                 )
             except Exception:
@@ -1342,6 +1363,7 @@ def startup():
                     result={
                         "ok": True,
                         "day_tendency": {"ok": True, "built_at_startup": False},
+                        "startup_failures": startup_failures,
                     },
                 )
             return
@@ -1364,6 +1386,7 @@ def startup():
                         "ok": True,
                         "count": tl.get("count"),
                         "day_tendency": {"ok": _has_day_tendency_model(), "built_at_startup": True},
+                        "startup_failures": startup_failures,
                     },
                 )
             except Exception:
@@ -1374,6 +1397,7 @@ def startup():
                     result={
                         "ok": True,
                         "day_tendency": {"ok": _has_day_tendency_model(), "built_at_startup": True},
+                        "startup_failures": startup_failures,
                     },
                 )
             return
@@ -1381,9 +1405,9 @@ def startup():
         if zones_ok and parquets_ok:
             start_generate(DEFAULT_BIN_MINUTES, DEFAULT_MIN_TRIPS_PER_WINDOW)
         else:
-            _set_state(state="idle")
+            _set_state(state="idle", result={"startup_failures": startup_failures})
     except Exception:
-        _set_state(state="idle")
+        _set_state(state="idle", result={"startup_failures": startup_failures})
 
 
 # =========================================================
