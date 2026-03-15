@@ -93,6 +93,12 @@ PICKUP_ZONE_SECOND_COMPONENT_MIN_POINTS = 3
 PICKUP_ZONE_SECOND_COMPONENT_MIN_SCORE_RATIO = 0.45
 HOTSPOT_RECENT_LOOKBACK_SECONDS = 6 * 3600
 HOTSPOT_TIMESLOT_BIN_MINUTES = 20
+PICKUP_SAVE_COOLDOWN_SECONDS = 600
+PICKUP_SAVE_MIN_DRIVING_SECONDS = 360
+PICKUP_SAVE_SESSION_BREAK_SECONDS = 480
+PICKUP_SAVE_MOTION_STALE_SECONDS = 180
+PICKUP_SAVE_RELOCATION_MIN_MILES = 0.25
+PICKUP_SAVE_SAME_POSITION_MAX_MILES = 0.08
 
 _pickup_zone_geom_cache: Optional[Dict[int, Dict[str, Any]]] = None
 _pickup_zone_geom_cache_mtime: Optional[float] = None
@@ -872,6 +878,12 @@ def _db_init() -> None:
         )
         _db_exec("CREATE INDEX IF NOT EXISTS idx_pickup_logs_created_at ON pickup_logs(created_at DESC);")
         _db_exec("CREATE INDEX IF NOT EXISTS idx_pickup_logs_zone_time ON pickup_logs(zone_id, created_at DESC);")
+        _db_exec("ALTER TABLE pickup_logs ADD COLUMN IF NOT EXISTS is_voided BOOLEAN NOT NULL DEFAULT FALSE;")
+        _db_exec("ALTER TABLE pickup_logs ADD COLUMN IF NOT EXISTS voided_at BIGINT;")
+        _db_exec("ALTER TABLE pickup_logs ADD COLUMN IF NOT EXISTS voided_by_admin_user_id BIGINT;")
+        _db_exec("ALTER TABLE pickup_logs ADD COLUMN IF NOT EXISTS void_reason TEXT;")
+        _db_exec("ALTER TABLE pickup_logs ADD COLUMN IF NOT EXISTS counted_for_pickup_stats BOOLEAN NOT NULL DEFAULT TRUE;")
+        _db_exec("ALTER TABLE pickup_logs ADD COLUMN IF NOT EXISTS guard_reason TEXT;")
 
         _db_exec(
             """
@@ -1031,12 +1043,42 @@ def _db_init() -> None:
           borough TEXT,
           frame_time TEXT,
           created_at INTEGER NOT NULL,
+          is_voided INTEGER NOT NULL DEFAULT 0,
+          voided_at INTEGER,
+          voided_by_admin_user_id INTEGER,
+          void_reason TEXT,
+          counted_for_pickup_stats INTEGER NOT NULL DEFAULT 1,
+          guard_reason TEXT,
           FOREIGN KEY(user_id) REFERENCES users(id)
         );
         """
     )
     _db_exec("CREATE INDEX IF NOT EXISTS idx_pickup_logs_created_at ON pickup_logs(created_at DESC);")
     _db_exec("CREATE INDEX IF NOT EXISTS idx_pickup_logs_zone_time ON pickup_logs(zone_id, created_at DESC);")
+    try:
+        _db_exec("ALTER TABLE pickup_logs ADD COLUMN is_voided INTEGER NOT NULL DEFAULT 0;")
+    except Exception:
+        pass
+    try:
+        _db_exec("ALTER TABLE pickup_logs ADD COLUMN voided_at INTEGER;")
+    except Exception:
+        pass
+    try:
+        _db_exec("ALTER TABLE pickup_logs ADD COLUMN voided_by_admin_user_id INTEGER;")
+    except Exception:
+        pass
+    try:
+        _db_exec("ALTER TABLE pickup_logs ADD COLUMN void_reason TEXT;")
+    except Exception:
+        pass
+    try:
+        _db_exec("ALTER TABLE pickup_logs ADD COLUMN counted_for_pickup_stats INTEGER NOT NULL DEFAULT 1;")
+    except Exception:
+        pass
+    try:
+        _db_exec("ALTER TABLE pickup_logs ADD COLUMN guard_reason TEXT;")
+    except Exception:
+        pass
 
     _db_exec(
         """
@@ -1252,7 +1294,11 @@ from leaderboard_service import (
     get_my_rank,
     get_overview_for_user,
 )
-from leaderboard_tracker import increment_pickup_count, record_presence_heartbeat
+from leaderboard_tracker import (
+    decrement_pickup_count_for_timestamp,
+    increment_pickup_count,
+    record_presence_heartbeat,
+)
 
 app.include_router(chat_router)
 app.include_router(leaderboard_router)
@@ -2110,34 +2156,283 @@ def log_pickup(payload: PickupPayload, user: sqlite3.Row = Depends(require_user)
     borough = (payload.borough or "").strip() or None
     frame_time = (payload.frame_time or "").strip() or None
 
-    _db_exec(
-        """
-        INSERT INTO pickup_logs(user_id, lat, lng, zone_id, zone_name, borough, frame_time, created_at)
-        VALUES(?,?,?,?,?,?,?,?)
+    with _db_lock:
+        conn = _db()
+        try:
+            cur = conn.cursor()
+            not_voided = _pickup_log_not_voided_sql("pl")
+            cur.execute(
+                _sql(
+                    f"""
+                    SELECT pl.*
+                    FROM pickup_logs pl
+                    WHERE pl.user_id = ?
+                      AND {not_voided}
+                    ORDER BY pl.created_at DESC, pl.id DESC
+                    LIMIT 1
+                    """
+                ),
+                (int(user["id"]),),
+            )
+            latest = cur.fetchone()
+            latest_data = dict(latest) if latest is not None else {}
+
+            if latest_data.get("created_at") is not None:
+                cooldown_until = int(latest_data["created_at"]) + PICKUP_SAVE_COOLDOWN_SECONDS
+                if now < cooldown_until:
+                    remaining = cooldown_until - now
+                    raise HTTPException(
+                        status_code=429,
+                        detail={
+                            "ok": False,
+                            "code": "pickup_cooldown_active",
+                            "title": "Save button cooling off",
+                            "detail": f"Save button cooling off — wait {_format_wait_short(remaining)}.",
+                            "cooldown_remaining_seconds": remaining,
+                            "cooldown_until_unix": cooldown_until,
+                        },
+                    )
+
+            cur.execute(_sql("SELECT * FROM driver_work_state WHERE user_id=? LIMIT 1"), (int(user["id"]),))
+            work_state = cur.fetchone()
+            work_state_data = dict(work_state) if work_state is not None else {}
+            movement_streak_started_at = int(work_state_data["movement_streak_started_at"]) if work_state_data.get("movement_streak_started_at") is not None else None
+            last_meaningful_motion_at = int(work_state_data["last_meaningful_motion_at"]) if work_state_data.get("last_meaningful_motion_at") is not None else None
+            driving_ok = bool(
+                movement_streak_started_at is not None
+                and last_meaningful_motion_at is not None
+                and (now - movement_streak_started_at) >= PICKUP_SAVE_MIN_DRIVING_SECONDS
+                and (now - last_meaningful_motion_at) <= PICKUP_SAVE_MOTION_STALE_SECONDS
+            )
+
+            previous_session_distance_miles = _safe_haversine_miles(
+                float(payload.lat),
+                float(payload.lng),
+                work_state_data.get("previous_session_end_lat"),
+                work_state_data.get("previous_session_end_lng"),
+            )
+            session_relocation_ok = bool(
+                previous_session_distance_miles is not None
+                and previous_session_distance_miles >= PICKUP_SAVE_RELOCATION_MIN_MILES
+            )
+
+            last_saved_distance_miles = _safe_haversine_miles(
+                float(payload.lat),
+                float(payload.lng),
+                latest_data.get("lat"),
+                latest_data.get("lng"),
+            )
+            last_saved_relocation_ok = bool(
+                last_saved_distance_miles is not None
+                and last_saved_distance_miles >= PICKUP_SAVE_RELOCATION_MIN_MILES
+            )
+
+            guard_reason = None
+            if driving_ok:
+                guard_reason = "recent_driving"
+            elif session_relocation_ok:
+                guard_reason = "relocated_from_previous_map_session"
+            elif last_saved_relocation_ok:
+                guard_reason = "relocated_from_last_saved_trip"
+            elif last_saved_distance_miles is not None and last_saved_distance_miles <= PICKUP_SAVE_SAME_POSITION_MAX_MILES:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "ok": False,
+                        "code": "pickup_same_position",
+                        "title": "Trip not saved",
+                        "detail": "Same position detected. Move to a new location or keep driving before saving another trip.",
+                        "distance_miles": last_saved_distance_miles,
+                        "required_distance_miles": PICKUP_SAVE_SAME_POSITION_MAX_MILES,
+                    },
+                )
+            else:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "ok": False,
+                        "code": "pickup_needs_recent_driving",
+                        "title": "Trip not saved",
+                        "detail": "Drive at least 6 minutes or move to a new location before saving this trip.",
+                    },
+                )
+
+            progression_before = get_progression_for_user(int(user["id"]))
+            cur.execute(
+                _sql(
+                    """
+                    INSERT INTO pickup_logs(
+                        user_id, lat, lng, zone_id, zone_name, borough, frame_time, created_at,
+                        is_voided, counted_for_pickup_stats, guard_reason
+                    )
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                    """
+                ),
+                (
+                    int(user["id"]),
+                    float(payload.lat),
+                    float(payload.lng),
+                    payload.zone_id,
+                    zone_name,
+                    borough,
+                    frame_time,
+                    now,
+                    False if DB_BACKEND == "postgres" else 0,
+                    True if DB_BACKEND == "postgres" else 1,
+                    guard_reason,
+                ),
+            )
+            cur.execute(
+                _sql(
+                    """
+                    INSERT INTO events(type, user_id, lat, lng, text, zone_id, created_at, expires_at)
+                    VALUES(?,?,?,?,?,?,?,?)
+                    """
+                ),
+                ("pickup", int(user["id"]), float(payload.lat), float(payload.lng), "", payload.zone_id, now, expires),
+            )
+            conn.commit()
+            increment_pickup_count(int(user["id"]))
+            progression_after = get_progression_for_user(int(user["id"]))
+            return {
+                "ok": True,
+                "xp_awarded": int(progression_after.get("total_xp", 0)) - int(progression_before.get("total_xp", 0)),
+                "leveled_up": int(progression_after.get("level", 1)) > int(progression_before.get("level", 1)),
+                "previous_level": int(progression_before.get("level", 1)),
+                "new_level": int(progression_after.get("level", 1)),
+                "progression": progression_after,
+                "cooldown_until_unix": now + PICKUP_SAVE_COOLDOWN_SECONDS,
+                "accepted_guard_reason": guard_reason,
+            }
+        finally:
+            conn.close()
+
+
+
+
+
+
+
+def _pickup_log_not_voided_sql(alias: str) -> str:
+    if DB_BACKEND == "postgres":
+        return f"COALESCE({alias}.is_voided, FALSE) = FALSE"
+    return f"COALESCE(CAST({alias}.is_voided AS INTEGER), 0) = 0"
+
+
+def _safe_haversine_miles(lat1, lng1, lat2, lng2) -> Optional[float]:
+    try:
+        if lat1 is None or lng1 is None or lat2 is None or lng2 is None:
+            return None
+        radius_m = 6371000.0
+        phi1 = math.radians(float(lat1))
+        phi2 = math.radians(float(lat2))
+        dphi = math.radians(float(lat2) - float(lat1))
+        dlambda = math.radians(float(lng2) - float(lng1))
+        a = math.sin(dphi / 2.0) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2.0) ** 2
+        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+        return (radius_m * c) * 0.000621371
+    except Exception:
+        return None
+
+
+def _format_wait_short(seconds: int) -> str:
+    sec = max(0, int(seconds))
+    m, s = divmod(sec, 60)
+    if m <= 0:
+        return f"{s}s"
+    if s == 0:
+        return f"{m}m"
+    return f"{m}m {s}s"
+
+
+def _latest_active_pickup_log_for_user(user_id: int) -> Optional[sqlite3.Row]:
+    not_voided = _pickup_log_not_voided_sql("pl")
+    return _db_query_one(
+        f"""
+        SELECT pl.*
+        FROM pickup_logs pl
+        WHERE pl.user_id = ?
+          AND {not_voided}
+        ORDER BY pl.created_at DESC, pl.id DESC
+        LIMIT 1
         """,
-        (int(user["id"]), float(payload.lat), float(payload.lng), payload.zone_id, zone_name, borough, frame_time, now),
+        (int(user_id),),
     )
 
-    _db_exec(
-        """
-        INSERT INTO events(type, user_id, lat, lng, text, zone_id, created_at, expires_at)
-        VALUES(?,?,?,?,?,?,?,?)
-        """,
-        ("pickup", int(user["id"]), float(payload.lat), float(payload.lng), "", payload.zone_id, now, expires),
+
+def _evaluate_pickup_save_guard(user_id: int, lat: float, lng: float, now_ts: int) -> Dict[str, Any]:
+    latest = _latest_active_pickup_log_for_user(int(user_id))
+    latest_data = dict(latest) if latest is not None else {}
+    if latest and latest_data.get("created_at") is not None:
+        cooldown_until = int(latest_data["created_at"]) + PICKUP_SAVE_COOLDOWN_SECONDS
+        if now_ts < cooldown_until:
+            remaining = cooldown_until - now_ts
+            return {
+                "ok": False,
+                "code": "pickup_cooldown_active",
+                "title": "Save button cooling off",
+                "detail": f"Save button cooling off — wait {_format_wait_short(remaining)}.",
+                "cooldown_remaining_seconds": remaining,
+                "cooldown_until_unix": cooldown_until,
+            }
+
+    work_state = _db_query_one("SELECT * FROM driver_work_state WHERE user_id=? LIMIT 1", (int(user_id),))
+    work_state_data = dict(work_state) if work_state is not None else {}
+    movement_streak_started_at = int(work_state_data["movement_streak_started_at"]) if work_state and work_state_data.get("movement_streak_started_at") is not None else None
+    last_meaningful_motion_at = int(work_state_data["last_meaningful_motion_at"]) if work_state and work_state_data.get("last_meaningful_motion_at") is not None else None
+    driving_ok = bool(
+        movement_streak_started_at is not None
+        and last_meaningful_motion_at is not None
+        and (now_ts - movement_streak_started_at) >= PICKUP_SAVE_MIN_DRIVING_SECONDS
+        and (now_ts - last_meaningful_motion_at) <= PICKUP_SAVE_MOTION_STALE_SECONDS
     )
-    progression_before = get_progression_for_user(int(user["id"]))
-    increment_pickup_count(int(user["id"]))
-    progression_after = get_progression_for_user(int(user["id"]))
+
+    previous_session_distance_miles = None
+    session_relocation_ok = False
+    if work_state is not None:
+        previous_session_distance_miles = _safe_haversine_miles(
+            lat,
+            lng,
+            work_state_data.get("previous_session_end_lat"),
+            work_state_data.get("previous_session_end_lng"),
+        )
+        session_relocation_ok = (
+            previous_session_distance_miles is not None
+            and previous_session_distance_miles >= PICKUP_SAVE_RELOCATION_MIN_MILES
+        )
+
+    last_saved_distance_miles = None
+    last_saved_relocation_ok = False
+    if latest is not None:
+        last_saved_distance_miles = _safe_haversine_miles(lat, lng, latest_data.get("lat"), latest_data.get("lng"))
+        last_saved_relocation_ok = (
+            last_saved_distance_miles is not None
+            and last_saved_distance_miles >= PICKUP_SAVE_RELOCATION_MIN_MILES
+        )
+
+    if driving_ok:
+        return {"ok": True, "guard_reason": "recent_driving"}
+    if session_relocation_ok:
+        return {"ok": True, "guard_reason": "relocated_from_previous_map_session"}
+    if last_saved_relocation_ok:
+        return {"ok": True, "guard_reason": "relocated_from_last_saved_trip"}
+
+    if last_saved_distance_miles is not None and last_saved_distance_miles <= PICKUP_SAVE_SAME_POSITION_MAX_MILES:
+        return {
+            "ok": False,
+            "code": "pickup_same_position",
+            "title": "Trip not saved",
+            "detail": "Same position detected. Move to a new location or keep driving before saving another trip.",
+            "distance_miles": last_saved_distance_miles,
+            "required_distance_miles": PICKUP_SAVE_SAME_POSITION_MAX_MILES,
+        }
+
     return {
-        "ok": True,
-        "xp_awarded": int(progression_after.get("total_xp", 0)) - int(progression_before.get("total_xp", 0)),
-        "leveled_up": int(progression_after.get("level", 1)) > int(progression_before.get("level", 1)),
-        "previous_level": int(progression_before.get("level", 1)),
-        "new_level": int(progression_after.get("level", 1)),
-        "progression": progression_after,
+        "ok": False,
+        "code": "pickup_needs_recent_driving",
+        "title": "Trip not saved",
+        "detail": "Drive at least 6 minutes or move to a new location before saving this trip.",
     }
-
-
 
 
 def _load_pickup_zone_geometries() -> Dict[int, Dict[str, Any]]:
@@ -2203,21 +2498,23 @@ def _pickup_zone_recent_points(
     cap = max(1, min(PICKUP_ZONE_HOTSPOT_MAX_POINTS, int(max_points_per_zone)))
     clean_zone_ids = list(dict.fromkeys(clean_zone_ids))[:256]
     placeholders = ",".join(["?"] * len(clean_zone_ids))
+    not_voided = _pickup_log_not_voided_sql("pl")
 
     sql = f"""
         WITH ranked AS (
             SELECT
-                id,
-                zone_id,
-                zone_name,
-                borough,
-                user_id,
-                lat,
-                lng,
-                created_at,
-                ROW_NUMBER() OVER (PARTITION BY zone_id ORDER BY created_at DESC, id DESC) AS rn
-            FROM pickup_logs
-            WHERE zone_id IN ({placeholders})
+                pl.id,
+                pl.zone_id,
+                pl.zone_name,
+                pl.borough,
+                pl.user_id,
+                pl.lat,
+                pl.lng,
+                pl.created_at,
+                ROW_NUMBER() OVER (PARTITION BY pl.zone_id ORDER BY pl.created_at DESC, pl.id DESC) AS rn
+            FROM pickup_logs pl
+            WHERE pl.zone_id IN ({placeholders})
+              AND {not_voided}
         )
         SELECT id, zone_id, zone_name, borough, user_id, lat, lng, created_at
         FROM ranked
@@ -2811,12 +3108,13 @@ def _pickup_zone_same_timeslot_support(zone_ids: List[int], now_ts: int) -> Dict
     lookback = now_ts - (14 * 24 * 3600)
     placeholders = ",".join(["?"] * len(zone_ids))
     sql = f"""
-        SELECT zone_id, COUNT(*) AS c
-        FROM pickup_logs
-        WHERE zone_id IN ({placeholders})
-          AND created_at >= ?
-          AND CAST(((created_at % 86400) / 60) / ? AS INTEGER) = ?
-        GROUP BY zone_id
+        SELECT pl.zone_id, COUNT(*) AS c
+        FROM pickup_logs pl
+        WHERE pl.zone_id IN ({placeholders})
+          AND {_pickup_log_not_voided_sql("pl")}
+          AND pl.created_at >= ?
+          AND CAST(((pl.created_at % 86400) / 60) / ? AS INTEGER) = ?
+        GROUP BY pl.zone_id
     """
     params = tuple(list(zone_ids) + [lookback, HOTSPOT_TIMESLOT_BIN_MINUTES, slot])
     rows = _db_query_all(sql, params)
@@ -2833,10 +3131,11 @@ def _pickup_zone_historical_support(zone_ids: List[int], now_ts: int) -> Dict[in
     placeholders = ",".join(["?"] * len(zone_ids))
     rows = _db_query_all(
         f"""
-        SELECT zone_id, COUNT(*) AS c
-        FROM pickup_logs
-        WHERE zone_id IN ({placeholders})
-          AND created_at >= ?
+        SELECT pl.zone_id, COUNT(*) AS c
+        FROM pickup_logs pl
+        WHERE pl.zone_id IN ({placeholders})
+          AND {_pickup_log_not_voided_sql("pl")}
+          AND pl.created_at >= ?
         GROUP BY zone_id
         """,
         tuple(list(zone_ids) + [lookback]),
@@ -2858,6 +3157,7 @@ def _pickup_zone_density_penalty(zone_ids: List[int]) -> Dict[int, float]:
         FROM presence p
         LEFT JOIN pickup_logs pl ON pl.user_id = p.user_id
         WHERE p.updated_at >= ?
+          AND {_pickup_log_not_voided_sql("pl")}
           AND pl.zone_id IN ({placeholders})
           AND pl.created_at >= ?
         GROUP BY pl.zone_id
@@ -3116,20 +3416,23 @@ def _pickup_zone_stats(zone_ids: List[int], sample_limit: int = 100) -> List[Dic
     safe_sample_limit = max(1, min(100, int(sample_limit)))
     clean_zone_ids = clean_zone_ids[:256]
     placeholders = ",".join(["?"] * len(clean_zone_ids))
+    not_voided = _pickup_log_not_voided_sql("pl")
 
     sql = f"""
         WITH ranked AS (
             SELECT
-                zone_id,
-                zone_name,
-                borough,
-                user_id,
-                lat,
-                lng,
-                created_at,
-                ROW_NUMBER() OVER (PARTITION BY zone_id ORDER BY created_at DESC, id DESC) AS rn
-            FROM pickup_logs
-            WHERE zone_id IN ({placeholders})
+                pl.zone_id,
+                pl.zone_name,
+                pl.borough,
+                pl.user_id,
+                pl.lat,
+                pl.lng,
+                pl.created_at,
+                pl.id,
+                ROW_NUMBER() OVER (PARTITION BY pl.zone_id ORDER BY pl.created_at DESC, pl.id DESC) AS rn
+            FROM pickup_logs pl
+            WHERE pl.zone_id IN ({placeholders})
+              AND {not_voided}
         )
         SELECT
             zone_id,
@@ -3239,15 +3542,16 @@ def _recent_pickups_payload(
     viewer_is_admin = bool(viewer is not None and _flag_to_int(viewer["is_admin"]) == 1)
     safe_limit = max(1, min(200, int(limit)))
     safe_zone_sample_limit = max(1, min(100, int(zone_sample_limit)))
-    sql = """
-        SELECT id, lat, lng, zone_id, zone_name, borough, frame_time, created_at
-        FROM pickup_logs
-        WHERE 1=1
+    not_voided = _pickup_log_not_voided_sql("pl")
+    sql = f"""
+        SELECT pl.id, pl.lat, pl.lng, pl.zone_id, pl.zone_name, pl.borough, pl.frame_time, pl.created_at
+        FROM pickup_logs pl
+        WHERE {not_voided}
     """
     params: List[Any] = []
 
     if zone_id is not None:
-        sql += " AND zone_id = ?"
+        sql += " AND pl.zone_id = ?"
         params.append(int(zone_id))
 
     bbox = [min_lat, min_lng, max_lat, max_lng]
@@ -3256,7 +3560,7 @@ def _recent_pickups_payload(
         hi_lat = max(float(min_lat), float(max_lat))
         lo_lng = min(float(min_lng), float(max_lng))
         hi_lng = max(float(min_lng), float(max_lng))
-        sql += " AND lat BETWEEN ? AND ? AND lng BETWEEN ? AND ?"
+        sql += " AND pl.lat BETWEEN ? AND ? AND pl.lng BETWEEN ? AND ?"
         params.extend([lo_lat, hi_lat, lo_lng, hi_lng])
 
     sql += " ORDER BY created_at DESC LIMIT ?"
@@ -3275,14 +3579,14 @@ def _recent_pickups_payload(
     if zone_id is not None:
         zone_ids_for_stats = [int(zone_id)]
     else:
-        stats_sql = "SELECT DISTINCT zone_id FROM pickup_logs WHERE zone_id IS NOT NULL"
+        stats_sql = f"SELECT DISTINCT pl.zone_id FROM pickup_logs pl WHERE pl.zone_id IS NOT NULL AND {_pickup_log_not_voided_sql('pl')}"
         stats_params: List[Any] = []
         if all(v is not None for v in bbox):
             lo_lat = min(float(min_lat), float(max_lat))
             hi_lat = max(float(min_lat), float(max_lat))
             lo_lng = min(float(min_lng), float(max_lng))
             hi_lng = max(float(min_lng), float(max_lng))
-            stats_sql += " AND lat BETWEEN ? AND ? AND lng BETWEEN ? AND ?"
+            stats_sql += " AND pl.lat BETWEEN ? AND ? AND pl.lng BETWEEN ? AND ?"
             stats_params.extend([lo_lat, hi_lat, lo_lng, hi_lng])
         stats_rows = _db_query_all(stats_sql, tuple(stats_params))
         zone_ids_for_stats = [int(dict(r)["zone_id"]) for r in stats_rows if dict(r).get("zone_id") is not None]
