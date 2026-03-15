@@ -10,6 +10,7 @@ from leaderboard_models import (
     LeaderboardPeriod,
     LeaderboardResponse,
     MyBadgesResponse,
+    MyProgressionResponse,
     MyRankResponse,
     OverviewResponse,
 )
@@ -18,6 +19,7 @@ from leaderboard_service import (
     get_leaderboard,
     get_my_rank,
     get_overview_for_user,
+    get_progression_for_user,
 )
 
 router = APIRouter(tags=["leaderboard"])
@@ -43,3 +45,8 @@ def leaderboard_badges_me(user: sqlite3.Row = Depends(require_user)):
 @router.get("/leaderboard/overview/me", response_model=OverviewResponse)
 def leaderboard_overview_me(user: sqlite3.Row = Depends(require_user)):
     return {"ok": True, **get_overview_for_user(int(user["id"]))}
+
+
+@router.get("/leaderboard/progression/me", response_model=MyProgressionResponse)
+def leaderboard_progression_me(user: sqlite3.Row = Depends(require_user)):
+    return {"ok": True, "progression": get_progression_for_user(int(user["id"]))}
