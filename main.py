@@ -2174,162 +2174,168 @@ def get_police(window_sec: int = 6 * 3600):
 
 @app.post("/events/pickup")
 def log_pickup(payload: PickupPayload, user: sqlite3.Row = Depends(require_user)):
-    now = int(time.time())
-    expires = now + EVENT_DEFAULT_WINDOW_SECONDS
-    zone_name = (payload.zone_name or "").strip() or None
-    borough = (payload.borough or "").strip() or None
-    frame_time = (payload.frame_time or "").strip() or None
+    try:
+        now = int(time.time())
+        expires = now + EVENT_DEFAULT_WINDOW_SECONDS
+        zone_name = (payload.zone_name or "").strip() or None
+        borough = (payload.borough or "").strip() or None
+        frame_time = (payload.frame_time or "").strip() or None
 
-    with _db_lock:
-        conn = _db()
-        try:
-            cur = conn.cursor()
-            not_voided = _pickup_log_not_voided_sql("pl")
-            cur.execute(
-                _sql(
-                    f"""
-                    SELECT pl.*
-                    FROM pickup_logs pl
-                    WHERE pl.user_id = ?
-                      AND {not_voided}
-                    ORDER BY pl.created_at DESC, pl.id DESC
-                    LIMIT 1
-                    """
-                ),
-                (int(user["id"]),),
-            )
-            latest = cur.fetchone()
-            latest_data = dict(latest) if latest is not None else {}
+        with _db_lock:
+            conn = _db()
+            try:
+                cur = conn.cursor()
+                not_voided = _pickup_log_not_voided_sql("pl")
+                cur.execute(
+                    _sql(
+                        f"""
+                        SELECT pl.*
+                        FROM pickup_logs pl
+                        WHERE pl.user_id = ?
+                          AND {not_voided}
+                        ORDER BY pl.created_at DESC, pl.id DESC
+                        LIMIT 1
+                        """
+                    ),
+                    (int(user["id"]),),
+                )
+                latest = cur.fetchone()
+                latest_data = dict(latest) if latest is not None else {}
 
-            if latest_data.get("created_at") is not None:
-                cooldown_until = int(latest_data["created_at"]) + PICKUP_SAVE_COOLDOWN_SECONDS
-                if now < cooldown_until:
-                    remaining = cooldown_until - now
+                if latest_data.get("created_at") is not None:
+                    cooldown_until = int(latest_data["created_at"]) + PICKUP_SAVE_COOLDOWN_SECONDS
+                    if now < cooldown_until:
+                        remaining = cooldown_until - now
+                        raise HTTPException(
+                            status_code=429,
+                            detail={
+                                "ok": False,
+                                "code": "pickup_cooldown_active",
+                                "title": "Save button cooling off",
+                                "detail": f"Save button cooling off — wait {_format_wait_short(remaining)}.",
+                                "cooldown_remaining_seconds": remaining,
+                                "cooldown_until_unix": cooldown_until,
+                            },
+                        )
+
+                cur.execute(_sql("SELECT * FROM driver_work_state WHERE user_id=? LIMIT 1"), (int(user["id"]),))
+                work_state = cur.fetchone()
+                work_state_data = dict(work_state) if work_state is not None else {}
+                movement_streak_started_at = int(work_state_data["movement_streak_started_at"]) if work_state_data.get("movement_streak_started_at") is not None else None
+                last_meaningful_motion_at = int(work_state_data["last_meaningful_motion_at"]) if work_state_data.get("last_meaningful_motion_at") is not None else None
+                driving_ok = bool(
+                    movement_streak_started_at is not None
+                    and last_meaningful_motion_at is not None
+                    and (now - movement_streak_started_at) >= PICKUP_SAVE_MIN_DRIVING_SECONDS
+                    and (now - last_meaningful_motion_at) <= PICKUP_SAVE_MOTION_STALE_SECONDS
+                )
+
+                previous_session_distance_miles = _safe_haversine_miles(
+                    float(payload.lat),
+                    float(payload.lng),
+                    work_state_data.get("previous_session_end_lat"),
+                    work_state_data.get("previous_session_end_lng"),
+                )
+                session_relocation_ok = bool(
+                    previous_session_distance_miles is not None
+                    and previous_session_distance_miles >= PICKUP_SAVE_RELOCATION_MIN_MILES
+                )
+
+                last_saved_distance_miles = _safe_haversine_miles(
+                    float(payload.lat),
+                    float(payload.lng),
+                    latest_data.get("lat"),
+                    latest_data.get("lng"),
+                )
+                last_saved_relocation_ok = bool(
+                    last_saved_distance_miles is not None
+                    and last_saved_distance_miles >= PICKUP_SAVE_RELOCATION_MIN_MILES
+                )
+
+                guard_reason = None
+                if driving_ok:
+                    guard_reason = "recent_driving"
+                elif session_relocation_ok:
+                    guard_reason = "relocated_from_previous_map_session"
+                elif last_saved_relocation_ok:
+                    guard_reason = "relocated_from_last_saved_trip"
+                elif last_saved_distance_miles is not None and last_saved_distance_miles <= PICKUP_SAVE_SAME_POSITION_MAX_MILES:
                     raise HTTPException(
-                        status_code=429,
+                        status_code=409,
                         detail={
                             "ok": False,
-                            "code": "pickup_cooldown_active",
-                            "title": "Save button cooling off",
-                            "detail": f"Save button cooling off — wait {_format_wait_short(remaining)}.",
-                            "cooldown_remaining_seconds": remaining,
-                            "cooldown_until_unix": cooldown_until,
+                            "code": "pickup_same_position",
+                            "title": "Trip not saved",
+                            "detail": "Same position detected. Move to a new location or keep driving before saving another trip.",
+                            "distance_miles": last_saved_distance_miles,
+                            "required_distance_miles": PICKUP_SAVE_SAME_POSITION_MAX_MILES,
+                        },
+                    )
+                else:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "ok": False,
+                            "code": "pickup_needs_recent_driving",
+                            "title": "Trip not saved",
+                            "detail": "Drive at least 6 minutes or move to a new location before saving this trip.",
                         },
                     )
 
-            cur.execute(_sql("SELECT * FROM driver_work_state WHERE user_id=? LIMIT 1"), (int(user["id"]),))
-            work_state = cur.fetchone()
-            work_state_data = dict(work_state) if work_state is not None else {}
-            movement_streak_started_at = int(work_state_data["movement_streak_started_at"]) if work_state_data.get("movement_streak_started_at") is not None else None
-            last_meaningful_motion_at = int(work_state_data["last_meaningful_motion_at"]) if work_state_data.get("last_meaningful_motion_at") is not None else None
-            driving_ok = bool(
-                movement_streak_started_at is not None
-                and last_meaningful_motion_at is not None
-                and (now - movement_streak_started_at) >= PICKUP_SAVE_MIN_DRIVING_SECONDS
-                and (now - last_meaningful_motion_at) <= PICKUP_SAVE_MOTION_STALE_SECONDS
-            )
-
-            previous_session_distance_miles = _safe_haversine_miles(
-                float(payload.lat),
-                float(payload.lng),
-                work_state_data.get("previous_session_end_lat"),
-                work_state_data.get("previous_session_end_lng"),
-            )
-            session_relocation_ok = bool(
-                previous_session_distance_miles is not None
-                and previous_session_distance_miles >= PICKUP_SAVE_RELOCATION_MIN_MILES
-            )
-
-            last_saved_distance_miles = _safe_haversine_miles(
-                float(payload.lat),
-                float(payload.lng),
-                latest_data.get("lat"),
-                latest_data.get("lng"),
-            )
-            last_saved_relocation_ok = bool(
-                last_saved_distance_miles is not None
-                and last_saved_distance_miles >= PICKUP_SAVE_RELOCATION_MIN_MILES
-            )
-
-            guard_reason = None
-            if driving_ok:
-                guard_reason = "recent_driving"
-            elif session_relocation_ok:
-                guard_reason = "relocated_from_previous_map_session"
-            elif last_saved_relocation_ok:
-                guard_reason = "relocated_from_last_saved_trip"
-            elif last_saved_distance_miles is not None and last_saved_distance_miles <= PICKUP_SAVE_SAME_POSITION_MAX_MILES:
-                raise HTTPException(
-                    status_code=409,
-                    detail={
-                        "ok": False,
-                        "code": "pickup_same_position",
-                        "title": "Trip not saved",
-                        "detail": "Same position detected. Move to a new location or keep driving before saving another trip.",
-                        "distance_miles": last_saved_distance_miles,
-                        "required_distance_miles": PICKUP_SAVE_SAME_POSITION_MAX_MILES,
-                    },
+                progression_before = get_progression_for_user(int(user["id"]))
+                cur.execute(
+                    _sql(
+                        """
+                        INSERT INTO pickup_logs(
+                            user_id, lat, lng, zone_id, zone_name, borough, frame_time, created_at,
+                            is_voided, counted_for_pickup_stats, guard_reason
+                        )
+                        VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                        """
+                    ),
+                    (
+                        int(user["id"]),
+                        float(payload.lat),
+                        float(payload.lng),
+                        payload.zone_id,
+                        zone_name,
+                        borough,
+                        frame_time,
+                        now,
+                        False if DB_BACKEND == "postgres" else 0,
+                        True if DB_BACKEND == "postgres" else 1,
+                        guard_reason,
+                    ),
                 )
-            else:
-                raise HTTPException(
-                    status_code=409,
-                    detail={
-                        "ok": False,
-                        "code": "pickup_needs_recent_driving",
-                        "title": "Trip not saved",
-                        "detail": "Drive at least 6 minutes or move to a new location before saving this trip.",
-                    },
+                cur.execute(
+                    _sql(
+                        """
+                        INSERT INTO events(type, user_id, lat, lng, text, zone_id, created_at, expires_at)
+                        VALUES(?,?,?,?,?,?,?,?)
+                        """
+                    ),
+                    ("pickup", int(user["id"]), float(payload.lat), float(payload.lng), "", payload.zone_id, now, expires),
                 )
-
-            progression_before = get_progression_for_user(int(user["id"]))
-            cur.execute(
-                _sql(
-                    """
-                    INSERT INTO pickup_logs(
-                        user_id, lat, lng, zone_id, zone_name, borough, frame_time, created_at,
-                        is_voided, counted_for_pickup_stats, guard_reason
-                    )
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?)
-                    """
-                ),
-                (
-                    int(user["id"]),
-                    float(payload.lat),
-                    float(payload.lng),
-                    payload.zone_id,
-                    zone_name,
-                    borough,
-                    frame_time,
-                    now,
-                    False if DB_BACKEND == "postgres" else 0,
-                    True if DB_BACKEND == "postgres" else 1,
-                    guard_reason,
-                ),
-            )
-            cur.execute(
-                _sql(
-                    """
-                    INSERT INTO events(type, user_id, lat, lng, text, zone_id, created_at, expires_at)
-                    VALUES(?,?,?,?,?,?,?,?)
-                    """
-                ),
-                ("pickup", int(user["id"]), float(payload.lat), float(payload.lng), "", payload.zone_id, now, expires),
-            )
-            conn.commit()
-            increment_pickup_count(int(user["id"]))
-            progression_after = get_progression_for_user(int(user["id"]))
-            return {
-                "ok": True,
-                "xp_awarded": int(progression_after.get("total_xp", 0)) - int(progression_before.get("total_xp", 0)),
-                "leveled_up": int(progression_after.get("level", 1)) > int(progression_before.get("level", 1)),
-                "previous_level": int(progression_before.get("level", 1)),
-                "new_level": int(progression_after.get("level", 1)),
-                "progression": progression_after,
-                "cooldown_until_unix": now + PICKUP_SAVE_COOLDOWN_SECONDS,
-                "accepted_guard_reason": guard_reason,
-            }
-        finally:
-            conn.close()
+                conn.commit()
+                increment_pickup_count(int(user["id"]))
+                progression_after = get_progression_for_user(int(user["id"]))
+                return {
+                    "ok": True,
+                    "xp_awarded": int(progression_after.get("total_xp", 0)) - int(progression_before.get("total_xp", 0)),
+                    "leveled_up": int(progression_after.get("level", 1)) > int(progression_before.get("level", 1)),
+                    "previous_level": int(progression_before.get("level", 1)),
+                    "new_level": int(progression_after.get("level", 1)),
+                    "progression": progression_after,
+                    "cooldown_until_unix": now + PICKUP_SAVE_COOLDOWN_SECONDS,
+                    "accepted_guard_reason": guard_reason,
+                }
+            finally:
+                conn.close()
+    except HTTPException:
+        raise
+    except Exception:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="pickup_save_failed")
 
 
 
@@ -3133,23 +3139,21 @@ def _pickup_zone_same_timeslot_support(zone_ids: List[int], now_ts: int) -> Dict
     placeholders = ",".join(["?"] * len(zone_ids))
     if DB_BACKEND == "postgres":
         sql = f"""
-            SELECT pl.zone_id, COUNT(*) AS c
-            FROM pickup_logs pl
-            WHERE pl.zone_id IN ({placeholders})
-              AND {_pickup_log_not_voided_sql("pl")}
-              AND pl.created_at >= ?
-              AND CAST((MOD(pl.created_at, 86400) / 60) / ? AS INTEGER) = ?
-            GROUP BY pl.zone_id
+            SELECT zone_id, COUNT(*) AS c
+            FROM pickup_logs
+            WHERE zone_id IN ({placeholders})
+              AND created_at >= ?
+              AND CAST((MOD(created_at, 86400) / 60) / ? AS INTEGER) = ?
+            GROUP BY zone_id
         """
     else:
         sql = f"""
-            SELECT pl.zone_id, COUNT(*) AS c
-            FROM pickup_logs pl
-            WHERE pl.zone_id IN ({placeholders})
-              AND {_pickup_log_not_voided_sql("pl")}
-              AND pl.created_at >= ?
-              AND CAST(((pl.created_at % 86400) / 60) / ? AS INTEGER) = ?
-            GROUP BY pl.zone_id
+            SELECT zone_id, COUNT(*) AS c
+            FROM pickup_logs
+            WHERE zone_id IN ({placeholders})
+              AND created_at >= ?
+              AND CAST(((created_at % 86400) / 60) / ? AS INTEGER) = ?
+            GROUP BY zone_id
         """
     params = tuple(list(zone_ids) + [lookback, HOTSPOT_TIMESLOT_BIN_MINUTES, slot])
     rows = _db_query_all(sql, params)
