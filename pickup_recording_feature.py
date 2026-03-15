@@ -9,8 +9,15 @@ from zoneinfo import ZoneInfo
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from core import DB_BACKEND, _db_exec, _db_lock, _db_query_all, _db_query_one, require_user
-from leaderboard_tracker import increment_pickup_count
+from core import DB_BACKEND, _db, _db_exec, _db_lock, _db_query_all, _db_query_one, _sql, require_user
+from leaderboard_service import (
+    LEVEL_XP_THRESHOLDS,
+    PROGRESSION_MAX_PICKUP_REPORTS_PER_DAY_FOR_XP,
+    PROGRESSION_XP_PER_HOUR,
+    PROGRESSION_XP_PER_MILE,
+    PROGRESSION_XP_PER_REPORTED_PICKUP,
+    RANK_LADDER,
+)
 
 router = APIRouter()
 NYC_TZ = ZoneInfo("America/New_York")
@@ -21,33 +28,6 @@ PICKUP_SAVE_SESSION_BREAK_SECONDS = 480
 PICKUP_SAVE_MOTION_STALE_SECONDS = 180
 PICKUP_SAVE_RELOCATION_MIN_MILES = 0.25
 PICKUP_SAVE_SAME_POSITION_MAX_MILES = 0.08
-
-PROGRESSION_XP_PER_MILE = 8
-PROGRESSION_XP_PER_HOUR = 30
-PROGRESSION_XP_PER_REPORTED_PICKUP = 20
-PROGRESSION_MAX_PICKUP_REPORTS_PER_DAY_FOR_XP = 25
-
-
-RANK_LADDER = [
-    (1, 4, "Recruit", "recruit"),
-    (5, 8, "Private", "private"),
-    (9, 12, "Corporal", "corporal"),
-    (13, 16, "Sergeant", "sergeant"),
-    (17, 20, "Staff Sergeant", "staff_sergeant"),
-    (21, 24, "Sergeant First Class", "sergeant_first_class"),
-    (25, 28, "Master Sergeant", "master_sergeant"),
-    (29, 32, "Lieutenant", "lieutenant"),
-    (33, 36, "Captain", "captain"),
-    (37, 40, "Major", "major"),
-    (41, 44, "Colonel", "colonel"),
-    (45, 52, "Brigadier", "brigadier"),
-    (53, 60, "Major General", "major_general"),
-    (61, 70, "Lieutenant General", "lieutenant_general"),
-    (71, 82, "General", "general"),
-    (83, 92, "Commander", "commander"),
-    (93, 100, "Road Legend", "road_legend"),
-]
-
 
 class PickupRecordingPayload(BaseModel):
     lat: float
@@ -135,6 +115,21 @@ def pickup_log_not_voided_sql(alias: str) -> str:
     if DB_BACKEND == "postgres":
         return f"COALESCE({a}.is_voided, FALSE) = FALSE"
     return f"COALESCE(CAST({a}.is_voided AS INTEGER), 0) = 0"
+
+
+def _query_one_cur(cur, sql: str, params: tuple = ()) -> Optional[dict]:
+    cur.execute(_sql(sql), params)
+    row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def _query_all_cur(cur, sql: str, params: tuple = ()) -> List[dict]:
+    cur.execute(_sql(sql), params)
+    return [dict(row) for row in cur.fetchall()]
+
+
+def _exec_cur(cur, sql: str, params: tuple = ()) -> None:
+    cur.execute(_sql(sql), params)
 
 
 def _safe_haversine_miles(lat1: Any, lng1: Any, lat2: Any, lng2: Any) -> float:
@@ -230,9 +225,8 @@ def record_pickup_presence_heartbeat(user_id: int, lat: float, lng: float, now_t
     )
 
 
-def _latest_active_pickup_log_for_user(user_id: int) -> Optional[Dict[str, Any]]:
-    row = _db_query_one(
-        f"""
+def _latest_active_pickup_log_for_user(user_id: int, cur=None) -> Optional[Dict[str, Any]]:
+    sql = f"""
         SELECT id, user_id, lat, lng, created_at, zone_id, zone_name, borough, frame_time, guard_reason,
                counted_for_pickup_stats, is_voided, voided_at, void_reason
         FROM pickup_logs pl
@@ -240,15 +234,20 @@ def _latest_active_pickup_log_for_user(user_id: int) -> Optional[Dict[str, Any]]
           AND {pickup_log_not_voided_sql('pl')}
         ORDER BY pl.created_at DESC, pl.id DESC
         LIMIT 1
-        """,
-        (int(user_id),),
-    )
+    """
+    if cur is not None:
+        return _query_one_cur(cur, sql, (int(user_id),))
+    row = _db_query_one(sql, (int(user_id),))
     return dict(row) if row else None
 
 
-def evaluate_pickup_guard(user_id: int, lat: float, lng: float, now_ts: int) -> Dict[str, Any]:
-    guard = _db_query_one("SELECT * FROM pickup_guard_state WHERE user_id=? LIMIT 1", (int(user_id),))
-    latest = _latest_active_pickup_log_for_user(int(user_id))
+def evaluate_pickup_guard(user_id: int, lat: float, lng: float, now_ts: int, cur=None) -> Dict[str, Any]:
+    if cur is not None:
+        guard = _query_one_cur(cur, "SELECT * FROM pickup_guard_state WHERE user_id=? LIMIT 1", (int(user_id),))
+    else:
+        row = _db_query_one("SELECT * FROM pickup_guard_state WHERE user_id=? LIMIT 1", (int(user_id),))
+        guard = dict(row) if row else None
+    latest = _latest_active_pickup_log_for_user(int(user_id), cur=cur)
 
     if latest is not None:
         cooldown_until = int(latest.get("created_at") or 0) + PICKUP_SAVE_COOLDOWN_SECONDS
@@ -331,34 +330,21 @@ def _nyc_business_date_from_unix(ts_unix: int) -> str:
     return local.date().isoformat()
 
 
-def _pickup_progression_rows_for_user(user_id: int) -> List[Dict[str, Any]]:
-    rows = _db_query_all(
-        """
+def _pickup_progression_rows_for_user(user_id: int, cur=None) -> List[Dict[str, Any]]:
+    sql = """
         SELECT nyc_date, miles_worked, hours_worked, pickups_recorded
         FROM driver_daily_stats
         WHERE user_id=?
         ORDER BY nyc_date ASC
-        """,
-        (int(user_id),),
-    )
+    """
+    if cur is not None:
+        return _query_all_cur(cur, sql, (int(user_id),))
+    rows = _db_query_all(sql, (int(user_id),))
     return [dict(r) for r in rows]
 
 
-def _build_level_xp_thresholds() -> List[int]:
-    thresholds = [0]
-    total_xp = 0
-    for level_index in range(2, 101):
-        step_xp = round(120 + ((level_index - 1) * 26) + (((level_index - 1) ** 1.28) * 7))
-        total_xp += int(step_xp)
-        thresholds.append(total_xp)
-    return thresholds
-
-
-LEVEL_XP_THRESHOLDS = _build_level_xp_thresholds()
-
-
-def get_pickup_progression_for_user(user_id: int) -> Dict[str, Any]:
-    rows = _pickup_progression_rows_for_user(int(user_id))
+def get_pickup_progression_for_user(user_id: int, cur=None) -> Dict[str, Any]:
+    rows = _pickup_progression_rows_for_user(int(user_id), cur=cur)
     lifetime_miles = 0.0
     lifetime_hours = 0.0
     lifetime_pickups_recorded = 0
@@ -415,51 +401,100 @@ def get_pickup_progression_for_user(user_id: int) -> Dict[str, Any]:
     }
 
 
-def create_pickup_record(payload: PickupRecordingPayload, user: Any) -> Dict[str, Any]:
-    now = int(time.time())
-    expires = now + 24 * 3600
-    guard = evaluate_pickup_guard(int(user["id"]), float(payload.lat), float(payload.lng), now)
-    if not guard.get("ok"):
-        status_code = 429 if guard.get("code") == "pickup_cooldown_active" else 409
-        raise HTTPException(status_code=status_code, detail=guard)
+def _increment_pickup_count_tx(cur, user_id: int, now_ts: int, amount: int = 1) -> None:
+    nyc_date = _nyc_business_date_from_unix(int(now_ts))
+    cur.execute(
+        _sql(
+            """
+            INSERT INTO driver_daily_stats(user_id, nyc_date, pickups_recorded, updated_at)
+            VALUES(?,?,?,?)
+            ON CONFLICT(user_id, nyc_date) DO UPDATE SET
+              pickups_recorded=driver_daily_stats.pickups_recorded + excluded.pickups_recorded,
+              updated_at=excluded.updated_at
+            """
+        ),
+        (int(user_id), nyc_date, int(amount), int(now_ts)),
+    )
 
+
+def _decrement_pickup_count_tx(cur, user_id: int, created_at_unix: int, amount: int = 1) -> None:
+    nyc_date = _nyc_business_date_from_unix(int(created_at_unix))
+    now = int(time.time())
+    _exec_cur(
+        cur,
+        """
+        UPDATE driver_daily_stats
+        SET pickups_recorded = CASE
+          WHEN pickups_recorded IS NULL THEN 0
+          WHEN pickups_recorded <= ? THEN 0
+          ELSE pickups_recorded - ?
+        END,
+        updated_at=?
+        WHERE user_id=? AND nyc_date=?
+        """,
+        (int(amount), int(amount), now, int(user_id), nyc_date),
+    )
+
+
+def create_pickup_record(payload: PickupRecordingPayload, user: Any) -> Dict[str, Any]:
     zone_name = (payload.zone_name or "").strip() or None
     borough = (payload.borough or "").strip() or None
     frame_time = (payload.frame_time or "").strip() or None
+    now = int(time.time())
+    expires = now + 24 * 3600
 
     with _db_lock:
-        progression_before = get_pickup_progression_for_user(int(user["id"]))
-        _db_exec(
-            """
-            INSERT INTO pickup_logs(
-              user_id, lat, lng, zone_id, zone_name, borough, frame_time, created_at,
-              is_voided, counted_for_pickup_stats, guard_reason
+        conn = _db()
+        try:
+            cur = conn.cursor()
+            progression_before = get_pickup_progression_for_user(int(user["id"]), cur=cur)
+            guard = evaluate_pickup_guard(int(user["id"]), float(payload.lat), float(payload.lng), now, cur=cur)
+            if not guard.get("ok"):
+                status_code = 429 if guard.get("code") == "pickup_cooldown_active" else 409
+                raise HTTPException(status_code=status_code, detail=guard)
+
+            _exec_cur(
+                cur,
+                """
+                INSERT INTO pickup_logs(
+                  user_id, lat, lng, zone_id, zone_name, borough, frame_time, created_at,
+                  is_voided, counted_for_pickup_stats, guard_reason
+                )
+                VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    int(user["id"]),
+                    float(payload.lat),
+                    float(payload.lng),
+                    payload.zone_id,
+                    zone_name,
+                    borough,
+                    frame_time,
+                    now,
+                    _bool_db_value(False),
+                    _bool_db_value(True),
+                    str(guard.get("accepted_guard_reason") or ""),
+                ),
             )
-            VALUES(?,?,?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                int(user["id"]),
-                float(payload.lat),
-                float(payload.lng),
-                payload.zone_id,
-                zone_name,
-                borough,
-                frame_time,
-                now,
-                _bool_db_value(False),
-                _bool_db_value(True),
-                str(guard.get("accepted_guard_reason") or ""),
-            ),
-        )
-        _db_exec(
-            """
-            INSERT INTO events(type, user_id, lat, lng, text, zone_id, created_at, expires_at)
-            VALUES(?,?,?,?,?,?,?,?)
-            """,
-            ("pickup", int(user["id"]), float(payload.lat), float(payload.lng), "", payload.zone_id, now, expires),
-        )
-        increment_pickup_count(int(user["id"]))
-        progression_after = get_pickup_progression_for_user(int(user["id"]))
+            _exec_cur(
+                cur,
+                """
+                INSERT INTO events(type, user_id, lat, lng, text, zone_id, created_at, expires_at)
+                VALUES(?,?,?,?,?,?,?,?)
+                """,
+                ("pickup", int(user["id"]), float(payload.lat), float(payload.lng), "", payload.zone_id, now, expires),
+            )
+            _increment_pickup_count_tx(cur, int(user["id"]), now, 1)
+            progression_after = get_pickup_progression_for_user(int(user["id"]), cur=cur)
+            conn.commit()
+        except HTTPException:
+            conn.rollback()
+            raise
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     return {
         "ok": True,
@@ -516,14 +551,26 @@ def admin_void_pickup_trip(trip_id: int, payload: AdminVoidPickupPayload, admin:
         raise HTTPException(status_code=400, detail="Reason must be at least 5 characters")
 
     with _db_lock:
-        trip = _db_query_one("SELECT * FROM pickup_logs WHERE id=? LIMIT 1", (int(trip_id),))
-        if not trip:
-            raise HTTPException(status_code=404, detail="Pickup trip not found")
+        conn = _db()
+        try:
+            cur = conn.cursor()
+            trip = _query_one_cur(cur, "SELECT * FROM pickup_logs WHERE id=? LIMIT 1", (int(trip_id),))
+            if not trip:
+                raise HTTPException(status_code=404, detail="Pickup trip not found")
 
-        already_voided = bool(trip["is_voided"]) if isinstance(trip["is_voided"], bool) else int(trip["is_voided"] or 0) == 1
-        stats_reversed = False
-        if not already_voided:
-            _db_exec(
+            already_voided = bool(trip["is_voided"]) if isinstance(trip["is_voided"], bool) else int(trip["is_voided"] or 0) == 1
+            if already_voided:
+                conn.rollback()
+                return {
+                    "ok": True,
+                    "trip_id": int(trip_id),
+                    "voided": True,
+                    "stats_reversed": False,
+                    "preserved_in_audit": True,
+                }
+
+            _exec_cur(
+                cur,
                 """
                 UPDATE pickup_logs
                 SET is_voided=?, voided_at=?, voided_by_admin_user_id=?, void_reason=?
@@ -531,24 +578,27 @@ def admin_void_pickup_trip(trip_id: int, payload: AdminVoidPickupPayload, admin:
                 """,
                 (_bool_db_value(True), now, int(admin["id"]), reason, int(trip_id)),
             )
+
+            stats_reversed = False
             counted = bool(trip["counted_for_pickup_stats"]) if isinstance(trip["counted_for_pickup_stats"], bool) else int(trip["counted_for_pickup_stats"] or 0) == 1
             if counted:
-                nyc_date = _nyc_business_date_from_unix(int(trip["created_at"] or now))
-                _db_exec(
-                    """
-                    UPDATE driver_daily_stats
-                    SET pickups_recorded = CASE
-                      WHEN pickups_recorded IS NULL THEN 0
-                      WHEN pickups_recorded <= 0 THEN 0
-                      ELSE pickups_recorded - 1
-                    END,
-                    updated_at=?
-                    WHERE user_id=? AND nyc_date=?
-                    """,
-                    (now, int(trip["user_id"]), nyc_date),
+                _decrement_pickup_count_tx(cur, int(trip["user_id"]), int(trip.get("created_at") or now), 1)
+                _exec_cur(
+                    cur,
+                    "UPDATE pickup_logs SET counted_for_pickup_stats=? WHERE id=?",
+                    (_bool_db_value(False), int(trip_id)),
                 )
-                _db_exec("UPDATE pickup_logs SET counted_for_pickup_stats=? WHERE id=?", (_bool_db_value(False), int(trip_id)))
                 stats_reversed = True
+
+            conn.commit()
+        except HTTPException:
+            conn.rollback()
+            raise
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     return {
         "ok": True,
