@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import List, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class AdminTripSummaryResponse(BaseModel):
@@ -12,6 +12,7 @@ class AdminTripSummaryResponse(BaseModel):
     latest_trip_at: Optional[str] = None
     distinct_users_count: Optional[int] = None
     distinct_zones_count: Optional[int] = None
+    voided_trips_count: Optional[int] = None
 
 
 class AdminRecentTripItem(BaseModel):
@@ -26,7 +27,22 @@ class AdminRecentTripItem(BaseModel):
     created_at: Optional[str] = None
     lat: Optional[float] = None
     lng: Optional[float] = None
+    is_voided: bool = False
+    voided_at: Optional[str] = None
+    void_reason: Optional[str] = None
 
 
 class AdminRecentTripsResponse(BaseModel):
     items: List[AdminRecentTripItem]
+
+
+class AdminVoidTripPayload(BaseModel):
+    reason: str = Field(..., min_length=5)
+
+
+class AdminVoidTripResponse(BaseModel):
+    ok: bool
+    trip_id: int
+    voided: bool
+    stats_reversed: bool
+    preserved_in_audit: bool
