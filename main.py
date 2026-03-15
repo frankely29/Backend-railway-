@@ -1253,9 +1253,17 @@ from leaderboard_service import (
     get_overview_for_user,
 )
 from leaderboard_tracker import increment_pickup_count, record_presence_heartbeat
+from pickup_recording_feature import (
+    router as pickup_recording_router,
+    ensure_pickup_recording_schema,
+    pickup_log_not_voided_sql,
+    record_pickup_presence_heartbeat,
+    create_pickup_record,
+)
 
 app.include_router(chat_router)
 app.include_router(leaderboard_router)
+app.include_router(pickup_recording_router)
 
 # =========================================================
 # Startup
@@ -1266,6 +1274,7 @@ def startup():
     FRAMES_DIR.mkdir(parents=True, exist_ok=True)
     _db_init()
     init_leaderboard_schema()
+    ensure_pickup_recording_schema()
     _ensure_admin_seed()
 
     # Auto-fill generate state if frames/day tendency already exist
@@ -1885,6 +1894,7 @@ def presence_update(payload: PresencePayload, user: sqlite3.Row = Depends(requir
         (int(user["id"]), float(payload.lat), float(payload.lng), payload.heading, payload.accuracy, now),
     )
     record_presence_heartbeat(int(user["id"]), float(payload.lat), float(payload.lng), payload.heading)
+    record_pickup_presence_heartbeat(int(user["id"]), float(payload.lat), float(payload.lng), now)
     return {"ok": True}
 
 
@@ -2104,38 +2114,7 @@ def get_police(window_sec: int = 6 * 3600):
 
 @app.post("/events/pickup")
 def log_pickup(payload: PickupPayload, user: sqlite3.Row = Depends(require_user)):
-    now = int(time.time())
-    expires = now + EVENT_DEFAULT_WINDOW_SECONDS
-    zone_name = (payload.zone_name or "").strip() or None
-    borough = (payload.borough or "").strip() or None
-    frame_time = (payload.frame_time or "").strip() or None
-
-    _db_exec(
-        """
-        INSERT INTO pickup_logs(user_id, lat, lng, zone_id, zone_name, borough, frame_time, created_at)
-        VALUES(?,?,?,?,?,?,?,?)
-        """,
-        (int(user["id"]), float(payload.lat), float(payload.lng), payload.zone_id, zone_name, borough, frame_time, now),
-    )
-
-    _db_exec(
-        """
-        INSERT INTO events(type, user_id, lat, lng, text, zone_id, created_at, expires_at)
-        VALUES(?,?,?,?,?,?,?,?)
-        """,
-        ("pickup", int(user["id"]), float(payload.lat), float(payload.lng), "", payload.zone_id, now, expires),
-    )
-    progression_before = get_progression_for_user(int(user["id"]))
-    increment_pickup_count(int(user["id"]))
-    progression_after = get_progression_for_user(int(user["id"]))
-    return {
-        "ok": True,
-        "xp_awarded": int(progression_after.get("total_xp", 0)) - int(progression_before.get("total_xp", 0)),
-        "leveled_up": int(progression_after.get("level", 1)) > int(progression_before.get("level", 1)),
-        "previous_level": int(progression_before.get("level", 1)),
-        "new_level": int(progression_after.get("level", 1)),
-        "progression": progression_after,
-    }
+    return create_pickup_record(payload, user)
 
 
 
@@ -2216,8 +2195,9 @@ def _pickup_zone_recent_points(
                 lng,
                 created_at,
                 ROW_NUMBER() OVER (PARTITION BY zone_id ORDER BY created_at DESC, id DESC) AS rn
-            FROM pickup_logs
+            FROM pickup_logs pl
             WHERE zone_id IN ({placeholders})
+              AND {pickup_log_not_voided_sql("pl")}
         )
         SELECT id, zone_id, zone_name, borough, user_id, lat, lng, created_at
         FROM ranked
@@ -2810,12 +2790,14 @@ def _pickup_zone_same_timeslot_support(zone_ids: List[int], now_ts: int) -> Dict
     slot = _current_timeslot_bin(now_ts)
     lookback = now_ts - (14 * 24 * 3600)
     placeholders = ",".join(["?"] * len(zone_ids))
+    timeslot_expr = "CAST(((MOD(created_at, 86400) / 60) / ? ) AS INTEGER)" if DB_BACKEND == "postgres" else "CAST(((created_at % 86400) / 60) / ? AS INTEGER)"
     sql = f"""
         SELECT zone_id, COUNT(*) AS c
-        FROM pickup_logs
+        FROM pickup_logs pl
         WHERE zone_id IN ({placeholders})
           AND created_at >= ?
-          AND CAST(((created_at % 86400) / 60) / ? AS INTEGER) = ?
+          AND {pickup_log_not_voided_sql('pl')}
+          AND {timeslot_expr} = ?
         GROUP BY zone_id
     """
     params = tuple(list(zone_ids) + [lookback, HOTSPOT_TIMESLOT_BIN_MINUTES, slot])
@@ -2834,9 +2816,10 @@ def _pickup_zone_historical_support(zone_ids: List[int], now_ts: int) -> Dict[in
     rows = _db_query_all(
         f"""
         SELECT zone_id, COUNT(*) AS c
-        FROM pickup_logs
+        FROM pickup_logs pl
         WHERE zone_id IN ({placeholders})
           AND created_at >= ?
+          AND {pickup_log_not_voided_sql("pl")}
         GROUP BY zone_id
         """,
         tuple(list(zone_ids) + [lookback]),
@@ -2856,7 +2839,7 @@ def _pickup_zone_density_penalty(zone_ids: List[int]) -> Dict[int, float]:
         f"""
         SELECT pl.zone_id, COUNT(DISTINCT p.user_id) AS c
         FROM presence p
-        LEFT JOIN pickup_logs pl ON pl.user_id = p.user_id
+        LEFT JOIN pickup_logs pl ON pl.user_id = p.user_id AND {pickup_log_not_voided_sql('pl')}
         WHERE p.updated_at >= ?
           AND pl.zone_id IN ({placeholders})
           AND pl.created_at >= ?
@@ -3128,8 +3111,9 @@ def _pickup_zone_stats(zone_ids: List[int], sample_limit: int = 100) -> List[Dic
                 lng,
                 created_at,
                 ROW_NUMBER() OVER (PARTITION BY zone_id ORDER BY created_at DESC, id DESC) AS rn
-            FROM pickup_logs
+            FROM pickup_logs pl
             WHERE zone_id IN ({placeholders})
+              AND {pickup_log_not_voided_sql("pl")}
         )
         SELECT
             zone_id,
@@ -3241,8 +3225,9 @@ def _recent_pickups_payload(
     safe_zone_sample_limit = max(1, min(100, int(zone_sample_limit)))
     sql = """
         SELECT id, lat, lng, zone_id, zone_name, borough, frame_time, created_at
-        FROM pickup_logs
+        FROM pickup_logs pl
         WHERE 1=1
+          AND {pickup_log_not_voided_sql("pl")}
     """
     params: List[Any] = []
 
@@ -3275,7 +3260,7 @@ def _recent_pickups_payload(
     if zone_id is not None:
         zone_ids_for_stats = [int(zone_id)]
     else:
-        stats_sql = "SELECT DISTINCT zone_id FROM pickup_logs WHERE zone_id IS NOT NULL"
+        stats_sql = f"SELECT DISTINCT zone_id FROM pickup_logs pl WHERE zone_id IS NOT NULL AND {pickup_log_not_voided_sql('pl')}"
         stats_params: List[Any] = []
         if all(v is not None for v in bbox):
             lo_lat = min(float(min_lat), float(max_lat))
