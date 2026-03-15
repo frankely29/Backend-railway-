@@ -3131,15 +3131,26 @@ def _pickup_zone_same_timeslot_support(zone_ids: List[int], now_ts: int) -> Dict
     slot = _current_timeslot_bin(now_ts)
     lookback = now_ts - (14 * 24 * 3600)
     placeholders = ",".join(["?"] * len(zone_ids))
-    sql = f"""
-        SELECT pl.zone_id, COUNT(*) AS c
-        FROM pickup_logs pl
-        WHERE pl.zone_id IN ({placeholders})
-          AND {_pickup_log_not_voided_sql("pl")}
-          AND pl.created_at >= ?
-          AND CAST(((pl.created_at % 86400) / 60) / ? AS INTEGER) = ?
-        GROUP BY pl.zone_id
-    """
+    if DB_BACKEND == "postgres":
+        sql = f"""
+            SELECT pl.zone_id, COUNT(*) AS c
+            FROM pickup_logs pl
+            WHERE pl.zone_id IN ({placeholders})
+              AND {_pickup_log_not_voided_sql("pl")}
+              AND pl.created_at >= ?
+              AND CAST((MOD(pl.created_at, 86400) / 60) / ? AS INTEGER) = ?
+            GROUP BY pl.zone_id
+        """
+    else:
+        sql = f"""
+            SELECT pl.zone_id, COUNT(*) AS c
+            FROM pickup_logs pl
+            WHERE pl.zone_id IN ({placeholders})
+              AND {_pickup_log_not_voided_sql("pl")}
+              AND pl.created_at >= ?
+              AND CAST(((pl.created_at % 86400) / 60) / ? AS INTEGER) = ?
+            GROUP BY pl.zone_id
+        """
     params = tuple(list(zone_ids) + [lookback, HOTSPOT_TIMESLOT_BIN_MINUTES, slot])
     rows = _db_query_all(sql, params)
     out: Dict[int, float] = {int(z): 0.0 for z in zone_ids}
