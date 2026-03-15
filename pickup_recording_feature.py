@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import math
 import time
-import traceback
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
@@ -564,26 +563,50 @@ def admin_void_pickup_trip(trip_id: int, payload: AdminVoidPickupPayload, admin:
 def admin_pickup_tests_health(admin: Any = Depends(_is_admin)):
     started = time.time()
     checks: Dict[str, Any] = {}
-    checks["status_endpoint_dependency_safe"] = True
-    checks["timeline_file_ready"] = True
-    checks["frame_0_ready"] = True
+
     try:
-        _db_query_one("SELECT 1 AS ok")
-        checks["guard_schema_ready"] = True
+        ensure_pickup_recording_schema()
+        checks["pickup_schema_ready"] = True
     except Exception:
-        checks["guard_schema_ready"] = False
+        checks["pickup_schema_ready"] = False
+
     try:
-        _db_query_all(f"SELECT id FROM pickup_logs pl WHERE {pickup_log_not_voided_sql('pl')} ORDER BY id DESC LIMIT 1")
-        checks["pickup_recent_helper_runs"] = True
+        _db_query_one("SELECT user_id FROM pickup_guard_state LIMIT 1")
+        checks["pickup_guard_state_exists"] = True
     except Exception:
-        checks["pickup_recent_helper_runs"] = False
+        checks["pickup_guard_state_exists"] = False
+
     try:
-        mod_expr = "CAST(((MOD(created_at, 86400) / 60) / ? ) AS INTEGER)" if DB_BACKEND == "postgres" else "CAST(((created_at % 86400) / 60) / ? AS INTEGER)"
-        _db_query_all(f"SELECT zone_id, COUNT(*) AS c FROM pickup_logs WHERE {mod_expr} = ? GROUP BY zone_id LIMIT 1", (20, 1))
+        _db_query_one(
+            """
+            SELECT is_voided, voided_at, voided_by_admin_user_id, void_reason, counted_for_pickup_stats, guard_reason
+            FROM pickup_logs
+            LIMIT 1
+            """
+        )
+        checks["pickup_logs_columns_ready"] = True
+    except Exception:
+        checks["pickup_logs_columns_ready"] = False
+
+    try:
+        _db_query_all(f"SELECT pl.id FROM pickup_logs pl WHERE {pickup_log_not_voided_sql('pl')} ORDER BY pl.id DESC LIMIT 1")
+        checks["active_recent_query_safe"] = True
+    except Exception:
+        checks["active_recent_query_safe"] = False
+
+    try:
+        if DB_BACKEND == "postgres":
+            timeslot_expr = "CAST((MOD(pl.created_at, 86400) / 60) / ? AS INTEGER)"
+        else:
+            timeslot_expr = "CAST(((pl.created_at % 86400) / 60) / ? AS INTEGER)"
+        _db_query_all(
+            f"SELECT pl.zone_id, COUNT(*) AS c FROM pickup_logs pl WHERE {timeslot_expr} = ? GROUP BY pl.zone_id LIMIT 1",
+            (20, 1),
+        )
         checks["same_timeslot_query_safe"] = True
     except Exception:
         checks["same_timeslot_query_safe"] = False
-    checks["pickup_route_callable"] = True
+
     return {
         "ok": all(bool(v) for v in checks.values()),
         "checks": checks,
