@@ -101,3 +101,15 @@ class ProgressionPayload(BaseModel):
 class MyProgressionResponse(BaseModel):
     ok: bool = True
     progression: ProgressionPayload
+
+
+class RankLadderRow(BaseModel):
+    start_level: int
+    end_level: int
+    rank_name: str
+    rank_icon_key: str
+
+
+class RankLadderResponse(BaseModel):
+    ok: bool = True
+    rows: List[RankLadderRow]

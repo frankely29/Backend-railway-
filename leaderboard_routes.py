@@ -9,6 +9,7 @@ from leaderboard_models import (
     LeaderboardMetric,
     LeaderboardPeriod,
     LeaderboardResponse,
+    RankLadderResponse,
     MyBadgesResponse,
     MyProgressionResponse,
     MyRankResponse,
@@ -17,6 +18,7 @@ from leaderboard_models import (
 from leaderboard_service import (
     get_current_badges_for_user,
     get_leaderboard,
+    get_rank_ladder,
     get_my_rank,
     get_overview_for_user,
     get_progression_for_user,
@@ -50,3 +52,8 @@ def leaderboard_overview_me(user: sqlite3.Row = Depends(require_user)):
 @router.get("/leaderboard/progression/me", response_model=MyProgressionResponse)
 def leaderboard_progression_me(user: sqlite3.Row = Depends(require_user)):
     return {"ok": True, "progression": get_progression_for_user(int(user["id"]))}
+
+
+@router.get("/leaderboard/ranks", response_model=RankLadderResponse)
+def leaderboard_ranks(user: sqlite3.Row = Depends(require_user)):
+    return {"ok": True, "rows": get_rank_ladder()}
