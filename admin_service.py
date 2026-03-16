@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from core import DB_BACKEND, _db_query_all, _db_query_one
+from pickup_recording_feature import pickup_log_not_voided_sql
 
 
 def _flag_to_bool(value: Any) -> bool:
@@ -231,10 +232,11 @@ def get_admin_police_reports(limit: int = 500) -> List[Dict[str, Any]]:
 
 def get_admin_pickup_logs(limit: int = 500) -> List[Dict[str, Any]]:
     rows = _db_query_all(
-        """
-        SELECT id, user_id, zone_id, zone_name, borough, lat, lng, frame_time, created_at
-        FROM pickup_logs
-        ORDER BY created_at DESC
+        f"""
+        SELECT pl.id, pl.user_id, pl.zone_id, pl.zone_name, pl.borough, pl.lat, pl.lng, pl.frame_time, pl.created_at, pl.guard_reason
+        FROM pickup_logs pl
+        WHERE {pickup_log_not_voided_sql('pl')}
+        ORDER BY pl.created_at DESC
         LIMIT ?
         """,
         (int(limit),),
@@ -250,6 +252,7 @@ def get_admin_pickup_logs(limit: int = 500) -> List[Dict[str, Any]]:
             "lng": float(dict(r)["lng"]),
             "frame_time": dict(r).get("frame_time"),
             "created_at": _to_iso(dict(r).get("created_at")),
+            "guard_reason": dict(r).get("guard_reason"),
         }
         for r in rows
     ]

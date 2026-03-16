@@ -12,6 +12,8 @@ class AdminTripSummaryResponse(BaseModel):
     latest_trip_at: Optional[str] = None
     distinct_users_count: Optional[int] = None
     distinct_zones_count: Optional[int] = None
+    active_recorded_trips: Optional[int] = None
+    voided_trips_count: Optional[int] = None
 
 
 class AdminRecentTripItem(BaseModel):
@@ -26,6 +28,11 @@ class AdminRecentTripItem(BaseModel):
     created_at: Optional[str] = None
     lat: Optional[float] = None
     lng: Optional[float] = None
+    is_voided: Optional[bool] = None
+    voided_at: Optional[str] = None
+    void_reason: Optional[str] = None
+    guard_reason: Optional[str] = None
+    counted_for_pickup_stats: Optional[bool] = None
 
 
 class AdminRecentTripsResponse(BaseModel):

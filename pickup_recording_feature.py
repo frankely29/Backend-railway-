@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import inspect
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
@@ -436,6 +437,76 @@ def _decrement_pickup_count_tx(cur, user_id: int, created_at_unix: int, amount: 
     )
 
 
+def _soft_void_pickup_trip_tx(cur, trip_id: int, admin_user_id: int, reason: str) -> Dict[str, Any]:
+    now = int(time.time())
+    trip = _query_one_cur(cur, "SELECT * FROM pickup_logs WHERE id=? LIMIT 1", (int(trip_id),))
+    if not trip:
+        raise HTTPException(status_code=404, detail="Pickup trip not found")
+
+    already_voided = bool(trip["is_voided"]) if isinstance(trip["is_voided"], bool) else int(trip["is_voided"] or 0) == 1
+    if already_voided:
+        return {
+            "ok": True,
+            "trip_id": int(trip_id),
+            "voided": True,
+            "stats_reversed": False,
+            "preserved_in_audit": True,
+            "already_voided": True,
+        }
+
+    _exec_cur(
+        cur,
+        """
+        UPDATE pickup_logs
+        SET is_voided=?, voided_at=?, voided_by_admin_user_id=?, void_reason=?
+        WHERE id=?
+        """,
+        (_bool_db_value(True), now, int(admin_user_id), reason, int(trip_id)),
+    )
+
+    stats_reversed = False
+    counted = (
+        bool(trip["counted_for_pickup_stats"])
+        if isinstance(trip["counted_for_pickup_stats"], bool)
+        else int(trip["counted_for_pickup_stats"] or 0) == 1
+    )
+    if counted:
+        _decrement_pickup_count_tx(cur, int(trip["user_id"]), int(trip.get("created_at") or now), 1)
+        _exec_cur(
+            cur,
+            "UPDATE pickup_logs SET counted_for_pickup_stats=? WHERE id=?",
+            (_bool_db_value(False), int(trip_id)),
+        )
+        stats_reversed = True
+
+    return {
+        "ok": True,
+        "trip_id": int(trip_id),
+        "voided": True,
+        "stats_reversed": stats_reversed,
+        "preserved_in_audit": True,
+        "already_voided": False,
+    }
+
+
+def soft_void_pickup_trip(trip_id: int, admin_user_id: int, reason: str) -> Dict[str, Any]:
+    with _db_lock:
+        conn = _db()
+        try:
+            cur = conn.cursor()
+            result = _soft_void_pickup_trip_tx(cur, int(trip_id), int(admin_user_id), str(reason))
+            conn.commit()
+            return result
+        except HTTPException:
+            conn.rollback()
+            raise
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+
 def create_pickup_record(payload: PickupRecordingPayload, user: Any) -> Dict[str, Any]:
     zone_name = (payload.zone_name or "").strip() or None
     borough = (payload.borough or "").strip() or None
@@ -545,68 +616,10 @@ def admin_recent_pickup_trips(
 
 @router.post("/admin/pickup-recording/trips/{trip_id}/void")
 def admin_void_pickup_trip(trip_id: int, payload: AdminVoidPickupPayload, admin: Any = Depends(_is_admin)):
-    now = int(time.time())
     reason = (payload.reason or "").strip()
     if len(reason) < 5:
         raise HTTPException(status_code=400, detail="Reason must be at least 5 characters")
-
-    with _db_lock:
-        conn = _db()
-        try:
-            cur = conn.cursor()
-            trip = _query_one_cur(cur, "SELECT * FROM pickup_logs WHERE id=? LIMIT 1", (int(trip_id),))
-            if not trip:
-                raise HTTPException(status_code=404, detail="Pickup trip not found")
-
-            already_voided = bool(trip["is_voided"]) if isinstance(trip["is_voided"], bool) else int(trip["is_voided"] or 0) == 1
-            if already_voided:
-                conn.rollback()
-                return {
-                    "ok": True,
-                    "trip_id": int(trip_id),
-                    "voided": True,
-                    "stats_reversed": False,
-                    "preserved_in_audit": True,
-                }
-
-            _exec_cur(
-                cur,
-                """
-                UPDATE pickup_logs
-                SET is_voided=?, voided_at=?, voided_by_admin_user_id=?, void_reason=?
-                WHERE id=?
-                """,
-                (_bool_db_value(True), now, int(admin["id"]), reason, int(trip_id)),
-            )
-
-            stats_reversed = False
-            counted = bool(trip["counted_for_pickup_stats"]) if isinstance(trip["counted_for_pickup_stats"], bool) else int(trip["counted_for_pickup_stats"] or 0) == 1
-            if counted:
-                _decrement_pickup_count_tx(cur, int(trip["user_id"]), int(trip.get("created_at") or now), 1)
-                _exec_cur(
-                    cur,
-                    "UPDATE pickup_logs SET counted_for_pickup_stats=? WHERE id=?",
-                    (_bool_db_value(False), int(trip_id)),
-                )
-                stats_reversed = True
-
-            conn.commit()
-        except HTTPException:
-            conn.rollback()
-            raise
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
-
-    return {
-        "ok": True,
-        "trip_id": int(trip_id),
-        "voided": True,
-        "stats_reversed": stats_reversed,
-        "preserved_in_audit": True,
-    }
+    return soft_void_pickup_trip(int(trip_id), int(admin["id"]), reason)
 
 
 @router.get("/admin/pickup-recording/tests/health")
@@ -643,6 +656,14 @@ def admin_pickup_tests_health(admin: Any = Depends(_is_admin)):
         checks["active_recent_query_safe"] = True
     except Exception:
         checks["active_recent_query_safe"] = False
+
+    try:
+        import admin_mutation_service
+
+        clear_source = inspect.getsource(admin_mutation_service.clear_pickup_report)
+        checks["legacy_clear_route_safe"] = "DELETE FROM pickup_logs" not in clear_source
+    except Exception:
+        checks["legacy_clear_route_safe"] = False
 
     try:
         if DB_BACKEND == "postgres":

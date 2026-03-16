@@ -64,5 +64,4 @@ def admin_clear_pickup_report(
     report_id: int,
     admin: sqlite3.Row = Depends(require_admin_user),
 ):
-    _ = admin
-    return clear_pickup_report(report_id=report_id)
+    return clear_pickup_report(report_id=report_id, admin_user_id=int(admin["id"]))
