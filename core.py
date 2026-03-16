@@ -116,6 +116,26 @@ def _verify_token(token: str) -> Dict[str, Any]:
         raise HTTPException(status_code=401, detail="Invalid token")
 
 
+def _flag_to_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return int(value) == 1
+
+    text = str(value).strip().lower()
+    if text in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "f", "no", "n", "off", ""}:
+        return False
+
+    try:
+        return int(text) == 1
+    except Exception:
+        return False
+
+
 def _auth_user_from_request(req: Request) -> sqlite3.Row:
     auth = req.headers.get("authorization", "")
     if not auth.lower().startswith("bearer "):
@@ -126,8 +146,10 @@ def _auth_user_from_request(req: Request) -> sqlite3.Row:
     row = _db_query_one("SELECT * FROM users WHERE id=? LIMIT 1", (uid,))
     if not row:
         raise HTTPException(status_code=401, detail="User not found")
-    if int(row["is_disabled"]) == 1:
+    if _flag_to_bool(row["is_disabled"]):
         raise HTTPException(status_code=403, detail="Account disabled")
+    if _flag_to_bool(row["is_suspended"] if "is_suspended" in row.keys() else None):
+        raise HTTPException(status_code=403, detail="Account suspended")
     return row
 
 
