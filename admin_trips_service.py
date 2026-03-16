@@ -4,6 +4,15 @@ import time
 from typing import Any, Dict, List, Optional
 
 from core import _db_query_all, _db_query_one
+from pickup_recording_feature import pickup_log_not_voided_sql
+
+
+def _flag_to_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return int(value) == 1
 
 
 def _to_iso(ts: Any) -> Optional[str]:
@@ -22,15 +31,16 @@ def get_admin_trips_summary() -> Dict[str, Any]:
     cutoff_7d = int(time.time()) - (7 * 86400)
 
     row = _db_query_one(
-        """
+        f"""
         SELECT
-            COUNT(*) AS total_recorded_trips,
-            SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END) AS trips_last_24h,
-            SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END) AS trips_last_7d,
-            MAX(created_at) AS latest_trip_at,
-            COUNT(DISTINCT user_id) AS distinct_users_count,
-            COUNT(DISTINCT zone_id) AS distinct_zones_count
-        FROM pickup_logs
+            SUM(CASE WHEN {pickup_log_not_voided_sql('pl')} THEN 1 ELSE 0 END) AS total_recorded_trips,
+            SUM(CASE WHEN {pickup_log_not_voided_sql('pl')} AND pl.created_at >= ? THEN 1 ELSE 0 END) AS trips_last_24h,
+            SUM(CASE WHEN {pickup_log_not_voided_sql('pl')} AND pl.created_at >= ? THEN 1 ELSE 0 END) AS trips_last_7d,
+            MAX(CASE WHEN {pickup_log_not_voided_sql('pl')} THEN pl.created_at ELSE NULL END) AS latest_trip_at,
+            COUNT(DISTINCT CASE WHEN {pickup_log_not_voided_sql('pl')} THEN pl.user_id ELSE NULL END) AS distinct_users_count,
+            COUNT(DISTINCT CASE WHEN {pickup_log_not_voided_sql('pl')} THEN pl.zone_id ELSE NULL END) AS distinct_zones_count,
+            SUM(CASE WHEN NOT ({pickup_log_not_voided_sql('pl')}) THEN 1 ELSE 0 END) AS voided_trips_count
+        FROM pickup_logs pl
         """,
         (cutoff_24h, cutoff_7d),
     )
@@ -43,22 +53,27 @@ def get_admin_trips_summary() -> Dict[str, Any]:
             "latest_trip_at": None,
             "distinct_users_count": 0,
             "distinct_zones_count": 0,
+            "active_recorded_trips": 0,
+            "voided_trips_count": 0,
         }
 
     data = dict(row)
+    active_recorded_trips = int(data.get("total_recorded_trips") or 0)
     return {
-        "total_recorded_trips": int(data.get("total_recorded_trips") or 0),
+        "total_recorded_trips": active_recorded_trips,
         "trips_last_24h": int(data.get("trips_last_24h") or 0),
         "trips_last_7d": int(data.get("trips_last_7d") or 0),
         "latest_trip_at": _to_iso(data.get("latest_trip_at")),
         "distinct_users_count": int(data.get("distinct_users_count") or 0),
         "distinct_zones_count": int(data.get("distinct_zones_count") or 0),
+        "active_recorded_trips": active_recorded_trips,
+        "voided_trips_count": int(data.get("voided_trips_count") or 0),
     }
 
 
-def get_admin_recent_trips(limit: int = 20) -> List[Dict[str, Any]]:
+def get_admin_recent_trips(limit: int = 20, include_voided: bool = True) -> List[Dict[str, Any]]:
     rows = _db_query_all(
-        """
+        f"""
         SELECT
             pl.id,
             pl.user_id,
@@ -70,9 +85,15 @@ def get_admin_recent_trips(limit: int = 20) -> List[Dict[str, Any]]:
             pl.frame_time,
             pl.created_at,
             pl.lat,
-            pl.lng
+            pl.lng,
+            pl.is_voided,
+            pl.voided_at,
+            pl.void_reason,
+            pl.guard_reason,
+            pl.counted_for_pickup_stats
         FROM pickup_logs pl
         LEFT JOIN users u ON u.id = pl.user_id
+        WHERE {'1=1' if include_voided else pickup_log_not_voided_sql('pl')}
         ORDER BY pl.created_at DESC
         LIMIT ?
         """,
@@ -95,6 +116,11 @@ def get_admin_recent_trips(limit: int = 20) -> List[Dict[str, Any]]:
                 "created_at": _to_iso(row.get("created_at")),
                 "lat": float(row["lat"]) if row.get("lat") is not None else None,
                 "lng": float(row["lng"]) if row.get("lng") is not None else None,
+                "is_voided": _flag_to_bool(row.get("is_voided")),
+                "voided_at": _to_iso(row.get("voided_at")),
+                "void_reason": row.get("void_reason"),
+                "guard_reason": row.get("guard_reason"),
+                "counted_for_pickup_stats": _flag_to_bool(row.get("counted_for_pickup_stats")),
             }
         )
     return items

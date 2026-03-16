@@ -6,6 +6,7 @@ from typing import Any, Dict, Optional
 from fastapi import HTTPException
 
 from core import DB_BACKEND, _db_exec, _db_query_one
+from pickup_recording_feature import soft_void_pickup_trip
 
 
 def _flag_to_bool(value: Any) -> bool:
@@ -129,11 +130,17 @@ def clear_police_report(report_id: int) -> Dict[str, Any]:
     return {"ok": True, "report_id": int(report_id), "cleared": True}
 
 
-def clear_pickup_report(report_id: int) -> Dict[str, Any]:
-    existing = _db_query_one("SELECT id FROM pickup_logs WHERE id=? LIMIT 1", (int(report_id),))
-    if not existing:
-        raise HTTPException(status_code=404, detail="Pickup report not found")
-
-    _db_exec("DELETE FROM pickup_logs WHERE id=?", (int(report_id),))
-
-    return {"ok": True, "report_id": int(report_id), "cleared": True}
+def clear_pickup_report(report_id: int, admin_user_id: int) -> Dict[str, Any]:
+    result = soft_void_pickup_trip(
+        trip_id=int(report_id),
+        admin_user_id=int(admin_user_id),
+        reason="Legacy admin clear pickup log",
+    )
+    response = {
+        "ok": True,
+        "report_id": int(report_id),
+        "cleared": True,
+        "soft_deleted": True,
+    }
+    response.update(result)
+    return response

@@ -20,7 +20,8 @@ def admin_trips_summary(admin: sqlite3.Row = Depends(require_admin_user)):
 @router.get("/recent", response_model=AdminRecentTripsResponse)
 def admin_trips_recent(
     limit: int = Query(default=20, ge=1, le=100),
+    include_voided: int = Query(default=1, ge=0, le=1),
     admin: sqlite3.Row = Depends(require_admin_user),
 ):
     _ = admin
-    return {"items": get_admin_recent_trips(limit=limit)}
+    return {"items": get_admin_recent_trips(limit=limit, include_voided=bool(include_voided))}
