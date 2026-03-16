@@ -50,6 +50,20 @@ RANK_LADDER = [
 ]
 
 
+def get_rank_ladder() -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for start, end, rank_name, rank_icon_key in RANK_LADDER:
+        rows.append(
+            {
+                "start_level": start,
+                "end_level": end,
+                "rank_name": rank_name,
+                "rank_icon_key": rank_icon_key,
+            }
+        )
+    return rows
+
+
 def _bool_db_value(flag: bool):
     if DB_BACKEND == "postgres":
         return bool(flag)
