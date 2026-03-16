@@ -1631,6 +1631,8 @@ def auth_login(payload: LoginPayload):
         raise HTTPException(status_code=401, detail="Invalid email or password")
     if _flag_to_int(row["is_disabled"]) == 1:
         raise HTTPException(status_code=403, detail="Account disabled")
+    if _flag_to_int(row["is_suspended"] if "is_suspended" in row.keys() else 0) == 1:
+        raise HTTPException(status_code=403, detail="Account suspended")
 
     # Trim any whitespace/newlines on stored salt and hash; some databases
     # (notably Postgres) may store trailing spaces, causing a mismatch.

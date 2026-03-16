@@ -59,6 +59,8 @@ def set_user_suspended(actor_user_id: int, user_id: int, is_suspended: bool) -> 
         raise HTTPException(status_code=400, detail="Admins cannot suspend themselves")
 
     _db_exec("UPDATE users SET is_suspended=? WHERE id=?", (_bool_db_value(is_suspended), int(user_id)))
+    if bool(is_suspended):
+        _db_exec("DELETE FROM presence WHERE user_id=?", (int(user_id),))
 
     return {"ok": True, "user_id": int(user_id), "is_suspended": bool(is_suspended)}
 
