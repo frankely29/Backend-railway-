@@ -31,6 +31,7 @@ class AdminUserDetailResponse(BaseModel):
     created_at: Optional[str] = None
     presence: Optional[dict] = None
     pickup_count: Optional[int] = None
+    voided_pickup_count: Optional[int] = None
     police_report_count: Optional[int] = None
 
 
