@@ -101,10 +101,16 @@ def _recent_voided_pickup_logs_count(window_seconds: int = 86400) -> int:
 def _admin_online_presence_counts(max_age_sec: int = 300) -> Dict[str, int]:
     cutoff = int(time.time()) - int(max_age_sec)
     try:
+        if DB_BACKEND == "postgres":
+            ghosted_expr = "CASE WHEN COALESCE(u.ghost_mode, FALSE) = TRUE THEN 1 ELSE 0 END"
+        else:
+            ghosted_expr = "CASE WHEN COALESCE(CAST(u.ghost_mode AS INTEGER), 0) = 1 THEN 1 ELSE 0 END"
+
         row = _db_query_one(
-            """
-            SELECT COUNT(*) AS online_count,
-                   SUM(CASE WHEN COALESCE(u.ghost_mode, 0) IN (1, TRUE) THEN 1 ELSE 0 END) AS ghosted_count
+            f"""
+            SELECT
+              COUNT(*) AS online_count,
+              COALESCE(SUM({ghosted_expr}), 0) AS ghosted_count
             FROM presence p
             LEFT JOIN users u ON u.id = p.user_id
             WHERE p.updated_at >= ?
@@ -149,7 +155,14 @@ def get_admin_summary() -> Dict[str, Any]:
     total_users = _safe_count("users") or 0
 
     try:
-        row = _db_query_one("SELECT COUNT(*) AS c FROM users WHERE is_admin = ?", (True if DB_BACKEND == "postgres" else 1,))
+        if DB_BACKEND == "postgres":
+            row = _db_query_one(
+                "SELECT COUNT(*) AS c FROM users WHERE COALESCE(is_admin, FALSE) = TRUE"
+            )
+        else:
+            row = _db_query_one(
+                "SELECT COUNT(*) AS c FROM users WHERE COALESCE(CAST(is_admin AS INTEGER), 0) = 1"
+            )
         admin_users = int(row["c"]) if row else 0
     except Exception:
         admin_users = 0
