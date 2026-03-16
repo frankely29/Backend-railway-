@@ -8,10 +8,14 @@ from pydantic import BaseModel
 class AdminSummaryResponse(BaseModel):
     total_users: int
     admin_users: int
+    admins_count: Optional[int] = None
     online_users: int
     ghosted_online_users: int
     police_reports_recent_count: int
+    police_reports_count: Optional[int] = None
     pickup_logs_recent_count: int
+    pickup_logs_count: Optional[int] = None
+    pickup_logs_voided_recent_count: Optional[int] = None
     timeline_ready: bool
     frame_count: int
     leaderboard_status: Dict[str, Any]

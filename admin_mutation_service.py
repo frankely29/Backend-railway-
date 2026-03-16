@@ -6,7 +6,7 @@ from typing import Any, Dict, Optional
 from fastapi import HTTPException
 
 from core import DB_BACKEND, _db_exec, _db_query_one
-from pickup_recording_feature import soft_void_pickup_trip
+from pickup_recording_feature import pickup_log_not_voided_sql, soft_void_pickup_trip
 
 
 def _flag_to_bool(value: Any) -> bool:
@@ -86,7 +86,22 @@ def get_admin_user_detail(user_id: int) -> Dict[str, Any]:
         (int(user_id),),
     )
 
-    pickup_count_row = _db_query_one("SELECT COUNT(*) AS c FROM pickup_logs WHERE user_id=?", (int(user_id),))
+    active_pickup_count_row = _db_query_one(
+        f"""
+        SELECT COUNT(*) AS c
+        FROM pickup_logs pl
+        WHERE pl.user_id=? AND {pickup_log_not_voided_sql('pl')}
+        """,
+        (int(user_id),),
+    )
+    voided_pickup_count_row = _db_query_one(
+        f"""
+        SELECT COUNT(*) AS c
+        FROM pickup_logs pl
+        WHERE pl.user_id=? AND NOT ({pickup_log_not_voided_sql('pl')})
+        """,
+        (int(user_id),),
+    )
     police_count_row = _db_query_one(
         "SELECT COUNT(*) AS c FROM events WHERE user_id=? AND lower(type)='police'",
         (int(user_id),),
@@ -112,7 +127,8 @@ def get_admin_user_detail(user_id: int) -> Dict[str, Any]:
         "avatar_url": user.get("avatar_url"),
         "created_at": _to_iso(user.get("created_at")),
         "presence": presence_payload,
-        "pickup_count": int(pickup_count_row["c"]) if pickup_count_row else 0,
+        "pickup_count": int(active_pickup_count_row["c"]) if active_pickup_count_row else 0,
+        "voided_pickup_count": int(voided_pickup_count_row["c"]) if voided_pickup_count_row else 0,
         "police_report_count": int(police_count_row["c"]) if police_count_row else 0,
     }
 

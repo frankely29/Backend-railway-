@@ -48,6 +48,77 @@ def _recent_count(table: str, window_seconds: int = 86400) -> int:
         return 0
 
 
+def _recent_police_reports_count(window_seconds: int = 86400) -> int:
+    cutoff = int(time.time()) - int(window_seconds)
+    try:
+        row = _db_query_one(
+            """
+            SELECT COUNT(*) AS c
+            FROM events
+            WHERE lower(type) = 'police' AND created_at >= ?
+            """,
+            (cutoff,),
+        )
+        return int(row["c"]) if row else 0
+    except Exception:
+        return 0
+
+
+def _recent_active_pickup_logs_count(window_seconds: int = 86400) -> int:
+    cutoff = int(time.time()) - int(window_seconds)
+    try:
+        row = _db_query_one(
+            f"""
+            SELECT COUNT(*) AS c
+            FROM pickup_logs pl
+            WHERE pl.created_at >= ?
+              AND {pickup_log_not_voided_sql('pl')}
+            """,
+            (cutoff,),
+        )
+        return int(row["c"]) if row else 0
+    except Exception:
+        return 0
+
+
+def _recent_voided_pickup_logs_count(window_seconds: int = 86400) -> int:
+    cutoff = int(time.time()) - int(window_seconds)
+    try:
+        row = _db_query_one(
+            f"""
+            SELECT COUNT(*) AS c
+            FROM pickup_logs pl
+            WHERE pl.created_at >= ?
+              AND NOT ({pickup_log_not_voided_sql('pl')})
+            """,
+            (cutoff,),
+        )
+        return int(row["c"]) if row else 0
+    except Exception:
+        return 0
+
+
+def _admin_online_presence_counts(max_age_sec: int = 300) -> Dict[str, int]:
+    cutoff = int(time.time()) - int(max_age_sec)
+    try:
+        row = _db_query_one(
+            """
+            SELECT COUNT(*) AS online_count,
+                   SUM(CASE WHEN COALESCE(u.ghost_mode, 0) IN (1, TRUE) THEN 1 ELSE 0 END) AS ghosted_count
+            FROM presence p
+            LEFT JOIN users u ON u.id = p.user_id
+            WHERE p.updated_at >= ?
+            """,
+            (cutoff,),
+        )
+        return {
+            "online_users": int(row["online_count"] or 0) if row else 0,
+            "ghosted_online_users": int(row["ghosted_count"] or 0) if row else 0,
+        }
+    except Exception:
+        return {"online_users": 0, "ghosted_online_users": 0}
+
+
 def _frames_info() -> Dict[str, Any]:
     data_dir = Path(os.environ.get("DATA_DIR", "/data"))
     frames_dir = Path(os.environ.get("FRAMES_DIR", str(data_dir / "frames")))
@@ -83,43 +154,26 @@ def get_admin_summary() -> Dict[str, Any]:
     except Exception:
         admin_users = 0
 
-    try:
-        if DB_BACKEND == "postgres":
-            counts = _db_query_one(
-                """
-                SELECT COUNT(*) AS online_count,
-                       SUM(CASE WHEN COALESCE(u.ghost_mode, FALSE) THEN 1 ELSE 0 END) AS ghosted_count
-                FROM presence p
-                LEFT JOIN users u ON u.id = p.user_id
-                WHERE EXTRACT(EPOCH FROM (NOW() - p.updated_at)) <= ?
-                """,
-                (300,),
-            )
-        else:
-            counts = _db_query_one(
-                """
-                SELECT COUNT(*) AS online_count,
-                       SUM(CASE WHEN COALESCE(u.ghost_mode, 0) = 1 THEN 1 ELSE 0 END) AS ghosted_count
-                FROM presence p
-                LEFT JOIN users u ON u.id = p.user_id
-                WHERE p.updated_at >= ?
-                """,
-                (int(time.time()) - 300,),
-            )
-        online_users = int(counts["online_count"] or 0) if counts else 0
-        ghosted_online_users = int(counts["ghosted_count"] or 0) if counts else 0
-    except Exception:
-        online_users = 0
-        ghosted_online_users = 0
+    presence_counts = _admin_online_presence_counts(max_age_sec=300)
+    online_users = int(presence_counts["online_users"])
+    ghosted_online_users = int(presence_counts["ghosted_online_users"])
+
+    police_reports_recent_count = _recent_police_reports_count()
+    pickup_logs_recent_count = _recent_active_pickup_logs_count()
+    pickup_logs_voided_recent_count = _recent_voided_pickup_logs_count()
 
     frames = _frames_info()
     return {
         "total_users": total_users,
         "admin_users": admin_users,
+        "admins_count": admin_users,
         "online_users": online_users,
         "ghosted_online_users": ghosted_online_users,
-        "police_reports_recent_count": _recent_count("events"),
-        "pickup_logs_recent_count": _recent_count("pickup_logs"),
+        "police_reports_recent_count": police_reports_recent_count,
+        "police_reports_count": police_reports_recent_count,
+        "pickup_logs_recent_count": pickup_logs_recent_count,
+        "pickup_logs_count": pickup_logs_recent_count,
+        "pickup_logs_voided_recent_count": pickup_logs_voided_recent_count,
         "timeline_ready": frames["timeline_ready"],
         "frame_count": frames["frame_count"],
         "leaderboard_status": _leaderboard_status(),
