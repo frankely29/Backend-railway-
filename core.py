@@ -75,6 +75,30 @@ def _db_query_all(sql: str, params: Tuple[Any, ...] = ()) -> List[sqlite3.Row]:
             conn.close()
 
 
+def _get_column_data_type(table: str, column: str) -> str:
+    """Return normalized declared DB type for a table column when available."""
+    try:
+        if DB_BACKEND == "postgres":
+            row = _db_query_one(
+                """
+                SELECT data_type
+                FROM information_schema.columns
+                WHERE table_name=? AND column_name=?
+                LIMIT 1
+                """,
+                (table, column),
+            )
+            return str(row["data_type"]).lower().strip() if row and row.get("data_type") is not None else ""
+
+        rows = _db_query_all(f"PRAGMA table_info({table})")
+        for row in rows:
+            if str(row["name"]).lower().strip() == column.lower().strip():
+                return str(row["type"] or "").lower().strip()
+    except Exception:
+        return ""
+    return ""
+
+
 def _require_jwt_secret() -> None:
     if not JWT_SECRET or len(JWT_SECRET) < 24:
         raise HTTPException(
