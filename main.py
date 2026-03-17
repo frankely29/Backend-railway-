@@ -949,6 +949,27 @@ def _db_init() -> None:
         _db_exec("UPDATE chat_messages SET room='global' WHERE room IS NULL OR btrim(room)='';")
         _db_exec("CREATE INDEX IF NOT EXISTS idx_chat_messages_id ON chat_messages(id);")
         _db_exec("CREATE INDEX IF NOT EXISTS idx_chat_messages_room_id ON chat_messages(room, id);")
+
+        _db_exec(
+            """
+            CREATE TABLE IF NOT EXISTS private_chat_messages (
+              id BIGSERIAL PRIMARY KEY,
+              sender_user_id BIGINT NOT NULL,
+              recipient_user_id BIGINT NOT NULL,
+              text TEXT NOT NULL,
+              created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+              read_at TIMESTAMP NULL,
+              FOREIGN KEY(sender_user_id) REFERENCES users(id),
+              FOREIGN KEY(recipient_user_id) REFERENCES users(id)
+            );
+            """
+        )
+        _db_exec(
+            "CREATE INDEX IF NOT EXISTS idx_private_chat_pair_created ON private_chat_messages(sender_user_id, recipient_user_id, created_at, id);"
+        )
+        _db_exec(
+            "CREATE INDEX IF NOT EXISTS idx_private_chat_recipient_read ON private_chat_messages(recipient_user_id, sender_user_id, read_at);"
+        )
         return
 
     _db_exec(
@@ -1111,6 +1132,27 @@ def _db_init() -> None:
     _db_exec("UPDATE chat_messages SET room='global' WHERE room IS NULL OR trim(room)='';")
     _db_exec("CREATE INDEX IF NOT EXISTS idx_chat_messages_id ON chat_messages(id);")
     _db_exec("CREATE INDEX IF NOT EXISTS idx_chat_messages_room_id ON chat_messages(room, id);")
+
+    _db_exec(
+        """
+        CREATE TABLE IF NOT EXISTS private_chat_messages (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          sender_user_id INTEGER NOT NULL,
+          recipient_user_id INTEGER NOT NULL,
+          text TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          read_at TEXT,
+          FOREIGN KEY(sender_user_id) REFERENCES users(id),
+          FOREIGN KEY(recipient_user_id) REFERENCES users(id)
+        );
+        """
+    )
+    _db_exec(
+        "CREATE INDEX IF NOT EXISTS idx_private_chat_pair_created ON private_chat_messages(sender_user_id, recipient_user_id, created_at, id);"
+    )
+    _db_exec(
+        "CREATE INDEX IF NOT EXISTS idx_private_chat_recipient_read ON private_chat_messages(recipient_user_id, sender_user_id, read_at);"
+    )
 
 
 # =========================================================
