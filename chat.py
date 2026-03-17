@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from core import DB_BACKEND, _clean_display_name, _db, _db_exec, _db_lock, _db_query_all, _sql, require_user
@@ -15,6 +18,26 @@ router = APIRouter(prefix="/chat", tags=["chat"])
 _RATE_LIMIT_SECONDS = 2.0
 _rate_limit_lock = threading.Lock()
 _last_message_by_user: dict[int, float] = {}
+
+_TEXT_RETENTION_SECONDS = 7 * 24 * 3600
+_VOICE_RETENTION_SECONDS = 24 * 3600
+_VOICE_MAX_DURATION_SEC = 10
+_VOICE_MAX_FILE_BYTES = 2 * 1024 * 1024
+_ALLOWED_AUDIO_MIME_TYPES = {
+    "audio/aac",
+    "audio/m4a",
+    "audio/mp4",
+    "audio/mpeg",
+    "audio/ogg",
+    "audio/wav",
+    "audio/webm",
+    "audio/x-m4a",
+    "audio/x-wav",
+}
+_VOICE_ROOT = Path("/data/chat_voice")
+_PURGE_DEBOUNCE_SECONDS = 600
+_purge_lock = threading.Lock()
+_last_purge_at = 0.0
 
 
 class ChatMessagePayload(BaseModel):
@@ -27,10 +50,18 @@ class PrivateChatSendIn(BaseModel):
 
 class PrivateChatMessageOut(BaseModel):
     id: int
+    user_id: int
     sender_user_id: int
     recipient_user_id: int
     text: str
     created_at: str
+    display_name: str
+    sender_display_name: str
+    sender_avatar_url: str | None = None
+    message_kind: str = "text"
+    voice_url: str | None = None
+    voice_duration_sec: int | None = None
+    expires_at: str | None = None
 
 
 class PrivateChatMessagesResponse(BaseModel):
@@ -41,11 +72,15 @@ class PrivateChatMessagesResponse(BaseModel):
 class PrivateChatThreadOut(BaseModel):
     other_user_id: int
     other_display_name: str
+    display_name: str
     other_avatar_url: str | None = None
+    avatar_url: str | None = None
     last_message_text: str
     last_message_at: str
     last_message_sender_user_id: int
     unread_count: int
+    message_kind: str = "text"
+    voice_duration_sec: int | None = None
 
 
 class PrivateChatThreadsResponse(BaseModel):
@@ -65,48 +100,13 @@ class DMUsersResponse(BaseModel):
     users: list[DMUserRow]
 
 
-class DMThreadRow(BaseModel):
-    other_user_id: int
-    display_name: str
-    avatar_url: str | None = None
-    last_message_text: str
-    last_message_created_at: str
-    last_message_user_id: int
-    room: str
-
-
-class DMThreadsResponse(BaseModel):
-    threads: list[DMThreadRow]
-
-
 def _to_iso(unix_ts: int) -> str:
     return datetime.fromtimestamp(int(unix_ts), tz=timezone.utc).isoformat()
 
 
-def _parse_after(after: str | None) -> tuple[str | None, int | None]:
-    if after is None:
-        return None, None
-
-    value = after.strip()
-    if not value:
-        return None, None
-
-    if value.isdigit():
-        return "id", int(value)
-
-    iso_value = value.replace("Z", "+00:00")
-    try:
-        dt = datetime.fromisoformat(iso_value)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid after. Use numeric id or ISO timestamp.")
-
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-
-    return "created_at", int(dt.timestamp())
-
-
 def _timestamp_to_iso(value: Any) -> str:
+    if value is None:
+        return ""
     if isinstance(value, datetime):
         dt = value
     elif isinstance(value, (int, float)):
@@ -123,16 +123,31 @@ def _timestamp_to_iso(value: Any) -> str:
     return dt.astimezone(timezone.utc).isoformat()
 
 
+def _unix_from_timestamp(value: Any) -> int:
+    if value is None:
+        return int(time.time())
+    if isinstance(value, datetime):
+        dt = value
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp())
+    if isinstance(value, (int, float)):
+        return int(value)
+    text = str(value).replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp())
+    except ValueError:
+        return int(float(value))
+
+
 def _normalize_room(room: str) -> str:
     cleaned = (room or "").strip()
     if not cleaned:
         raise HTTPException(status_code=400, detail="Room is required")
     return cleaned
-
-
-def _dm_room_for_users(a: int, b: int) -> str:
-    low, high = sorted((int(a), int(b)))
-    return f"dm:{low}:{high}"
 
 
 def _validate_text(text: str) -> str:
@@ -153,49 +168,71 @@ def _enforce_rate_limit(user_id: int) -> None:
         _last_message_by_user[user_id] = now
 
 
-def _serialize_message(row: dict) -> dict:
-    # created_at is an int in SQLite or a datetime in Postgres. Normalize it.
-    created = row["created_at"]
-    if isinstance(created, (int, float)):
-        ts = int(created)
-    else:
-        ts = int(created.timestamp())
+def _resolve_sender_display_name(row: dict, prefix: str = "") -> str:
+    sender_id = int(row[f"{prefix}sender_user_id"] if f"{prefix}sender_user_id" in row else row["user_id"])
+    user_display_name = (row.get(f"{prefix}sender_display_name") or row.get("user_display_name") or "").strip()
+    user_email = (row.get(f"{prefix}sender_email") or row.get("user_email") or "").strip()
+    message_display_name = (row.get("message_display_name") or row.get("display_name") or "").strip()
 
+    if user_display_name:
+        return user_display_name
+    if user_email and "@" in user_email:
+        return user_email.split("@", 1)[0].strip() or f"User {sender_id}"
+    if message_display_name:
+        return message_display_name
+    return f"User {sender_id}"
+
+
+def _expires_iso(row: dict) -> str | None:
+    expires_value = row.get("expires_at")
+    if expires_value is None:
+        return None
+    return _to_iso(_unix_from_timestamp(expires_value))
+
+
+def _serialize_public_message(row: dict) -> dict:
     sender_name = _resolve_sender_display_name(row)
-    sender_avatar_url = row.get("sender_avatar_url")
-
+    message_kind = (row.get("message_kind") or "text").strip().lower()
+    voice_url = f"/chat/voice/public/{int(row['id'])}" if message_kind == "voice" else None
     return {
         "id": int(row["id"]),
         "room": row["room"],
         "user_id": int(row["user_id"]),
         "display_name": sender_name,
         "sender_display_name": sender_name,
-        "sender_avatar_url": sender_avatar_url,
-        "text": row["message"],
-        "created_at": _to_iso(ts),
+        "sender_avatar_url": row.get("sender_avatar_url"),
+        "text": row.get("message") or "",
+        "created_at": _to_iso(_unix_from_timestamp(row["created_at"])),
+        "message_kind": message_kind,
+        "voice_url": voice_url,
+        "voice_duration_sec": int(row["voice_duration_sec"]) if row.get("voice_duration_sec") is not None else None,
+        "expires_at": _expires_iso(row),
     }
 
 
-def _resolve_sender_display_name(row: dict) -> str:
-    user_id = int(row["user_id"])
-    user_display_name = (row.get("user_display_name") or "").strip()
-    user_email = (row.get("user_email") or "").strip()
-    message_display_name = (row.get("message_display_name") or row.get("display_name") or "").strip()
-
-    if user_display_name:
-        return user_display_name
-    if user_email and "@" in user_email:
-        return user_email.split("@", 1)[0].strip() or f"User {user_id}"
-    if message_display_name:
-        return message_display_name
-    return f"User {user_id}"
+def _serialize_private_message(row: dict) -> dict:
+    sender_name = _resolve_sender_display_name(row, prefix="private_")
+    message_kind = (row.get("message_kind") or "text").strip().lower()
+    voice_url = f"/chat/voice/private/{int(row['id'])}" if message_kind == "voice" else None
+    return {
+        "id": int(row["id"]),
+        "user_id": int(row["sender_user_id"]),
+        "sender_user_id": int(row["sender_user_id"]),
+        "recipient_user_id": int(row["recipient_user_id"]),
+        "text": row.get("text") or "",
+        "created_at": _timestamp_to_iso(row["created_at"]),
+        "display_name": sender_name,
+        "sender_display_name": sender_name,
+        "sender_avatar_url": row.get("private_sender_avatar_url"),
+        "message_kind": message_kind,
+        "voice_url": voice_url,
+        "voice_duration_sec": int(row["voice_duration_sec"]) if row.get("voice_duration_sec") is not None else None,
+        "expires_at": _expires_iso(row),
+    }
 
 
 def _ensure_dm_target_exists(other_user_id: int):
-    row = _db_query_all(
-        "SELECT id, is_disabled FROM users WHERE id=? LIMIT 1",
-        (int(other_user_id),),
-    )
+    row = _db_query_all("SELECT id, is_disabled FROM users WHERE id=? LIMIT 1", (int(other_user_id),))
     if not row:
         raise HTTPException(status_code=404, detail="User not found")
     target = dict(row[0])
@@ -204,31 +241,278 @@ def _ensure_dm_target_exists(other_user_id: int):
         raise HTTPException(status_code=404, detail="User not found")
 
 
-def _serialize_private_message(row: dict) -> dict:
-    return {
-        "id": int(row["id"]),
-        "sender_user_id": int(row["sender_user_id"]),
-        "recipient_user_id": int(row["recipient_user_id"]),
-        "text": row["text"],
-        "created_at": _timestamp_to_iso(row["created_at"]),
+def _voice_extension(mime: str) -> str:
+    mapping = {
+        "audio/mpeg": ".mp3",
+        "audio/mp4": ".m4a",
+        "audio/m4a": ".m4a",
+        "audio/x-m4a": ".m4a",
+        "audio/aac": ".aac",
+        "audio/ogg": ".ogg",
+        "audio/wav": ".wav",
+        "audio/x-wav": ".wav",
+        "audio/webm": ".webm",
     }
+    return mapping.get(mime.lower(), ".audio")
+
+
+def _save_voice_file(scope: str, data: bytes, mime: str) -> str:
+    folder = _VOICE_ROOT / scope
+    folder.mkdir(parents=True, exist_ok=True)
+    ext = _voice_extension(mime)
+    filename = f"{int(time.time())}_{uuid.uuid4().hex}{ext}"
+    path = folder / filename
+    path.write_bytes(data)
+    return str(path)
+
+
+def _validate_voice_upload(upload: UploadFile, duration_sec: int) -> bytes:
+    if duration_sec < 1 or duration_sec > _VOICE_MAX_DURATION_SEC:
+        raise HTTPException(status_code=400, detail="duration_sec must be between 1 and 10")
+    mime = (upload.content_type or "").lower().strip()
+    if mime not in _ALLOWED_AUDIO_MIME_TYPES:
+        raise HTTPException(status_code=400, detail="Unsupported audio type")
+    data = upload.file.read(_VOICE_MAX_FILE_BYTES + 1)
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty file")
+    if len(data) > _VOICE_MAX_FILE_BYTES:
+        raise HTTPException(status_code=400, detail="Voice file too large")
+    return data
+
+
+def _touch_chat_maintenance() -> None:
+    purge_expired_chat_rows_if_due(force=False)
+
+
+def purge_expired_chat_rows_if_due(force: bool = False) -> None:
+    global _last_purge_at
+    now_mono = time.monotonic()
+    with _purge_lock:
+        if not force and (now_mono - _last_purge_at) < _PURGE_DEBOUNCE_SECONDS:
+            return
+        _last_purge_at = now_mono
+
+    now = int(time.time())
+    expired_public = _db_query_all(
+        "SELECT id, voice_path FROM chat_messages WHERE expires_at IS NOT NULL AND expires_at <= ?",
+        (now,),
+    )
+    expired_private = _db_query_all(
+        "SELECT id, voice_path FROM private_chat_messages WHERE expires_at IS NOT NULL AND expires_at <= ?",
+        (now,),
+    )
+
+    _db_exec("DELETE FROM chat_messages WHERE expires_at IS NOT NULL AND expires_at <= ?", (now,))
+    _db_exec("DELETE FROM private_chat_messages WHERE expires_at IS NOT NULL AND expires_at <= ?", (now,))
+
+    for row in [*expired_public, *expired_private]:
+        voice_path = row.get("voice_path")
+        if not voice_path:
+            continue
+        try:
+            p = Path(str(voice_path))
+            if p.exists() and p.is_file():
+                p.unlink()
+        except Exception:
+            continue
+
+
+def _list_messages_for_room(room: str, limit: int, after: str | None = None) -> dict:
+    _touch_chat_maintenance()
+    safe_room = _normalize_room(room)
+    safe_limit = max(1, min(200, int(limit)))
+    now = int(time.time())
+
+    where = ["room = ?", "(expires_at IS NULL OR expires_at > ?)"]
+    params: list[Any] = [safe_room, now]
+    after_value = (after or "").strip()
+    if after_value.isdigit():
+        where.append("id > ?")
+        params.append(int(after_value))
+
+    rows = _db_query_all(
+        f"""
+        SELECT cm.id, cm.room, cm.user_id,
+               cm.display_name AS message_display_name,
+               u.display_name AS user_display_name,
+               u.email AS user_email,
+               u.avatar_url AS sender_avatar_url,
+               cm.message, cm.created_at, cm.message_kind,
+               cm.voice_duration_sec, cm.expires_at
+        FROM (
+            SELECT id, room, user_id, display_name, message, created_at, message_kind, voice_duration_sec, expires_at
+            FROM chat_messages
+            WHERE {' AND '.join(where)}
+            ORDER BY id DESC
+            LIMIT ?
+        ) cm
+        LEFT JOIN users u ON u.id = cm.user_id
+        ORDER BY cm.id ASC
+        """,
+        tuple(params + [safe_limit]),
+    )
+
+    return {"room": safe_room, "messages": [_serialize_public_message(dict(r)) for r in rows]}
+
+
+def _create_public_text_message(room: str, payload: ChatMessagePayload, user) -> dict:
+    _touch_chat_maintenance()
+    safe_room = _normalize_room(room)
+    message = _validate_text(payload.text)
+    user_id = int(user["id"])
+    _enforce_rate_limit(user_id)
+
+    now = int(time.time())
+    expires_at = now + _TEXT_RETENTION_SECONDS
+    display_name = _clean_display_name(user["display_name"] or "", user["email"])
+
+    with _db_lock:
+        conn = _db()
+        try:
+            cur = conn.cursor()
+            if DB_BACKEND == "postgres":
+                cur.execute(
+                    _sql(
+                        """
+                        INSERT INTO chat_messages(room, user_id, display_name, message, created_at, message_kind, expires_at)
+                        VALUES (?, ?, ?, ?, ?, 'text', ?)
+                        RETURNING id, room, user_id, display_name AS message_display_name, message, created_at,
+                                  message_kind, voice_duration_sec, expires_at
+                        """
+                    ),
+                    (safe_room, user_id, display_name, message, now, expires_at),
+                )
+                row = dict(cur.fetchone())
+            else:
+                cur.execute(
+                    _sql(
+                        """
+                        INSERT INTO chat_messages(room, user_id, display_name, message, created_at, message_kind, expires_at)
+                        VALUES (?, ?, ?, ?, ?, 'text', ?)
+                        """
+                    ),
+                    (safe_room, user_id, display_name, message, now, expires_at),
+                )
+                new_id = int(cur.lastrowid)
+                cur.execute(
+                    _sql(
+                        """
+                        SELECT id, room, user_id, display_name AS message_display_name, message, created_at,
+                               message_kind, voice_duration_sec, expires_at
+                        FROM chat_messages
+                        WHERE id=?
+                        """
+                    ),
+                    (new_id,),
+                )
+                row = dict(cur.fetchone())
+            conn.commit()
+        finally:
+            conn.close()
+
+    row["user_display_name"] = user.get("display_name")
+    row["user_email"] = user.get("email")
+    row["sender_avatar_url"] = user.get("avatar_url")
+    return _serialize_public_message(row)
+
+
+def _create_public_voice_message(room: str, user, upload: UploadFile, duration_sec: int) -> dict:
+    _touch_chat_maintenance()
+    safe_room = _normalize_room(room)
+    user_id = int(user["id"])
+    _enforce_rate_limit(user_id)
+
+    data = _validate_voice_upload(upload, duration_sec)
+    voice_path = _save_voice_file("public", data, upload.content_type or "audio/webm")
+
+    now = int(time.time())
+    expires_at = now + _VOICE_RETENTION_SECONDS
+    display_name = _clean_display_name(user["display_name"] or "", user["email"])
+
+    with _db_lock:
+        conn = _db()
+        try:
+            cur = conn.cursor()
+            if DB_BACKEND == "postgres":
+                cur.execute(
+                    _sql(
+                        """
+                        INSERT INTO chat_messages(
+                            room, user_id, display_name, message, created_at, message_kind,
+                            voice_path, voice_mime, voice_duration_sec, expires_at
+                        )
+                        VALUES (?, ?, ?, '', ?, 'voice', ?, ?, ?, ?)
+                        RETURNING id, room, user_id, display_name AS message_display_name, message, created_at,
+                                  message_kind, voice_duration_sec, expires_at
+                        """
+                    ),
+                    (safe_room, user_id, display_name, now, voice_path, upload.content_type, int(duration_sec), expires_at),
+                )
+                row = dict(cur.fetchone())
+            else:
+                cur.execute(
+                    _sql(
+                        """
+                        INSERT INTO chat_messages(
+                            room, user_id, display_name, message, created_at, message_kind,
+                            voice_path, voice_mime, voice_duration_sec, expires_at
+                        )
+                        VALUES (?, ?, ?, '', ?, 'voice', ?, ?, ?, ?)
+                        """
+                    ),
+                    (safe_room, user_id, display_name, now, voice_path, upload.content_type, int(duration_sec), expires_at),
+                )
+                new_id = int(cur.lastrowid)
+                cur.execute(
+                    _sql(
+                        """
+                        SELECT id, room, user_id, display_name AS message_display_name, message, created_at,
+                               message_kind, voice_duration_sec, expires_at
+                        FROM chat_messages
+                        WHERE id=?
+                        """
+                    ),
+                    (new_id,),
+                )
+                row = dict(cur.fetchone())
+            conn.commit()
+        except Exception:
+            try:
+                Path(voice_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    row["user_display_name"] = user.get("display_name")
+    row["user_email"] = user.get("email")
+    row["sender_avatar_url"] = user.get("avatar_url")
+    return _serialize_public_message(row)
 
 
 def _fetch_private_conversation(me: int, other: int, since_id: int | None) -> list[dict]:
+    _touch_chat_maintenance()
     where = [
-        "((sender_user_id=? AND recipient_user_id=?) OR (sender_user_id=? AND recipient_user_id=?))"
+        "((pcm.sender_user_id=? AND pcm.recipient_user_id=?) OR (pcm.sender_user_id=? AND pcm.recipient_user_id=?))",
+        "(pcm.expires_at IS NULL OR pcm.expires_at > ?)",
     ]
-    params: list[int] = [int(me), int(other), int(other), int(me)]
+    params: list[Any] = [int(me), int(other), int(other), int(me), int(time.time())]
     if since_id is not None:
-        where.append("id > ?")
+        where.append("pcm.id > ?")
         params.append(int(since_id))
 
     rows = _db_query_all(
         f"""
-        SELECT id, sender_user_id, recipient_user_id, text, created_at
-        FROM private_chat_messages
+        SELECT pcm.id, pcm.sender_user_id, pcm.recipient_user_id, pcm.text, pcm.created_at,
+               pcm.message_kind, pcm.voice_duration_sec, pcm.expires_at,
+               u.display_name AS private_sender_display_name,
+               u.email AS private_sender_email,
+               u.avatar_url AS private_sender_avatar_url
+        FROM private_chat_messages pcm
+        LEFT JOIN users u ON u.id = pcm.sender_user_id
         WHERE {' AND '.join(where)}
-        ORDER BY created_at ASC, id ASC
+        ORDER BY pcm.created_at ASC, pcm.id ASC
         """,
         tuple(params),
     )
@@ -257,27 +541,35 @@ def _mark_private_read(me: int, other: int) -> None:
 
 
 def _list_private_threads(me: int) -> list[dict]:
-    thread_rows = _db_query_all(
+    _touch_chat_maintenance()
+    now = int(time.time())
+    message_rows = _db_query_all(
         """
-        SELECT
-            CASE
-                WHEN sender_user_id=? THEN recipient_user_id
-                ELSE sender_user_id
-            END AS other_user_id,
-            MAX(created_at) AS last_message_at
+        SELECT id, sender_user_id, recipient_user_id, text, created_at, message_kind, voice_duration_sec
         FROM private_chat_messages
-        WHERE sender_user_id=? OR recipient_user_id=?
-        GROUP BY other_user_id
-        ORDER BY last_message_at DESC
+        WHERE (sender_user_id=? OR recipient_user_id=?)
+          AND (expires_at IS NULL OR expires_at > ?)
+        ORDER BY created_at DESC, id DESC
         """,
-        (int(me), int(me), int(me)),
+        (int(me), int(me), now),
     )
-    if not thread_rows:
+    if not message_rows:
         return []
 
-    other_ids = [int(row["other_user_id"]) for row in thread_rows]
-    placeholders = ", ".join(["?"] * len(other_ids))
+    latest_by_other: dict[int, dict[str, Any]] = {}
+    for row in message_rows:
+        sender_user_id = int(row["sender_user_id"])
+        recipient_user_id = int(row["recipient_user_id"])
+        other_user_id = recipient_user_id if sender_user_id == int(me) else sender_user_id
+        if other_user_id == int(me) or other_user_id in latest_by_other:
+            continue
+        latest_by_other[other_user_id] = dict(row)
 
+    if not latest_by_other:
+        return []
+
+    other_ids = list(latest_by_other.keys())
+    placeholders = ", ".join(["?"] * len(other_ids))
     user_rows = _db_query_all(
         f"SELECT id, display_name, avatar_url, email FROM users WHERE id IN ({placeholders})",
         tuple(other_ids),
@@ -296,49 +588,49 @@ def _list_private_threads(me: int) -> list[dict]:
         FROM private_chat_messages
         WHERE recipient_user_id=?
           AND read_at IS NULL
+          AND (expires_at IS NULL OR expires_at > ?)
           AND sender_user_id IN ({placeholders})
         GROUP BY sender_user_id
         """,
-        tuple([int(me)] + other_ids),
+        tuple([int(me), now] + other_ids),
     )
     unread_by_other = {int(row["other_user_id"]): int(row["unread_count"]) for row in unread_rows}
 
     threads: list[dict] = []
-    for row in thread_rows:
-        other_user_id = int(row["other_user_id"])
-        latest = _db_query_all(
-            """
-            SELECT id, sender_user_id, recipient_user_id, text, created_at
-            FROM private_chat_messages
-            WHERE (sender_user_id=? AND recipient_user_id=?) OR (sender_user_id=? AND recipient_user_id=?)
-            ORDER BY created_at DESC, id DESC
-            LIMIT 1
-            """,
-            (int(me), other_user_id, other_user_id, int(me)),
-        )
-        if not latest:
-            continue
-        last_message = dict(latest[0])
+    for other_user_id, last_message in latest_by_other.items():
         user_payload = users.get(other_user_id)
         if user_payload is None:
             continue
+        message_kind = (last_message.get("message_kind") or "text").strip().lower()
+        last_text = (last_message.get("text") or "").strip()
+        if message_kind == "voice" and not last_text:
+            last_text = "[Voice message]"
         threads.append(
             {
                 "other_user_id": other_user_id,
                 "other_display_name": user_payload["display_name"],
+                "display_name": user_payload["display_name"],
                 "other_avatar_url": user_payload["avatar_url"],
-                "last_message_text": last_message["text"],
+                "avatar_url": user_payload["avatar_url"],
+                "last_message_text": last_text,
                 "last_message_at": _timestamp_to_iso(last_message["created_at"]),
                 "last_message_sender_user_id": int(last_message["sender_user_id"]),
                 "unread_count": int(unread_by_other.get(other_user_id, 0)),
+                "message_kind": message_kind,
+                "voice_duration_sec": int(last_message["voice_duration_sec"]) if last_message.get("voice_duration_sec") is not None else None,
             }
         )
+
+    threads.sort(key=lambda item: item["last_message_at"], reverse=True)
     return threads
 
 
 def _create_private_message(sender_user_id: int, recipient_user_id: int, text: str) -> dict:
+    _touch_chat_maintenance()
     clean_text = _validate_text(text)
     _enforce_rate_limit(int(sender_user_id))
+    now = int(time.time())
+    expires_at = now + _TEXT_RETENTION_SECONDS
 
     with _db_lock:
         conn = _db()
@@ -348,29 +640,37 @@ def _create_private_message(sender_user_id: int, recipient_user_id: int, text: s
                 cur.execute(
                     _sql(
                         """
-                        INSERT INTO private_chat_messages(sender_user_id, recipient_user_id, text)
-                        VALUES (?, ?, ?)
-                        RETURNING id, sender_user_id, recipient_user_id, text, created_at
+                        INSERT INTO private_chat_messages(
+                            sender_user_id, recipient_user_id, text, created_at,
+                            message_kind, expires_at
+                        )
+                        VALUES (?, ?, ?, NOW(), 'text', ?)
+                        RETURNING id, sender_user_id, recipient_user_id, text, created_at,
+                                  message_kind, voice_duration_sec, expires_at
                         """
                     ),
-                    (int(sender_user_id), int(recipient_user_id), clean_text),
+                    (int(sender_user_id), int(recipient_user_id), clean_text, expires_at),
                 )
                 row = dict(cur.fetchone())
             else:
                 cur.execute(
                     _sql(
                         """
-                        INSERT INTO private_chat_messages(sender_user_id, recipient_user_id, text)
-                        VALUES (?, ?, ?)
+                        INSERT INTO private_chat_messages(
+                            sender_user_id, recipient_user_id, text, created_at,
+                            message_kind, expires_at
+                        )
+                        VALUES (?, ?, ?, CURRENT_TIMESTAMP, 'text', ?)
                         """
                     ),
-                    (int(sender_user_id), int(recipient_user_id), clean_text),
+                    (int(sender_user_id), int(recipient_user_id), clean_text, expires_at),
                 )
                 new_id = int(cur.lastrowid)
                 cur.execute(
                     _sql(
                         """
-                        SELECT id, sender_user_id, recipient_user_id, text, created_at
+                        SELECT id, sender_user_id, recipient_user_id, text, created_at,
+                               message_kind, voice_duration_sec, expires_at
                         FROM private_chat_messages
                         WHERE id=?
                         LIMIT 1
@@ -383,25 +683,98 @@ def _create_private_message(sender_user_id: int, recipient_user_id: int, text: s
         finally:
             conn.close()
 
+    sender_row = _db_query_all("SELECT display_name, email, avatar_url FROM users WHERE id=? LIMIT 1", (int(sender_user_id),))
+    if sender_row:
+        row["private_sender_display_name"] = sender_row[0]["display_name"]
+        row["private_sender_email"] = sender_row[0]["email"]
+        row["private_sender_avatar_url"] = sender_row[0]["avatar_url"]
     return _serialize_private_message(row)
 
 
-def _other_user_id_from_dm_room(room: str, me: int) -> int | None:
-    parts = (room or "").split(":")
-    if len(parts) != 3 or parts[0] != "dm":
-        return None
-    try:
-        left = int(parts[1])
-        right = int(parts[2])
-    except ValueError:
-        return None
+def _create_private_voice_message(sender_user_id: int, recipient_user_id: int, upload: UploadFile, duration_sec: int) -> dict:
+    _touch_chat_maintenance()
+    _enforce_rate_limit(int(sender_user_id))
+    data = _validate_voice_upload(upload, duration_sec)
+    voice_path = _save_voice_file("private", data, upload.content_type or "audio/webm")
+    now = int(time.time())
+    expires_at = now + _VOICE_RETENTION_SECONDS
 
-    if left == int(me):
-        return right
-    if right == int(me):
-        return left
+    with _db_lock:
+        conn = _db()
+        try:
+            cur = conn.cursor()
+            if DB_BACKEND == "postgres":
+                cur.execute(
+                    _sql(
+                        """
+                        INSERT INTO private_chat_messages(
+                            sender_user_id, recipient_user_id, text, created_at,
+                            message_kind, voice_path, voice_mime, voice_duration_sec, expires_at
+                        )
+                        VALUES (?, ?, '', NOW(), 'voice', ?, ?, ?, ?)
+                        RETURNING id, sender_user_id, recipient_user_id, text, created_at,
+                                  message_kind, voice_duration_sec, expires_at
+                        """
+                    ),
+                    (int(sender_user_id), int(recipient_user_id), voice_path, upload.content_type, int(duration_sec), expires_at),
+                )
+                row = dict(cur.fetchone())
+            else:
+                cur.execute(
+                    _sql(
+                        """
+                        INSERT INTO private_chat_messages(
+                            sender_user_id, recipient_user_id, text, created_at,
+                            message_kind, voice_path, voice_mime, voice_duration_sec, expires_at
+                        )
+                        VALUES (?, ?, '', CURRENT_TIMESTAMP, 'voice', ?, ?, ?, ?)
+                        """
+                    ),
+                    (int(sender_user_id), int(recipient_user_id), voice_path, upload.content_type, int(duration_sec), expires_at),
+                )
+                new_id = int(cur.lastrowid)
+                cur.execute(
+                    _sql(
+                        """
+                        SELECT id, sender_user_id, recipient_user_id, text, created_at,
+                               message_kind, voice_duration_sec, expires_at
+                        FROM private_chat_messages
+                        WHERE id=?
+                        LIMIT 1
+                        """
+                    ),
+                    (new_id,),
+                )
+                row = dict(cur.fetchone())
+            conn.commit()
+        except Exception:
+            try:
+                Path(voice_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    sender_row = _db_query_all("SELECT display_name, email, avatar_url FROM users WHERE id=? LIMIT 1", (int(sender_user_id),))
+    if sender_row:
+        row["private_sender_display_name"] = sender_row[0]["display_name"]
+        row["private_sender_email"] = sender_row[0]["email"]
+        row["private_sender_avatar_url"] = sender_row[0]["avatar_url"]
+    return _serialize_private_message(row)
+
+
+
+
+def _resolve_since_id(since_id: int | None, after: str | None) -> int | None:
+    if since_id is not None:
+        return int(since_id)
+    value = (after or '').strip()
+    if not value:
+        return None
+    if value.isdigit():
+        return int(value)
     return None
-
 
 def _list_dm_users(me: int, q: str | None) -> list[dict]:
     search = (q or "").strip().lower()
@@ -435,14 +808,14 @@ def _list_dm_users(me: int, q: str | None) -> list[dict]:
     users: list[dict[str, Any]] = []
     user_ids: list[int] = []
     for row in user_rows:
-        rid = int(row["id"])
-        user_ids.append(rid)
+        user_id = int(row["id"])
+        user_ids.append(user_id)
         users.append(
             {
-                "id": rid,
+                "id": user_id,
                 "display_name": _clean_display_name(row["display_name"] or "", row["email"]),
                 "avatar_url": row["avatar_url"],
-                "is_online": None,
+                "is_online": False,
                 "last_seen_at": None,
                 "leaderboard_badge_code": None,
             }
@@ -477,232 +850,37 @@ def _list_dm_users(me: int, q: str | None) -> list[dict]:
     return users
 
 
-def _list_dm_threads(me: int) -> list[dict]:
-    message_rows = _db_query_all(
-        """
-        SELECT id, room, user_id, message, created_at
-        FROM chat_messages
-        WHERE room LIKE 'dm:%'
-          AND (room LIKE ? OR room LIKE ?)
-        ORDER BY created_at DESC, id DESC
-        """,
-        (f"dm:{int(me)}:%", f"dm:%:{int(me)}"),
-    )
-    if not message_rows:
-        return []
-
-    latest_by_other: dict[int, dict[str, Any]] = {}
-    for row in message_rows:
-        room = str(row["room"])
-        other_user_id = _other_user_id_from_dm_room(room, int(me))
-        if other_user_id is None or other_user_id == int(me):
-            continue
-        if other_user_id in latest_by_other:
-            continue
-        latest_by_other[other_user_id] = {
-            "other_user_id": int(other_user_id),
-            "last_message_text": row["message"],
-            "last_message_created_at": _timestamp_to_iso(row["created_at"]),
-            "last_message_user_id": int(row["user_id"]),
-            "room": room,
-        }
-
-    if not latest_by_other:
-        return []
-
-    other_ids = list(latest_by_other.keys())
-    placeholders = ", ".join(["?"] * len(other_ids))
-    user_rows = _db_query_all(
-        f"""
-        SELECT id, display_name, avatar_url, email
-        FROM users
-        WHERE id IN ({placeholders})
-        """,
-        tuple(other_ids),
-    )
-    users: dict[int, dict[str, Any]] = {
-        int(row["id"]): {
-            "display_name": _clean_display_name(row["display_name"] or "", row["email"]),
-            "avatar_url": row["avatar_url"],
-        }
-        for row in user_rows
-    }
-
-    threads: list[dict] = []
-    for other_user_id, payload in latest_by_other.items():
-        user_payload = users.get(int(other_user_id))
-        if user_payload is None:
-            continue
-        threads.append(
-            {
-                "other_user_id": int(other_user_id),
-                "display_name": user_payload["display_name"],
-                "avatar_url": user_payload["avatar_url"],
-                "last_message_text": payload["last_message_text"],
-                "last_message_created_at": payload["last_message_created_at"],
-                "last_message_user_id": payload["last_message_user_id"],
-                "room": payload["room"],
-            }
-        )
-
-    threads.sort(key=lambda item: item["last_message_created_at"], reverse=True)
-    return threads
-
-
-def _list_messages_for_room(room: str, after: str | None, limit: int) -> dict:
-    safe_room = _normalize_room(room)
-    safe_limit = max(1, min(200, int(limit)))
-    after_field, after_value = _parse_after(after)
-
-    where = ["cm.room = ?"]
-    params: list[int | str] = [safe_room]
-
-    if after_field == "id":
-        where.append("cm.id > ?")
-        params.append(int(after_value))
-    elif after_field == "created_at":
-        if DB_BACKEND == "postgres":
-            where.append("cm.created_at > to_timestamp(?)")
-            params.append(int(after_value))
-        else:
-            where.append("cm.created_at > ?")
-            params.append(int(after_value))
-
-    if after_field is None:
-        rows = _db_query_all(
-            """
-            SELECT cm.id, cm.room, cm.user_id,
-                   cm.display_name AS message_display_name,
-                   u.display_name AS user_display_name,
-                   u.email AS user_email,
-                   u.avatar_url AS sender_avatar_url,
-                   cm.message, cm.created_at
-            FROM (
-                SELECT id, room, user_id, display_name, message, created_at
-                FROM chat_messages
-                WHERE room = ?
-                ORDER BY id DESC
-                LIMIT ?
-            ) cm
-            LEFT JOIN users u ON u.id = cm.user_id
-            ORDER BY cm.id ASC
-            """,
-            (safe_room, safe_limit),
-        )
-    else:
-        rows = _db_query_all(
-            f"""
-            SELECT cm.id, cm.room, cm.user_id,
-                   cm.display_name AS message_display_name,
-                   u.display_name AS user_display_name,
-                   u.email AS user_email,
-                   u.avatar_url AS sender_avatar_url,
-                   cm.message, cm.created_at
-            FROM chat_messages cm
-            LEFT JOIN users u ON u.id = cm.user_id
-            WHERE {' AND '.join(where)}
-            ORDER BY cm.id ASC
-            LIMIT ?
-            """,
-            tuple(params + [safe_limit]),
-        )
-
-    return {"room": safe_room, "messages": [_serialize_message(dict(r)) for r in rows]}
-
-
-def _create_message_for_room(room: str, payload: ChatMessagePayload, user) -> dict:
-    safe_room = _normalize_room(room)
-    message = _validate_text(payload.text)
-    user_id = int(user["id"])
-    _enforce_rate_limit(user_id)
-
-    now = int(time.time())
-    display_name = _clean_display_name(user["display_name"] or "", user["email"])
-
-    with _db_lock:
-        conn = _db()
-        try:
-            cur = conn.cursor()
-            if DB_BACKEND == "postgres":
-                insert_sql = """
-                    INSERT INTO chat_messages(room, user_id, display_name, message, created_at)
-                    VALUES (?, ?, ?, ?, to_timestamp(?))
-                """
-                cur.execute(_sql(insert_sql + " RETURNING id"), (safe_room, user_id, display_name, message, now))
-                row = cur.fetchone()
-                new_id = int(row["id"])
-            else:
-                insert_sql = """
-                    INSERT INTO chat_messages(room, user_id, display_name, message, created_at)
-                    VALUES (?, ?, ?, ?, ?)
-                """
-                cur.execute(_sql(insert_sql), (safe_room, user_id, display_name, message, now))
-                new_id = int(cur.lastrowid)
-            conn.commit()
-        finally:
-            conn.close()
-
-    return {
-        "id": new_id,
-        "room": safe_room,
-        "user_id": user_id,
-        "display_name": display_name,
-        "sender_display_name": display_name,
-        "sender_avatar_url": user["avatar_url"] if "avatar_url" in user.keys() else None,
-        "text": message,
-        "created_at": _to_iso(now),
-    }
-
-
 @router.get("/rooms/{room}")
-def list_room_messages(
-    room: str,
-    after: str | None = None,
-    limit: int = 50,
-    user=Depends(require_user),
-):
+def list_room_messages(room: str, after: str | None = None, limit: int = 50, user=Depends(require_user)):
     _ = user
-    return _list_messages_for_room(room, after, limit)
+    return _list_messages_for_room(room, limit, after=after)
 
 
 @router.post("/rooms/{room}")
 def create_room_message(room: str, payload: ChatMessagePayload, user=Depends(require_user)):
-    return _create_message_for_room(room, payload, user)
+    return _create_public_text_message(room, payload, user)
+
+
+@router.post("/rooms/{room}/voice")
+def create_room_voice_message(
+    room: str,
+    duration_sec: int = Form(...),
+    file: UploadFile = File(...),
+    user=Depends(require_user),
+):
+    return _create_public_voice_message(room, user, file, int(duration_sec))
 
 
 @router.get("/dm/users", response_model=DMUsersResponse)
 def list_dm_users(q: str | None = None, user=Depends(require_user)):
+    _touch_chat_maintenance()
     return {"users": _list_dm_users(int(user["id"]), q)}
 
 
-@router.get("/dm/threads", response_model=DMThreadsResponse)
-def list_dm_threads(user=Depends(require_user)):
-    return {"threads": _list_dm_threads(int(user["id"]))}
-
-
-@router.get("/dm/{other_user_id}")
-def list_dm_messages(
-    other_user_id: int,
-    after: str | None = None,
-    limit: int = 50,
-    user=Depends(require_user),
-):
-    my_user_id = int(user["id"])
-    if int(other_user_id) == my_user_id:
-        raise HTTPException(status_code=400, detail="Cannot message yourself")
-    _ensure_dm_target_exists(int(other_user_id))
-    room = _dm_room_for_users(my_user_id, int(other_user_id))
-    return _list_messages_for_room(room, after, limit)
-
-
-@router.post("/dm/{other_user_id}")
-def create_dm_message(other_user_id: int, payload: ChatMessagePayload, user=Depends(require_user)):
-    my_user_id = int(user["id"])
-    if int(other_user_id) == my_user_id:
-        raise HTTPException(status_code=400, detail="Cannot message yourself")
-    _ensure_dm_target_exists(int(other_user_id))
-    room = _dm_room_for_users(my_user_id, int(other_user_id))
-    return _create_message_for_room(room, payload, user)
+@router.get("/private/users", response_model=DMUsersResponse)
+def list_private_users(q: str | None = None, user=Depends(require_user)):
+    _touch_chat_maintenance()
+    return {"users": _list_dm_users(int(user["id"]), q)}
 
 
 @router.get("/private/threads", response_model=PrivateChatThreadsResponse)
@@ -710,17 +888,27 @@ def list_private_threads(user=Depends(require_user)):
     return {"threads": _list_private_threads(int(user["id"]))}
 
 
+@router.get("/dm/threads", response_model=PrivateChatThreadsResponse)
+def list_dm_threads(user=Depends(require_user)):
+    return {"threads": _list_private_threads(int(user["id"]))}
+
+
 @router.get("/private/{other_user_id}", response_model=PrivateChatMessagesResponse)
-def list_private_messages(other_user_id: int, since_id: int | None = None, user=Depends(require_user)):
+def list_private_messages(other_user_id: int, since_id: int | None = None, after: str | None = None, user=Depends(require_user)):
     my_user_id = int(user["id"])
     if int(other_user_id) == my_user_id:
         raise HTTPException(status_code=400, detail="Cannot message yourself")
     _ensure_dm_target_exists(int(other_user_id))
 
-    messages = _fetch_private_conversation(my_user_id, int(other_user_id), since_id)
+    messages = _fetch_private_conversation(my_user_id, int(other_user_id), _resolve_since_id(since_id, after))
     _mark_private_read(my_user_id, int(other_user_id))
 
     return {"other_user_id": int(other_user_id), "messages": messages}
+
+
+@router.get("/dm/{other_user_id}", response_model=PrivateChatMessagesResponse)
+def list_dm_messages(other_user_id: int, since_id: int | None = None, after: str | None = None, user=Depends(require_user)):
+    return list_private_messages(other_user_id=other_user_id, since_id=since_id, after=after, user=user)
 
 
 @router.post("/private/{other_user_id}", response_model=PrivateChatMessageOut)
@@ -730,3 +918,81 @@ def create_private_message(other_user_id: int, payload: PrivateChatSendIn, user=
         raise HTTPException(status_code=400, detail="Cannot message yourself")
     _ensure_dm_target_exists(int(other_user_id))
     return _create_private_message(my_user_id, int(other_user_id), payload.text)
+
+
+@router.post("/dm/{other_user_id}", response_model=PrivateChatMessageOut)
+def create_dm_message(other_user_id: int, payload: PrivateChatSendIn, user=Depends(require_user)):
+    return create_private_message(other_user_id=other_user_id, payload=payload, user=user)
+
+
+@router.post("/private/{other_user_id}/voice", response_model=PrivateChatMessageOut)
+def create_private_voice_message(
+    other_user_id: int,
+    duration_sec: int = Form(...),
+    file: UploadFile = File(...),
+    user=Depends(require_user),
+):
+    my_user_id = int(user["id"])
+    if int(other_user_id) == my_user_id:
+        raise HTTPException(status_code=400, detail="Cannot message yourself")
+    _ensure_dm_target_exists(int(other_user_id))
+    return _create_private_voice_message(my_user_id, int(other_user_id), file, int(duration_sec))
+
+
+@router.post("/dm/{other_user_id}/voice", response_model=PrivateChatMessageOut)
+def create_dm_voice_message(
+    other_user_id: int,
+    duration_sec: int = Form(...),
+    file: UploadFile = File(...),
+    user=Depends(require_user),
+):
+    return create_private_voice_message(other_user_id=other_user_id, duration_sec=duration_sec, file=file, user=user)
+
+
+@router.get("/voice/public/{message_id}")
+def get_public_voice_file(message_id: int, user=Depends(require_user)):
+    _ = user
+    _touch_chat_maintenance()
+    row = _db_query_all(
+        """
+        SELECT voice_path, voice_mime
+        FROM chat_messages
+        WHERE id=?
+          AND message_kind='voice'
+          AND (expires_at IS NULL OR expires_at > ?)
+        LIMIT 1
+        """,
+        (int(message_id), int(time.time())),
+    )
+    if not row or not row[0]["voice_path"]:
+        raise HTTPException(status_code=404, detail="Voice message not found")
+    path = Path(str(row[0]["voice_path"]))
+    if not path.exists() or not path.is_file():
+        raise HTTPException(status_code=404, detail="Voice message file missing")
+    return FileResponse(path, media_type=row[0]["voice_mime"] or "application/octet-stream")
+
+
+@router.get("/voice/private/{message_id}")
+def get_private_voice_file(message_id: int, user=Depends(require_user)):
+    my_user_id = int(user["id"])
+    _touch_chat_maintenance()
+    row = _db_query_all(
+        """
+        SELECT sender_user_id, recipient_user_id, voice_path, voice_mime
+        FROM private_chat_messages
+        WHERE id=?
+          AND message_kind='voice'
+          AND (expires_at IS NULL OR expires_at > ?)
+        LIMIT 1
+        """,
+        (int(message_id), int(time.time())),
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Voice message not found")
+    payload = row[0]
+    if my_user_id not in {int(payload["sender_user_id"]), int(payload["recipient_user_id"])}:
+        raise HTTPException(status_code=403, detail="Not allowed")
+    path = Path(str(payload["voice_path"] or ""))
+    if not path.exists() or not path.is_file():
+        raise HTTPException(status_code=404, detail="Voice message file missing")
+    return FileResponse(path, media_type=payload["voice_mime"] or "application/octet-stream")
