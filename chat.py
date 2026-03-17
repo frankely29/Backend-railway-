@@ -11,7 +11,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from core import DB_BACKEND, _clean_display_name, _db, _db_exec, _db_lock, _db_query_all, _sql, require_user
+from core import DB_BACKEND, _clean_display_name, _db, _db_exec, _db_lock, _db_query_all, _get_column_data_type, _sql, require_user
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
@@ -38,6 +38,49 @@ _VOICE_ROOT = Path("/data/chat_voice")
 _PURGE_DEBOUNCE_SECONDS = 600
 _purge_lock = threading.Lock()
 _last_purge_at = 0.0
+
+_chat_column_type_cache: dict[tuple[str, str], str] = {}
+
+
+def _is_timestamp_type(data_type: str) -> bool:
+    value = (data_type or "").strip().lower()
+    return ("timestamp" in value) or ("date" in value) or ("time" in value)
+
+
+def _column_data_type(table: str, column: str) -> str:
+    key = (table, column)
+    cached = _chat_column_type_cache.get(key)
+    if cached is not None:
+        return cached
+    data_type = _get_column_data_type(table, column)
+    _chat_column_type_cache[key] = data_type
+    return data_type
+
+
+def _expires_is_timestamp(table: str) -> bool:
+    return _is_timestamp_type(_column_data_type(table, "expires_at"))
+
+
+def _expires_bind_value(table: str, unix_ts: int) -> Any:
+    if _expires_is_timestamp(table):
+        return datetime.fromtimestamp(int(unix_ts), tz=timezone.utc)
+    return int(unix_ts)
+
+
+def _now_sql() -> str:
+    return "NOW()" if DB_BACKEND == "postgres" else "CURRENT_TIMESTAMP"
+
+
+def _expired_clause(table: str, qualified_column: str = "expires_at") -> tuple[str, tuple[Any, ...]]:
+    if _expires_is_timestamp(table):
+        return f"{qualified_column} IS NOT NULL AND {qualified_column} <= {_now_sql()}", ()
+    return f"{qualified_column} IS NOT NULL AND {qualified_column} <= ?", (int(time.time()),)
+
+
+def _not_expired_clause(table: str, qualified_column: str = "expires_at") -> tuple[str, tuple[Any, ...]]:
+    if _expires_is_timestamp(table):
+        return f"({qualified_column} IS NULL OR {qualified_column} > {_now_sql()})", ()
+    return f"({qualified_column} IS NULL OR {qualified_column} > ?)", (int(time.time()),)
 
 
 class ChatMessagePayload(BaseModel):
@@ -292,18 +335,20 @@ def purge_expired_chat_rows_if_due(force: bool = False) -> None:
             return
         _last_purge_at = now_mono
 
-    now = int(time.time())
+    public_clause, public_params = _expired_clause("chat_messages")
+    private_clause, private_params = _expired_clause("private_chat_messages")
+
     expired_public = _db_query_all(
-        "SELECT id, voice_path FROM chat_messages WHERE expires_at IS NOT NULL AND expires_at <= ?",
-        (now,),
+        f"SELECT id, voice_path FROM chat_messages WHERE {public_clause}",
+        public_params,
     )
     expired_private = _db_query_all(
-        "SELECT id, voice_path FROM private_chat_messages WHERE expires_at IS NOT NULL AND expires_at <= ?",
-        (now,),
+        f"SELECT id, voice_path FROM private_chat_messages WHERE {private_clause}",
+        private_params,
     )
 
-    _db_exec("DELETE FROM chat_messages WHERE expires_at IS NOT NULL AND expires_at <= ?", (now,))
-    _db_exec("DELETE FROM private_chat_messages WHERE expires_at IS NOT NULL AND expires_at <= ?", (now,))
+    _db_exec(f"DELETE FROM chat_messages WHERE {public_clause}", public_params)
+    _db_exec(f"DELETE FROM private_chat_messages WHERE {private_clause}", private_params)
 
     for row in [*expired_public, *expired_private]:
         voice_path = row.get("voice_path")
@@ -323,8 +368,9 @@ def _list_messages_for_room(room: str, limit: int, after: str | None = None) -> 
     safe_limit = max(1, min(200, int(limit)))
     now = int(time.time())
 
-    where = ["room = ?", "(expires_at IS NULL OR expires_at > ?)"]
-    params: list[Any] = [safe_room, now]
+    expires_clause, expires_params = _not_expired_clause("chat_messages")
+    where = ["room = ?", expires_clause]
+    params: list[Any] = [safe_room, *expires_params]
     after_value = (after or "").strip()
     if after_value.isdigit():
         where.append("id > ?")
@@ -380,7 +426,7 @@ def _create_public_text_message(room: str, payload: ChatMessagePayload, user) ->
                                   message_kind, voice_duration_sec, expires_at
                         """
                     ),
-                    (safe_room, user_id, display_name, message, now, expires_at),
+                    (safe_room, user_id, display_name, message, now, _expires_bind_value("chat_messages", expires_at)),
                 )
                 row = dict(cur.fetchone())
             else:
@@ -391,7 +437,7 @@ def _create_public_text_message(room: str, payload: ChatMessagePayload, user) ->
                         VALUES (?, ?, ?, ?, ?, 'text', ?)
                         """
                     ),
-                    (safe_room, user_id, display_name, message, now, expires_at),
+                    (safe_room, user_id, display_name, message, now, _expires_bind_value("chat_messages", expires_at)),
                 )
                 new_id = int(cur.lastrowid)
                 cur.execute(
@@ -446,7 +492,7 @@ def _create_public_voice_message(room: str, user, upload: UploadFile, duration_s
                                   message_kind, voice_duration_sec, expires_at
                         """
                     ),
-                    (safe_room, user_id, display_name, now, voice_path, upload.content_type, int(duration_sec), expires_at),
+                    (safe_room, user_id, display_name, now, voice_path, upload.content_type, int(duration_sec), _expires_bind_value("chat_messages", expires_at)),
                 )
                 row = dict(cur.fetchone())
             else:
@@ -460,7 +506,7 @@ def _create_public_voice_message(room: str, user, upload: UploadFile, duration_s
                         VALUES (?, ?, ?, '', ?, 'voice', ?, ?, ?, ?)
                         """
                     ),
-                    (safe_room, user_id, display_name, now, voice_path, upload.content_type, int(duration_sec), expires_at),
+                    (safe_room, user_id, display_name, now, voice_path, upload.content_type, int(duration_sec), _expires_bind_value("chat_messages", expires_at)),
                 )
                 new_id = int(cur.lastrowid)
                 cur.execute(
@@ -495,9 +541,11 @@ def _fetch_private_conversation(me: int, other: int, since_id: int | None) -> li
     _touch_chat_maintenance()
     where = [
         "((pcm.sender_user_id=? AND pcm.recipient_user_id=?) OR (pcm.sender_user_id=? AND pcm.recipient_user_id=?))",
-        "(pcm.expires_at IS NULL OR pcm.expires_at > ?)",
     ]
-    params: list[Any] = [int(me), int(other), int(other), int(me), int(time.time())]
+    params: list[Any] = [int(me), int(other), int(other), int(me)]
+    expires_clause, expires_params = _not_expired_clause("private_chat_messages", "pcm.expires_at")
+    where.append(expires_clause)
+    params.extend(expires_params)
     if since_id is not None:
         where.append("pcm.id > ?")
         params.append(int(since_id))
@@ -542,16 +590,16 @@ def _mark_private_read(me: int, other: int) -> None:
 
 def _list_private_threads(me: int) -> list[dict]:
     _touch_chat_maintenance()
-    now = int(time.time())
+    expires_clause, expires_params = _not_expired_clause("private_chat_messages")
     message_rows = _db_query_all(
-        """
+        f"""
         SELECT id, sender_user_id, recipient_user_id, text, created_at, message_kind, voice_duration_sec
         FROM private_chat_messages
         WHERE (sender_user_id=? OR recipient_user_id=?)
-          AND (expires_at IS NULL OR expires_at > ?)
+          AND {expires_clause}
         ORDER BY created_at DESC, id DESC
         """,
-        (int(me), int(me), now),
+        tuple([int(me), int(me), *expires_params]),
     )
     if not message_rows:
         return []
@@ -588,11 +636,11 @@ def _list_private_threads(me: int) -> list[dict]:
         FROM private_chat_messages
         WHERE recipient_user_id=?
           AND read_at IS NULL
-          AND (expires_at IS NULL OR expires_at > ?)
+          AND {expires_clause}
           AND sender_user_id IN ({placeholders})
         GROUP BY sender_user_id
         """,
-        tuple([int(me), now] + other_ids),
+        tuple([int(me), *expires_params] + other_ids),
     )
     unread_by_other = {int(row["other_user_id"]): int(row["unread_count"]) for row in unread_rows}
 
@@ -649,7 +697,7 @@ def _create_private_message(sender_user_id: int, recipient_user_id: int, text: s
                                   message_kind, voice_duration_sec, expires_at
                         """
                     ),
-                    (int(sender_user_id), int(recipient_user_id), clean_text, expires_at),
+                    (int(sender_user_id), int(recipient_user_id), clean_text, _expires_bind_value("private_chat_messages", expires_at)),
                 )
                 row = dict(cur.fetchone())
             else:
@@ -663,7 +711,7 @@ def _create_private_message(sender_user_id: int, recipient_user_id: int, text: s
                         VALUES (?, ?, ?, CURRENT_TIMESTAMP, 'text', ?)
                         """
                     ),
-                    (int(sender_user_id), int(recipient_user_id), clean_text, expires_at),
+                    (int(sender_user_id), int(recipient_user_id), clean_text, _expires_bind_value("private_chat_messages", expires_at)),
                 )
                 new_id = int(cur.lastrowid)
                 cur.execute(
@@ -716,7 +764,7 @@ def _create_private_voice_message(sender_user_id: int, recipient_user_id: int, u
                                   message_kind, voice_duration_sec, expires_at
                         """
                     ),
-                    (int(sender_user_id), int(recipient_user_id), voice_path, upload.content_type, int(duration_sec), expires_at),
+                    (int(sender_user_id), int(recipient_user_id), voice_path, upload.content_type, int(duration_sec), _expires_bind_value("private_chat_messages", expires_at)),
                 )
                 row = dict(cur.fetchone())
             else:
@@ -730,7 +778,7 @@ def _create_private_voice_message(sender_user_id: int, recipient_user_id: int, u
                         VALUES (?, ?, '', CURRENT_TIMESTAMP, 'voice', ?, ?, ?, ?)
                         """
                     ),
-                    (int(sender_user_id), int(recipient_user_id), voice_path, upload.content_type, int(duration_sec), expires_at),
+                    (int(sender_user_id), int(recipient_user_id), voice_path, upload.content_type, int(duration_sec), _expires_bind_value("private_chat_messages", expires_at)),
                 )
                 new_id = int(cur.lastrowid)
                 cur.execute(
@@ -953,16 +1001,17 @@ def create_dm_voice_message(
 def get_public_voice_file(message_id: int, user=Depends(require_user)):
     _ = user
     _touch_chat_maintenance()
+    expires_clause, expires_params = _not_expired_clause("chat_messages")
     row = _db_query_all(
-        """
+        f"""
         SELECT voice_path, voice_mime
         FROM chat_messages
         WHERE id=?
           AND message_kind='voice'
-          AND (expires_at IS NULL OR expires_at > ?)
+          AND {expires_clause}
         LIMIT 1
         """,
-        (int(message_id), int(time.time())),
+        tuple([int(message_id), *expires_params]),
     )
     if not row or not row[0]["voice_path"]:
         raise HTTPException(status_code=404, detail="Voice message not found")
@@ -976,16 +1025,17 @@ def get_public_voice_file(message_id: int, user=Depends(require_user)):
 def get_private_voice_file(message_id: int, user=Depends(require_user)):
     my_user_id = int(user["id"])
     _touch_chat_maintenance()
+    expires_clause, expires_params = _not_expired_clause("private_chat_messages")
     row = _db_query_all(
-        """
+        f"""
         SELECT sender_user_id, recipient_user_id, voice_path, voice_mime
         FROM private_chat_messages
         WHERE id=?
           AND message_kind='voice'
-          AND (expires_at IS NULL OR expires_at > ?)
+          AND {expires_clause}
         LIMIT 1
         """,
-        (int(message_id), int(time.time())),
+        tuple([int(message_id), *expires_params]),
     )
     if not row:
         raise HTTPException(status_code=404, detail="Voice message not found")

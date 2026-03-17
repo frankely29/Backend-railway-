@@ -43,6 +43,7 @@ from core import (
     _db_lock,
     _db_query_all,
     _db_query_one,
+    _get_column_data_type,
     _hash_password,
     _sql,
     DB_BACKEND,
@@ -1262,23 +1263,62 @@ def _is_bool_column(table: str, column: str) -> bool:
 
 
 def _is_timestamp_column(table: str, column: str) -> bool:
-    """Return True when a Postgres column is a timestamp variant."""
-    if DB_BACKEND != "postgres":
-        return False
+    """Return True when a DB column is a timestamp/date/datetime variant."""
+    data_type = _get_column_data_type(table, column)
+    normalized = (data_type or "").strip().lower()
+    return ("timestamp" in normalized) or ("date" in normalized) or ("time" in normalized)
+
+
+def _chat_backfill_set_expr(table: str) -> str:
+    created_is_timestamp = _is_timestamp_column(table, "created_at")
+    expires_is_timestamp = _is_timestamp_column(table, "expires_at")
+
+    if DB_BACKEND == "postgres":
+        created_expr = "created_at" if created_is_timestamp else "to_timestamp(created_at)"
+        if expires_is_timestamp:
+            return f"{created_expr} + (CASE WHEN COALESCE(message_kind, 'text') = 'voice' THEN 86400 ELSE 604800 END) * INTERVAL '1 second'"
+        return f"EXTRACT(EPOCH FROM ({created_expr} + (CASE WHEN COALESCE(message_kind, 'text') = 'voice' THEN 86400 ELSE 604800 END) * INTERVAL '1 second'))::BIGINT"
+
+    created_epoch_expr = "CAST(strftime('%s', created_at) AS INTEGER)" if created_is_timestamp else "CAST(created_at AS INTEGER)"
+    if expires_is_timestamp:
+        return f"datetime({created_epoch_expr} + CASE WHEN COALESCE(message_kind, 'text') = 'voice' THEN 86400 ELSE 604800 END, 'unixepoch')"
+    return f"{created_epoch_expr} + CASE WHEN COALESCE(message_kind, 'text') = 'voice' THEN 86400 ELSE 604800 END"
+
+
+def _chat_expires_bind_value(table: str, value: Any) -> Any:
+    if value is None:
+        return None
+    expires_is_timestamp = _is_timestamp_column(table, "expires_at")
+    if expires_is_timestamp:
+        if isinstance(value, datetime):
+            dt = value
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        if isinstance(value, (int, float)):
+            return datetime.fromtimestamp(int(value), tz=timezone.utc)
+        text = str(value).strip().replace("Z", "+00:00")
+        try:
+            dt = datetime.fromisoformat(text)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            return datetime.fromtimestamp(int(float(text)), tz=timezone.utc)
+
+    if isinstance(value, datetime):
+        dt = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp())
+    if isinstance(value, (int, float)):
+        return int(value)
+    text = str(value).strip().replace("Z", "+00:00")
     try:
-        row = _db_query_one(
-            """
-            SELECT data_type
-            FROM information_schema.columns
-            WHERE table_name=? AND column_name=?
-            LIMIT 1
-            """,
-            (table, column),
-        )
-        data_type = str(row["data_type"]).lower().strip() if row and row["data_type"] is not None else ""
-        return data_type.startswith("timestamp")
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp())
     except Exception:
-        return False
+        return int(float(text))
 
 
 def _flag_to_int(value: Any) -> int:
@@ -1372,41 +1412,12 @@ def _ensure_admin_seed() -> None:
 
 
 def _backfill_chat_expirations() -> None:
-    if DB_BACKEND == "postgres":
-        if _is_timestamp_column("chat_messages", "created_at"):
-            chat_expires_sql = """
-                UPDATE chat_messages
-                SET expires_at = EXTRACT(EPOCH FROM (created_at + (CASE WHEN COALESCE(message_kind, 'text') = 'voice' THEN 86400 ELSE 604800 END) * INTERVAL '1 second'))::BIGINT
-                WHERE expires_at IS NULL
-            """
-        else:
-            chat_expires_sql = """
-                UPDATE chat_messages
-                SET expires_at = created_at + CASE WHEN COALESCE(message_kind, 'text') = 'voice' THEN 86400 ELSE 604800 END
-                WHERE expires_at IS NULL
-            """
+    for table in ("chat_messages", "private_chat_messages"):
+        expr = _chat_backfill_set_expr(table)
         _db_exec(
-            chat_expires_sql
-        )
-        _db_exec(
-            """
-            UPDATE private_chat_messages
-            SET expires_at = EXTRACT(EPOCH FROM (created_at + (CASE WHEN COALESCE(message_kind, 'text') = 'voice' THEN 86400 ELSE 604800 END) * INTERVAL '1 second'))::BIGINT
-            WHERE expires_at IS NULL
-            """
-        )
-    else:
-        _db_exec(
-            """
-            UPDATE chat_messages
-            SET expires_at = created_at + CASE WHEN COALESCE(message_kind, 'text') = 'voice' THEN 86400 ELSE 604800 END
-            WHERE expires_at IS NULL
-            """
-        )
-        _db_exec(
-            """
-            UPDATE private_chat_messages
-            SET expires_at = CAST(strftime('%s', created_at) AS INTEGER) + CASE WHEN COALESCE(message_kind, 'text') = 'voice' THEN 86400 ELSE 604800 END
+            f"""
+            UPDATE {table}
+            SET expires_at = {expr}
             WHERE expires_at IS NULL
             """
         )
@@ -1468,7 +1479,7 @@ def _migrate_legacy_dm_rooms_into_private() -> None:
                             payload.get("voice_path"),
                             payload.get("voice_mime"),
                             payload.get("voice_duration_sec"),
-                            payload.get("expires_at"),
+                            _chat_expires_bind_value("private_chat_messages", payload.get("expires_at")),
                             int(payload["id"]),
                         ),
                     )
@@ -1492,7 +1503,7 @@ def _migrate_legacy_dm_rooms_into_private() -> None:
                             payload.get("voice_path"),
                             payload.get("voice_mime"),
                             payload.get("voice_duration_sec"),
-                            payload.get("expires_at"),
+                            _chat_expires_bind_value("private_chat_messages", payload.get("expires_at")),
                             int(payload["id"]),
                         ),
                     )
@@ -1543,7 +1554,11 @@ def startup():
     except Exception:
         print("[warn] chat bootstrap failed during startup; continuing without blocking boot")
         print(traceback.format_exc())
-    purge_expired_chat_rows_if_due(force=True)
+    try:
+        purge_expired_chat_rows_if_due(force=True)
+    except Exception:
+        print("[warn] chat purge failed during startup; continuing without blocking boot")
+        print(traceback.format_exc())
     init_leaderboard_schema()
     ensure_pickup_recording_schema()
     _ensure_admin_seed()
