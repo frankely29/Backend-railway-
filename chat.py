@@ -161,14 +161,34 @@ def _serialize_message(row: dict) -> dict:
     else:
         ts = int(created.timestamp())
 
+    sender_name = _resolve_sender_display_name(row)
+    sender_avatar_url = row.get("sender_avatar_url")
+
     return {
         "id": int(row["id"]),
         "room": row["room"],
         "user_id": int(row["user_id"]),
-        "display_name": row["display_name"],
+        "display_name": sender_name,
+        "sender_display_name": sender_name,
+        "sender_avatar_url": sender_avatar_url,
         "text": row["message"],
         "created_at": _to_iso(ts),
     }
+
+
+def _resolve_sender_display_name(row: dict) -> str:
+    user_id = int(row["user_id"])
+    user_display_name = (row.get("user_display_name") or "").strip()
+    user_email = (row.get("user_email") or "").strip()
+    message_display_name = (row.get("message_display_name") or row.get("display_name") or "").strip()
+
+    if user_display_name:
+        return user_display_name
+    if user_email and "@" in user_email:
+        return user_email.split("@", 1)[0].strip() or f"User {user_id}"
+    if message_display_name:
+        return message_display_name
+    return f"User {user_id}"
 
 
 def _ensure_dm_target_exists(other_user_id: int):
@@ -534,42 +554,54 @@ def _list_messages_for_room(room: str, after: str | None, limit: int) -> dict:
     safe_limit = max(1, min(200, int(limit)))
     after_field, after_value = _parse_after(after)
 
-    where = ["room = ?"]
+    where = ["cm.room = ?"]
     params: list[int | str] = [safe_room]
 
     if after_field == "id":
-        where.append("id > ?")
+        where.append("cm.id > ?")
         params.append(int(after_value))
     elif after_field == "created_at":
         if DB_BACKEND == "postgres":
-            where.append("created_at > to_timestamp(?)")
+            where.append("cm.created_at > to_timestamp(?)")
             params.append(int(after_value))
         else:
-            where.append("created_at > ?")
+            where.append("cm.created_at > ?")
             params.append(int(after_value))
 
     if after_field is None:
         rows = _db_query_all(
             """
-            SELECT id, room, user_id, display_name, message, created_at
+            SELECT cm.id, cm.room, cm.user_id,
+                   cm.display_name AS message_display_name,
+                   u.display_name AS user_display_name,
+                   u.email AS user_email,
+                   u.avatar_url AS sender_avatar_url,
+                   cm.message, cm.created_at
             FROM (
                 SELECT id, room, user_id, display_name, message, created_at
                 FROM chat_messages
                 WHERE room = ?
                 ORDER BY id DESC
                 LIMIT ?
-            ) recent
-            ORDER BY id ASC
+            ) cm
+            LEFT JOIN users u ON u.id = cm.user_id
+            ORDER BY cm.id ASC
             """,
             (safe_room, safe_limit),
         )
     else:
         rows = _db_query_all(
             f"""
-            SELECT id, room, user_id, display_name, message, created_at
-            FROM chat_messages
+            SELECT cm.id, cm.room, cm.user_id,
+                   cm.display_name AS message_display_name,
+                   u.display_name AS user_display_name,
+                   u.email AS user_email,
+                   u.avatar_url AS sender_avatar_url,
+                   cm.message, cm.created_at
+            FROM chat_messages cm
+            LEFT JOIN users u ON u.id = cm.user_id
             WHERE {' AND '.join(where)}
-            ORDER BY id ASC
+            ORDER BY cm.id ASC
             LIMIT ?
             """,
             tuple(params + [safe_limit]),
@@ -615,6 +647,8 @@ def _create_message_for_room(room: str, payload: ChatMessagePayload, user) -> di
         "room": safe_room,
         "user_id": user_id,
         "display_name": display_name,
+        "sender_display_name": display_name,
+        "sender_avatar_url": user["avatar_url"] if "avatar_url" in user.keys() else None,
         "text": message,
         "created_at": _to_iso(now),
     }
