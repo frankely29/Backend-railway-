@@ -1261,6 +1261,26 @@ def _is_bool_column(table: str, column: str) -> bool:
         return False
 
 
+def _is_timestamp_column(table: str, column: str) -> bool:
+    """Return True when a Postgres column is a timestamp variant."""
+    if DB_BACKEND != "postgres":
+        return False
+    try:
+        row = _db_query_one(
+            """
+            SELECT data_type
+            FROM information_schema.columns
+            WHERE table_name=? AND column_name=?
+            LIMIT 1
+            """,
+            (table, column),
+        )
+        data_type = str(row["data_type"]).lower().strip() if row and row["data_type"] is not None else ""
+        return data_type.startswith("timestamp")
+    except Exception:
+        return False
+
+
 def _flag_to_int(value: Any) -> int:
     if isinstance(value, bool):
         return 1 if value else 0
@@ -1353,17 +1373,25 @@ def _ensure_admin_seed() -> None:
 
 def _backfill_chat_expirations() -> None:
     if DB_BACKEND == "postgres":
+        if _is_timestamp_column("chat_messages", "created_at"):
+            chat_expires_sql = """
+                UPDATE chat_messages
+                SET expires_at = EXTRACT(EPOCH FROM (created_at + (CASE WHEN COALESCE(message_kind, 'text') = 'voice' THEN 86400 ELSE 604800 END) * INTERVAL '1 second'))::BIGINT
+                WHERE expires_at IS NULL
+            """
+        else:
+            chat_expires_sql = """
+                UPDATE chat_messages
+                SET expires_at = created_at + CASE WHEN COALESCE(message_kind, 'text') = 'voice' THEN 86400 ELSE 604800 END
+                WHERE expires_at IS NULL
+            """
         _db_exec(
-            """
-            UPDATE chat_messages
-            SET expires_at = created_at + CASE WHEN COALESCE(message_kind, 'text') = 'voice' THEN 86400 ELSE 604800 END
-            WHERE expires_at IS NULL
-            """
+            chat_expires_sql
         )
         _db_exec(
             """
             UPDATE private_chat_messages
-            SET expires_at = EXTRACT(EPOCH FROM created_at)::BIGINT + CASE WHEN COALESCE(message_kind, 'text') = 'voice' THEN 86400 ELSE 604800 END
+            SET expires_at = EXTRACT(EPOCH FROM (created_at + (CASE WHEN COALESCE(message_kind, 'text') = 'voice' THEN 86400 ELSE 604800 END) * INTERVAL '1 second'))::BIGINT
             WHERE expires_at IS NULL
             """
         )
@@ -1510,7 +1538,11 @@ def startup():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     FRAMES_DIR.mkdir(parents=True, exist_ok=True)
     _db_init()
-    _bootstrap_chat_unification()
+    try:
+        _bootstrap_chat_unification()
+    except Exception:
+        print("[warn] chat bootstrap failed during startup; continuing without blocking boot")
+        print(traceback.format_exc())
     purge_expired_chat_rows_if_due(force=True)
     init_leaderboard_schema()
     ensure_pickup_recording_schema()
