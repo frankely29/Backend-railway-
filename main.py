@@ -954,6 +954,27 @@ def _db_init() -> None:
         _db_exec("UPDATE chat_messages SET room='global' WHERE room IS NULL OR btrim(room)='';")
         _db_exec("CREATE INDEX IF NOT EXISTS idx_chat_messages_id ON chat_messages(id);")
         _db_exec("CREATE INDEX IF NOT EXISTS idx_chat_messages_room_id ON chat_messages(room, id);")
+        _try_alter(
+            "ALTER TABLE chat_messages ADD COLUMN message_kind TEXT NOT NULL DEFAULT 'text';",
+            "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS message_kind TEXT NOT NULL DEFAULT 'text';",
+        )
+        _try_alter(
+            "ALTER TABLE chat_messages ADD COLUMN voice_path TEXT NULL;",
+            "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS voice_path TEXT NULL;",
+        )
+        _try_alter(
+            "ALTER TABLE chat_messages ADD COLUMN voice_mime TEXT NULL;",
+            "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS voice_mime TEXT NULL;",
+        )
+        _try_alter(
+            "ALTER TABLE chat_messages ADD COLUMN voice_duration_sec INTEGER NULL;",
+            "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS voice_duration_sec INTEGER NULL;",
+        )
+        _try_alter(
+            "ALTER TABLE chat_messages ADD COLUMN expires_at BIGINT NULL;",
+            "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS expires_at BIGINT NULL;",
+        )
+        _db_exec("CREATE INDEX IF NOT EXISTS idx_chat_messages_expires_at ON chat_messages(expires_at);")
 
         _db_exec(
             """
@@ -975,6 +996,32 @@ def _db_init() -> None:
         _db_exec(
             "CREATE INDEX IF NOT EXISTS idx_private_chat_recipient_read ON private_chat_messages(recipient_user_id, sender_user_id, read_at);"
         )
+        _try_alter(
+            "ALTER TABLE private_chat_messages ADD COLUMN message_kind TEXT NOT NULL DEFAULT 'text';",
+            "ALTER TABLE private_chat_messages ADD COLUMN IF NOT EXISTS message_kind TEXT NOT NULL DEFAULT 'text';",
+        )
+        _try_alter(
+            "ALTER TABLE private_chat_messages ADD COLUMN voice_path TEXT NULL;",
+            "ALTER TABLE private_chat_messages ADD COLUMN IF NOT EXISTS voice_path TEXT NULL;",
+        )
+        _try_alter(
+            "ALTER TABLE private_chat_messages ADD COLUMN voice_mime TEXT NULL;",
+            "ALTER TABLE private_chat_messages ADD COLUMN IF NOT EXISTS voice_mime TEXT NULL;",
+        )
+        _try_alter(
+            "ALTER TABLE private_chat_messages ADD COLUMN voice_duration_sec INTEGER NULL;",
+            "ALTER TABLE private_chat_messages ADD COLUMN IF NOT EXISTS voice_duration_sec INTEGER NULL;",
+        )
+        _try_alter(
+            "ALTER TABLE private_chat_messages ADD COLUMN expires_at BIGINT NULL;",
+            "ALTER TABLE private_chat_messages ADD COLUMN IF NOT EXISTS expires_at BIGINT NULL;",
+        )
+        _try_alter(
+            "ALTER TABLE private_chat_messages ADD COLUMN legacy_chat_message_id BIGINT UNIQUE;",
+            "ALTER TABLE private_chat_messages ADD COLUMN IF NOT EXISTS legacy_chat_message_id BIGINT UNIQUE;",
+        )
+        _db_exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_private_chat_legacy_id ON private_chat_messages(legacy_chat_message_id) WHERE legacy_chat_message_id IS NOT NULL;")
+        _db_exec("CREATE INDEX IF NOT EXISTS idx_private_chat_expires_at ON private_chat_messages(expires_at);")
         return
 
     _db_exec(
@@ -1139,6 +1186,12 @@ def _db_init() -> None:
     _db_exec("UPDATE chat_messages SET room='global' WHERE room IS NULL OR trim(room)='';")
     _db_exec("CREATE INDEX IF NOT EXISTS idx_chat_messages_id ON chat_messages(id);")
     _db_exec("CREATE INDEX IF NOT EXISTS idx_chat_messages_room_id ON chat_messages(room, id);")
+    _try_alter("ALTER TABLE chat_messages ADD COLUMN message_kind TEXT NOT NULL DEFAULT 'text';")
+    _try_alter("ALTER TABLE chat_messages ADD COLUMN voice_path TEXT;")
+    _try_alter("ALTER TABLE chat_messages ADD COLUMN voice_mime TEXT;")
+    _try_alter("ALTER TABLE chat_messages ADD COLUMN voice_duration_sec INTEGER;")
+    _try_alter("ALTER TABLE chat_messages ADD COLUMN expires_at INTEGER;")
+    _db_exec("CREATE INDEX IF NOT EXISTS idx_chat_messages_expires_at ON chat_messages(expires_at);")
 
     _db_exec(
         """
@@ -1160,6 +1213,14 @@ def _db_init() -> None:
     _db_exec(
         "CREATE INDEX IF NOT EXISTS idx_private_chat_recipient_read ON private_chat_messages(recipient_user_id, sender_user_id, read_at);"
     )
+    _try_alter("ALTER TABLE private_chat_messages ADD COLUMN message_kind TEXT NOT NULL DEFAULT 'text';")
+    _try_alter("ALTER TABLE private_chat_messages ADD COLUMN voice_path TEXT;")
+    _try_alter("ALTER TABLE private_chat_messages ADD COLUMN voice_mime TEXT;")
+    _try_alter("ALTER TABLE private_chat_messages ADD COLUMN voice_duration_sec INTEGER;")
+    _try_alter("ALTER TABLE private_chat_messages ADD COLUMN expires_at INTEGER;")
+    _try_alter("ALTER TABLE private_chat_messages ADD COLUMN legacy_chat_message_id INTEGER UNIQUE;")
+    _db_exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_private_chat_legacy_id ON private_chat_messages(legacy_chat_message_id);")
+    _db_exec("CREATE INDEX IF NOT EXISTS idx_private_chat_expires_at ON private_chat_messages(expires_at);")
 
 
 # =========================================================
@@ -1290,7 +1351,134 @@ def _ensure_admin_seed() -> None:
     )
 
 
-from chat import router as chat_router
+def _backfill_chat_expirations() -> None:
+    if DB_BACKEND == "postgres":
+        _db_exec(
+            """
+            UPDATE chat_messages
+            SET expires_at = created_at + CASE WHEN COALESCE(message_kind, 'text') = 'voice' THEN 86400 ELSE 604800 END
+            WHERE expires_at IS NULL
+            """
+        )
+        _db_exec(
+            """
+            UPDATE private_chat_messages
+            SET expires_at = EXTRACT(EPOCH FROM created_at)::BIGINT + CASE WHEN COALESCE(message_kind, 'text') = 'voice' THEN 86400 ELSE 604800 END
+            WHERE expires_at IS NULL
+            """
+        )
+    else:
+        _db_exec(
+            """
+            UPDATE chat_messages
+            SET expires_at = created_at + CASE WHEN COALESCE(message_kind, 'text') = 'voice' THEN 86400 ELSE 604800 END
+            WHERE expires_at IS NULL
+            """
+        )
+        _db_exec(
+            """
+            UPDATE private_chat_messages
+            SET expires_at = CAST(strftime('%s', created_at) AS INTEGER) + CASE WHEN COALESCE(message_kind, 'text') = 'voice' THEN 86400 ELSE 604800 END
+            WHERE expires_at IS NULL
+            """
+        )
+
+
+def _migrate_legacy_dm_rooms_into_private() -> None:
+    rows = _db_query_all(
+        """
+        SELECT id, room, user_id, message, created_at, message_kind, voice_path, voice_mime, voice_duration_sec, expires_at
+        FROM chat_messages
+        WHERE room LIKE 'dm:%'
+        ORDER BY id ASC
+        """
+    )
+    if not rows:
+        return
+
+    with _db_lock:
+        conn = _db()
+        try:
+            cur = conn.cursor()
+            for row in rows:
+                payload = dict(row)
+                parts = str(payload.get("room") or "").split(":")
+                if len(parts) != 3 or parts[0] != "dm":
+                    continue
+                try:
+                    left = int(parts[1])
+                    right = int(parts[2])
+                    sender = int(payload["user_id"])
+                except Exception:
+                    continue
+                if sender not in {left, right}:
+                    continue
+                recipient = right if sender == left else left
+
+                cur.execute(_sql("SELECT id FROM private_chat_messages WHERE legacy_chat_message_id=? LIMIT 1"), (int(payload["id"]),))
+                if cur.fetchone() is not None:
+                    continue
+
+                created_at = payload.get("created_at")
+                if DB_BACKEND == "postgres":
+                    cur.execute(
+                        _sql(
+                            """
+                            INSERT INTO private_chat_messages(
+                                sender_user_id, recipient_user_id, text, created_at,
+                                message_kind, voice_path, voice_mime, voice_duration_sec, expires_at, legacy_chat_message_id
+                            )
+                            VALUES (?, ?, ?, to_timestamp(?), ?, ?, ?, ?, ?, ?)
+                            """
+                        ),
+                        (
+                            sender,
+                            recipient,
+                            payload.get("message") or "",
+                            int(created_at),
+                            payload.get("message_kind") or "text",
+                            payload.get("voice_path"),
+                            payload.get("voice_mime"),
+                            payload.get("voice_duration_sec"),
+                            payload.get("expires_at"),
+                            int(payload["id"]),
+                        ),
+                    )
+                else:
+                    cur.execute(
+                        _sql(
+                            """
+                            INSERT INTO private_chat_messages(
+                                sender_user_id, recipient_user_id, text, created_at,
+                                message_kind, voice_path, voice_mime, voice_duration_sec, expires_at, legacy_chat_message_id
+                            )
+                            VALUES (?, ?, ?, datetime(?, 'unixepoch'), ?, ?, ?, ?, ?, ?)
+                            """
+                        ),
+                        (
+                            sender,
+                            recipient,
+                            payload.get("message") or "",
+                            int(created_at),
+                            payload.get("message_kind") or "text",
+                            payload.get("voice_path"),
+                            payload.get("voice_mime"),
+                            payload.get("voice_duration_sec"),
+                            payload.get("expires_at"),
+                            int(payload["id"]),
+                        ),
+                    )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def _bootstrap_chat_unification() -> None:
+    _backfill_chat_expirations()
+    _migrate_legacy_dm_rooms_into_private()
+
+
+from chat import purge_expired_chat_rows_if_due, router as chat_router
 from leaderboard_db import init_leaderboard_schema
 from leaderboard_models import LeaderboardPeriod
 from leaderboard_routes import router as leaderboard_router
@@ -1322,6 +1510,8 @@ def startup():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     FRAMES_DIR.mkdir(parents=True, exist_ok=True)
     _db_init()
+    _bootstrap_chat_unification()
+    purge_expired_chat_rows_if_due(force=True)
     init_leaderboard_schema()
     ensure_pickup_recording_schema()
     _ensure_admin_seed()
