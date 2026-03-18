@@ -6,11 +6,11 @@ import re
 import threading
 import time
 from datetime import datetime, timezone
+from email.utils import formatdate
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, Response, UploadFile
 from pydantic import BaseModel
 
 from core import (
@@ -62,6 +62,7 @@ class PrivateChatMessageOut(BaseModel):
     created_at: str
     audio_url: str | None = None
     audio_duration_ms: int | None = None
+    audio_mime_type: str | None = None
 
 
 class PrivateChatMessagesResponse(BaseModel):
@@ -208,6 +209,14 @@ def _private_audio_url(message_id: int) -> str:
     return f"/chat/audio/private/{int(message_id)}"
 
 
+def _voice_fields(audio_url: str, row: dict) -> dict[str, Any]:
+    return {
+        "audio_url": audio_url,
+        "audio_duration_ms": int(row["audio_duration_ms"]) if row.get("audio_duration_ms") is not None else None,
+        "audio_mime_type": row.get("audio_mime_type"),
+    }
+
+
 def _serialize_public_message(row: dict) -> dict:
     payload = {
         "id": int(row["id"]),
@@ -217,12 +226,12 @@ def _serialize_public_message(row: dict) -> dict:
         "text": row["message"] or "",
         "message_type": row.get("message_type") or "text",
         "created_at": _timestamp_to_iso(row["created_at"]),
+        "audio_url": None,
+        "audio_duration_ms": None,
+        "audio_mime_type": None,
     }
     if payload["message_type"] == "voice" and row.get("audio_path"):
-        payload["audio_url"] = _public_audio_url(payload["id"])
-        payload["audio_duration_ms"] = (
-            int(row["audio_duration_ms"]) if row.get("audio_duration_ms") is not None else None
-        )
+        payload.update(_voice_fields(_public_audio_url(payload["id"]), row))
     return payload
 
 
@@ -234,12 +243,12 @@ def _serialize_private_message(row: dict, include_legacy_aliases: bool = False) 
         "text": row.get("text") or "",
         "message_type": row.get("message_type") or "text",
         "created_at": _timestamp_to_iso(row["created_at"]),
+        "audio_url": None,
+        "audio_duration_ms": None,
+        "audio_mime_type": None,
     }
     if payload["message_type"] == "voice" and row.get("audio_path"):
-        payload["audio_url"] = _private_audio_url(payload["id"])
-        payload["audio_duration_ms"] = (
-            int(row["audio_duration_ms"]) if row.get("audio_duration_ms") is not None else None
-        )
+        payload.update(_voice_fields(_private_audio_url(payload["id"]), row))
     if include_legacy_aliases:
         payload["user_id"] = payload["sender_user_id"]
         payload["room"] = _dm_room_for_users(payload["sender_user_id"], payload["recipient_user_id"])
@@ -599,6 +608,26 @@ def _log_voice_upload_failure(request: Request, file: UploadFile | None, audio: 
     )
 
 
+def _log_voice_file_issue(
+    *,
+    route: str,
+    message_id: int | None,
+    content_type: str | None,
+    file_exists: bool | None,
+    detail: str,
+) -> None:
+    _LOGGER.warning(
+        "Voice note issue: %s",
+        detail,
+        extra={
+            "route": route,
+            "message_id": message_id,
+            "content_type": content_type,
+            "file_exists": file_exists,
+        },
+    )
+
+
 def _resolve_voice_upload(request: Request, file: UploadFile | None, audio: UploadFile | None) -> UploadFile:
     upload = file or audio
     if upload is None:
@@ -632,8 +661,21 @@ def _store_audio_file(relative_dir: str, message_id: int, user_id: int, extensio
     target = _resolve_audio_path(relative_path)
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.with_suffix(target.suffix + ".tmp")
-    tmp.write_bytes(payload)
+    with tmp.open("wb") as fh:
+        fh.write(payload)
+        fh.flush()
+        os.fsync(fh.fileno())
     tmp.replace(target)
+    try:
+        dir_fd = os.open(str(target.parent), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
+    if not target.exists() or not target.is_file():
+        raise RuntimeError("Audio file was not persisted")
     return relative_path
 
 
@@ -642,26 +684,106 @@ def _persist_public_voice_message(room: str, user, upload: UploadFile, duration_
     clean_text = _voice_note_text_fallback(text)
     safe_duration_ms = _validate_duration_ms(duration_ms)
     payload, mime_type, extension = _read_upload_audio(upload)
-    row = _insert_public_message(room, user, clean_text, message_type="voice")
     relative_dir = f"public/{_room_slug(room)}"
+    target: Path | None = None
+    conn = None
+    row: dict | None = None
     try:
-        relative_path = _store_audio_file(relative_dir, int(row["id"]), int(user["id"]), extension, payload)
-        _db_exec(
-            """
-            UPDATE chat_messages
-            SET audio_path=?, audio_mime_type=?, audio_duration_ms=?
-            WHERE id=?
-            """,
-            (relative_path, mime_type, safe_duration_ms, int(row["id"])),
-        )
-        row["audio_path"] = relative_path
-        row["audio_mime_type"] = mime_type
-        row["audio_duration_ms"] = safe_duration_ms
+        with _db_lock:
+            conn = _db()
+            cur = conn.cursor()
+            safe_room = _normalize_room(room)
+            display_name = _clean_display_name(user["display_name"] or "", user["email"])
+            user_id = int(user["id"])
+            now = int(time.time())
+            if DB_BACKEND == "postgres":
+                cur.execute(
+                    _sql(
+                        """
+                        INSERT INTO chat_messages(
+                            room, user_id, display_name, message, created_at, message_type, audio_path, audio_mime_type, audio_duration_ms
+                        )
+                        VALUES (?, ?, ?, ?, to_timestamp(?), ?, ?, ?, ?)
+                        RETURNING id, room, user_id, display_name, message, created_at, message_type, audio_path, audio_mime_type, audio_duration_ms
+                        """
+                    ),
+                    (safe_room, user_id, display_name, clean_text, now, "voice", None, None, None),
+                )
+                row = dict(cur.fetchone())
+            else:
+                cur.execute(
+                    _sql(
+                        """
+                        INSERT INTO chat_messages(
+                            room, user_id, display_name, message, created_at, message_type, audio_path, audio_mime_type, audio_duration_ms
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """
+                    ),
+                    (safe_room, user_id, display_name, clean_text, now, "voice", None, None, None),
+                )
+                new_id = int(cur.lastrowid)
+                cur.execute(
+                    _sql(
+                        """
+                        SELECT id, room, user_id, display_name, message, created_at, message_type, audio_path, audio_mime_type, audio_duration_ms
+                        FROM chat_messages
+                        WHERE id=?
+                        LIMIT 1
+                        """
+                    ),
+                    (new_id,),
+                )
+                row = dict(cur.fetchone())
+            relative_path = _store_audio_file(relative_dir, int(row["id"]), user_id, extension, payload)
+            target = _resolve_audio_path(relative_path)
+            cur.execute(
+                _sql(
+                    """
+                    UPDATE chat_messages
+                    SET audio_path=?, audio_mime_type=?, audio_duration_ms=?
+                    WHERE id=?
+                    """
+                ),
+                (relative_path, mime_type, safe_duration_ms, int(row["id"])),
+            )
+            cur.execute(
+                _sql(
+                    """
+                    SELECT id, room, user_id, display_name, message, created_at, message_type, audio_path, audio_mime_type, audio_duration_ms
+                    FROM chat_messages
+                    WHERE id=?
+                    LIMIT 1
+                    """
+                ),
+                (int(row["id"]),),
+            )
+            row = dict(cur.fetchone())
+            conn.commit()
         return _serialize_public_message(row)
     except Exception:
-        _LOGGER.exception("Failed to persist public voice note", extra={"room": room, "message_id": int(row["id"]), "user_id": int(user["id"])})
-        _db_exec("DELETE FROM chat_messages WHERE id=?", (int(row["id"]),))
+        if conn is not None:
+            conn.rollback()
+            conn.close()
+            conn = None
+        file_exists = bool(target and target.exists() and target.is_file())
+        _LOGGER.exception(
+            "Failed to persist public voice note",
+            extra={"room": room, "message_id": int(row["id"]) if row else None, "user_id": int(user["id"])},
+        )
+        _log_voice_file_issue(
+            route=f"/chat/rooms/{room}/voice",
+            message_id=int(row["id"]) if row else None,
+            content_type=mime_type,
+            file_exists=file_exists,
+            detail="public voice persistence failed",
+        )
+        if target and target.exists():
+            target.unlink(missing_ok=True)
         raise
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def _persist_private_voice_message(
@@ -675,26 +797,235 @@ def _persist_private_voice_message(
     clean_text = _voice_note_text_fallback(text)
     safe_duration_ms = _validate_duration_ms(duration_ms)
     payload, mime_type, extension = _read_upload_audio(upload)
-    row = _insert_private_message(sender_user_id, recipient_user_id, clean_text, message_type="voice")
     relative_dir = _private_audio_subdir(sender_user_id, recipient_user_id)
+    target: Path | None = None
+    conn = None
+    row: dict | None = None
     try:
-        relative_path = _store_audio_file(relative_dir, int(row["id"]), int(sender_user_id), extension, payload)
-        _db_exec(
-            """
-            UPDATE private_chat_messages
-            SET audio_path=?, audio_mime_type=?, audio_duration_ms=?
-            WHERE id=?
-            """,
-            (relative_path, mime_type, safe_duration_ms, int(row["id"])),
-        )
-        row["audio_path"] = relative_path
-        row["audio_mime_type"] = mime_type
-        row["audio_duration_ms"] = safe_duration_ms
+        with _db_lock:
+            conn = _db()
+            cur = conn.cursor()
+            if DB_BACKEND == "postgres":
+                cur.execute(
+                    _sql(
+                        """
+                        INSERT INTO private_chat_messages(
+                            sender_user_id, recipient_user_id, text, message_type, audio_path, audio_mime_type, audio_duration_ms
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        RETURNING id, sender_user_id, recipient_user_id, text, created_at, message_type, audio_path, audio_mime_type, audio_duration_ms
+                        """
+                    ),
+                    (int(sender_user_id), int(recipient_user_id), clean_text, "voice", None, None, None),
+                )
+                row = dict(cur.fetchone())
+            else:
+                cur.execute(
+                    _sql(
+                        """
+                        INSERT INTO private_chat_messages(
+                            sender_user_id, recipient_user_id, text, message_type, audio_path, audio_mime_type, audio_duration_ms
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """
+                    ),
+                    (int(sender_user_id), int(recipient_user_id), clean_text, "voice", None, None, None),
+                )
+                new_id = int(cur.lastrowid)
+                cur.execute(
+                    _sql(
+                        """
+                        SELECT id, sender_user_id, recipient_user_id, text, created_at, message_type, audio_path, audio_mime_type, audio_duration_ms
+                        FROM private_chat_messages
+                        WHERE id=?
+                        LIMIT 1
+                        """
+                    ),
+                    (new_id,),
+                )
+                row = dict(cur.fetchone())
+            relative_path = _store_audio_file(relative_dir, int(row["id"]), int(sender_user_id), extension, payload)
+            target = _resolve_audio_path(relative_path)
+            cur.execute(
+                _sql(
+                    """
+                    UPDATE private_chat_messages
+                    SET audio_path=?, audio_mime_type=?, audio_duration_ms=?
+                    WHERE id=?
+                    """
+                ),
+                (relative_path, mime_type, safe_duration_ms, int(row["id"])),
+            )
+            cur.execute(
+                _sql(
+                    """
+                    SELECT id, sender_user_id, recipient_user_id, text, created_at, message_type, audio_path, audio_mime_type, audio_duration_ms
+                    FROM private_chat_messages
+                    WHERE id=?
+                    LIMIT 1
+                    """
+                ),
+                (int(row["id"]),),
+            )
+            row = dict(cur.fetchone())
+            conn.commit()
         return _serialize_private_message(row)
     except Exception:
-        _LOGGER.exception("Failed to persist private voice note", extra={"message_id": int(row["id"]), "sender_user_id": int(sender_user_id), "recipient_user_id": int(recipient_user_id)})
-        _db_exec("DELETE FROM private_chat_messages WHERE id=?", (int(row["id"]),))
+        if conn is not None:
+            conn.rollback()
+            conn.close()
+            conn = None
+        file_exists = bool(target and target.exists() and target.is_file())
+        _LOGGER.exception(
+            "Failed to persist private voice note",
+            extra={
+                "message_id": int(row["id"]) if row else None,
+                "sender_user_id": int(sender_user_id),
+                "recipient_user_id": int(recipient_user_id),
+            },
+        )
+        _log_voice_file_issue(
+            route=f"/chat/private/{recipient_user_id}/voice",
+            message_id=int(row["id"]) if row else None,
+            content_type=mime_type,
+            file_exists=file_exists,
+            detail="private voice persistence failed",
+        )
+        if target and target.exists():
+            target.unlink(missing_ok=True)
         raise
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def _parse_range_header(range_header: str | None, file_size: int) -> tuple[int, int] | None:
+    if not range_header:
+        return None
+    text = range_header.strip().lower()
+    if not text.startswith("bytes="):
+        raise HTTPException(status_code=416, detail="Invalid range")
+    try:
+        start_text, _, end_text = text[6:].partition("-")
+        if not start_text and not end_text:
+            raise HTTPException(status_code=416, detail="Invalid range")
+        if not start_text:
+            length = int(end_text)
+            if length <= 0:
+                raise HTTPException(status_code=416, detail="Invalid range")
+            start = max(0, file_size - length)
+            end = file_size - 1
+            return start, end
+        start = int(start_text)
+        end = file_size - 1 if not end_text else int(end_text)
+    except ValueError as exc:
+        raise HTTPException(status_code=416, detail="Invalid range") from exc
+    if start < 0 or end < start or start >= file_size:
+        raise HTTPException(status_code=416, detail="Invalid range")
+    return start, min(end, file_size - 1)
+
+
+def _audio_response(target: Path, mime_type: str, range_header: str | None, head_only: bool) -> Response:
+    stat_result = target.stat()
+    file_size = int(stat_result.st_size)
+    byte_range = _parse_range_header(range_header, file_size)
+    common_headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Type": mime_type,
+        "Last-Modified": formatdate(stat_result.st_mtime, usegmt=True),
+    }
+    if byte_range is None:
+        common_headers["Content-Length"] = str(file_size)
+        return Response(
+            content=b"" if head_only else target.read_bytes(),
+            media_type=mime_type,
+            headers=common_headers,
+            status_code=200,
+        )
+
+    start, end = byte_range
+    content_length = (end - start) + 1
+    common_headers["Content-Length"] = str(content_length)
+    common_headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+    if head_only:
+        return Response(status_code=206, headers=common_headers)
+    with target.open("rb") as fh:
+        fh.seek(start)
+        content = fh.read(content_length)
+    return Response(content=content, media_type=mime_type, headers=common_headers, status_code=206)
+
+
+def _fetch_public_audio_row(message_id: int) -> dict:
+    rows = _db_query_all(
+        """
+        SELECT id, audio_path, audio_mime_type
+        FROM chat_messages
+        WHERE id=? AND message_type='voice'
+        LIMIT 1
+        """,
+        (int(message_id),),
+    )
+    if not rows:
+        _log_voice_file_issue(
+            route="/chat/audio/public/{message_id}",
+            message_id=int(message_id),
+            content_type=None,
+            file_exists=None,
+            detail="public audio metadata missing",
+        )
+        raise HTTPException(status_code=404, detail="Audio not found")
+    return dict(rows[0])
+
+
+def _fetch_private_audio_row(message_id: int) -> dict:
+    rows = _db_query_all(
+        """
+        SELECT id, sender_user_id, recipient_user_id, audio_path, audio_mime_type
+        FROM private_chat_messages
+        WHERE id=? AND message_type='voice'
+        LIMIT 1
+        """,
+        (int(message_id),),
+    )
+    if not rows:
+        _log_voice_file_issue(
+            route="/chat/audio/private/{message_id}",
+            message_id=int(message_id),
+            content_type=None,
+            file_exists=None,
+            detail="private audio metadata missing",
+        )
+        raise HTTPException(status_code=404, detail="Audio not found")
+    return dict(rows[0])
+
+
+def _serve_audio(route: str, message_id: int, row: dict, request: Request) -> Response:
+    if not row.get("audio_path"):
+        _log_voice_file_issue(
+            route=route,
+            message_id=message_id,
+            content_type=row.get("audio_mime_type"),
+            file_exists=False,
+            detail="audio path missing",
+        )
+        raise HTTPException(status_code=404, detail="Audio not found")
+    target = _resolve_audio_path(str(row["audio_path"]))
+    exists = target.exists() and target.is_file()
+    if not exists:
+        _log_voice_file_issue(
+            route=route,
+            message_id=message_id,
+            content_type=row.get("audio_mime_type"),
+            file_exists=False,
+            detail="audio file missing",
+        )
+        raise HTTPException(status_code=404, detail="Audio file missing")
+    return _audio_response(
+        target=target,
+        mime_type=row.get("audio_mime_type") or "application/octet-stream",
+        range_header=request.headers.get("range"),
+        head_only=request.method.upper() == "HEAD",
+    )
 
 
 def _create_private_text_message(sender_user_id: int, recipient_user_id: int, text: str) -> dict:
@@ -702,6 +1033,16 @@ def _create_private_text_message(sender_user_id: int, recipient_user_id: int, te
     _enforce_rate_limit(int(sender_user_id))
     row = _insert_private_message(sender_user_id, recipient_user_id, clean_text, message_type="text")
     return _serialize_private_message(row)
+
+
+def _with_sender_legacy_fields(message: dict, sender_user_id: int, other_user_id: int) -> dict:
+    sender_payload = _user_directory_payloads([sender_user_id]).get(sender_user_id, {})
+    enriched = dict(message)
+    enriched["user_id"] = sender_user_id
+    enriched["display_name"] = sender_payload.get("display_name")
+    enriched["sender_display_name"] = sender_payload.get("display_name")
+    enriched["room"] = _dm_room_for_users(sender_user_id, int(other_user_id))
+    return enriched
 
 
 def _list_messages_for_room(room: str, after: str | None, limit: int) -> dict:
@@ -844,12 +1185,7 @@ def create_dm_message(other_user_id: int, payload: ChatMessagePayload, user=Depe
         raise HTTPException(status_code=400, detail="Cannot message yourself")
     _ensure_dm_target_exists(int(other_user_id))
     message = _create_private_text_message(my_user_id, int(other_user_id), payload.text)
-    sender_payload = _user_directory_payloads([my_user_id]).get(my_user_id, {})
-    message["user_id"] = my_user_id
-    message["display_name"] = sender_payload.get("display_name")
-    message["sender_display_name"] = sender_payload.get("display_name")
-    message["room"] = _dm_room_for_users(my_user_id, int(other_user_id))
-    return message
+    return _with_sender_legacy_fields(message, my_user_id, int(other_user_id))
 
 
 @router.post("/dm/{other_user_id}/voice")
@@ -868,12 +1204,7 @@ def create_dm_voice_message(
     _ensure_dm_target_exists(int(other_user_id))
     upload = _resolve_voice_upload(request, file, audio)
     message = _persist_private_voice_message(my_user_id, int(other_user_id), upload, duration_ms, text)
-    sender_payload = _user_directory_payloads([my_user_id]).get(my_user_id, {})
-    message["user_id"] = my_user_id
-    message["display_name"] = sender_payload.get("display_name")
-    message["sender_display_name"] = sender_payload.get("display_name")
-    message["room"] = _dm_room_for_users(my_user_id, int(other_user_id))
-    return message
+    return _with_sender_legacy_fields(message, my_user_id, int(other_user_id))
 
 
 @router.get("/private/threads", response_model=PrivateChatThreadsResponse)
@@ -928,49 +1259,17 @@ def create_private_voice_message(
     return _persist_private_voice_message(my_user_id, int(other_user_id), upload, duration_ms, text)
 
 
-@router.get("/audio/public/{message_id}")
-def get_public_audio(message_id: int, user=Depends(require_user)):
+@router.api_route("/audio/public/{message_id}", methods=["GET", "HEAD"])
+def get_public_audio(message_id: int, request: Request, user=Depends(require_user)):
     _ = user
-    rows = _db_query_all(
-        """
-        SELECT id, audio_path, audio_mime_type
-        FROM chat_messages
-        WHERE id=? AND message_type='voice'
-        LIMIT 1
-        """,
-        (int(message_id),),
-    )
-    if not rows:
-        raise HTTPException(status_code=404, detail="Audio not found")
-    row = dict(rows[0])
-    if not row.get("audio_path"):
-        raise HTTPException(status_code=404, detail="Audio not found")
-    target = _resolve_audio_path(str(row["audio_path"]))
-    if not target.exists() or not target.is_file():
-        raise HTTPException(status_code=404, detail="Audio file missing")
-    return FileResponse(target, media_type=row.get("audio_mime_type") or "application/octet-stream")
+    row = _fetch_public_audio_row(message_id)
+    return _serve_audio("/chat/audio/public/{message_id}", int(message_id), row, request)
 
 
-@router.get("/audio/private/{message_id}")
-def get_private_audio(message_id: int, user=Depends(require_user)):
+@router.api_route("/audio/private/{message_id}", methods=["GET", "HEAD"])
+def get_private_audio(message_id: int, request: Request, user=Depends(require_user)):
     my_user_id = int(user["id"])
-    rows = _db_query_all(
-        """
-        SELECT id, sender_user_id, recipient_user_id, audio_path, audio_mime_type
-        FROM private_chat_messages
-        WHERE id=? AND message_type='voice'
-        LIMIT 1
-        """,
-        (int(message_id),),
-    )
-    if not rows:
-        raise HTTPException(status_code=404, detail="Audio not found")
-    row = dict(rows[0])
+    row = _fetch_private_audio_row(message_id)
     if my_user_id not in {int(row["sender_user_id"]), int(row["recipient_user_id"])}:
         raise HTTPException(status_code=403, detail="Not allowed")
-    if not row.get("audio_path"):
-        raise HTTPException(status_code=404, detail="Audio not found")
-    target = _resolve_audio_path(str(row["audio_path"]))
-    if not target.exists() or not target.is_file():
-        raise HTTPException(status_code=404, detail="Audio file missing")
-    return FileResponse(target, media_type=row.get("audio_mime_type") or "application/octet-stream")
+    return _serve_audio("/chat/audio/private/{message_id}", int(message_id), row, request)

@@ -123,12 +123,48 @@ _generate_state: Dict[str, Any] = {
 # =========================================================
 app = FastAPI(title="NYC TLC Hotspot Backend", version="2.2")
 
+
+def _split_env_origins(*names: str) -> list[str]:
+    origins: list[str] = []
+    for name in names:
+        raw = os.environ.get(name, "")
+        if not raw:
+            continue
+        for value in raw.split(","):
+            origin = value.strip().rstrip("/")
+            if origin and origin not in origins:
+                origins.append(origin)
+    return origins
+
+
+def _cors_allow_origins() -> list[str]:
+    configured = _split_env_origins(
+        "CORS_ALLOW_ORIGINS",
+        "FRONTEND_ORIGIN",
+        "FRONTEND_ORIGINS",
+        "FRONTEND_URL",
+        "APP_URL",
+        "WEB_URL",
+    )
+    defaults = [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ]
+    for origin in defaults:
+        if origin not in configured:
+            configured.append(origin)
+    return configured
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # lock down later
+    allow_origins=_cors_allow_origins(),
+    allow_origin_regex=r"https://([a-zA-Z0-9-]+\.)*(railway\.app|up\.railway\.app)",
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Type", "Content-Length", "Accept-Ranges", "Content-Range"],
 )
 
 app.include_router(admin_router)
