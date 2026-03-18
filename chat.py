@@ -34,6 +34,9 @@ _last_message_by_user: dict[int, float] = {}
 _CHAT_AUDIO_DIR = DATA_DIR / "chat_audio"
 _MAX_AUDIO_BYTES = int(os.environ.get("CHAT_AUDIO_MAX_BYTES", str(6 * 1024 * 1024)))
 _MAX_PRIVATE_PAGE_SIZE = 200
+CHAT_VOICE_MAX_MS = 60_000
+CHAT_RETENTION_SECONDS = 24 * 60 * 60
+CHAT_RETENTION_SWEEP_SECONDS = 15 * 60
 _ALLOWED_AUDIO_MIME_TYPES = {
     "audio/mpeg": ".mp3",
     "audio/mp4": ".mp4",
@@ -43,6 +46,10 @@ _ALLOWED_AUDIO_MIME_TYPES = {
 
 _LOGGER = logging.getLogger(__name__)
 _VOICE_NOTE_FALLBACK_TEXT = "Voice note"
+_retention_state_lock = threading.Lock()
+_retention_purge_lock = threading.Lock()
+_retention_last_run_monotonic = 0.0
+_retention_sweeper_started = False
 
 
 class ChatMessagePayload(BaseModel):
@@ -180,7 +187,201 @@ def _validate_duration_ms(duration_ms: int | None) -> int | None:
     value = int(duration_ms)
     if value < 0:
         return 0
-    return min(value, 3_600_000)
+    return min(value, CHAT_VOICE_MAX_MS)
+
+
+def _retention_cutoff_unix() -> int:
+    return int(time.time()) - CHAT_RETENTION_SECONDS
+
+
+def _public_expired_created_at_clause() -> str:
+    if DB_BACKEND == "postgres":
+        return "created_at < to_timestamp(?)"
+    return "CAST(created_at AS INTEGER) < ?"
+
+
+def _private_expired_created_at_clause() -> str:
+    if DB_BACKEND == "postgres":
+        return "created_at < to_timestamp(?)"
+    return "CAST(strftime('%s', created_at) AS INTEGER) < ?"
+
+
+def _safe_unlink_chat_audio(relative_path: str | None) -> None:
+    if not relative_path:
+        return
+    try:
+        target = _resolve_audio_path(str(relative_path))
+    except HTTPException:
+        _LOGGER.warning("Skipping unsafe chat audio purge path", extra={"audio_path": relative_path})
+        return
+
+    try:
+        target.unlink(missing_ok=True)
+    except OSError:
+        _LOGGER.warning("Failed to unlink expired chat audio", exc_info=True, extra={"audio_path": relative_path})
+        return
+
+    allowed_cleanup_roots = {
+        (_CHAT_AUDIO_DIR / "public").resolve(),
+        (_CHAT_AUDIO_DIR / "private").resolve(),
+    }
+    for parent in target.parents:
+        resolved_parent = parent.resolve()
+        if resolved_parent == _CHAT_AUDIO_DIR.resolve():
+            break
+        if resolved_parent not in allowed_cleanup_roots and not any(
+            root == resolved_parent or root in resolved_parent.parents for root in allowed_cleanup_roots
+        ):
+            break
+        try:
+            parent.rmdir()
+        except OSError:
+            break
+
+
+def _collect_expired_chat_audio_rows(cutoff_unix: int) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    public_rows = _db_query_all(
+        f"""
+        SELECT id, audio_path
+        FROM chat_messages
+        WHERE message_type='voice'
+          AND audio_path IS NOT NULL
+          AND {_public_expired_created_at_clause()}
+        """,
+        (int(cutoff_unix),),
+    )
+    private_rows = _db_query_all(
+        f"""
+        SELECT id, audio_path
+        FROM private_chat_messages
+        WHERE message_type='voice'
+          AND audio_path IS NOT NULL
+          AND {_private_expired_created_at_clause()}
+        """,
+        (int(cutoff_unix),),
+    )
+    rows.extend({"scope": "public", "id": int(row["id"]), "audio_path": row["audio_path"]} for row in public_rows)
+    rows.extend({"scope": "private", "id": int(row["id"]), "audio_path": row["audio_path"]} for row in private_rows)
+    return rows
+
+
+def _delete_expired_public_messages(cutoff_unix: int) -> int:
+    with _db_lock:
+        conn = _db()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                _sql(
+                    f"""
+                    DELETE FROM chat_messages
+                    WHERE {_public_expired_created_at_clause()}
+                    """
+                ),
+                (int(cutoff_unix),),
+            )
+            deleted = int(cur.rowcount or 0)
+            conn.commit()
+            return deleted
+        finally:
+            conn.close()
+
+
+def _delete_expired_private_messages(cutoff_unix: int) -> int:
+    with _db_lock:
+        conn = _db()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                _sql(
+                    f"""
+                    DELETE FROM private_chat_messages
+                    WHERE {_private_expired_created_at_clause()}
+                    """
+                ),
+                (int(cutoff_unix),),
+            )
+            deleted = int(cur.rowcount or 0)
+            conn.commit()
+            return deleted
+        finally:
+            conn.close()
+
+
+def _purge_expired_chat_data(force: bool = False) -> bool:
+    global _retention_last_run_monotonic
+
+    now_monotonic = time.monotonic()
+    with _retention_state_lock:
+        if not force and (now_monotonic - _retention_last_run_monotonic) < CHAT_RETENTION_SWEEP_SECONDS:
+            return False
+
+    if not _retention_purge_lock.acquire(blocking=False):
+        return False
+
+    try:
+        cutoff_unix = _retention_cutoff_unix()
+        expired_audio_rows = _collect_expired_chat_audio_rows(cutoff_unix)
+        seen_paths: set[str] = set()
+        for row in expired_audio_rows:
+            audio_path = str(row.get("audio_path") or "").strip()
+            if not audio_path or audio_path in seen_paths:
+                continue
+            seen_paths.add(audio_path)
+            _safe_unlink_chat_audio(audio_path)
+
+        public_deleted = _delete_expired_public_messages(cutoff_unix)
+        private_deleted = _delete_expired_private_messages(cutoff_unix)
+        with _retention_state_lock:
+            _retention_last_run_monotonic = time.monotonic()
+        if expired_audio_rows or public_deleted or private_deleted:
+            _LOGGER.info(
+                "Purged expired chat data",
+                extra={
+                    "cutoff_unix": cutoff_unix,
+                    "expired_audio_files": len(seen_paths),
+                    "deleted_public_messages": public_deleted,
+                    "deleted_private_messages": private_deleted,
+                },
+            )
+        return True
+    except Exception:
+        _LOGGER.exception("Failed to purge expired chat data")
+        raise
+    finally:
+        _retention_purge_lock.release()
+
+
+def maybe_purge_expired_chat_data() -> bool:
+    try:
+        return _purge_expired_chat_data(force=False)
+    except Exception:
+        return False
+
+
+def start_chat_retention_sweeper() -> bool:
+    global _retention_sweeper_started
+
+    with _retention_state_lock:
+        if _retention_sweeper_started:
+            return False
+        _retention_sweeper_started = True
+
+    def _worker() -> None:
+        while True:
+            try:
+                _purge_expired_chat_data(force=True)
+            except Exception:
+                _LOGGER.exception("Chat retention sweeper iteration failed")
+            time.sleep(CHAT_RETENTION_SWEEP_SECONDS)
+
+    thread = threading.Thread(
+        target=_worker,
+        name="chat-retention-sweeper",
+        daemon=True,
+    )
+    thread.start()
+    return True
 
 
 def _enforce_rate_limit(user_id: int) -> None:
@@ -1140,11 +1341,13 @@ def list_room_messages(
     user=Depends(require_user),
 ):
     _ = user
+    maybe_purge_expired_chat_data()
     return _list_messages_for_room(room, after, limit)
 
 
 @router.post("/rooms/{room}")
 def create_room_message(room: str, payload: ChatMessagePayload, user=Depends(require_user)):
+    maybe_purge_expired_chat_data()
     return _create_message_for_room(room, payload, user)
 
 
@@ -1158,6 +1361,7 @@ def create_room_voice_message(
     text: str | None = Form(default=None),
     user=Depends(require_user),
 ):
+    maybe_purge_expired_chat_data()
     upload = _resolve_voice_upload(request, file, audio)
     return _persist_public_voice_message(room, user, upload, duration_ms, text)
 
@@ -1172,6 +1376,7 @@ def list_dm_messages(
     user=Depends(require_user),
 ):
     my_user_id = int(user["id"])
+    maybe_purge_expired_chat_data()
     if int(other_user_id) == my_user_id:
         raise HTTPException(status_code=400, detail="Cannot message yourself")
     _ensure_dm_target_exists(int(other_user_id))
@@ -1181,6 +1386,7 @@ def list_dm_messages(
 @router.post("/dm/{other_user_id}")
 def create_dm_message(other_user_id: int, payload: ChatMessagePayload, user=Depends(require_user)):
     my_user_id = int(user["id"])
+    maybe_purge_expired_chat_data()
     if int(other_user_id) == my_user_id:
         raise HTTPException(status_code=400, detail="Cannot message yourself")
     _ensure_dm_target_exists(int(other_user_id))
@@ -1199,6 +1405,7 @@ def create_dm_voice_message(
     user=Depends(require_user),
 ):
     my_user_id = int(user["id"])
+    maybe_purge_expired_chat_data()
     if int(other_user_id) == my_user_id:
         raise HTTPException(status_code=400, detail="Cannot message yourself")
     _ensure_dm_target_exists(int(other_user_id))
@@ -1209,6 +1416,7 @@ def create_dm_voice_message(
 
 @router.get("/private/threads", response_model=PrivateChatThreadsResponse)
 def list_private_threads(user=Depends(require_user)):
+    maybe_purge_expired_chat_data()
     return {"threads": _list_private_threads(int(user["id"]))}
 
 
@@ -1221,6 +1429,7 @@ def list_private_messages(
     user=Depends(require_user),
 ):
     my_user_id = int(user["id"])
+    maybe_purge_expired_chat_data()
     if int(other_user_id) == my_user_id:
         raise HTTPException(status_code=400, detail="Cannot message yourself")
     _ensure_dm_target_exists(int(other_user_id))
@@ -1235,6 +1444,7 @@ def list_private_messages(
 @router.post("/private/{other_user_id}", response_model=PrivateChatMessageOut)
 def create_private_message(other_user_id: int, payload: PrivateChatSendIn, user=Depends(require_user)):
     my_user_id = int(user["id"])
+    maybe_purge_expired_chat_data()
     if int(other_user_id) == my_user_id:
         raise HTTPException(status_code=400, detail="Cannot message yourself")
     _ensure_dm_target_exists(int(other_user_id))
@@ -1252,6 +1462,7 @@ def create_private_voice_message(
     user=Depends(require_user),
 ):
     my_user_id = int(user["id"])
+    maybe_purge_expired_chat_data()
     if int(other_user_id) == my_user_id:
         raise HTTPException(status_code=400, detail="Cannot message yourself")
     _ensure_dm_target_exists(int(other_user_id))
