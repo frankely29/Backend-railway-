@@ -43,6 +43,7 @@ from core import (
     _db_lock,
     _db_query_all,
     _db_query_one,
+    _debug_log_chat_time_types,
     _hash_password,
     _is_integerish_type,
     _is_timestampish_type,
@@ -1435,7 +1436,9 @@ def _backfill_chat_expirations() -> None:
 def _migrate_legacy_dm_rooms_into_private() -> None:
     rows = _db_query_all(
         """
-        SELECT id, room, user_id, message, created_at
+        SELECT id, room, user_id, message, created_at,
+               COALESCE(message_kind, 'text') AS message_kind,
+               voice_path, voice_mime, voice_duration_sec, expires_at
         FROM chat_messages
         WHERE room LIKE 'dm:%'
         ORDER BY id ASC
@@ -1467,8 +1470,16 @@ def _migrate_legacy_dm_rooms_into_private() -> None:
                 if cur.fetchone() is not None:
                     continue
 
-                created_at = int(payload.get("created_at") or 0)
-                expires_at = created_at + 604800
+                message_kind = str(payload.get("message_kind") or "text").strip().lower() or "text"
+                text_value = (payload.get("message") or "") if message_kind != "voice" else ""
+                created_at = payload.get("created_at")
+                created_ts = _chat_expires_bind_value("private_chat_messages", created_at)
+                expires_at = payload.get("expires_at")
+                if expires_at in (None, ""):
+                    created_epoch = _chat_expires_bind_value("chat_messages", created_at)
+                    retention_seconds = 86400 if message_kind == "voice" else 604800
+                    expires_at = int(created_epoch) + retention_seconds if created_epoch is not None else int(time.time()) + retention_seconds
+
                 if DB_BACKEND == "postgres":
                     cur.execute(
                         _sql(
@@ -1477,14 +1488,18 @@ def _migrate_legacy_dm_rooms_into_private() -> None:
                                 sender_user_id, recipient_user_id, text, created_at,
                                 message_kind, voice_path, voice_mime, voice_duration_sec, expires_at, legacy_chat_message_id
                             )
-                            VALUES (?, ?, ?, to_timestamp(?), 'text', NULL, NULL, NULL, ?, ?)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             """
                         ),
                         (
                             sender,
                             recipient,
-                            payload.get("message") or "",
-                            created_at,
+                            text_value,
+                            created_ts,
+                            message_kind,
+                            payload.get("voice_path"),
+                            payload.get("voice_mime"),
+                            payload.get("voice_duration_sec"),
                             _chat_expires_bind_value("private_chat_messages", expires_at),
                             int(payload["id"]),
                         ),
@@ -1497,14 +1512,18 @@ def _migrate_legacy_dm_rooms_into_private() -> None:
                                 sender_user_id, recipient_user_id, text, created_at,
                                 message_kind, voice_path, voice_mime, voice_duration_sec, expires_at, legacy_chat_message_id
                             )
-                            VALUES (?, ?, ?, datetime(?, 'unixepoch'), 'text', NULL, NULL, NULL, ?, ?)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             """
                         ),
                         (
                             sender,
                             recipient,
-                            payload.get("message") or "",
-                            created_at,
+                            text_value,
+                            created_ts,
+                            message_kind,
+                            payload.get("voice_path"),
+                            payload.get("voice_mime"),
+                            payload.get("voice_duration_sec"),
                             _chat_expires_bind_value("private_chat_messages", expires_at),
                             int(payload["id"]),
                         ),
@@ -1512,13 +1531,6 @@ def _migrate_legacy_dm_rooms_into_private() -> None:
             conn.commit()
         finally:
             conn.close()
-
-
-def _debug_log_chat_time_types() -> None:
-    for table in ("chat_messages", "private_chat_messages"):
-        created_type = _schema_column_type(table, "created_at") or "unknown"
-        expires_type = _schema_column_type(table, "expires_at") or "unknown"
-        print(f"[chat] {table}.created_at={created_type} {table}.expires_at={expires_type}")
 
 
 def _bootstrap_chat_unification() -> None:

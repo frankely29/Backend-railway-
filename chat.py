@@ -15,7 +15,6 @@ from core import (
     DB_BACKEND,
     _chat_expired_where_clause,
     _chat_not_expired_where_clause,
-    _clean_display_name,
     _db,
     _db_exec,
     _db_lock,
@@ -119,16 +118,19 @@ def _to_iso(unix_ts: int) -> str:
 def _timestamp_to_iso(value: Any) -> str:
     if value is None:
         return ""
-    if isinstance(value, datetime):
-        dt = value
-    elif isinstance(value, (int, float)):
-        dt = datetime.fromtimestamp(int(value), tz=timezone.utc)
-    else:
-        text = str(value).replace("Z", "+00:00")
-        try:
-            dt = datetime.fromisoformat(text)
-        except ValueError:
-            dt = datetime.fromtimestamp(int(float(value)), tz=timezone.utc)
+    try:
+        if isinstance(value, datetime):
+            dt = value
+        elif isinstance(value, (int, float)):
+            dt = datetime.fromtimestamp(int(value), tz=timezone.utc)
+        else:
+            text = str(value).strip().replace("Z", "+00:00")
+            try:
+                dt = datetime.fromisoformat(text)
+            except ValueError:
+                dt = datetime.fromtimestamp(int(float(text)), tz=timezone.utc)
+    except Exception:
+        dt = datetime.fromtimestamp(int(time.time()), tz=timezone.utc)
 
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
@@ -138,21 +140,24 @@ def _timestamp_to_iso(value: Any) -> str:
 def _unix_from_timestamp(value: Any) -> int:
     if value is None:
         return int(time.time())
-    if isinstance(value, datetime):
-        dt = value
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return int(dt.timestamp())
-    if isinstance(value, (int, float)):
-        return int(value)
-    text = str(value).replace("Z", "+00:00")
     try:
-        dt = datetime.fromisoformat(text)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return int(dt.timestamp())
-    except ValueError:
-        return int(float(value))
+        if isinstance(value, datetime):
+            dt = value
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return int(dt.timestamp())
+        if isinstance(value, (int, float)):
+            return int(value)
+        text = str(value).strip().replace("Z", "+00:00")
+        try:
+            dt = datetime.fromisoformat(text)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return int(dt.timestamp())
+        except ValueError:
+            return int(float(text))
+    except Exception:
+        return int(time.time())
 
 
 def _normalize_room(room: str) -> str:
@@ -182,19 +187,29 @@ def _enforce_rate_limit(user_id: int) -> None:
         _last_message_by_user[user_id] = now
 
 
+def _is_placeholder_sender_name(value: Any) -> bool:
+    normalized = str(value or "").strip().lower()
+    return normalized in {"", "driver"}
+
+
 def _resolve_sender_display_name(row: dict, prefix: str = "") -> str:
-    sender_id = int(row[f"{prefix}sender_user_id"] if f"{prefix}sender_user_id" in row else row["user_id"])
+    sender_raw = row.get(f"{prefix}sender_user_id") if f"{prefix}sender_user_id" in row else row.get("user_id")
+    try:
+        sender_id = int(sender_raw)
+    except Exception:
+        sender_id = 0
+
     user_display_name = (row.get(f"{prefix}sender_display_name") or row.get("user_display_name") or "").strip()
     user_email = (row.get(f"{prefix}sender_email") or row.get("user_email") or "").strip()
     message_display_name = (row.get("message_display_name") or row.get("display_name") or "").strip()
 
-    if user_display_name:
+    if not _is_placeholder_sender_name(user_display_name):
         return user_display_name
     if user_email and "@" in user_email:
-        return user_email.split("@", 1)[0].strip() or f"User {sender_id}"
-    if message_display_name:
+        return user_email.split("@", 1)[0].strip() or f"User {sender_id or '?'}"
+    if not _is_placeholder_sender_name(message_display_name):
         return message_display_name
-    return f"User {sender_id}"
+    return f"User {sender_id}" if sender_id > 0 else "User"
 
 
 def _expires_iso(row: dict) -> str | None:
@@ -351,7 +366,6 @@ def _list_messages_for_room(room: str, limit: int, after: str | None = None) -> 
     _touch_chat_maintenance()
     safe_room = _normalize_room(room)
     safe_limit = max(1, min(200, int(limit)))
-    now = int(time.time())
 
     expires_clause, expires_params = _chat_not_expired_where_clause("chat_messages")
     where = ["room = ?", expires_clause]
@@ -378,7 +392,7 @@ def _list_messages_for_room(room: str, limit: int, after: str | None = None) -> 
             LIMIT ?
         ) cm
         LEFT JOIN users u ON u.id = cm.user_id
-        ORDER BY cm.id ASC
+        ORDER BY cm.created_at ASC, cm.id ASC
         """,
         tuple(params + [safe_limit]),
     )
@@ -395,7 +409,7 @@ def _create_public_text_message(room: str, payload: ChatMessagePayload, user) ->
 
     now = int(time.time())
     expires_at = _retention_deadline_value("chat_messages", "text")
-    display_name = _clean_display_name(user["display_name"] or "", user["email"])
+    display_name = _resolve_sender_display_name({"user_id": user_id, "user_display_name": user.get("display_name"), "user_email": user.get("email")})
 
     with _db_lock:
         conn = _db()
@@ -458,7 +472,7 @@ def _create_public_voice_message(room: str, user, upload: UploadFile, duration_s
 
     now = int(time.time())
     expires_at = _retention_deadline_value("chat_messages", "voice")
-    display_name = _clean_display_name(user["display_name"] or "", user["email"])
+    display_name = _resolve_sender_display_name({"user_id": user_id, "user_display_name": user.get("display_name"), "user_email": user.get("email")})
 
     with _db_lock:
         conn = _db()

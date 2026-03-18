@@ -136,6 +136,13 @@ def _retention_deadline_value(table_name: str, message_kind: str) -> Any:
     return deadline
 
 
+def _debug_log_chat_time_types() -> None:
+    for table_name in ("chat_messages", "private_chat_messages"):
+        created_type = _schema_column_type(table_name, "created_at") or "unknown"
+        expires_type = _schema_column_type(table_name, "expires_at") or "unknown"
+        print(f"[chat] {table_name}.created_at={created_type} {table_name}.expires_at={expires_type}")
+
+
 def _chat_expired_where_clause(table_name: str, column_name: str = "expires_at") -> tuple[str, tuple[Any, ...]]:
     expires_type = _schema_column_type(table_name, column_name)
     qualified_column = column_name
@@ -274,7 +281,9 @@ def require_user(req: Request) -> sqlite3.Row:
 def _clean_display_name(name: str, email: str) -> str:
     n = (name or "").strip()
     if not n:
-        n = (email.split("@")[0] if "@" in email else "Driver")
+        n = (email.split("@")[0] if "@" in email else "User")
+    if n.strip().lower() == "driver":
+        n = (email.split("@")[0] if "@" in email else "User")
     n = " ".join(n.split())
     if len(n) > 28:
         n = n[:28]
