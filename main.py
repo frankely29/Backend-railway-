@@ -43,9 +43,11 @@ from core import (
     _db_lock,
     _db_query_all,
     _db_query_one,
-    _get_column_data_type,
     _hash_password,
+    _is_integerish_type,
+    _is_timestampish_type,
     _sql,
+    _schema_column_type,
     DB_BACKEND,
     _make_token,
     _require_jwt_secret,
@@ -975,7 +977,7 @@ def _db_init() -> None:
             "ALTER TABLE chat_messages ADD COLUMN expires_at BIGINT NULL;",
             "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS expires_at BIGINT NULL;",
         )
-        _db_exec("CREATE INDEX IF NOT EXISTS idx_chat_messages_expires_at ON chat_messages(expires_at);")
+        _db_exec("CREATE INDEX IF NOT EXISTS idx_chat_messages_expires ON chat_messages(expires_at);")
 
         _db_exec(
             """
@@ -1014,15 +1016,15 @@ def _db_init() -> None:
             "ALTER TABLE private_chat_messages ADD COLUMN IF NOT EXISTS voice_duration_sec INTEGER NULL;",
         )
         _try_alter(
-            "ALTER TABLE private_chat_messages ADD COLUMN expires_at BIGINT NULL;",
-            "ALTER TABLE private_chat_messages ADD COLUMN IF NOT EXISTS expires_at BIGINT NULL;",
+            "ALTER TABLE private_chat_messages ADD COLUMN expires_at TIMESTAMP NULL;",
+            "ALTER TABLE private_chat_messages ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP NULL;",
         )
         _try_alter(
             "ALTER TABLE private_chat_messages ADD COLUMN legacy_chat_message_id BIGINT UNIQUE;",
             "ALTER TABLE private_chat_messages ADD COLUMN IF NOT EXISTS legacy_chat_message_id BIGINT UNIQUE;",
         )
-        _db_exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_private_chat_legacy_id ON private_chat_messages(legacy_chat_message_id) WHERE legacy_chat_message_id IS NOT NULL;")
-        _db_exec("CREATE INDEX IF NOT EXISTS idx_private_chat_expires_at ON private_chat_messages(expires_at);")
+        _db_exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_private_chat_legacy ON private_chat_messages(legacy_chat_message_id) WHERE legacy_chat_message_id IS NOT NULL;")
+        _db_exec("CREATE INDEX IF NOT EXISTS idx_private_chat_expires ON private_chat_messages(expires_at);")
         return
 
     _db_exec(
@@ -1192,7 +1194,7 @@ def _db_init() -> None:
     _try_alter("ALTER TABLE chat_messages ADD COLUMN voice_mime TEXT;")
     _try_alter("ALTER TABLE chat_messages ADD COLUMN voice_duration_sec INTEGER;")
     _try_alter("ALTER TABLE chat_messages ADD COLUMN expires_at INTEGER;")
-    _db_exec("CREATE INDEX IF NOT EXISTS idx_chat_messages_expires_at ON chat_messages(expires_at);")
+    _db_exec("CREATE INDEX IF NOT EXISTS idx_chat_messages_expires ON chat_messages(expires_at);")
 
     _db_exec(
         """
@@ -1218,10 +1220,10 @@ def _db_init() -> None:
     _try_alter("ALTER TABLE private_chat_messages ADD COLUMN voice_path TEXT;")
     _try_alter("ALTER TABLE private_chat_messages ADD COLUMN voice_mime TEXT;")
     _try_alter("ALTER TABLE private_chat_messages ADD COLUMN voice_duration_sec INTEGER;")
-    _try_alter("ALTER TABLE private_chat_messages ADD COLUMN expires_at INTEGER;")
+    _try_alter("ALTER TABLE private_chat_messages ADD COLUMN expires_at TEXT;")
     _try_alter("ALTER TABLE private_chat_messages ADD COLUMN legacy_chat_message_id INTEGER UNIQUE;")
-    _db_exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_private_chat_legacy_id ON private_chat_messages(legacy_chat_message_id);")
-    _db_exec("CREATE INDEX IF NOT EXISTS idx_private_chat_expires_at ON private_chat_messages(expires_at);")
+    _db_exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_private_chat_legacy ON private_chat_messages(legacy_chat_message_id);")
+    _db_exec("CREATE INDEX IF NOT EXISTS idx_private_chat_expires ON private_chat_messages(expires_at);")
 
 
 # =========================================================
@@ -1264,31 +1266,38 @@ def _is_bool_column(table: str, column: str) -> bool:
 
 def _is_timestamp_column(table: str, column: str) -> bool:
     """Return True when a DB column is a timestamp/date/datetime variant."""
-    data_type = _get_column_data_type(table, column)
-    normalized = (data_type or "").strip().lower()
-    return ("timestamp" in normalized) or ("date" in normalized) or ("time" in normalized)
+    return _is_timestampish_type(_schema_column_type(table, column))
 
 
 def _chat_backfill_set_expr(table: str) -> str:
-    created_is_timestamp = _is_timestamp_column(table, "created_at")
-    expires_is_timestamp = _is_timestamp_column(table, "expires_at")
+    created_type = _schema_column_type(table, "created_at")
+    expires_type = _schema_column_type(table, "expires_at")
+    created_is_timestamp = _is_timestampish_type(created_type)
+    expires_is_timestamp = _is_timestampish_type(expires_type)
+    expires_is_integer = _is_integerish_type(expires_type)
+
+    retention_seconds = "CASE WHEN COALESCE(message_kind, 'text') = 'voice' THEN 86400 ELSE 604800 END"
 
     if DB_BACKEND == "postgres":
-        created_expr = "created_at" if created_is_timestamp else "to_timestamp(created_at)"
+        created_ts_expr = "created_at" if created_is_timestamp else "to_timestamp(created_at)"
         if expires_is_timestamp:
-            return f"{created_expr} + (CASE WHEN COALESCE(message_kind, 'text') = 'voice' THEN 86400 ELSE 604800 END) * INTERVAL '1 second'"
-        return f"EXTRACT(EPOCH FROM ({created_expr} + (CASE WHEN COALESCE(message_kind, 'text') = 'voice' THEN 86400 ELSE 604800 END) * INTERVAL '1 second'))::BIGINT"
+            return f"{created_ts_expr} + ({retention_seconds}) * INTERVAL '1 second'"
+        if expires_is_integer:
+            return f"EXTRACT(EPOCH FROM ({created_ts_expr} + ({retention_seconds}) * INTERVAL '1 second'))::BIGINT"
+        return f"EXTRACT(EPOCH FROM ({created_ts_expr} + ({retention_seconds}) * INTERVAL '1 second'))::BIGINT"
 
     created_epoch_expr = "CAST(strftime('%s', created_at) AS INTEGER)" if created_is_timestamp else "CAST(created_at AS INTEGER)"
     if expires_is_timestamp:
-        return f"datetime({created_epoch_expr} + CASE WHEN COALESCE(message_kind, 'text') = 'voice' THEN 86400 ELSE 604800 END, 'unixepoch')"
-    return f"{created_epoch_expr} + CASE WHEN COALESCE(message_kind, 'text') = 'voice' THEN 86400 ELSE 604800 END"
+        return f"datetime({created_epoch_expr} + ({retention_seconds}), 'unixepoch')"
+    if expires_is_integer:
+        return f"{created_epoch_expr} + ({retention_seconds})"
+    return f"datetime({created_epoch_expr} + ({retention_seconds}), 'unixepoch')"
 
 
 def _chat_expires_bind_value(table: str, value: Any) -> Any:
     if value is None:
         return None
-    expires_is_timestamp = _is_timestamp_column(table, "expires_at")
+    expires_is_timestamp = _is_timestampish_type(_schema_column_type(table, "expires_at"))
     if expires_is_timestamp:
         if isinstance(value, datetime):
             dt = value
@@ -1426,7 +1435,7 @@ def _backfill_chat_expirations() -> None:
 def _migrate_legacy_dm_rooms_into_private() -> None:
     rows = _db_query_all(
         """
-        SELECT id, room, user_id, message, created_at, message_kind, voice_path, voice_mime, voice_duration_sec, expires_at
+        SELECT id, room, user_id, message, created_at
         FROM chat_messages
         WHERE room LIKE 'dm:%'
         ORDER BY id ASC
@@ -1458,7 +1467,8 @@ def _migrate_legacy_dm_rooms_into_private() -> None:
                 if cur.fetchone() is not None:
                     continue
 
-                created_at = payload.get("created_at")
+                created_at = int(payload.get("created_at") or 0)
+                expires_at = created_at + 604800
                 if DB_BACKEND == "postgres":
                     cur.execute(
                         _sql(
@@ -1467,19 +1477,15 @@ def _migrate_legacy_dm_rooms_into_private() -> None:
                                 sender_user_id, recipient_user_id, text, created_at,
                                 message_kind, voice_path, voice_mime, voice_duration_sec, expires_at, legacy_chat_message_id
                             )
-                            VALUES (?, ?, ?, to_timestamp(?), ?, ?, ?, ?, ?, ?)
+                            VALUES (?, ?, ?, to_timestamp(?), 'text', NULL, NULL, NULL, ?, ?)
                             """
                         ),
                         (
                             sender,
                             recipient,
                             payload.get("message") or "",
-                            int(created_at),
-                            payload.get("message_kind") or "text",
-                            payload.get("voice_path"),
-                            payload.get("voice_mime"),
-                            payload.get("voice_duration_sec"),
-                            _chat_expires_bind_value("private_chat_messages", payload.get("expires_at")),
+                            created_at,
+                            _chat_expires_bind_value("private_chat_messages", expires_at),
                             int(payload["id"]),
                         ),
                     )
@@ -1491,19 +1497,15 @@ def _migrate_legacy_dm_rooms_into_private() -> None:
                                 sender_user_id, recipient_user_id, text, created_at,
                                 message_kind, voice_path, voice_mime, voice_duration_sec, expires_at, legacy_chat_message_id
                             )
-                            VALUES (?, ?, ?, datetime(?, 'unixepoch'), ?, ?, ?, ?, ?, ?)
+                            VALUES (?, ?, ?, datetime(?, 'unixepoch'), 'text', NULL, NULL, NULL, ?, ?)
                             """
                         ),
                         (
                             sender,
                             recipient,
                             payload.get("message") or "",
-                            int(created_at),
-                            payload.get("message_kind") or "text",
-                            payload.get("voice_path"),
-                            payload.get("voice_mime"),
-                            payload.get("voice_duration_sec"),
-                            _chat_expires_bind_value("private_chat_messages", payload.get("expires_at")),
+                            created_at,
+                            _chat_expires_bind_value("private_chat_messages", expires_at),
                             int(payload["id"]),
                         ),
                     )
@@ -1512,7 +1514,15 @@ def _migrate_legacy_dm_rooms_into_private() -> None:
             conn.close()
 
 
+def _debug_log_chat_time_types() -> None:
+    for table in ("chat_messages", "private_chat_messages"):
+        created_type = _schema_column_type(table, "created_at") or "unknown"
+        expires_type = _schema_column_type(table, "expires_at") or "unknown"
+        print(f"[chat] {table}.created_at={created_type} {table}.expires_at={expires_type}")
+
+
 def _bootstrap_chat_unification() -> None:
+    _debug_log_chat_time_types()
     _backfill_chat_expirations()
     _migrate_legacy_dm_rooms_into_private()
 

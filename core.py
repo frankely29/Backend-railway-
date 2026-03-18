@@ -9,6 +9,7 @@ import secrets
 import sqlite3
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -25,6 +26,7 @@ TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "7"))
 ENFORCE_TRIAL = str(os.environ.get("ENFORCE_TRIAL", "0")).strip().lower() in ("1", "true", "yes", "on")
 
 _db_lock = threading.Lock()
+_schema_type_cache: dict[tuple[str, str], str] = {}
 
 
 def _db():
@@ -97,6 +99,65 @@ def _get_column_data_type(table: str, column: str) -> str:
     except Exception:
         return ""
     return ""
+
+
+def _schema_column_type(table_name: str, column_name: str) -> str:
+    key = (str(table_name).strip().lower(), str(column_name).strip().lower())
+    cached = _schema_type_cache.get(key)
+    if cached is not None:
+        return cached
+    data_type = _get_column_data_type(table_name, column_name)
+    _schema_type_cache[key] = data_type
+    return data_type
+
+
+def _is_timestampish_type(dtype: str) -> bool:
+    normalized = (dtype or "").strip().lower()
+    return any(token in normalized for token in ("timestamp", "datetime", "date", "time"))
+
+
+def _is_integerish_type(dtype: str) -> bool:
+    normalized = (dtype or "").strip().lower()
+    return any(token in normalized for token in ("int", "serial", "number", "numeric", "decimal", "real", "double", "float"))
+
+
+def _retention_seconds(message_kind: str) -> int:
+    return 24 * 3600 if (message_kind or "text").strip().lower() == "voice" else 7 * 24 * 3600
+
+
+def _retention_deadline_value(table_name: str, message_kind: str) -> Any:
+    seconds = _retention_seconds(message_kind)
+    expires_type = _schema_column_type(table_name, "expires_at")
+    deadline = int(time.time()) + seconds
+    if _is_timestampish_type(expires_type):
+        if DB_BACKEND == "postgres":
+            return datetime.fromtimestamp(deadline, tz=timezone.utc)
+        return datetime.fromtimestamp(deadline, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    return deadline
+
+
+def _chat_expired_where_clause(table_name: str, column_name: str = "expires_at") -> tuple[str, tuple[Any, ...]]:
+    expires_type = _schema_column_type(table_name, column_name)
+    qualified_column = column_name
+    if _is_timestampish_type(expires_type):
+        if DB_BACKEND == "postgres":
+            return f"{qualified_column} IS NOT NULL AND {qualified_column} <= NOW()", ()
+        return f"{qualified_column} IS NOT NULL AND {qualified_column} <= CURRENT_TIMESTAMP", ()
+    if _is_integerish_type(expires_type):
+        return f"{qualified_column} IS NOT NULL AND {qualified_column} <= ?", (int(time.time()),)
+    return f"{qualified_column} IS NOT NULL AND {qualified_column} <= ?", (int(time.time()),)
+
+
+def _chat_not_expired_where_clause(table_name: str, column_name: str = "expires_at") -> tuple[str, tuple[Any, ...]]:
+    expires_type = _schema_column_type(table_name, column_name)
+    qualified_column = column_name
+    if _is_timestampish_type(expires_type):
+        if DB_BACKEND == "postgres":
+            return f"({qualified_column} IS NULL OR {qualified_column} > NOW())", ()
+        return f"({qualified_column} IS NULL OR {qualified_column} > CURRENT_TIMESTAMP)", ()
+    if _is_integerish_type(expires_type):
+        return f"({qualified_column} IS NULL OR {qualified_column} > ?)", (int(time.time()),)
+    return f"({qualified_column} IS NULL OR {qualified_column} > ?)", (int(time.time()),)
 
 
 def _require_jwt_secret() -> None:
