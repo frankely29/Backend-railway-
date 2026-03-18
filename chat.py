@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
@@ -587,6 +587,26 @@ def _insert_public_message(
     return row
 
 
+def _log_voice_upload_failure(request: Request, file: UploadFile | None, audio: UploadFile | None) -> None:
+    _LOGGER.warning(
+        "Voice upload missing multipart file",
+        extra={
+            "route": request.url.path,
+            "content_type": request.headers.get("content-type"),
+            "file_present": file is not None,
+            "audio_present": audio is not None,
+        },
+    )
+
+
+def _resolve_voice_upload(request: Request, file: UploadFile | None, audio: UploadFile | None) -> UploadFile:
+    upload = file or audio
+    if upload is None:
+        _log_voice_upload_failure(request, file, audio)
+        raise HTTPException(status_code=422, detail="file or audio required")
+    return upload
+
+
 def _read_upload_audio(upload: UploadFile) -> tuple[bytes, str, str]:
     mime_type = (upload.content_type or "").strip().lower()
     if mime_type not in _ALLOWED_AUDIO_MIME_TYPES:
@@ -790,12 +810,15 @@ def create_room_message(room: str, payload: ChatMessagePayload, user=Depends(req
 @router.post("/rooms/{room}/voice")
 def create_room_voice_message(
     room: str,
-    file: UploadFile = File(...),
-    duration_ms: int | None = Form(default=None),
+    request: Request,
+    file: UploadFile | None = File(None),
+    audio: UploadFile | None = File(None),
+    duration_ms: int | None = Form(None),
     text: str | None = Form(default=None),
     user=Depends(require_user),
 ):
-    return _persist_public_voice_message(room, user, file, duration_ms, text)
+    upload = _resolve_voice_upload(request, file, audio)
+    return _persist_public_voice_message(room, user, upload, duration_ms, text)
 
 
 @router.get("/dm/{other_user_id}")
@@ -832,8 +855,10 @@ def create_dm_message(other_user_id: int, payload: ChatMessagePayload, user=Depe
 @router.post("/dm/{other_user_id}/voice")
 def create_dm_voice_message(
     other_user_id: int,
-    file: UploadFile = File(...),
-    duration_ms: int | None = Form(default=None),
+    request: Request,
+    file: UploadFile | None = File(None),
+    audio: UploadFile | None = File(None),
+    duration_ms: int | None = Form(None),
     text: str | None = Form(default=None),
     user=Depends(require_user),
 ):
@@ -841,7 +866,8 @@ def create_dm_voice_message(
     if int(other_user_id) == my_user_id:
         raise HTTPException(status_code=400, detail="Cannot message yourself")
     _ensure_dm_target_exists(int(other_user_id))
-    message = _persist_private_voice_message(my_user_id, int(other_user_id), file, duration_ms, text)
+    upload = _resolve_voice_upload(request, file, audio)
+    message = _persist_private_voice_message(my_user_id, int(other_user_id), upload, duration_ms, text)
     sender_payload = _user_directory_payloads([my_user_id]).get(my_user_id, {})
     message["user_id"] = my_user_id
     message["display_name"] = sender_payload.get("display_name")
@@ -887,8 +913,10 @@ def create_private_message(other_user_id: int, payload: PrivateChatSendIn, user=
 @router.post("/private/{other_user_id}/voice", response_model=PrivateChatMessageOut)
 def create_private_voice_message(
     other_user_id: int,
-    file: UploadFile = File(...),
-    duration_ms: int | None = Form(default=None),
+    request: Request,
+    file: UploadFile | None = File(None),
+    audio: UploadFile | None = File(None),
+    duration_ms: int | None = Form(None),
     text: str | None = Form(default=None),
     user=Depends(require_user),
 ):
@@ -896,7 +924,8 @@ def create_private_voice_message(
     if int(other_user_id) == my_user_id:
         raise HTTPException(status_code=400, detail="Cannot message yourself")
     _ensure_dm_target_exists(int(other_user_id))
-    return _persist_private_voice_message(my_user_id, int(other_user_id), file, duration_ms, text)
+    upload = _resolve_voice_upload(request, file, audio)
+    return _persist_private_voice_message(my_user_id, int(other_user_id), upload, duration_ms, text)
 
 
 @router.get("/audio/public/{message_id}")
