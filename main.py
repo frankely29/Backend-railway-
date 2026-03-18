@@ -43,12 +43,8 @@ from core import (
     _db_lock,
     _db_query_all,
     _db_query_one,
-    _debug_log_chat_time_types,
     _hash_password,
-    _is_integerish_type,
-    _is_timestampish_type,
     _sql,
-    _schema_column_type,
     DB_BACKEND,
     _make_token,
     _require_jwt_secret,
@@ -103,9 +99,6 @@ _pickup_zone_geom_cache_mtime: Optional[float] = None
 _pickup_zone_hotspot_feature_cache: Dict[int, Dict[str, Any]] = {}
 _pickup_zone_score_cache: Dict[int, float] = {}
 _pickup_zone_hotspot_cache_lock = threading.Lock()
-_driver_profile_cache_lock = threading.Lock()
-_driver_profile_cache: Dict[int, Dict[str, Any]] = {}
-DRIVER_PROFILE_CACHE_TTL_SECONDS = 25
 _to_3857 = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
 _to_4326 = Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
 
@@ -842,8 +835,6 @@ def _db_init() -> None:
             );
             """
         )
-        _db_exec("CREATE INDEX IF NOT EXISTS idx_presence_updated_at ON presence(updated_at DESC);")
-        _db_exec("CREATE INDEX IF NOT EXISTS idx_presence_updated_user ON presence(updated_at DESC, user_id);")
         _db_exec(
             """
             CREATE TABLE IF NOT EXISTS events (
@@ -958,27 +949,6 @@ def _db_init() -> None:
         _db_exec("UPDATE chat_messages SET room='global' WHERE room IS NULL OR btrim(room)='';")
         _db_exec("CREATE INDEX IF NOT EXISTS idx_chat_messages_id ON chat_messages(id);")
         _db_exec("CREATE INDEX IF NOT EXISTS idx_chat_messages_room_id ON chat_messages(room, id);")
-        _try_alter(
-            "ALTER TABLE chat_messages ADD COLUMN message_kind TEXT NOT NULL DEFAULT 'text';",
-            "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS message_kind TEXT NOT NULL DEFAULT 'text';",
-        )
-        _try_alter(
-            "ALTER TABLE chat_messages ADD COLUMN voice_path TEXT NULL;",
-            "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS voice_path TEXT NULL;",
-        )
-        _try_alter(
-            "ALTER TABLE chat_messages ADD COLUMN voice_mime TEXT NULL;",
-            "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS voice_mime TEXT NULL;",
-        )
-        _try_alter(
-            "ALTER TABLE chat_messages ADD COLUMN voice_duration_sec INTEGER NULL;",
-            "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS voice_duration_sec INTEGER NULL;",
-        )
-        _try_alter(
-            "ALTER TABLE chat_messages ADD COLUMN expires_at BIGINT NULL;",
-            "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS expires_at BIGINT NULL;",
-        )
-        _db_exec("CREATE INDEX IF NOT EXISTS idx_chat_messages_expires ON chat_messages(expires_at);")
 
         _db_exec(
             """
@@ -1000,32 +970,6 @@ def _db_init() -> None:
         _db_exec(
             "CREATE INDEX IF NOT EXISTS idx_private_chat_recipient_read ON private_chat_messages(recipient_user_id, sender_user_id, read_at);"
         )
-        _try_alter(
-            "ALTER TABLE private_chat_messages ADD COLUMN message_kind TEXT NOT NULL DEFAULT 'text';",
-            "ALTER TABLE private_chat_messages ADD COLUMN IF NOT EXISTS message_kind TEXT NOT NULL DEFAULT 'text';",
-        )
-        _try_alter(
-            "ALTER TABLE private_chat_messages ADD COLUMN voice_path TEXT NULL;",
-            "ALTER TABLE private_chat_messages ADD COLUMN IF NOT EXISTS voice_path TEXT NULL;",
-        )
-        _try_alter(
-            "ALTER TABLE private_chat_messages ADD COLUMN voice_mime TEXT NULL;",
-            "ALTER TABLE private_chat_messages ADD COLUMN IF NOT EXISTS voice_mime TEXT NULL;",
-        )
-        _try_alter(
-            "ALTER TABLE private_chat_messages ADD COLUMN voice_duration_sec INTEGER NULL;",
-            "ALTER TABLE private_chat_messages ADD COLUMN IF NOT EXISTS voice_duration_sec INTEGER NULL;",
-        )
-        _try_alter(
-            "ALTER TABLE private_chat_messages ADD COLUMN expires_at TIMESTAMP NULL;",
-            "ALTER TABLE private_chat_messages ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP NULL;",
-        )
-        _try_alter(
-            "ALTER TABLE private_chat_messages ADD COLUMN legacy_chat_message_id BIGINT UNIQUE;",
-            "ALTER TABLE private_chat_messages ADD COLUMN IF NOT EXISTS legacy_chat_message_id BIGINT UNIQUE;",
-        )
-        _db_exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_private_chat_legacy ON private_chat_messages(legacy_chat_message_id) WHERE legacy_chat_message_id IS NOT NULL;")
-        _db_exec("CREATE INDEX IF NOT EXISTS idx_private_chat_expires ON private_chat_messages(expires_at);")
         return
 
     _db_exec(
@@ -1077,8 +1021,6 @@ def _db_init() -> None:
         );
         """
     )
-    _db_exec("CREATE INDEX IF NOT EXISTS idx_presence_updated_at ON presence(updated_at DESC);")
-    _db_exec("CREATE INDEX IF NOT EXISTS idx_presence_updated_user ON presence(updated_at DESC, user_id);")
     _db_exec(
         """
         CREATE TABLE IF NOT EXISTS events (
@@ -1190,12 +1132,6 @@ def _db_init() -> None:
     _db_exec("UPDATE chat_messages SET room='global' WHERE room IS NULL OR trim(room)='';")
     _db_exec("CREATE INDEX IF NOT EXISTS idx_chat_messages_id ON chat_messages(id);")
     _db_exec("CREATE INDEX IF NOT EXISTS idx_chat_messages_room_id ON chat_messages(room, id);")
-    _try_alter("ALTER TABLE chat_messages ADD COLUMN message_kind TEXT NOT NULL DEFAULT 'text';")
-    _try_alter("ALTER TABLE chat_messages ADD COLUMN voice_path TEXT;")
-    _try_alter("ALTER TABLE chat_messages ADD COLUMN voice_mime TEXT;")
-    _try_alter("ALTER TABLE chat_messages ADD COLUMN voice_duration_sec INTEGER;")
-    _try_alter("ALTER TABLE chat_messages ADD COLUMN expires_at INTEGER;")
-    _db_exec("CREATE INDEX IF NOT EXISTS idx_chat_messages_expires ON chat_messages(expires_at);")
 
     _db_exec(
         """
@@ -1217,14 +1153,6 @@ def _db_init() -> None:
     _db_exec(
         "CREATE INDEX IF NOT EXISTS idx_private_chat_recipient_read ON private_chat_messages(recipient_user_id, sender_user_id, read_at);"
     )
-    _try_alter("ALTER TABLE private_chat_messages ADD COLUMN message_kind TEXT NOT NULL DEFAULT 'text';")
-    _try_alter("ALTER TABLE private_chat_messages ADD COLUMN voice_path TEXT;")
-    _try_alter("ALTER TABLE private_chat_messages ADD COLUMN voice_mime TEXT;")
-    _try_alter("ALTER TABLE private_chat_messages ADD COLUMN voice_duration_sec INTEGER;")
-    _try_alter("ALTER TABLE private_chat_messages ADD COLUMN expires_at TEXT;")
-    _try_alter("ALTER TABLE private_chat_messages ADD COLUMN legacy_chat_message_id INTEGER UNIQUE;")
-    _db_exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_private_chat_legacy ON private_chat_messages(legacy_chat_message_id);")
-    _db_exec("CREATE INDEX IF NOT EXISTS idx_private_chat_expires ON private_chat_messages(expires_at);")
 
 
 # =========================================================
@@ -1263,72 +1191,6 @@ def _is_bool_column(table: str, column: str) -> bool:
         return data_type.startswith("bool")
     except Exception:
         return False
-
-
-def _is_timestamp_column(table: str, column: str) -> bool:
-    """Return True when a DB column is a timestamp/date/datetime variant."""
-    return _is_timestampish_type(_schema_column_type(table, column))
-
-
-def _chat_backfill_set_expr(table: str) -> str:
-    created_type = _schema_column_type(table, "created_at")
-    expires_type = _schema_column_type(table, "expires_at")
-    created_is_timestamp = _is_timestampish_type(created_type)
-    expires_is_timestamp = _is_timestampish_type(expires_type)
-    expires_is_integer = _is_integerish_type(expires_type)
-
-    retention_seconds = "CASE WHEN COALESCE(message_kind, 'text') = 'voice' THEN 86400 ELSE 604800 END"
-
-    if DB_BACKEND == "postgres":
-        created_ts_expr = "created_at" if created_is_timestamp else "to_timestamp(created_at)"
-        if expires_is_timestamp:
-            return f"{created_ts_expr} + ({retention_seconds}) * INTERVAL '1 second'"
-        if expires_is_integer:
-            return f"EXTRACT(EPOCH FROM ({created_ts_expr} + ({retention_seconds}) * INTERVAL '1 second'))::BIGINT"
-        return f"EXTRACT(EPOCH FROM ({created_ts_expr} + ({retention_seconds}) * INTERVAL '1 second'))::BIGINT"
-
-    created_epoch_expr = "CAST(strftime('%s', created_at) AS INTEGER)" if created_is_timestamp else "CAST(created_at AS INTEGER)"
-    if expires_is_timestamp:
-        return f"datetime({created_epoch_expr} + ({retention_seconds}), 'unixepoch')"
-    if expires_is_integer:
-        return f"{created_epoch_expr} + ({retention_seconds})"
-    return f"datetime({created_epoch_expr} + ({retention_seconds}), 'unixepoch')"
-
-
-def _chat_expires_bind_value(table: str, value: Any) -> Any:
-    if value is None:
-        return None
-    expires_is_timestamp = _is_timestampish_type(_schema_column_type(table, "expires_at"))
-    if expires_is_timestamp:
-        if isinstance(value, datetime):
-            dt = value
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt.astimezone(timezone.utc)
-        if isinstance(value, (int, float)):
-            return datetime.fromtimestamp(int(value), tz=timezone.utc)
-        text = str(value).strip().replace("Z", "+00:00")
-        try:
-            dt = datetime.fromisoformat(text)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt.astimezone(timezone.utc)
-        except Exception:
-            return datetime.fromtimestamp(int(float(text)), tz=timezone.utc)
-
-    if isinstance(value, datetime):
-        dt = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
-        return int(dt.timestamp())
-    if isinstance(value, (int, float)):
-        return int(value)
-    text = str(value).strip().replace("Z", "+00:00")
-    try:
-        dt = datetime.fromisoformat(text)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return int(dt.timestamp())
-    except Exception:
-        return int(float(text))
 
 
 def _flag_to_int(value: Any) -> int:
@@ -1421,134 +1283,16 @@ def _ensure_admin_seed() -> None:
     )
 
 
-def _backfill_chat_expirations() -> None:
-    for table in ("chat_messages", "private_chat_messages"):
-        expr = _chat_backfill_set_expr(table)
-        _db_exec(
-            f"""
-            UPDATE {table}
-            SET expires_at = {expr}
-            WHERE expires_at IS NULL
-            """
-        )
-
-
-def _migrate_legacy_dm_rooms_into_private() -> None:
-    rows = _db_query_all(
-        """
-        SELECT id, room, user_id, message, created_at,
-               COALESCE(message_kind, 'text') AS message_kind,
-               voice_path, voice_mime, voice_duration_sec, expires_at
-        FROM chat_messages
-        WHERE room LIKE 'dm:%'
-        ORDER BY id ASC
-        """
-    )
-    if not rows:
-        return
-
-    with _db_lock:
-        conn = _db()
-        try:
-            cur = conn.cursor()
-            for row in rows:
-                payload = dict(row)
-                parts = str(payload.get("room") or "").split(":")
-                if len(parts) != 3 or parts[0] != "dm":
-                    continue
-                try:
-                    left = int(parts[1])
-                    right = int(parts[2])
-                    sender = int(payload["user_id"])
-                except Exception:
-                    continue
-                if sender not in {left, right}:
-                    continue
-                recipient = right if sender == left else left
-
-                cur.execute(_sql("SELECT id FROM private_chat_messages WHERE legacy_chat_message_id=? LIMIT 1"), (int(payload["id"]),))
-                if cur.fetchone() is not None:
-                    continue
-
-                message_kind = str(payload.get("message_kind") or "text").strip().lower() or "text"
-                text_value = (payload.get("message") or "") if message_kind != "voice" else ""
-                created_at = payload.get("created_at")
-                created_ts = _chat_expires_bind_value("private_chat_messages", created_at)
-                expires_at = payload.get("expires_at")
-                if expires_at in (None, ""):
-                    created_epoch = _chat_expires_bind_value("chat_messages", created_at)
-                    retention_seconds = 86400 if message_kind == "voice" else 604800
-                    expires_at = int(created_epoch) + retention_seconds if created_epoch is not None else int(time.time()) + retention_seconds
-
-                if DB_BACKEND == "postgres":
-                    cur.execute(
-                        _sql(
-                            """
-                            INSERT INTO private_chat_messages(
-                                sender_user_id, recipient_user_id, text, created_at,
-                                message_kind, voice_path, voice_mime, voice_duration_sec, expires_at, legacy_chat_message_id
-                            )
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            """
-                        ),
-                        (
-                            sender,
-                            recipient,
-                            text_value,
-                            created_ts,
-                            message_kind,
-                            payload.get("voice_path"),
-                            payload.get("voice_mime"),
-                            payload.get("voice_duration_sec"),
-                            _chat_expires_bind_value("private_chat_messages", expires_at),
-                            int(payload["id"]),
-                        ),
-                    )
-                else:
-                    cur.execute(
-                        _sql(
-                            """
-                            INSERT INTO private_chat_messages(
-                                sender_user_id, recipient_user_id, text, created_at,
-                                message_kind, voice_path, voice_mime, voice_duration_sec, expires_at, legacy_chat_message_id
-                            )
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            """
-                        ),
-                        (
-                            sender,
-                            recipient,
-                            text_value,
-                            created_ts,
-                            message_kind,
-                            payload.get("voice_path"),
-                            payload.get("voice_mime"),
-                            payload.get("voice_duration_sec"),
-                            _chat_expires_bind_value("private_chat_messages", expires_at),
-                            int(payload["id"]),
-                        ),
-                    )
-            conn.commit()
-        finally:
-            conn.close()
-
-
-def _bootstrap_chat_unification() -> None:
-    _debug_log_chat_time_types()
-    _backfill_chat_expirations()
-    _migrate_legacy_dm_rooms_into_private()
-
-
-from chat import purge_expired_chat_rows_if_due, router as chat_router
+from chat import router as chat_router
 from leaderboard_db import init_leaderboard_schema
-from leaderboard_models import LeaderboardPeriod
+from leaderboard_models import LeaderboardMetric, LeaderboardPeriod
 from leaderboard_routes import router as leaderboard_router
 from leaderboard_service import (
-    current_period_bounds,
     get_best_current_badge_for_user,
     get_best_current_badges_for_users,
     get_progression_for_user,
-    get_progression_for_users,
+    get_my_rank,
+    get_overview_for_user,
 )
 from leaderboard_tracker import increment_pickup_count, record_presence_heartbeat
 from pickup_recording_feature import (
@@ -1571,16 +1315,6 @@ def startup():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     FRAMES_DIR.mkdir(parents=True, exist_ok=True)
     _db_init()
-    try:
-        _bootstrap_chat_unification()
-    except Exception:
-        print("[warn] chat bootstrap failed during startup; continuing without blocking boot")
-        print(traceback.format_exc())
-    try:
-        purge_expired_chat_rows_if_due(force=True)
-    except Exception:
-        print("[warn] chat purge failed during startup; continuing without blocking boot")
-        print(traceback.format_exc())
     init_leaderboard_schema()
     ensure_pickup_recording_schema()
     _ensure_admin_seed()
@@ -1963,7 +1697,6 @@ def auth_login(payload: LoginPayload):
     if not dn:
         dn = _clean_display_name("", email)
         _db_exec("UPDATE users SET display_name=? WHERE id=?", (dn, int(row["id"])))
-        _invalidate_driver_profile_cache(int(row["id"]))
 
     now = int(time.time())
     exp = now + TOKEN_TTL_SECONDS
@@ -2010,24 +1743,9 @@ def me(user: sqlite3.Row = Depends(require_user)):
     }
 
 
-def _resolve_driver_display_name(user_id: int, display_name: Any, email: Any) -> str:
-    clean_name = (display_name or "").strip()
-    if clean_name:
-        return clean_name
-
-    clean_email = (email or "").strip()
-    if clean_email and "@" in clean_email:
-        return clean_email.split("@", 1)[0].strip() or f"User {int(user_id)}"
-
-    return f"User {int(user_id)}"
-
-
-def _invalidate_driver_profile_cache(user_id: int) -> None:
-    with _driver_profile_cache_lock:
-        _driver_profile_cache.pop(int(user_id), None)
-
-
-def build_driver_profile_snapshot(user_id: int) -> Dict[str, Any]:
+@app.get("/drivers/{user_id}/profile")
+def driver_profile(user_id: int, viewer: sqlite3.Row = Depends(require_user)):
+    _ = viewer
     target = _db_query_one(
         "SELECT id, email, display_name, avatar_url, is_disabled FROM users WHERE id=? LIMIT 1",
         (int(user_id),),
@@ -2036,82 +1754,20 @@ def build_driver_profile_snapshot(user_id: int) -> Dict[str, Any]:
         raise HTTPException(status_code=404, detail="Driver not found")
 
     target_user_id = int(target["id"])
-    display_name = _resolve_driver_display_name(target_user_id, target["display_name"], target["email"])
-    if not (target["display_name"] or "").strip() and display_name:
-        _db_exec("UPDATE users SET display_name=? WHERE id=?", (display_name, target_user_id))
+    display_name = _clean_display_name(target["display_name"] or "", target["email"])
 
-    daily_bounds = current_period_bounds(LeaderboardPeriod.daily)
-    weekly_bounds = current_period_bounds(LeaderboardPeriod.weekly)
-    monthly_bounds = current_period_bounds(LeaderboardPeriod.monthly)
-    yearly_bounds = current_period_bounds(LeaderboardPeriod.yearly)
-
-    stats_raw = _db_query_one(
-        """
-        SELECT
-          COALESCE(SUM(CASE WHEN nyc_date = ? THEN miles_worked ELSE 0 END), 0) AS daily_miles,
-          COALESCE(SUM(CASE WHEN nyc_date = ? THEN hours_worked ELSE 0 END), 0) AS daily_hours,
-          COALESCE(SUM(CASE WHEN nyc_date = ? THEN pickups_recorded ELSE 0 END), 0) AS daily_pickups,
-          COALESCE(SUM(CASE WHEN nyc_date >= ? AND nyc_date <= ? THEN miles_worked ELSE 0 END), 0) AS weekly_miles,
-          COALESCE(SUM(CASE WHEN nyc_date >= ? AND nyc_date <= ? THEN hours_worked ELSE 0 END), 0) AS weekly_hours,
-          COALESCE(SUM(CASE WHEN nyc_date >= ? AND nyc_date <= ? THEN pickups_recorded ELSE 0 END), 0) AS weekly_pickups,
-          COALESCE(SUM(CASE WHEN nyc_date >= ? AND nyc_date <= ? THEN miles_worked ELSE 0 END), 0) AS monthly_miles,
-          COALESCE(SUM(CASE WHEN nyc_date >= ? AND nyc_date <= ? THEN hours_worked ELSE 0 END), 0) AS monthly_hours,
-          COALESCE(SUM(CASE WHEN nyc_date >= ? AND nyc_date <= ? THEN pickups_recorded ELSE 0 END), 0) AS monthly_pickups,
-          COALESCE(SUM(CASE WHEN nyc_date >= ? AND nyc_date <= ? THEN miles_worked ELSE 0 END), 0) AS yearly_miles,
-          COALESCE(SUM(CASE WHEN nyc_date >= ? AND nyc_date <= ? THEN hours_worked ELSE 0 END), 0) AS yearly_hours,
-          COALESCE(SUM(CASE WHEN nyc_date >= ? AND nyc_date <= ? THEN pickups_recorded ELSE 0 END), 0) AS yearly_pickups
-        FROM driver_daily_stats
-        WHERE user_id=?
-          AND nyc_date >= ?
-          AND nyc_date <= ?
-        """,
-        (
-            daily_bounds.start_date.isoformat(),
-            daily_bounds.start_date.isoformat(),
-            daily_bounds.start_date.isoformat(),
-            weekly_bounds.start_date.isoformat(), weekly_bounds.end_date.isoformat(),
-            weekly_bounds.start_date.isoformat(), weekly_bounds.end_date.isoformat(),
-            weekly_bounds.start_date.isoformat(), weekly_bounds.end_date.isoformat(),
-            monthly_bounds.start_date.isoformat(), monthly_bounds.end_date.isoformat(),
-            monthly_bounds.start_date.isoformat(), monthly_bounds.end_date.isoformat(),
-            monthly_bounds.start_date.isoformat(), monthly_bounds.end_date.isoformat(),
-            yearly_bounds.start_date.isoformat(), yearly_bounds.end_date.isoformat(),
-            yearly_bounds.start_date.isoformat(), yearly_bounds.end_date.isoformat(),
-            yearly_bounds.start_date.isoformat(), yearly_bounds.end_date.isoformat(),
-            target_user_id,
-            yearly_bounds.start_date.isoformat(),
-            yearly_bounds.end_date.isoformat(),
-        ),
-    )
-    stats_row = dict(stats_raw) if stats_raw else {}
-
-    rank_row = _db_query_one(
-        """
-        WITH daily AS (
-          SELECT
-            user_id,
-            COALESCE(SUM(miles_worked), 0) AS miles_value,
-            COALESCE(SUM(hours_worked), 0) AS hours_value
-          FROM driver_daily_stats
-          WHERE nyc_date = ?
-          GROUP BY user_id
-        ), ranked AS (
-          SELECT
-            user_id,
-            ROW_NUMBER() OVER (ORDER BY miles_value DESC, user_id ASC) AS miles_rank,
-            ROW_NUMBER() OVER (ORDER BY hours_value DESC, user_id ASC) AS hours_rank
-          FROM daily
-        )
-        SELECT miles_rank, hours_rank
-        FROM ranked
-        WHERE user_id=?
-        LIMIT 1
-        """,
-        (daily_bounds.start_date.isoformat(), target_user_id),
-    )
-
+    overview = get_overview_for_user(target_user_id) or {}
+    daily = overview.get("daily") or {}
+    weekly = overview.get("weekly") or {}
+    monthly = overview.get("monthly") or {}
+    yearly = overview.get("yearly") or {}
+    miles_rank_data = get_my_rank(target_user_id, LeaderboardMetric.miles, LeaderboardPeriod.daily)
+    hours_rank_data = get_my_rank(target_user_id, LeaderboardMetric.hours, LeaderboardPeriod.daily)
     best_badge = get_best_current_badge_for_user(target_user_id)
-    progression = get_progression_for_users([target_user_id]).get(target_user_id) or get_progression_for_user(target_user_id)
+    progression = get_progression_for_user(target_user_id)
+
+    miles_rank = miles_rank_data.get("row", {}).get("rank_position") if miles_rank_data.get("row") else None
+    hours_rank = hours_rank_data.get("row", {}).get("rank_position") if hours_rank_data.get("row") else None
 
     return {
         "ok": True,
@@ -2122,49 +1778,29 @@ def build_driver_profile_snapshot(user_id: int) -> Dict[str, Any]:
             "leaderboard_badge_code": best_badge.get("leaderboard_badge_code"),
         },
         "daily": {
-            "miles": float(stats_row.get("daily_miles") or 0),
-            "hours": float(stats_row.get("daily_hours") or 0),
-            "pickups": int(stats_row.get("daily_pickups") or 0),
-            "miles_rank": int(rank_row["miles_rank"]) if rank_row and rank_row["miles_rank"] is not None else None,
-            "hours_rank": int(rank_row["hours_rank"]) if rank_row and rank_row["hours_rank"] is not None else None,
+            "miles": daily.get("miles", 0),
+            "hours": daily.get("hours", 0),
+            "pickups": daily.get("pickups", 0),
+            "miles_rank": miles_rank,
+            "hours_rank": hours_rank,
         },
         "weekly": {
-            "miles": float(stats_row.get("weekly_miles") or 0),
-            "hours": float(stats_row.get("weekly_hours") or 0),
-            "pickups": int(stats_row.get("weekly_pickups") or 0),
+            "miles": weekly.get("miles", 0),
+            "hours": weekly.get("hours", 0),
+            "pickups": weekly.get("pickups", 0),
         },
         "monthly": {
-            "miles": float(stats_row.get("monthly_miles") or 0),
-            "hours": float(stats_row.get("monthly_hours") or 0),
-            "pickups": int(stats_row.get("monthly_pickups") or 0),
+            "miles": monthly.get("miles", 0),
+            "hours": monthly.get("hours", 0),
+            "pickups": monthly.get("pickups", 0),
         },
         "yearly": {
-            "miles": float(stats_row.get("yearly_miles") or 0),
-            "hours": float(stats_row.get("yearly_hours") or 0),
-            "pickups": int(stats_row.get("yearly_pickups") or 0),
+            "miles": yearly.get("miles", 0),
+            "hours": yearly.get("hours", 0),
+            "pickups": yearly.get("pickups", 0),
         },
         "progression": progression,
     }
-
-
-@app.get("/drivers/{user_id}/profile")
-def driver_profile(user_id: int, viewer: sqlite3.Row = Depends(require_user)):
-    _ = viewer
-    cache_key = int(user_id)
-    now = time.time()
-    with _driver_profile_cache_lock:
-        cached = _driver_profile_cache.get(cache_key)
-        if cached and float(cached.get("expires_at") or 0) > now:
-            return dict(cached["payload"])
-
-    payload = build_driver_profile_snapshot(cache_key)
-    with _driver_profile_cache_lock:
-        _driver_profile_cache[cache_key] = {
-            "expires_at": now + DRIVER_PROFILE_CACHE_TTL_SECONDS,
-            "payload": payload,
-        }
-
-    return payload
 
 
 class MeUpdatePayload(BaseModel):
@@ -2219,8 +1855,6 @@ def me_update(payload: MeUpdatePayload, user: sqlite3.Row = Depends(require_user
     if updates:
         args.append(int(user["id"]))
         _db_exec(f"UPDATE users SET {', '.join(updates)} WHERE id=?", tuple(args))
-        if new_dn is not None or update_avatar:
-            _invalidate_driver_profile_cache(int(user["id"]))
 
     row = _db_query_one("SELECT id, email, display_name, ghost_mode, avatar_url, map_identity_mode, is_admin, trial_expires_at FROM users WHERE id=? LIMIT 1", (int(user["id"]),))
     if not row:
@@ -2317,22 +1951,11 @@ def presence_all(
     # Filter out ghost_mode enabled users.
     ghost_visible = _ghost_visible_sql("u.ghost_mode")
     try:
-        counts_row = _db_query_one(
-            """
-            SELECT
-              COUNT(*) AS online_count,
-              COALESCE(SUM(CASE WHEN COALESCE(u.ghost_mode, FALSE) THEN 1 ELSE 0 END), 0) AS ghosted_count,
-              COALESCE(MAX(p.updated_at), 0) AS max_updated_at
-            FROM presence p
-            LEFT JOIN users u ON u.id = p.user_id
-            WHERE p.updated_at >= ?
-            """,
-            (cutoff,),
-        )
         rows = _db_query_all(
             f"""
             SELECT
               p.user_id,
+              u.email,
               u.display_name,
               u.avatar_url,
               u.map_identity_mode,
@@ -2358,11 +1981,15 @@ def presence_all(
     items: List[Dict[str, Any]] = []
     for r in rows:
         best_badge = badge_by_user.get(int(r["user_id"]), {})
-        dn = _resolve_driver_display_name(int(r["user_id"]), r["display_name"], None)
+        email = (r["email"] or "").strip()
+        dn = (r["display_name"] or "").strip()
+        if not dn:
+            dn = _clean_display_name("", email or "Driver")
 
         items.append(
             {
                 "user_id": int(r["user_id"]),
+                "email": email,
                 "display_name": dn,
                 "avatar_url": r["avatar_url"],
                 "map_identity_mode": (str(r["map_identity_mode"]).strip().lower() if r["map_identity_mode"] is not None and str(r["map_identity_mode"]).strip().lower() in ALLOWED_MAP_IDENTITY_MODES else "name"),
@@ -2371,6 +1998,7 @@ def presence_all(
                 "heading": float(r["heading"]) if r["heading"] is not None else None,
                 "accuracy": float(r["accuracy"]) if r["accuracy"] is not None else None,
                 "updated_at": int(r["updated_at"]),
+                "updated_at_unix": int(r["updated_at"]),
                 "leaderboard_badge_code": best_badge.get("leaderboard_badge_code"),
             }
         )
@@ -2378,18 +2006,7 @@ def presence_all(
     print(
         f"[info] /presence/all ok=1 user_id={int(viewer['id'])} count={len(items)} db_backend={DB_BACKEND}"
     )
-    counts = dict(counts_row) if counts_row else {}
-    online_count = int(counts.get("online_count") or len(items))
-    ghosted_count = int(counts.get("ghosted_count") or 0)
-    max_updated_at = int(counts.get("max_updated_at") or 0)
-    return {
-        "ok": True,
-        "count": len(items),
-        "online_count": online_count,
-        "ghosted_count": ghosted_count,
-        "max_updated_at": max_updated_at,
-        "items": items,
-    }
+    return {"ok": True, "count": len(items), "items": items}
 
 
 @app.get("/presence/summary")
