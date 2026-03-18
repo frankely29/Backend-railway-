@@ -750,6 +750,84 @@ def _presence_visibility_snapshot(max_age_sec: int) -> Dict[str, Any]:
     }
 
 
+def _parse_legacy_dm_room(room: str) -> Tuple[int, int] | None:
+    match = re.fullmatch(r"dm:(\d+):(\d+)", (room or "").strip())
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def _legacy_dm_created_at_param(value: Any) -> Any:
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, (int, float)):
+        dt = datetime.fromtimestamp(int(value), tz=timezone.utc)
+    else:
+        text = str(value).strip().replace("Z", "+00:00")
+        try:
+            dt = datetime.fromisoformat(text)
+        except ValueError:
+            dt = datetime.fromtimestamp(int(float(value)), tz=timezone.utc)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc) if DB_BACKEND == "postgres" else dt.astimezone(timezone.utc).isoformat()
+
+
+def _postgres_column_type(table: str, column: str) -> Optional[str]:
+    if DB_BACKEND != "postgres":
+        return None
+    row = _db_query_one(
+        """
+        SELECT data_type
+        FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = ? AND column_name = ?
+        LIMIT 1
+        """,
+        (table, column),
+    )
+    return str(row["data_type"]).strip().lower() if row and row.get("data_type") else None
+
+
+def _migrate_legacy_dm_rows_to_private() -> None:
+    legacy_rows = _db_query_all(
+        """
+        SELECT id, room, user_id, message, created_at
+        FROM chat_messages
+        WHERE room LIKE ?
+        ORDER BY id ASC
+        """,
+        ("dm:%:%",),
+    )
+    for legacy_row in legacy_rows:
+        row = dict(legacy_row)
+        pair = _parse_legacy_dm_room(str(row.get("room") or ""))
+        if pair is None:
+            continue
+        sender_user_id = int(row["user_id"])
+        low, high = pair
+        if sender_user_id == low:
+            recipient_user_id = high
+        elif sender_user_id == high:
+            recipient_user_id = low
+        else:
+            continue
+        if _db_query_one(
+            "SELECT id FROM private_chat_messages WHERE legacy_room_message_id=? LIMIT 1",
+            (int(row["id"]),),
+        ):
+            continue
+        created_at_value = _legacy_dm_created_at_param(row["created_at"])
+        _db_exec(
+            """
+            INSERT INTO private_chat_messages(
+                sender_user_id, recipient_user_id, text, created_at, read_at, message_type, legacy_room_message_id
+            )
+            VALUES(?, ?, ?, ?, NULL, 'text', ?)
+            """,
+            (sender_user_id, recipient_user_id, row["message"], created_at_value, int(row["id"])),
+        )
+
+
 def _db_init() -> None:
     if DB_BACKEND == "postgres":
         _db_exec(
@@ -937,7 +1015,7 @@ def _db_init() -> None:
               user_id BIGINT NOT NULL,
               display_name TEXT,
               message TEXT NOT NULL,
-              created_at BIGINT NOT NULL,
+              created_at TIMESTAMP NOT NULL DEFAULT NOW(),
               FOREIGN KEY(user_id) REFERENCES users(id)
             );
             """
@@ -946,7 +1024,27 @@ def _db_init() -> None:
             "ALTER TABLE chat_messages ADD COLUMN room TEXT NOT NULL DEFAULT 'global';",
             "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS room TEXT NOT NULL DEFAULT 'global';",
         )
+        _try_alter(
+            "ALTER TABLE chat_messages ADD COLUMN message_type TEXT NOT NULL DEFAULT 'text';",
+            "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS message_type TEXT NOT NULL DEFAULT 'text';",
+        )
+        _try_alter(
+            "ALTER TABLE chat_messages ADD COLUMN audio_path TEXT;",
+            "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS audio_path TEXT;",
+        )
+        _try_alter(
+            "ALTER TABLE chat_messages ADD COLUMN audio_mime_type TEXT;",
+            "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS audio_mime_type TEXT;",
+        )
+        _try_alter(
+            "ALTER TABLE chat_messages ADD COLUMN audio_duration_ms INTEGER;",
+            "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS audio_duration_ms INTEGER;",
+        )
+        if (_postgres_column_type("chat_messages", "created_at") or "") in {"bigint", "integer", "numeric"}:
+            _db_exec("ALTER TABLE chat_messages ALTER COLUMN created_at TYPE TIMESTAMP USING to_timestamp(created_at::double precision);")
+        _db_exec("ALTER TABLE chat_messages ALTER COLUMN created_at SET DEFAULT NOW();")
         _db_exec("UPDATE chat_messages SET room='global' WHERE room IS NULL OR btrim(room)='';")
+        _db_exec("UPDATE chat_messages SET message_type='text' WHERE message_type IS NULL OR btrim(message_type)='';")
         _db_exec("CREATE INDEX IF NOT EXISTS idx_chat_messages_id ON chat_messages(id);")
         _db_exec("CREATE INDEX IF NOT EXISTS idx_chat_messages_room_id ON chat_messages(room, id);")
 
@@ -964,12 +1062,37 @@ def _db_init() -> None:
             );
             """
         )
+        _try_alter(
+            "ALTER TABLE private_chat_messages ADD COLUMN message_type TEXT NOT NULL DEFAULT 'text';",
+            "ALTER TABLE private_chat_messages ADD COLUMN IF NOT EXISTS message_type TEXT NOT NULL DEFAULT 'text';",
+        )
+        _try_alter(
+            "ALTER TABLE private_chat_messages ADD COLUMN audio_path TEXT;",
+            "ALTER TABLE private_chat_messages ADD COLUMN IF NOT EXISTS audio_path TEXT;",
+        )
+        _try_alter(
+            "ALTER TABLE private_chat_messages ADD COLUMN audio_mime_type TEXT;",
+            "ALTER TABLE private_chat_messages ADD COLUMN IF NOT EXISTS audio_mime_type TEXT;",
+        )
+        _try_alter(
+            "ALTER TABLE private_chat_messages ADD COLUMN audio_duration_ms INTEGER;",
+            "ALTER TABLE private_chat_messages ADD COLUMN IF NOT EXISTS audio_duration_ms INTEGER;",
+        )
+        _try_alter(
+            "ALTER TABLE private_chat_messages ADD COLUMN legacy_room_message_id BIGINT;",
+            "ALTER TABLE private_chat_messages ADD COLUMN IF NOT EXISTS legacy_room_message_id BIGINT;",
+        )
+        _db_exec("UPDATE private_chat_messages SET message_type='text' WHERE message_type IS NULL OR btrim(message_type)='';")
         _db_exec(
             "CREATE INDEX IF NOT EXISTS idx_private_chat_pair_created ON private_chat_messages(sender_user_id, recipient_user_id, created_at, id);"
         )
         _db_exec(
             "CREATE INDEX IF NOT EXISTS idx_private_chat_recipient_read ON private_chat_messages(recipient_user_id, sender_user_id, read_at);"
         )
+        _db_exec(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_private_chat_legacy_room_message_id ON private_chat_messages(legacy_room_message_id);"
+        )
+        _migrate_legacy_dm_rows_to_private()
         return
 
     _db_exec(
@@ -1129,7 +1252,12 @@ def _db_init() -> None:
         """
     )
     _try_alter("ALTER TABLE chat_messages ADD COLUMN room TEXT NOT NULL DEFAULT 'global';")
+    _try_alter("ALTER TABLE chat_messages ADD COLUMN message_type TEXT NOT NULL DEFAULT 'text';")
+    _try_alter("ALTER TABLE chat_messages ADD COLUMN audio_path TEXT;")
+    _try_alter("ALTER TABLE chat_messages ADD COLUMN audio_mime_type TEXT;")
+    _try_alter("ALTER TABLE chat_messages ADD COLUMN audio_duration_ms INTEGER;")
     _db_exec("UPDATE chat_messages SET room='global' WHERE room IS NULL OR trim(room)='';")
+    _db_exec("UPDATE chat_messages SET message_type='text' WHERE message_type IS NULL OR trim(message_type)='';")
     _db_exec("CREATE INDEX IF NOT EXISTS idx_chat_messages_id ON chat_messages(id);")
     _db_exec("CREATE INDEX IF NOT EXISTS idx_chat_messages_room_id ON chat_messages(room, id);")
 
@@ -1147,12 +1275,22 @@ def _db_init() -> None:
         );
         """
     )
+    _try_alter("ALTER TABLE private_chat_messages ADD COLUMN message_type TEXT NOT NULL DEFAULT 'text';")
+    _try_alter("ALTER TABLE private_chat_messages ADD COLUMN audio_path TEXT;")
+    _try_alter("ALTER TABLE private_chat_messages ADD COLUMN audio_mime_type TEXT;")
+    _try_alter("ALTER TABLE private_chat_messages ADD COLUMN audio_duration_ms INTEGER;")
+    _try_alter("ALTER TABLE private_chat_messages ADD COLUMN legacy_room_message_id INTEGER;")
+    _db_exec("UPDATE private_chat_messages SET message_type='text' WHERE message_type IS NULL OR trim(message_type)='';")
     _db_exec(
         "CREATE INDEX IF NOT EXISTS idx_private_chat_pair_created ON private_chat_messages(sender_user_id, recipient_user_id, created_at, id);"
     )
     _db_exec(
         "CREATE INDEX IF NOT EXISTS idx_private_chat_recipient_read ON private_chat_messages(recipient_user_id, sender_user_id, read_at);"
     )
+    _db_exec(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_private_chat_legacy_room_message_id ON private_chat_messages(legacy_room_message_id);"
+    )
+    _migrate_legacy_dm_rows_to_private()
 
 
 # =========================================================
@@ -2075,6 +2213,10 @@ def chat_send(payload: ChatSendPayload, user: sqlite3.Row = Depends(require_user
                 VALUES (?, ?, ?, ?, ?)
             """
             if DB_BACKEND == "postgres":
+                insert_sql = """
+                    INSERT INTO chat_messages(room, user_id, display_name, message, created_at)
+                    VALUES (?, ?, ?, ?, to_timestamp(?))
+                """
                 cur.execute(_sql(insert_sql + " RETURNING id"), ("global", int(user["id"]), display_name, message, now))
                 row = cur.fetchone()
                 new_id = int(row["id"])
