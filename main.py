@@ -99,6 +99,9 @@ _pickup_zone_geom_cache_mtime: Optional[float] = None
 _pickup_zone_hotspot_feature_cache: Dict[int, Dict[str, Any]] = {}
 _pickup_zone_score_cache: Dict[int, float] = {}
 _pickup_zone_hotspot_cache_lock = threading.Lock()
+_driver_profile_cache_lock = threading.Lock()
+_driver_profile_cache: Dict[int, tuple[float, Dict[str, Any]]] = {}
+_DRIVER_PROFILE_CACHE_TTL_SECONDS = 25
 _to_3857 = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
 _to_4326 = Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
 
@@ -750,6 +753,154 @@ def _presence_visibility_snapshot(max_age_sec: int) -> Dict[str, Any]:
     }
 
 
+def _resolve_user_display_name_strong(user_id: int, display_name: Any, email: Any) -> str:
+    cleaned_display_name = (str(display_name or "").strip())
+    if cleaned_display_name:
+        return cleaned_display_name
+
+    cleaned_email = (str(email or "").strip())
+    if cleaned_email:
+        email_local = cleaned_email.split("@", 1)[0].strip()
+        if email_local:
+            return email_local
+
+    return f"User {int(user_id)}"
+
+
+def _invalidate_driver_profile_cache(user_id: int) -> None:
+    with _driver_profile_cache_lock:
+        _driver_profile_cache.pop(int(user_id), None)
+
+
+def _load_driver_profile_snapshot(target_user_id: int) -> Dict[str, Any]:
+    period_bounds = {
+        "daily": current_period_bounds(LeaderboardPeriod.daily),
+        "weekly": current_period_bounds(LeaderboardPeriod.weekly),
+        "monthly": current_period_bounds(LeaderboardPeriod.monthly),
+        "yearly": current_period_bounds(LeaderboardPeriod.yearly),
+    }
+    yearly_start = period_bounds["yearly"].start_date.isoformat()
+    yearly_end = period_bounds["yearly"].end_date.isoformat()
+
+    row = _db_query_one(
+        """
+        SELECT
+          COALESCE(SUM(CASE WHEN nyc_date = ? THEN miles_worked ELSE 0 END), 0) AS daily_miles,
+          COALESCE(SUM(CASE WHEN nyc_date = ? THEN hours_worked ELSE 0 END), 0) AS daily_hours,
+          COALESCE(SUM(CASE WHEN nyc_date = ? THEN pickups_recorded ELSE 0 END), 0) AS daily_pickups,
+          COALESCE(SUM(CASE WHEN nyc_date >= ? AND nyc_date <= ? THEN miles_worked ELSE 0 END), 0) AS weekly_miles,
+          COALESCE(SUM(CASE WHEN nyc_date >= ? AND nyc_date <= ? THEN hours_worked ELSE 0 END), 0) AS weekly_hours,
+          COALESCE(SUM(CASE WHEN nyc_date >= ? AND nyc_date <= ? THEN pickups_recorded ELSE 0 END), 0) AS weekly_pickups,
+          COALESCE(SUM(CASE WHEN nyc_date >= ? AND nyc_date <= ? THEN miles_worked ELSE 0 END), 0) AS monthly_miles,
+          COALESCE(SUM(CASE WHEN nyc_date >= ? AND nyc_date <= ? THEN hours_worked ELSE 0 END), 0) AS monthly_hours,
+          COALESCE(SUM(CASE WHEN nyc_date >= ? AND nyc_date <= ? THEN pickups_recorded ELSE 0 END), 0) AS monthly_pickups,
+          COALESCE(SUM(CASE WHEN nyc_date >= ? AND nyc_date <= ? THEN miles_worked ELSE 0 END), 0) AS yearly_miles,
+          COALESCE(SUM(CASE WHEN nyc_date >= ? AND nyc_date <= ? THEN hours_worked ELSE 0 END), 0) AS yearly_hours,
+          COALESCE(SUM(CASE WHEN nyc_date >= ? AND nyc_date <= ? THEN pickups_recorded ELSE 0 END), 0) AS yearly_pickups
+        FROM driver_daily_stats
+        WHERE user_id = ? AND nyc_date >= ? AND nyc_date <= ?
+        """,
+        (
+            period_bounds["daily"].start_date.isoformat(),
+            period_bounds["daily"].start_date.isoformat(),
+            period_bounds["daily"].start_date.isoformat(),
+            period_bounds["weekly"].start_date.isoformat(),
+            period_bounds["weekly"].end_date.isoformat(),
+            period_bounds["weekly"].start_date.isoformat(),
+            period_bounds["weekly"].end_date.isoformat(),
+            period_bounds["weekly"].start_date.isoformat(),
+            period_bounds["weekly"].end_date.isoformat(),
+            period_bounds["monthly"].start_date.isoformat(),
+            period_bounds["monthly"].end_date.isoformat(),
+            period_bounds["monthly"].start_date.isoformat(),
+            period_bounds["monthly"].end_date.isoformat(),
+            period_bounds["monthly"].start_date.isoformat(),
+            period_bounds["monthly"].end_date.isoformat(),
+            period_bounds["yearly"].start_date.isoformat(),
+            period_bounds["yearly"].end_date.isoformat(),
+            period_bounds["yearly"].start_date.isoformat(),
+            period_bounds["yearly"].end_date.isoformat(),
+            period_bounds["yearly"].start_date.isoformat(),
+            period_bounds["yearly"].end_date.isoformat(),
+            int(target_user_id),
+            yearly_start,
+            yearly_end,
+        ),
+    )
+    aggregate = row or {}
+
+    rank_row = _db_query_one(
+        """
+        WITH daily_scores AS (
+          SELECT
+            user_id,
+            COALESCE(SUM(miles_worked), 0) AS miles_value,
+            COALESCE(SUM(hours_worked), 0) AS hours_value
+          FROM driver_daily_stats
+          WHERE nyc_date = ?
+          GROUP BY user_id
+        ),
+        miles_ranked AS (
+          SELECT user_id, ROW_NUMBER() OVER (ORDER BY miles_value DESC, user_id ASC) AS miles_rank
+          FROM daily_scores
+        ),
+        hours_ranked AS (
+          SELECT user_id, ROW_NUMBER() OVER (ORDER BY hours_value DESC, user_id ASC) AS hours_rank
+          FROM daily_scores
+        )
+        SELECT m.miles_rank, h.hours_rank
+        FROM miles_ranked m
+        LEFT JOIN hours_ranked h ON h.user_id = m.user_id
+        WHERE m.user_id = ?
+        LIMIT 1
+        """,
+        (period_bounds["daily"].start_date.isoformat(), int(target_user_id)),
+    )
+
+    best_badge = get_best_current_badge_for_user(int(target_user_id))
+    progression = get_progression_for_user(int(target_user_id))
+
+    return {
+        "daily": {
+            "miles": round(float(aggregate.get("daily_miles") or 0.0), 4),
+            "hours": round(float(aggregate.get("daily_hours") or 0.0), 4),
+            "pickups": int(aggregate.get("daily_pickups") or 0),
+            "miles_rank": int(rank_row["miles_rank"]) if rank_row and rank_row["miles_rank"] is not None else None,
+            "hours_rank": int(rank_row["hours_rank"]) if rank_row and rank_row["hours_rank"] is not None else None,
+        },
+        "weekly": {
+            "miles": round(float(aggregate.get("weekly_miles") or 0.0), 4),
+            "hours": round(float(aggregate.get("weekly_hours") or 0.0), 4),
+            "pickups": int(aggregate.get("weekly_pickups") or 0),
+        },
+        "monthly": {
+            "miles": round(float(aggregate.get("monthly_miles") or 0.0), 4),
+            "hours": round(float(aggregate.get("monthly_hours") or 0.0), 4),
+            "pickups": int(aggregate.get("monthly_pickups") or 0),
+        },
+        "yearly": {
+            "miles": round(float(aggregate.get("yearly_miles") or 0.0), 4),
+            "hours": round(float(aggregate.get("yearly_hours") or 0.0), 4),
+            "pickups": int(aggregate.get("yearly_pickups") or 0),
+        },
+        "leaderboard_badge_code": best_badge.get("leaderboard_badge_code"),
+        "progression": progression,
+    }
+
+
+def build_driver_profile_snapshot(target_user_id: int) -> Dict[str, Any]:
+    now = time.monotonic()
+    with _driver_profile_cache_lock:
+        cached = _driver_profile_cache.get(int(target_user_id))
+        if cached and cached[0] > now:
+            return dict(cached[1])
+
+    snapshot = _load_driver_profile_snapshot(int(target_user_id))
+    with _driver_profile_cache_lock:
+        _driver_profile_cache[int(target_user_id)] = (now + _DRIVER_PROFILE_CACHE_TTL_SECONDS, dict(snapshot))
+    return snapshot
+
+
 def _db_init() -> None:
     if DB_BACKEND == "postgres":
         _db_exec(
@@ -835,6 +986,8 @@ def _db_init() -> None:
             );
             """
         )
+        _db_exec("CREATE INDEX IF NOT EXISTS idx_presence_updated_at ON presence(updated_at DESC);")
+        _db_exec("CREATE INDEX IF NOT EXISTS idx_presence_updated_user ON presence(updated_at DESC, user_id);")
         _db_exec(
             """
             CREATE TABLE IF NOT EXISTS events (
@@ -1021,6 +1174,8 @@ def _db_init() -> None:
         );
         """
     )
+    _db_exec("CREATE INDEX IF NOT EXISTS idx_presence_updated_at ON presence(updated_at DESC);")
+    _db_exec("CREATE INDEX IF NOT EXISTS idx_presence_updated_user ON presence(updated_at DESC, user_id);")
     _db_exec(
         """
         CREATE TABLE IF NOT EXISTS events (
@@ -1288,11 +1443,10 @@ from leaderboard_db import init_leaderboard_schema
 from leaderboard_models import LeaderboardMetric, LeaderboardPeriod
 from leaderboard_routes import router as leaderboard_router
 from leaderboard_service import (
+    current_period_bounds,
     get_best_current_badge_for_user,
     get_best_current_badges_for_users,
     get_progression_for_user,
-    get_my_rank,
-    get_overview_for_user,
 )
 from leaderboard_tracker import increment_pickup_count, record_presence_heartbeat
 from pickup_recording_feature import (
@@ -1754,20 +1908,12 @@ def driver_profile(user_id: int, viewer: sqlite3.Row = Depends(require_user)):
         raise HTTPException(status_code=404, detail="Driver not found")
 
     target_user_id = int(target["id"])
-    display_name = _clean_display_name(target["display_name"] or "", target["email"])
+    display_name = _resolve_user_display_name_strong(target_user_id, target["display_name"], target["email"])
+    stored_display_name = (target["display_name"] or "").strip()
+    if not stored_display_name:
+        _db_exec("UPDATE users SET display_name=? WHERE id=?", (display_name, target_user_id))
 
-    overview = get_overview_for_user(target_user_id) or {}
-    daily = overview.get("daily") or {}
-    weekly = overview.get("weekly") or {}
-    monthly = overview.get("monthly") or {}
-    yearly = overview.get("yearly") or {}
-    miles_rank_data = get_my_rank(target_user_id, LeaderboardMetric.miles, LeaderboardPeriod.daily)
-    hours_rank_data = get_my_rank(target_user_id, LeaderboardMetric.hours, LeaderboardPeriod.daily)
-    best_badge = get_best_current_badge_for_user(target_user_id)
-    progression = get_progression_for_user(target_user_id)
-
-    miles_rank = miles_rank_data.get("row", {}).get("rank_position") if miles_rank_data.get("row") else None
-    hours_rank = hours_rank_data.get("row", {}).get("rank_position") if hours_rank_data.get("row") else None
+    snapshot = build_driver_profile_snapshot(target_user_id)
 
     return {
         "ok": True,
@@ -1775,31 +1921,13 @@ def driver_profile(user_id: int, viewer: sqlite3.Row = Depends(require_user)):
             "id": target_user_id,
             "display_name": display_name,
             "avatar_url": target["avatar_url"] if target["avatar_url"] else None,
-            "leaderboard_badge_code": best_badge.get("leaderboard_badge_code"),
+            "leaderboard_badge_code": snapshot.get("leaderboard_badge_code"),
         },
-        "daily": {
-            "miles": daily.get("miles", 0),
-            "hours": daily.get("hours", 0),
-            "pickups": daily.get("pickups", 0),
-            "miles_rank": miles_rank,
-            "hours_rank": hours_rank,
-        },
-        "weekly": {
-            "miles": weekly.get("miles", 0),
-            "hours": weekly.get("hours", 0),
-            "pickups": weekly.get("pickups", 0),
-        },
-        "monthly": {
-            "miles": monthly.get("miles", 0),
-            "hours": monthly.get("hours", 0),
-            "pickups": monthly.get("pickups", 0),
-        },
-        "yearly": {
-            "miles": yearly.get("miles", 0),
-            "hours": yearly.get("hours", 0),
-            "pickups": yearly.get("pickups", 0),
-        },
-        "progression": progression,
+        "daily": snapshot.get("daily", {}),
+        "weekly": snapshot.get("weekly", {}),
+        "monthly": snapshot.get("monthly", {}),
+        "yearly": snapshot.get("yearly", {}),
+        "progression": snapshot.get("progression", {}),
     }
 
 
@@ -1855,6 +1983,8 @@ def me_update(payload: MeUpdatePayload, user: sqlite3.Row = Depends(require_user
     if updates:
         args.append(int(user["id"]))
         _db_exec(f"UPDATE users SET {', '.join(updates)} WHERE id=?", tuple(args))
+        if new_dn is not None or update_avatar:
+            _invalidate_driver_profile_cache(int(user["id"]))
 
     row = _db_query_one("SELECT id, email, display_name, ghost_mode, avatar_url, map_identity_mode, is_admin, trial_expires_at FROM users WHERE id=? LIMIT 1", (int(user["id"]),))
     if not row:
@@ -1978,18 +2108,31 @@ def presence_all(
 
     badge_by_user = get_best_current_badges_for_users([int(r["user_id"]) for r in rows])
 
+    counts_row = _db_query_one(
+        """
+        SELECT
+          COUNT(*) AS online_count,
+          SUM(CASE WHEN COALESCE(u.ghost_mode, FALSE) THEN 1 ELSE 0 END) AS ghosted_count
+        FROM presence p
+        LEFT JOIN users u ON u.id = p.user_id
+        WHERE p.updated_at >= ?
+        """,
+        (cutoff,),
+    )
+
     items: List[Dict[str, Any]] = []
+    max_updated_at = 0
     for r in rows:
         best_badge = badge_by_user.get(int(r["user_id"]), {})
         email = (r["email"] or "").strip()
-        dn = (r["display_name"] or "").strip()
-        if not dn:
-            dn = _clean_display_name("", email or "Driver")
+        dn = _resolve_user_display_name_strong(int(r["user_id"]), r["display_name"], email)
+        updated_at = int(r["updated_at"])
+        if updated_at > max_updated_at:
+            max_updated_at = updated_at
 
         items.append(
             {
                 "user_id": int(r["user_id"]),
-                "email": email,
                 "display_name": dn,
                 "avatar_url": r["avatar_url"],
                 "map_identity_mode": (str(r["map_identity_mode"]).strip().lower() if r["map_identity_mode"] is not None and str(r["map_identity_mode"]).strip().lower() in ALLOWED_MAP_IDENTITY_MODES else "name"),
@@ -1997,16 +2140,25 @@ def presence_all(
                 "lng": float(r["lng"]),
                 "heading": float(r["heading"]) if r["heading"] is not None else None,
                 "accuracy": float(r["accuracy"]) if r["accuracy"] is not None else None,
-                "updated_at": int(r["updated_at"]),
-                "updated_at_unix": int(r["updated_at"]),
+                "updated_at": updated_at,
                 "leaderboard_badge_code": best_badge.get("leaderboard_badge_code"),
             }
         )
 
+    online_count = int(counts_row["online_count"] or 0) if counts_row else 0
+    ghosted_count = int(counts_row["ghosted_count"] or 0) if counts_row else 0
+
     print(
         f"[info] /presence/all ok=1 user_id={int(viewer['id'])} count={len(items)} db_backend={DB_BACKEND}"
     )
-    return {"ok": True, "count": len(items), "items": items}
+    return {
+        "ok": True,
+        "count": len(items),
+        "items": items,
+        "online_count": online_count,
+        "ghosted_count": ghosted_count,
+        "max_updated_at": max_updated_at,
+    }
 
 
 @app.get("/presence/summary")
