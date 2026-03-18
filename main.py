@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import os
+import copy
 import re
 import sqlite3
 import threading
@@ -18,6 +19,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from pyproj import Transformer
 from shapely.geometry import MultiPolygon, Point, Polygon, mapping, shape
@@ -74,6 +76,7 @@ JWT_SECRET = os.environ.get("JWT_SECRET", "")  # REQUIRED (set in Railway)
 ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "").strip().lower()
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 ADMIN_BOOTSTRAP_TOKEN = os.environ.get("ADMIN_BOOTSTRAP_TOKEN", "").strip()
+DEBUG_VERBOSE_LOGS = str(os.environ.get("DEBUG_VERBOSE_LOGS", "0")).strip().lower() in ("1", "true", "yes", "on")
 
 TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "7"))
 TOKEN_TTL_SECONDS = int(os.environ.get("TOKEN_TTL_SECONDS", str(30 * 24 * 3600)))  # 30 days
@@ -96,9 +99,32 @@ HOTSPOT_TIMESLOT_BIN_MINUTES = 20
 
 _pickup_zone_geom_cache: Optional[Dict[int, Dict[str, Any]]] = None
 _pickup_zone_geom_cache_mtime: Optional[float] = None
+_pickup_zone_geom_missing_warned = False
+_pickup_zone_geom_parse_warned = False
 _pickup_zone_hotspot_feature_cache: Dict[int, Dict[str, Any]] = {}
 _pickup_zone_score_cache: Dict[int, float] = {}
 _pickup_zone_hotspot_cache_lock = threading.Lock()
+_timeline_cache_data: Optional[Dict[str, Any]] = None
+_timeline_cache_mtime: Optional[float] = None
+_timeline_cache_lock = threading.Lock()
+_frame_cache: Dict[int, Dict[str, Any]] = {}
+_frame_cache_meta: Dict[int, float] = {}
+_frame_cache_order: deque[int] = deque()
+_frame_cache_lock = threading.Lock()
+FRAME_CACHE_MAX = 8
+ARTIFACT_CACHE_CONTROL = "public, max-age=60"
+PICKUP_RECENT_CACHE_TTL_SECONDS = float(os.environ.get("PICKUP_RECENT_CACHE_TTL_SECONDS", "10"))
+PICKUP_RECENT_CACHE_MAX = int(os.environ.get("PICKUP_RECENT_CACHE_MAX", "64"))
+PICKUP_HOTSPOT_CACHE_TTL_SECONDS = float(os.environ.get("PICKUP_HOTSPOT_CACHE_TTL_SECONDS", "180"))
+PICKUP_HOTSPOT_CACHE_STALE_SECONDS = float(os.environ.get("PICKUP_HOTSPOT_CACHE_STALE_SECONDS", "900"))
+PICKUP_SCORE_CACHE_TTL_SECONDS = float(os.environ.get("PICKUP_SCORE_CACHE_TTL_SECONDS", "15"))
+PICKUP_EXPERIMENT_PRUNE_INTERVAL_SECONDS = float(os.environ.get("PICKUP_EXPERIMENT_PRUNE_INTERVAL_SECONDS", "300"))
+_pickup_recent_cache: Dict[str, Dict[str, Any]] = {}
+_pickup_recent_cache_lock = threading.Lock()
+_pickup_zone_score_bundle_cache: Dict[str, Dict[str, Any]] = {}
+_pickup_zone_score_bundle_lock = threading.Lock()
+_pickup_zone_maintenance_lock = threading.Lock()
+_pickup_last_experiment_prune_monotonic = 0.0
 _to_3857 = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
 _to_4326 = Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
 
@@ -135,6 +161,11 @@ def _split_env_origins(*names: str) -> list[str]:
             if origin and origin not in origins:
                 origins.append(origin)
     return origins
+
+
+def _debug_log(*args: Any) -> None:
+    if DEBUG_VERBOSE_LOGS:
+        print(*args)
 
 
 def _cors_allow_origins() -> list[str]:
@@ -190,6 +221,53 @@ def _has_frames() -> bool:
 
 def _read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _json_cached_response(payload: Any, cache_control: str = ARTIFACT_CACHE_CONTROL) -> JSONResponse:
+    return JSONResponse(content=payload, headers={"Cache-Control": cache_control})
+
+
+def _read_timeline_cached() -> Dict[str, Any]:
+    global _timeline_cache_data, _timeline_cache_mtime
+    mtime = TIMELINE_PATH.stat().st_mtime
+    with _timeline_cache_lock:
+        if _timeline_cache_data is not None and _timeline_cache_mtime == mtime:
+            return _timeline_cache_data
+        data = _read_json(TIMELINE_PATH)
+        _timeline_cache_data = data
+        _timeline_cache_mtime = mtime
+        return data
+
+
+def _read_frame_cached(idx: int) -> Dict[str, Any]:
+    frame_path = FRAMES_DIR / f"frame_{idx:06d}.json"
+    if not frame_path.exists():
+        raise HTTPException(status_code=404, detail=f"frame not found: {idx}")
+
+    mtime = frame_path.stat().st_mtime
+    with _frame_cache_lock:
+        cached = _frame_cache.get(idx)
+        if cached is not None and _frame_cache_meta.get(idx) == mtime:
+            try:
+                _frame_cache_order.remove(idx)
+            except ValueError:
+                pass
+            _frame_cache_order.append(idx)
+            return cached
+
+        data = _read_json(frame_path)
+        _frame_cache[idx] = data
+        _frame_cache_meta[idx] = mtime
+        try:
+            _frame_cache_order.remove(idx)
+        except ValueError:
+            pass
+        _frame_cache_order.append(idx)
+        while len(_frame_cache_order) > FRAME_CACHE_MAX:
+            evicted_idx = _frame_cache_order.popleft()
+            _frame_cache.pop(evicted_idx, None)
+            _frame_cache_meta.pop(evicted_idx, None)
+        return data
 
 
 def _has_day_tendency_model() -> bool:
@@ -395,7 +473,7 @@ def _resolve_day_tendency_payload(
     mode_flags: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     model = _read_day_tendency_model()
-    print("[debug] model keys:", list(model.keys()))
+    _debug_log("[debug] model keys:", list(model.keys()))
     generated_at = model.get("generated_at") or datetime.now(timezone.utc).isoformat()
     bin_minutes = int(model.get("bin_minutes") or 20)
     resolved_scope = resolve_tendency_scope(lat=lat, lng=lng, mode_flags=mode_flags or {})
@@ -405,7 +483,7 @@ def _resolve_day_tendency_payload(
             "borough": resolved_scope.get("borough"),
             "borough_key": resolved_scope.get("borough_key"),
         }
-    print("[debug] resolved scope:", resolved_scope)
+    _debug_log("[debug] resolved scope:", resolved_scope)
 
     def insufficient() -> Dict[str, Any]:
         return {
@@ -449,7 +527,7 @@ def _resolve_day_tendency_payload(
         }
 
     if model.get("status") == "insufficient_data":
-        print("[debug] using path=insufficient_data")
+        _debug_log("[debug] using path=insufficient_data")
         return insufficient()
 
     now_nyc = datetime.now(NYC_TZ)
@@ -469,7 +547,7 @@ def _resolve_day_tendency_payload(
     global_bin = (scoped_model or {}).get("global_bin") or model.get("global_bin") or {}
     global_baseline = (scoped_model or {}).get("global_baseline") or model.get("global_baseline") or {}
 
-    print("[debug] day_tendency cohort sizes:", {
+    _debug_log("[debug] day_tendency cohort sizes:", {
         "borough_weekday_bin": len(borough_weekday_bin) if isinstance(borough_weekday_bin, dict) else 0,
         "borough_bin": len(borough_bin) if isinstance(borough_bin, dict) else 0,
         "borough_baseline": len(borough_baseline) if isinstance(borough_baseline, dict) else 0,
@@ -529,24 +607,24 @@ def _resolve_day_tendency_payload(
         key_bin = f"{borough_key}|{bin_index}"
         key_borough = borough_key
         if isinstance(borough_weekday_bin, dict) and key_weekday in borough_weekday_bin:
-            print("[debug] using path=borough_weekday_bin")
+            _debug_log("[debug] using path=borough_weekday_bin")
             return from_item(borough_weekday_bin[key_weekday], fallback_cohort_type="borough_weekday_bin", resolved=borough_context)
         if isinstance(borough_bin, dict) and key_bin in borough_bin:
-            print("[debug] using path=borough_bin")
+            _debug_log("[debug] using path=borough_bin")
             return from_item(borough_bin[key_bin], fallback_cohort_type="borough_bin", resolved=borough_context)
         if isinstance(borough_baseline, dict) and key_borough in borough_baseline:
-            print("[debug] using path=borough_baseline")
+            _debug_log("[debug] using path=borough_baseline")
             return from_item(borough_baseline[key_borough], fallback_cohort_type="borough_baseline", resolved=borough_context)
 
     key_global_bin = f"{bin_index}"
     if isinstance(global_bin, dict) and key_global_bin in global_bin:
-        print("[debug] using path=global_bin")
+        _debug_log("[debug] using path=global_bin")
         return from_item(global_bin[key_global_bin], fallback_cohort_type="global_bin", resolved=borough_context)
     if isinstance(global_baseline, dict) and global_baseline:
-        print("[debug] using path=global_baseline")
+        _debug_log("[debug] using path=global_baseline")
         return from_item(global_baseline, fallback_cohort_type="global_baseline", resolved=borough_context)
 
-    print("[debug] using path=insufficient_data")
+    _debug_log("[debug] using path=insufficient_data")
     return insufficient()
 
 
@@ -949,6 +1027,7 @@ def _db_init() -> None:
             );
             """
         )
+        _db_exec("CREATE INDEX IF NOT EXISTS idx_presence_updated_at ON presence(updated_at);")
         _db_exec(
             """
             CREATE TABLE IF NOT EXISTS events (
@@ -1182,6 +1261,7 @@ def _db_init() -> None:
         );
         """
     )
+    _db_exec("CREATE INDEX IF NOT EXISTS idx_presence_updated_at ON presence(updated_at);")
     _db_exec(
         """
         CREATE TABLE IF NOT EXISTS events (
@@ -1668,7 +1748,7 @@ def day_tendency_today(
         "brooklyn_mode": brooklyn_mode,
     }
     payload = _resolve_day_tendency_payload(target_date, lat=lat, lng=lng, mode_flags=mode_flags)
-    print("[debug] day_tendency_today payload:", payload)
+    _debug_log("[debug] day_tendency_today payload:", payload)
     return payload
 
 
@@ -1701,7 +1781,7 @@ def day_tendency_for_date(
         "brooklyn_mode": brooklyn_mode,
     }
     payload = _resolve_day_tendency_payload(parsed_date, lat=lat, lng=lng, mode_flags=mode_flags)
-    print("[debug] day_tendency_for_date payload:", payload)
+    _debug_log("[debug] day_tendency_for_date payload:", payload)
     return payload
 
 
@@ -1709,17 +1789,14 @@ def day_tendency_for_date(
 def timeline():
     if not _has_frames():
         raise HTTPException(status_code=409, detail="timeline not ready. Call /generate first.")
-    return _read_json(TIMELINE_PATH)
+    return _json_cached_response(_read_timeline_cached())
 
 
 @app.get("/frame/{idx}")
 def frame(idx: int):
     if not _has_frames():
         raise HTTPException(status_code=409, detail="timeline not ready. Call /generate first.")
-    p = FRAMES_DIR / f"frame_{idx:06d}.json"
-    if not p.exists():
-        raise HTTPException(status_code=404, detail=f"frame not found: {idx}")
-    return _read_json(p)
+    return _json_cached_response(_read_frame_cached(idx))
 
 
 @app.post("/upload_zones_geojson")
@@ -2163,10 +2240,11 @@ def presence_all(
             (cutoff,),
         )
     except Exception:
-        print(f"[warn] /presence/all ok=0 user_id={int(viewer['id'])} count=0 db_backend={DB_BACKEND}")
         raise
 
     badge_by_user = get_best_current_badges_for_users([int(r["user_id"]) for r in rows])
+    online_count = len(rows)
+    ghosted_count = 0
 
     items: List[Dict[str, Any]] = []
     for r in rows:
@@ -2192,11 +2270,19 @@ def presence_all(
                 "leaderboard_badge_code": best_badge.get("leaderboard_badge_code"),
             }
         )
-
-    print(
-        f"[info] /presence/all ok=1 user_id={int(viewer['id'])} count={len(items)} db_backend={DB_BACKEND}"
-    )
-    return {"ok": True, "count": len(items), "items": items}
+    snapshot = _presence_visibility_snapshot(max_age_sec)
+    if snapshot.get("ok"):
+        online_count = int(snapshot.get("online_count") or online_count)
+        ghosted_count = int(snapshot.get("ghosted_count") or 0)
+    visible_count = len(items)
+    return {
+        "ok": True,
+        "count": visible_count,
+        "items": items,
+        "online_count": online_count,
+        "ghosted_count": ghosted_count,
+        "visible_count": visible_count,
+    }
 
 
 @app.get("/presence/summary")
@@ -2359,11 +2445,14 @@ def log_pickup(payload: PickupPayload, user: sqlite3.Row = Depends(require_user)
 
 def _load_pickup_zone_geometries() -> Dict[int, Dict[str, Any]]:
     global _pickup_zone_geom_cache, _pickup_zone_geom_cache_mtime
+    global _pickup_zone_geom_missing_warned, _pickup_zone_geom_parse_warned
     zones_path = DATA_DIR / "taxi_zones.geojson"
     try:
         mtime = zones_path.stat().st_mtime
     except Exception:
-        print("[warn] taxi_zones.geojson not available for pickup hotspots")
+        if not _pickup_zone_geom_missing_warned:
+            print("[warn] taxi_zones.geojson not available for pickup hotspots")
+            _pickup_zone_geom_missing_warned = True
         _pickup_zone_geom_cache = {}
         _pickup_zone_geom_cache_mtime = None
         return {}
@@ -2397,9 +2486,13 @@ def _load_pickup_zone_geometries() -> Dict[int, Dict[str, Any]]:
                 "geometry": geom,
             }
     except Exception:
-        print("[warn] Failed to parse taxi_zones.geojson for pickup hotspots", traceback.format_exc())
+        if not _pickup_zone_geom_parse_warned:
+            print("[warn] Failed to parse taxi_zones.geojson for pickup hotspots", traceback.format_exc())
+            _pickup_zone_geom_parse_warned = True
         parsed = {}
 
+    _pickup_zone_geom_missing_warned = False
+    _pickup_zone_geom_parse_warned = False
     _pickup_zone_geom_cache = parsed
     _pickup_zone_geom_cache_mtime = mtime
     return parsed
@@ -3022,6 +3115,97 @@ def _active_visible_driver_count() -> int:
     return int(row["c"] or 0) if row else 0
 
 
+def _rounded_bbox_key(
+    min_lat: Optional[float],
+    min_lng: Optional[float],
+    max_lat: Optional[float],
+    max_lng: Optional[float],
+) -> Optional[Tuple[float, float, float, float]]:
+    bbox = [min_lat, min_lng, max_lat, max_lng]
+    if not all(v is not None for v in bbox):
+        return None
+    lo_lat = min(float(min_lat), float(max_lat))
+    hi_lat = max(float(min_lat), float(max_lat))
+    lo_lng = min(float(min_lng), float(max_lng))
+    hi_lng = max(float(min_lng), float(max_lng))
+    return (
+        round(lo_lat, 4),
+        round(lo_lng, 4),
+        round(hi_lat, 4),
+        round(hi_lng, 4),
+    )
+
+
+def _pickup_recent_cache_key(
+    *,
+    limit: int,
+    zone_sample_limit: int,
+    zone_id: Optional[int],
+    bbox_key: Optional[Tuple[float, float, float, float]],
+    include_debug: bool,
+    viewer_is_admin: bool,
+) -> str:
+    parts = [
+        f"limit={int(limit)}",
+        f"zone_sample_limit={int(zone_sample_limit)}",
+        f"zone_id={int(zone_id) if zone_id is not None else 'all'}",
+        f"bbox={bbox_key!r}",
+        f"debug={1 if include_debug else 0}",
+        f"admin={1 if viewer_is_admin else 0}",
+    ]
+    return "|".join(parts)
+
+
+def _purge_pickup_recent_cache(now_monotonic: Optional[float] = None) -> None:
+    now_value = now_monotonic if now_monotonic is not None else time.monotonic()
+    expired = [
+        key for key, value in _pickup_recent_cache.items()
+        if float(value.get("expires_at_monotonic") or 0.0) <= now_value
+    ]
+    for key in expired:
+        _pickup_recent_cache.pop(key, None)
+    while len(_pickup_recent_cache) > PICKUP_RECENT_CACHE_MAX:
+        oldest_key = min(
+            _pickup_recent_cache.items(),
+            key=lambda item: float(item[1].get("last_access_monotonic") or 0.0),
+        )[0]
+        _pickup_recent_cache.pop(oldest_key, None)
+
+
+def _cleanup_pickup_zone_caches(now_monotonic: Optional[float] = None) -> None:
+    now_value = now_monotonic if now_monotonic is not None else time.monotonic()
+    with _pickup_zone_hotspot_cache_lock:
+        stale_zone_ids = [
+            zone_id
+            for zone_id, cached in _pickup_zone_hotspot_feature_cache.items()
+            if (now_value - float(cached.get("last_access_monotonic") or 0.0)) > PICKUP_HOTSPOT_CACHE_STALE_SECONDS
+        ]
+        for zone_id in stale_zone_ids:
+            _pickup_zone_hotspot_feature_cache.pop(zone_id, None)
+            _pickup_zone_score_cache.pop(zone_id, None)
+    with _pickup_zone_score_bundle_lock:
+        stale_bundle_keys = [
+            key
+            for key, cached in _pickup_zone_score_bundle_cache.items()
+            if float(cached.get("expires_at_monotonic") or 0.0) <= now_value
+        ]
+        for key in stale_bundle_keys:
+            _pickup_zone_score_bundle_cache.pop(key, None)
+
+
+def _maybe_prune_pickup_experiment_tables(now_ts: int) -> None:
+    global _pickup_last_experiment_prune_monotonic
+    now_monotonic = time.monotonic()
+    if (now_monotonic - _pickup_last_experiment_prune_monotonic) < PICKUP_EXPERIMENT_PRUNE_INTERVAL_SECONDS:
+        return
+    with _pickup_zone_maintenance_lock:
+        now_monotonic = time.monotonic()
+        if (now_monotonic - _pickup_last_experiment_prune_monotonic) < PICKUP_EXPERIMENT_PRUNE_INTERVAL_SECONDS:
+            return
+        prune_experiment_tables(_db_exec, now_ts=now_ts)
+        _pickup_last_experiment_prune_monotonic = now_monotonic
+
+
 def _pickup_zone_same_timeslot_support(zone_ids: List[int], now_ts: int) -> Dict[int, float]:
     if not zone_ids:
         return {}
@@ -3094,7 +3278,10 @@ def _pickup_zone_density_penalty(zone_ids: List[int]) -> Dict[int, float]:
     return out
 
 
-def _pickup_zone_hotspots_with_debug(zone_ids: List[int]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+def _pickup_zone_hotspots_with_debug(
+    zone_ids: List[int],
+    include_debug: bool = False,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     empty = {"type": "FeatureCollection", "features": []}
     clean_zone_ids: List[int] = []
     for z in zone_ids:
@@ -3109,154 +3296,215 @@ def _pickup_zone_hotspots_with_debug(zone_ids: List[int]) -> Tuple[Dict[str, Any
         "zone_hotspot_count": 0,
         "orphan_micro_hotspot_count": 0,
         "top_level_micro_hotspot_count": 0,
-        "qualified_zone_ids": [],
-        "rendered_zone_ids": [],
-        "global_errors": [],
-        "zones": [],
     }
+    if include_debug:
+        debug.update(
+            {
+                "qualified_zone_ids": [],
+                "rendered_zone_ids": [],
+                "global_errors": [],
+                "zones": [],
+            }
+        )
     if not clean_zone_ids:
         return empty, debug
 
     now_ts = int(time.time())
+    now_monotonic = time.monotonic()
+    zone_geoms: Dict[int, Dict[str, Any]] = {}
     try:
         zone_geoms = _load_pickup_zone_geometries()
     except Exception:
-        zone_geoms = {}
-        debug["global_errors"].append("zone_geometry_load_failed")
+        if include_debug:
+            debug["global_errors"].append("zone_geometry_load_failed")
     if not zone_geoms:
-        if "zone_geometry_load_failed" not in debug["global_errors"]:
+        if include_debug and "zone_geometry_load_failed" not in debug["global_errors"]:
             debug["global_errors"].append("zone_geometry_missing")
         return empty, debug
 
+    zone_points: Dict[int, List[Dict[str, Any]]] = {}
     try:
         zone_points = _pickup_zone_recent_points(clean_zone_ids, PICKUP_ZONE_HOTSPOT_MAX_POINTS)
     except Exception:
-        zone_points = {}
-        debug["global_errors"].append("recent_points_load_failed")
+        if include_debug:
+            debug["global_errors"].append("recent_points_load_failed")
+
+    zone_signatures = {zone_id: _pickup_zone_signature(zone_points.get(zone_id, [])) for zone_id in clean_zone_ids}
+    score_cache_key = "|".join(
+        [f"slot={_current_timeslot_bin(now_ts)}"]
+        + [f"{zone_id}:{zone_signatures[zone_id]}" for zone_id in clean_zone_ids]
+    )
+    with _pickup_zone_score_bundle_lock:
+        score_bundle = _pickup_zone_score_bundle_cache.get(score_cache_key)
+    score_bundle_fresh = bool(
+        score_bundle and float(score_bundle.get("expires_at_monotonic") or 0.0) > now_monotonic
+    )
 
     zone_scores: Dict[int, Any] = {}
-    try:
-        historical_support = _pickup_zone_historical_support(clean_zone_ids, now_ts)
-        same_timeslot_support = _pickup_zone_same_timeslot_support(clean_zone_ids, now_ts)
-        density_penalty_by_zone = _pickup_zone_density_penalty(clean_zone_ids)
-        active_driver_count = 0
+    if score_bundle_fresh:
+        zone_scores = score_bundle.get("zone_scores") or {}
+    else:
         try:
+            historical_support = _pickup_zone_historical_support(clean_zone_ids, now_ts)
+            same_timeslot_support = _pickup_zone_same_timeslot_support(clean_zone_ids, now_ts)
+            density_penalty_by_zone = _pickup_zone_density_penalty(clean_zone_ids)
             active_driver_count = _active_visible_driver_count()
+            zone_scores = score_zones(
+                now_ts=now_ts,
+                zone_points=zone_points,
+                historical_by_zone=historical_support,
+                same_timeslot_by_zone=same_timeslot_support,
+                density_by_zone=density_penalty_by_zone,
+                active_driver_count=active_driver_count,
+                previous_scores=_pickup_zone_score_cache,
+            )
+            with _pickup_zone_score_bundle_lock:
+                _pickup_zone_score_bundle_cache[score_cache_key] = {
+                    "zone_scores": zone_scores,
+                    "expires_at_monotonic": now_monotonic + PICKUP_SCORE_CACHE_TTL_SECONDS,
+                }
+            try:
+                log_zone_bins(_db_exec, bin_time=now_ts, rows=zone_scores.values())
+            except Exception:
+                if include_debug:
+                    debug["global_errors"].append("log_zone_bins_failed")
+                print("[warn] Failed to log pickup zone bins", traceback.format_exc())
         except Exception:
-            debug["global_errors"].append("active_visible_driver_count_failed")
-            print("[warn] Failed to read active visible driver count", traceback.format_exc())
-        zone_scores = score_zones(
-            now_ts=now_ts,
-            zone_points=zone_points,
-            historical_by_zone=historical_support,
-            same_timeslot_by_zone=same_timeslot_support,
-            density_by_zone=density_penalty_by_zone,
-            active_driver_count=active_driver_count,
-            previous_scores=_pickup_zone_score_cache,
-        )
-    except Exception:
-        debug["global_errors"].append("score_zones_failed")
-        print("[warn] Failed to score pickup zones", traceback.format_exc())
+            if include_debug:
+                debug["global_errors"].append("score_zones_failed")
+            print("[warn] Failed to score pickup zones", traceback.format_exc())
+            zone_scores = {}
 
     try:
-        log_zone_bins(_db_exec, bin_time=now_ts, rows=zone_scores.values())
+        _maybe_prune_pickup_experiment_tables(now_ts)
     except Exception:
-        debug["global_errors"].append("log_zone_bins_failed")
-        print("[warn] Failed to log pickup zone bins", traceback.format_exc())
-
-    try:
-        prune_experiment_tables(_db_exec, now_ts=now_ts)
-    except Exception:
-        debug["global_errors"].append("prune_experiment_tables_failed")
+        if include_debug:
+            debug["global_errors"].append("prune_experiment_tables_failed")
         print("[warn] Failed to prune pickup hotspot experiment tables", traceback.format_exc())
 
     features: List[Dict[str, Any]] = []
-    requested_zone_ids = set(clean_zone_ids)
     for zone_id in clean_zone_ids:
         pts = zone_points.get(zone_id, [])
         zone_data = zone_geoms.get(zone_id)
-        zone_debug: Dict[str, Any] = {
-            "zone_id": zone_id,
-            "zone_name": "",
-            "borough": "",
-            "point_count": len(pts),
-            "qualified": len(pts) >= PICKUP_ZONE_HOTSPOT_MIN_POINTS,
-            "geometry_found": bool(zone_data),
-            "cached_hit": False,
-            "primary_attempted": False,
-            "primary_ok": False,
-            "fallback_attempted": False,
-            "fallback_ok": False,
-            "feature_emitted": False,
-            "micro_hotspot_count": 0,
-            "hotspot_method": "none",
-            "signature": "",
-            "errors": [],
-        }
-
-        if zone_data:
-            zone_debug["zone_name"] = zone_data.get("zone_name") or ""
-            zone_debug["borough"] = zone_data.get("borough") or ""
-        elif pts:
-            zone_debug["zone_name"] = (pts[0].get("zone_name") if isinstance(pts[0], dict) else "") or ""
-            zone_debug["borough"] = (pts[0].get("borough") if isinstance(pts[0], dict) else "") or ""
-
-        if zone_debug["qualified"]:
-            debug["qualified_zone_ids"].append(zone_id)
+        signature = zone_signatures.get(zone_id) or _pickup_zone_signature([])
+        qualified = len(pts) >= PICKUP_ZONE_HOTSPOT_MIN_POINTS
+        zone_debug: Optional[Dict[str, Any]] = None
+        if include_debug:
+            zone_debug = {
+                "zone_id": zone_id,
+                "zone_name": (zone_data or {}).get("zone_name") or "",
+                "borough": (zone_data or {}).get("borough") or "",
+                "point_count": len(pts),
+                "qualified": qualified,
+                "geometry_found": bool(zone_data),
+                "cached_hit": False,
+                "primary_attempted": False,
+                "primary_ok": False,
+                "fallback_attempted": False,
+                "fallback_ok": False,
+                "feature_emitted": False,
+                "micro_hotspot_count": 0,
+                "hotspot_method": "none",
+                "signature": signature,
+                "errors": [],
+            }
+            if qualified:
+                debug["qualified_zone_ids"].append(zone_id)
 
         if not zone_data:
-            zone_debug["errors"].append("geometry_missing")
-            debug["zones"].append(zone_debug)
+            if zone_debug is not None:
+                zone_debug["errors"].append("geometry_missing")
+                debug["zones"].append(zone_debug)
             continue
 
-        signature = _pickup_zone_signature(pts)
-        zone_debug["signature"] = signature
+        zone_features: List[Dict[str, Any]] = []
+        cached_hit = False
         with _pickup_zone_hotspot_cache_lock:
             cached = _pickup_zone_hotspot_feature_cache.get(zone_id)
-        if cached and cached.get("signature") == signature and cached.get("features"):
+            if (
+                cached
+                and cached.get("signature") == signature
+                and cached.get("features")
+                and (now_monotonic - float(cached.get("created_at_monotonic") or 0.0)) <= PICKUP_HOTSPOT_CACHE_TTL_SECONDS
+            ):
+                cached["last_access_monotonic"] = now_monotonic
+                zone_features = copy.deepcopy(cached["features"])
+                cached_hit = True
+        if zone_debug is not None and cached_hit:
             zone_debug["cached_hit"] = True
-
-        zone_features: List[Dict[str, Any]] = []
-        zone_component_debug: Dict[str, Any] = {}
-        if zone_debug["cached_hit"]:
-            zone_features = list(cached["features"])
             zone_debug["hotspot_method"] = "cache"
-        elif zone_debug["qualified"]:
-            zone_debug["primary_attempted"] = True
+
+        zone_component_debug: Dict[str, Any] = {}
+        if not zone_features and qualified:
+            if zone_debug is not None:
+                zone_debug["primary_attempted"] = True
             try:
                 zone_features, zone_component_debug = _build_zone_hotspot_components(zone_id, zone_data, pts, fallback=False)
-                zone_debug["primary_ok"] = bool(zone_features)
-                if zone_features:
-                    zone_debug["hotspot_method"] = "primary"
+                if zone_debug is not None:
+                    zone_debug["primary_ok"] = bool(zone_features)
+                    if zone_features:
+                        zone_debug["hotspot_method"] = "primary"
             except Exception:
-                zone_debug["errors"].append("primary_hotspot_build_failed")
+                if zone_debug is not None:
+                    zone_debug["errors"].append("primary_hotspot_build_failed")
                 print(f"[warn] Failed to generate pickup zone hotspot for zone {zone_id}", traceback.format_exc())
 
-        if not zone_features and zone_debug["qualified"]:
-            zone_debug["fallback_attempted"] = True
+        if not zone_features and qualified:
+            if zone_debug is not None:
+                zone_debug["fallback_attempted"] = True
             try:
                 zone_features, zone_component_debug = _build_zone_hotspot_components(zone_id, zone_data, pts, fallback=True)
-                zone_debug["fallback_ok"] = bool(zone_features)
-                if zone_features:
-                    zone_debug["hotspot_method"] = "fallback"
+                if zone_debug is not None:
+                    zone_debug["fallback_ok"] = bool(zone_features)
+                    if zone_features:
+                        zone_debug["hotspot_method"] = "fallback"
             except Exception:
-                zone_debug["errors"].append("fallback_hotspot_build_failed")
+                if zone_debug is not None:
+                    zone_debug["errors"].append("fallback_hotspot_build_failed")
                 print(f"[warn] Failed to generate fallback pickup zone hotspot for zone {zone_id}", traceback.format_exc())
 
-        if zone_component_debug:
+        if zone_debug is not None and zone_component_debug:
             zone_debug.update(zone_component_debug)
 
         if not zone_features:
             with _pickup_zone_hotspot_cache_lock:
                 _pickup_zone_hotspot_feature_cache.pop(zone_id, None)
-            debug["zones"].append(zone_debug)
+            if zone_debug is not None:
+                debug["zones"].append(zone_debug)
             continue
+
+        if not cached_hit:
+            zone_micro_total = 0
+            for feature in zone_features:
+                props = feature.setdefault("properties", {})
+                props["signature"] = signature
+                try:
+                    micro_payload = _build_zone_micro_hotspots_payload(zone_id, zone_data, pts, feature)
+                except Exception:
+                    micro_payload = []
+                    if zone_debug is not None:
+                        zone_debug["errors"].append("micro_hotspot_build_failed")
+                    print(f"[warn] Failed to build pickup micro-hotspots for zone {zone_id}", traceback.format_exc())
+                props["micro_hotspots"] = [item for item in micro_payload if isinstance(item, dict)][:1]
+                zone_micro_total += len(props["micro_hotspots"])
+                feature.pop("_hotspot_proj", None)
+                feature.pop("_component_cells", None)
+            with _pickup_zone_hotspot_cache_lock:
+                _pickup_zone_hotspot_feature_cache[zone_id] = {
+                    "signature": signature,
+                    "features": copy.deepcopy(zone_features),
+                    "created_at_monotonic": now_monotonic,
+                    "last_access_monotonic": now_monotonic,
+                }
+            if zone_debug is not None:
+                zone_debug["micro_hotspot_count"] = zone_micro_total
 
         score = zone_scores.get(zone_id)
         zone_micro_total = 0
         for feature in zone_features:
             props = feature.setdefault("properties", {})
             props["signature"] = signature
+            zone_micro_total += len(props.get("micro_hotspots") or [])
             if score is not None:
                 _pickup_zone_score_cache[zone_id] = score.final_score
                 props["hotspot_score"] = score.final_score
@@ -3267,7 +3515,7 @@ def _pickup_zone_hotspots_with_debug(zone_ids: List[int]) -> Tuple[Dict[str, Any
                 props["weighted_trip_count"] = score.weighted_trip_count
                 props["unique_driver_count"] = score.unique_driver_count
                 props["recommended"] = score.recommended
-                if score.recommended:
+                if score.recommended and not score_bundle_fresh:
                     try:
                         log_recommendation_outcome(
                             _db_exec,
@@ -3278,38 +3526,18 @@ def _pickup_zone_hotspots_with_debug(zone_ids: List[int]) -> Tuple[Dict[str, Any
                             cluster_id=None,
                         )
                     except Exception:
-                        zone_debug["errors"].append("log_recommendation_outcome_failed")
+                        if zone_debug is not None:
+                            zone_debug["errors"].append("log_recommendation_outcome_failed")
                         print(f"[warn] Failed to log recommendation outcome for zone {zone_id}", traceback.format_exc())
-
-            micro_payload: List[Dict[str, Any]] = []
-            try:
-                micro_payload = _build_zone_micro_hotspots_payload(zone_id, zone_data, pts, feature)
-            except Exception:
-                zone_debug["errors"].append("micro_hotspot_build_failed")
-                print(f"[warn] Failed to build pickup micro-hotspots for zone {zone_id}", traceback.format_exc())
-            props["micro_hotspots"] = [item for item in micro_payload if isinstance(item, dict)][:1]
-            zone_micro_total += len(props["micro_hotspots"])
-
-            feature.pop("_hotspot_proj", None)
-            feature.pop("_component_cells", None)
             features.append(feature)
 
-        zone_debug["micro_hotspot_count"] = zone_micro_total
+        if zone_debug is not None:
+            zone_debug["feature_emitted"] = bool(zone_features)
+            zone_debug["micro_hotspot_count"] = zone_micro_total
+            debug["rendered_zone_ids"].append(zone_id)
+            debug["zones"].append(zone_debug)
 
-        with _pickup_zone_hotspot_cache_lock:
-            _pickup_zone_hotspot_feature_cache[zone_id] = {
-                "signature": signature,
-                "features": zone_features,
-            }
-        zone_debug["feature_emitted"] = bool(zone_features)
-        debug["rendered_zone_ids"].append(zone_id)
-        debug["zones"].append(zone_debug)
-
-    with _pickup_zone_hotspot_cache_lock:
-        stale_zone_ids = [zid for zid in list(_pickup_zone_hotspot_feature_cache.keys()) if zid not in requested_zone_ids]
-        for zid in stale_zone_ids:
-            _pickup_zone_hotspot_feature_cache.pop(zid, None)
-
+    _cleanup_pickup_zone_caches(now_monotonic)
     payload = {"type": "FeatureCollection", "features": features}
     debug["zone_hotspot_count"] = len(features)
     debug["orphan_micro_hotspot_count"] = 0
@@ -3460,10 +3688,34 @@ def _recent_pickups_payload(
     max_lng: Optional[float] = None,
     viewer: Optional[sqlite3.Row] = None,
 ) -> Dict[str, Any]:
-    viewer_id = int(viewer["id"]) if viewer is not None and viewer["id"] is not None else -1
     viewer_is_admin = bool(viewer is not None and _flag_to_int(viewer["is_admin"]) == 1)
     safe_limit = max(1, min(200, int(limit)))
     safe_zone_sample_limit = max(1, min(100, int(zone_sample_limit)))
+    include_debug = int(debug) == 1 and viewer_is_admin
+    bbox_key = _rounded_bbox_key(min_lat, min_lng, max_lat, max_lng)
+    lo_lat = hi_lat = lo_lng = hi_lng = None
+    if bbox_key is not None:
+        lo_lat = min(float(min_lat), float(max_lat))
+        hi_lat = max(float(min_lat), float(max_lat))
+        lo_lng = min(float(min_lng), float(max_lng))
+        hi_lng = max(float(min_lng), float(max_lng))
+    now_monotonic = time.monotonic()
+    cache_key = _pickup_recent_cache_key(
+        limit=safe_limit,
+        zone_sample_limit=safe_zone_sample_limit,
+        zone_id=zone_id,
+        bbox_key=bbox_key,
+        include_debug=include_debug,
+        viewer_is_admin=viewer_is_admin,
+    )
+    if not include_debug:
+        with _pickup_recent_cache_lock:
+            _purge_pickup_recent_cache(now_monotonic)
+            cached = _pickup_recent_cache.get(cache_key)
+            if cached and float(cached.get("expires_at_monotonic") or 0.0) > now_monotonic:
+                cached["last_access_monotonic"] = now_monotonic
+                return copy.deepcopy(cached["payload"])
+
     sql = f"""
         SELECT id, lat, lng, zone_id, zone_name, borough, frame_time, created_at
         FROM pickup_logs pl
@@ -3476,25 +3728,14 @@ def _recent_pickups_payload(
         sql += " AND pl.zone_id = ?"
         params.append(int(zone_id))
 
-    bbox = [min_lat, min_lng, max_lat, max_lng]
-    if all(v is not None for v in bbox):
-        lo_lat = min(float(min_lat), float(max_lat))
-        hi_lat = max(float(min_lat), float(max_lat))
-        lo_lng = min(float(min_lng), float(max_lng))
-        hi_lng = max(float(min_lng), float(max_lng))
+    if bbox_key is not None:
         sql += " AND pl.lat BETWEEN ? AND ? AND pl.lng BETWEEN ? AND ?"
         params.extend([lo_lat, hi_lat, lo_lng, hi_lng])
 
     sql += " ORDER BY pl.created_at DESC LIMIT ?"
     params.append(safe_limit)
 
-    try:
-        rows = _db_query_all(sql, tuple(params))
-    except Exception:
-        print(
-            f"[warn] /events/pickups/recent ok=0 user_id={viewer_id} item_count=0 zone_hotspot_count=0 micro_hotspot_count=0"
-        )
-        raise
+    rows = _db_query_all(sql, tuple(params))
     items = [dict(r) for r in rows]
 
     zone_ids_for_stats: List[int] = []
@@ -3503,11 +3744,7 @@ def _recent_pickups_payload(
     else:
         stats_sql = f"SELECT DISTINCT pl.zone_id FROM pickup_logs pl WHERE pl.zone_id IS NOT NULL AND {pickup_log_not_voided_sql('pl')}"
         stats_params: List[Any] = []
-        if all(v is not None for v in bbox):
-            lo_lat = min(float(min_lat), float(max_lat))
-            hi_lat = max(float(min_lat), float(max_lat))
-            lo_lng = min(float(min_lng), float(max_lng))
-            hi_lng = max(float(min_lng), float(max_lng))
+        if bbox_key is not None:
             stats_sql += " AND pl.lat BETWEEN ? AND ? AND pl.lng BETWEEN ? AND ?"
             stats_params.extend([lo_lat, hi_lat, lo_lng, hi_lng])
         stats_rows = _db_query_all(stats_sql, tuple(stats_params))
@@ -3517,11 +3754,11 @@ def _recent_pickups_payload(
     hotspot_zone_ids = [int(z.get("zone_id")) for z in zone_stats if z.get("zone_id") is not None]
     pickup_hotspot_debug: Dict[str, Any] = {}
     try:
-        zone_hotspots, pickup_hotspot_debug = _pickup_zone_hotspots_with_debug(hotspot_zone_ids)
-    except Exception:
-        print(
-            f"[warn] /events/pickups/recent ok=0 user_id={viewer_id} item_count={len(items)} zone_hotspot_count=0 micro_hotspot_count=0"
+        zone_hotspots, pickup_hotspot_debug = _pickup_zone_hotspots_with_debug(
+            hotspot_zone_ids,
+            include_debug=include_debug,
         )
+    except Exception:
         print("[warn] Failed to attach pickup zone hotspots", traceback.format_exc())
         zone_hotspots = {"type": "FeatureCollection", "features": []}
         pickup_hotspot_debug = {
@@ -3552,11 +3789,16 @@ def _recent_pickups_payload(
             "top_level_micro_hotspot_count": len(micro_hotspots),
         },
     }
-    if int(debug) == 1 and viewer_is_admin:
+    if include_debug:
         response["pickup_hotspot_debug"] = pickup_hotspot_debug
-    print(
-        f"[info] /events/pickups/recent ok=1 user_id={viewer_id} item_count={len(items)} zone_hotspot_count={zone_hotspot_count} micro_hotspot_count={len(micro_hotspots)}"
-    )
+    if not include_debug:
+        with _pickup_recent_cache_lock:
+            _pickup_recent_cache[cache_key] = {
+                "payload": copy.deepcopy(response),
+                "expires_at_monotonic": now_monotonic + PICKUP_RECENT_CACHE_TTL_SECONDS,
+                "last_access_monotonic": now_monotonic,
+            }
+            _purge_pickup_recent_cache(now_monotonic)
     return response
 
 
