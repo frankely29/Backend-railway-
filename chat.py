@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import re
 import threading
@@ -31,19 +32,17 @@ _rate_limit_lock = threading.Lock()
 _last_message_by_user: dict[int, float] = {}
 
 _CHAT_AUDIO_DIR = DATA_DIR / "chat_audio"
-_MAX_AUDIO_BYTES = int(os.environ.get("CHAT_AUDIO_MAX_BYTES", str(10 * 1024 * 1024)))
+_MAX_AUDIO_BYTES = int(os.environ.get("CHAT_AUDIO_MAX_BYTES", str(6 * 1024 * 1024)))
 _MAX_PRIVATE_PAGE_SIZE = 200
 _ALLOWED_AUDIO_MIME_TYPES = {
     "audio/mpeg": ".mp3",
-    "audio/mp3": ".mp3",
-    "audio/mp4": ".m4a",
-    "audio/x-m4a": ".m4a",
-    "audio/aac": ".aac",
-    "audio/webm": ".webm",
+    "audio/mp4": ".mp4",
     "audio/ogg": ".ogg",
-    "audio/wav": ".wav",
-    "audio/x-wav": ".wav",
+    "audio/webm": ".webm",
 }
+
+_LOGGER = logging.getLogger(__name__)
+_VOICE_NOTE_FALLBACK_TEXT = "Voice note"
 
 
 class ChatMessagePayload(BaseModel):
@@ -167,20 +166,20 @@ def _validate_text(text: str) -> str:
     return cleaned
 
 
-def _clean_optional_text(text: str | None) -> str:
+def _voice_note_text_fallback(text: str | None) -> str:
     cleaned = (text or "").strip()
     if len(cleaned) > 600:
         raise HTTPException(status_code=400, detail="text too long (max 600)")
-    return cleaned
+    return cleaned or _VOICE_NOTE_FALLBACK_TEXT
 
 
 def _validate_duration_ms(duration_ms: int | None) -> int | None:
     if duration_ms is None:
         return None
     value = int(duration_ms)
-    if value < 0 or value > 3_600_000:
-        raise HTTPException(status_code=400, detail="duration_ms must be between 0 and 3600000")
-    return value
+    if value < 0:
+        return 0
+    return min(value, 3_600_000)
 
 
 def _enforce_rate_limit(user_id: int) -> None:
@@ -608,8 +607,8 @@ def _resolve_audio_path(relative_path: str) -> Path:
     return target
 
 
-def _store_audio_file(relative_dir: str, message_id: int, extension: str, payload: bytes) -> str:
-    relative_path = f"{relative_dir}/message-{int(message_id)}{extension}"
+def _store_audio_file(relative_dir: str, message_id: int, user_id: int, extension: str, payload: bytes) -> str:
+    relative_path = f"{relative_dir}/user-{int(user_id)}-message-{int(message_id)}{extension}"
     target = _resolve_audio_path(relative_path)
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.with_suffix(target.suffix + ".tmp")
@@ -620,13 +619,13 @@ def _store_audio_file(relative_dir: str, message_id: int, extension: str, payloa
 
 def _persist_public_voice_message(room: str, user, upload: UploadFile, duration_ms: int | None, text: str | None) -> dict:
     _enforce_rate_limit(int(user["id"]))
-    clean_text = _clean_optional_text(text)
+    clean_text = _voice_note_text_fallback(text)
     safe_duration_ms = _validate_duration_ms(duration_ms)
     payload, mime_type, extension = _read_upload_audio(upload)
     row = _insert_public_message(room, user, clean_text, message_type="voice")
     relative_dir = f"public/{_room_slug(room)}"
     try:
-        relative_path = _store_audio_file(relative_dir, int(row["id"]), extension, payload)
+        relative_path = _store_audio_file(relative_dir, int(row["id"]), int(user["id"]), extension, payload)
         _db_exec(
             """
             UPDATE chat_messages
@@ -640,6 +639,7 @@ def _persist_public_voice_message(room: str, user, upload: UploadFile, duration_
         row["audio_duration_ms"] = safe_duration_ms
         return _serialize_public_message(row)
     except Exception:
+        _LOGGER.exception("Failed to persist public voice note", extra={"room": room, "message_id": int(row["id"]), "user_id": int(user["id"])})
         _db_exec("DELETE FROM chat_messages WHERE id=?", (int(row["id"]),))
         raise
 
@@ -652,13 +652,13 @@ def _persist_private_voice_message(
     text: str | None,
 ) -> dict:
     _enforce_rate_limit(int(sender_user_id))
-    clean_text = _clean_optional_text(text)
+    clean_text = _voice_note_text_fallback(text)
     safe_duration_ms = _validate_duration_ms(duration_ms)
     payload, mime_type, extension = _read_upload_audio(upload)
     row = _insert_private_message(sender_user_id, recipient_user_id, clean_text, message_type="voice")
     relative_dir = _private_audio_subdir(sender_user_id, recipient_user_id)
     try:
-        relative_path = _store_audio_file(relative_dir, int(row["id"]), extension, payload)
+        relative_path = _store_audio_file(relative_dir, int(row["id"]), int(sender_user_id), extension, payload)
         _db_exec(
             """
             UPDATE private_chat_messages
@@ -672,6 +672,7 @@ def _persist_private_voice_message(
         row["audio_duration_ms"] = safe_duration_ms
         return _serialize_private_message(row)
     except Exception:
+        _LOGGER.exception("Failed to persist private voice note", extra={"message_id": int(row["id"]), "sender_user_id": int(sender_user_id), "recipient_user_id": int(recipient_user_id)})
         _db_exec("DELETE FROM private_chat_messages WHERE id=?", (int(row["id"]),))
         raise
 
@@ -820,6 +821,27 @@ def create_dm_message(other_user_id: int, payload: ChatMessagePayload, user=Depe
         raise HTTPException(status_code=400, detail="Cannot message yourself")
     _ensure_dm_target_exists(int(other_user_id))
     message = _create_private_text_message(my_user_id, int(other_user_id), payload.text)
+    sender_payload = _user_directory_payloads([my_user_id]).get(my_user_id, {})
+    message["user_id"] = my_user_id
+    message["display_name"] = sender_payload.get("display_name")
+    message["sender_display_name"] = sender_payload.get("display_name")
+    message["room"] = _dm_room_for_users(my_user_id, int(other_user_id))
+    return message
+
+
+@router.post("/dm/{other_user_id}/voice")
+def create_dm_voice_message(
+    other_user_id: int,
+    file: UploadFile = File(...),
+    duration_ms: int | None = Form(default=None),
+    text: str | None = Form(default=None),
+    user=Depends(require_user),
+):
+    my_user_id = int(user["id"])
+    if int(other_user_id) == my_user_id:
+        raise HTTPException(status_code=400, detail="Cannot message yourself")
+    _ensure_dm_target_exists(int(other_user_id))
+    message = _persist_private_voice_message(my_user_id, int(other_user_id), file, duration_ms, text)
     sender_payload = _user_directory_payloads([my_user_id]).get(my_user_id, {})
     message["user_id"] = my_user_id
     message["display_name"] = sender_payload.get("display_name")
