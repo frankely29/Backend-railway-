@@ -1083,6 +1083,7 @@ def _db_init() -> None:
         _db_exec("UPDATE chat_messages SET message_type='text' WHERE message_type IS NULL OR btrim(message_type)='';")
         _db_exec("CREATE INDEX IF NOT EXISTS idx_chat_messages_id ON chat_messages(id);")
         _db_exec("CREATE INDEX IF NOT EXISTS idx_chat_messages_room_id ON chat_messages(room, id);")
+        _db_exec("CREATE INDEX IF NOT EXISTS idx_chat_messages_created_at ON chat_messages(created_at);")
 
         _db_exec(
             """
@@ -1122,6 +1123,7 @@ def _db_init() -> None:
         _db_exec(
             "CREATE INDEX IF NOT EXISTS idx_private_chat_pair_created ON private_chat_messages(sender_user_id, recipient_user_id, created_at, id);"
         )
+        _db_exec("CREATE INDEX IF NOT EXISTS idx_private_chat_messages_created_at ON private_chat_messages(created_at);")
         _db_exec(
             "CREATE INDEX IF NOT EXISTS idx_private_chat_recipient_read ON private_chat_messages(recipient_user_id, sender_user_id, read_at);"
         )
@@ -1296,6 +1298,7 @@ def _db_init() -> None:
     _db_exec("UPDATE chat_messages SET message_type='text' WHERE message_type IS NULL OR trim(message_type)='';")
     _db_exec("CREATE INDEX IF NOT EXISTS idx_chat_messages_id ON chat_messages(id);")
     _db_exec("CREATE INDEX IF NOT EXISTS idx_chat_messages_room_id ON chat_messages(room, id);")
+    _db_exec("CREATE INDEX IF NOT EXISTS idx_chat_messages_created_at ON chat_messages(created_at);")
 
     _db_exec(
         """
@@ -1320,6 +1323,7 @@ def _db_init() -> None:
     _db_exec(
         "CREATE INDEX IF NOT EXISTS idx_private_chat_pair_created ON private_chat_messages(sender_user_id, recipient_user_id, created_at, id);"
     )
+    _db_exec("CREATE INDEX IF NOT EXISTS idx_private_chat_messages_created_at ON private_chat_messages(created_at);")
     _db_exec(
         "CREATE INDEX IF NOT EXISTS idx_private_chat_recipient_read ON private_chat_messages(recipient_user_id, sender_user_id, read_at);"
     )
@@ -1457,7 +1461,11 @@ def _ensure_admin_seed() -> None:
     )
 
 
-from chat import router as chat_router
+from chat import (
+    _purge_expired_chat_data,
+    router as chat_router,
+    start_chat_retention_sweeper,
+)
 from leaderboard_db import init_leaderboard_schema
 from leaderboard_models import LeaderboardMetric, LeaderboardPeriod
 from leaderboard_routes import router as leaderboard_router
@@ -1492,6 +1500,14 @@ def startup():
     init_leaderboard_schema()
     ensure_pickup_recording_schema()
     _ensure_admin_seed()
+    try:
+        _purge_expired_chat_data(force=True)
+    except Exception:
+        traceback.print_exc()
+    try:
+        start_chat_retention_sweeper()
+    except Exception:
+        traceback.print_exc()
 
     # Auto-fill generate state if frames/day tendency already exist
     try:
