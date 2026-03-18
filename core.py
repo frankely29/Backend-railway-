@@ -9,7 +9,6 @@ import secrets
 import sqlite3
 import threading
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -26,7 +25,6 @@ TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "7"))
 ENFORCE_TRIAL = str(os.environ.get("ENFORCE_TRIAL", "0")).strip().lower() in ("1", "true", "yes", "on")
 
 _db_lock = threading.Lock()
-_schema_type_cache: dict[tuple[str, str], str] = {}
 
 
 def _db():
@@ -75,96 +73,6 @@ def _db_query_all(sql: str, params: Tuple[Any, ...] = ()) -> List[sqlite3.Row]:
             return list(cur.fetchall())
         finally:
             conn.close()
-
-
-def _get_column_data_type(table: str, column: str) -> str:
-    """Return normalized declared DB type for a table column when available."""
-    try:
-        if DB_BACKEND == "postgres":
-            row = _db_query_one(
-                """
-                SELECT data_type
-                FROM information_schema.columns
-                WHERE table_name=? AND column_name=?
-                LIMIT 1
-                """,
-                (table, column),
-            )
-            return str(row["data_type"]).lower().strip() if row and row.get("data_type") is not None else ""
-
-        rows = _db_query_all(f"PRAGMA table_info({table})")
-        for row in rows:
-            if str(row["name"]).lower().strip() == column.lower().strip():
-                return str(row["type"] or "").lower().strip()
-    except Exception:
-        return ""
-    return ""
-
-
-def _schema_column_type(table_name: str, column_name: str) -> str:
-    key = (str(table_name).strip().lower(), str(column_name).strip().lower())
-    cached = _schema_type_cache.get(key)
-    if cached is not None:
-        return cached
-    data_type = _get_column_data_type(table_name, column_name)
-    _schema_type_cache[key] = data_type
-    return data_type
-
-
-def _is_timestampish_type(dtype: str) -> bool:
-    normalized = (dtype or "").strip().lower()
-    return any(token in normalized for token in ("timestamp", "datetime", "date", "time"))
-
-
-def _is_integerish_type(dtype: str) -> bool:
-    normalized = (dtype or "").strip().lower()
-    return any(token in normalized for token in ("int", "serial", "number", "numeric", "decimal", "real", "double", "float"))
-
-
-def _retention_seconds(message_kind: str) -> int:
-    return 24 * 3600 if (message_kind or "text").strip().lower() == "voice" else 7 * 24 * 3600
-
-
-def _retention_deadline_value(table_name: str, message_kind: str) -> Any:
-    seconds = _retention_seconds(message_kind)
-    expires_type = _schema_column_type(table_name, "expires_at")
-    deadline = int(time.time()) + seconds
-    if _is_timestampish_type(expires_type):
-        if DB_BACKEND == "postgres":
-            return datetime.fromtimestamp(deadline, tz=timezone.utc)
-        return datetime.fromtimestamp(deadline, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    return deadline
-
-
-def _debug_log_chat_time_types() -> None:
-    for table_name in ("chat_messages", "private_chat_messages"):
-        created_type = _schema_column_type(table_name, "created_at") or "unknown"
-        expires_type = _schema_column_type(table_name, "expires_at") or "unknown"
-        print(f"[chat] {table_name}.created_at={created_type} {table_name}.expires_at={expires_type}")
-
-
-def _chat_expired_where_clause(table_name: str, column_name: str = "expires_at") -> tuple[str, tuple[Any, ...]]:
-    expires_type = _schema_column_type(table_name, column_name)
-    qualified_column = column_name
-    if _is_timestampish_type(expires_type):
-        if DB_BACKEND == "postgres":
-            return f"{qualified_column} IS NOT NULL AND {qualified_column} <= NOW()", ()
-        return f"{qualified_column} IS NOT NULL AND {qualified_column} <= CURRENT_TIMESTAMP", ()
-    if _is_integerish_type(expires_type):
-        return f"{qualified_column} IS NOT NULL AND {qualified_column} <= ?", (int(time.time()),)
-    return f"{qualified_column} IS NOT NULL AND {qualified_column} <= ?", (int(time.time()),)
-
-
-def _chat_not_expired_where_clause(table_name: str, column_name: str = "expires_at") -> tuple[str, tuple[Any, ...]]:
-    expires_type = _schema_column_type(table_name, column_name)
-    qualified_column = column_name
-    if _is_timestampish_type(expires_type):
-        if DB_BACKEND == "postgres":
-            return f"({qualified_column} IS NULL OR {qualified_column} > NOW())", ()
-        return f"({qualified_column} IS NULL OR {qualified_column} > CURRENT_TIMESTAMP)", ()
-    if _is_integerish_type(expires_type):
-        return f"({qualified_column} IS NULL OR {qualified_column} > ?)", (int(time.time()),)
-    return f"({qualified_column} IS NULL OR {qualified_column} > ?)", (int(time.time()),)
 
 
 def _require_jwt_secret() -> None:
@@ -281,9 +189,7 @@ def require_user(req: Request) -> sqlite3.Row:
 def _clean_display_name(name: str, email: str) -> str:
     n = (name or "").strip()
     if not n:
-        n = (email.split("@")[0] if "@" in email else "User")
-    if n.strip().lower() == "driver":
-        n = (email.split("@")[0] if "@" in email else "User")
+        n = (email.split("@")[0] if "@" in email else "Driver")
     n = " ".join(n.split())
     if len(n) > 28:
         n = n[:28]
