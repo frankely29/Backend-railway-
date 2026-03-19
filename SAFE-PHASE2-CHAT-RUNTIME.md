@@ -15,7 +15,9 @@ Plain browser `EventSource` cannot attach custom Bearer headers reliably for thi
 - scoped by:
   - `uid`
   - `scope` (`public` or `private`)
-- short TTL via `LIVE_TOKEN_TTL_SECONDS` (default 300 seconds)
+- short TTL via `LIVE_TOKEN_TTL_SECONDS` (default 60 seconds, clamped to 30-90 seconds)
+- validated on connection before the stream starts
+- rejected with `401` for invalid/expired signatures and `403` for scope mismatch
 
 The long-lived login token is intentionally not placed directly in EventSource query strings.
 
@@ -45,6 +47,7 @@ The long-lived login token is intentionally not placed directly in EventSource q
 ## Replay / recovery
 - `Last-Event-ID` is supported against the bounded in-memory history
 - if the requested event is too old, the broker emits a `reset` event
+- clients should refetch `/chat/live/capabilities` when a signed URL expires or before reconnecting after a longer disconnect
 - clients should reconcile with polling summary routes:
   - `/chat/public/summary`
   - `/chat/private/summary`

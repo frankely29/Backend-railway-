@@ -27,6 +27,10 @@ Preserved unchanged:
 - `GET /chat/private/events`
   - per-authenticated-user SSE stream for compact DM thread/unread updates
 
+### Browser-safe capability route
+- `GET /chat/live/capabilities`
+  - authenticated discovery endpoint returning signed short-lived SSE URLs for browser `EventSource`
+
 ### Lightweight diagnostics
 - `GET /chat/live/status`
   - reports current SSE heartbeat/history config and active in-process channel counts
@@ -112,8 +116,10 @@ Compact payload fields used for DM summary delivery:
 
 SSE uses the same authenticated user gate as polling routes:
 - signed-in user required
+- browser EventSource uses a short-lived signed `live_token` minted by `/chat/live/capabilities`
 - disabled users blocked
 - suspended users blocked
+- deleted/missing users blocked
 - trial/admin gating unchanged
 - DM target validation unchanged on send/list paths
 - no presence SSE added in this phase
@@ -126,6 +132,7 @@ SSE uses the same authenticated user gate as polling routes:
   - `GET /chat/rooms/{room}/events`
   - `GET /chat/private/events`
 - Support is bounded to the in-process replay buffer.
+- Signed SSE URLs are intentionally short-lived and should be refreshed through `/chat/live/capabilities` for reconnects outside the ticket TTL.
 - If the requested `Last-Event-ID` is older than the retained replay window, the stream emits a compact `reset` event so the client can reconcile with existing polling summary/history routes.
 
 ### Fallback assumptions remain

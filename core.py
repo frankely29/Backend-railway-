@@ -36,7 +36,7 @@ TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "7"))
 ENFORCE_TRIAL = str(os.environ.get("ENFORCE_TRIAL", "0")).strip().lower() in ("1", "true", "yes", "on")
 POSTGRES_POOL_MIN = max(1, int(os.environ.get("POSTGRES_POOL_MIN", "1")))
 POSTGRES_POOL_MAX = max(POSTGRES_POOL_MIN, int(os.environ.get("POSTGRES_POOL_MAX", "12")))
-LIVE_TOKEN_TTL_SECONDS = max(30, int(os.environ.get("LIVE_TOKEN_TTL_SECONDS", "300")))
+LIVE_TOKEN_TTL_SECONDS = min(90, max(30, int(os.environ.get("LIVE_TOKEN_TTL_SECONDS", "60"))))
 
 
 class _DynamicDBLock:

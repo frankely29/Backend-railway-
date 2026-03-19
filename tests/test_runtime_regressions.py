@@ -10,7 +10,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from fastapi.testclient import TestClient
@@ -468,30 +468,39 @@ def test_chat_sse_requires_auth_and_reports_status(app_env):
     live_status = client.get("/chat/live/status", headers=alice_headers)
     assert live_status.status_code == 200
     assert live_status.json()["sse"]["heartbeat_seconds"] >= 1
+    no_auth_capabilities = client.get("/chat/live/capabilities")
+    assert no_auth_capabilities.status_code == 401
+
     capabilities = client.get("/chat/live/capabilities", headers=alice_headers)
     assert capabilities.status_code == 200
     capabilities_payload = capabilities.json()
+    assert capabilities_payload["ok"] is True
     assert capabilities_payload["public"]["enabled"] is True
     assert capabilities_payload["private"]["enabled"] is True
-    assert capabilities_payload["live_token_ttl_seconds"] >= 30
+    assert capabilities_payload["ttl_seconds"] == capabilities_payload["live_token_ttl_seconds"]
+    assert 30 <= capabilities_payload["ttl_seconds"] <= 90
 
     chat_module = sys.modules["chat"]
     public_parts = urlsplit(capabilities_payload["public"]["url"])
+    public_query = parse_qs(public_parts.query)
+    assert public_query["live_token"]
     public_response = asyncio.run(
         chat_module.public_chat_events(
             _make_request(public_parts.path + "?" + public_parts.query),
             None,
-            public_parts.query.split("live_token=", 1)[1],
+            public_query["live_token"][0],
         )
     )
     assert public_response.media_type == "text/event-stream"
 
     private_parts = urlsplit(capabilities_payload["private"]["url"])
+    private_query = parse_qs(private_parts.query)
+    assert private_query["live_token"]
     private_response = asyncio.run(
         chat_module.private_summary_events(
             _make_request(private_parts.path + "?" + private_parts.query),
             None,
-            private_parts.query.split("live_token=", 1)[1],
+            private_query["live_token"][0],
         )
     )
     assert private_response.media_type == "text/event-stream"
@@ -501,6 +510,9 @@ def test_chat_sse_requires_auth_and_reports_status(app_env):
 
     invalid_private = client.get("/chat/private/events?live_token=bad-token")
     assert invalid_private.status_code == 401
+
+    scope_mismatch = client.get(f"/chat/private/events?live_token={public_query['live_token'][0]}")
+    assert scope_mismatch.status_code == 403
 
 
 def test_public_chat_sse_delivers_new_message_and_replay(app_env):
@@ -564,3 +576,100 @@ def test_private_chat_sse_delivers_dm_summary_updates(app_env):
     assert dm_event["data"]["recipient_user_id"] == bob["id"]
     assert dm_event["data"]["text_preview"] == "dm sse hello"
     assert dm_event["data"]["unread_count"] >= 1
+
+
+def test_chat_live_tokens_expire_and_respect_block_state(app_env):
+    _, client, _ = app_env
+    core_module = sys.modules["core"]
+    alice = _signup(client, "alice-live-expiry@example.com", display_name="Alice Live Expiry")
+    admin_login = client.post("/auth/login", json={"email": "admin@example.com", "password": "password123"})
+    assert admin_login.status_code == 200
+    admin_headers = _auth_headers(admin_login.json()["token"])
+
+    expired_public = core_module._make_live_token(user_id=alice["id"], stream="public", ttl_seconds=-1)
+    expired_response = client.get(f"/chat/public/events?live_token={expired_public}")
+    assert expired_response.status_code == 401
+
+    valid_private = core_module._make_live_token(user_id=alice["id"], stream="private", ttl_seconds=60)
+    disable_response = client.post(
+        "/admin/users/disable",
+        json={"user_id": alice["id"], "disabled": True},
+        headers=admin_headers,
+    )
+    assert disable_response.status_code == 200
+
+    disabled_private = client.get(f"/chat/private/events?live_token={valid_private}")
+    assert disabled_private.status_code == 403
+
+
+def test_presence_contract_shapes_remain_stable(app_env):
+    _, client, _ = app_env
+    alice = _signup(client, "alice-presence-contract@example.com", display_name="Alice Presence Contract")
+    bob = _signup(client, "bob-presence-contract@example.com", display_name="Bob Presence Contract")
+    alice_headers = _auth_headers(alice["token"])
+    bob_headers = _auth_headers(bob["token"])
+
+    alice_update = client.post(
+        "/presence/update",
+        json={"lat": 40.75, "lng": -73.99, "heading": 45, "accuracy": 5},
+        headers=alice_headers,
+    )
+    assert alice_update.status_code == 200
+
+    viewport_snapshot = client.get(
+        "/presence/viewport?min_lat=40.70&min_lng=-74.10&max_lat=40.90&max_lng=-73.80&zoom=13",
+        headers=alice_headers,
+    )
+    assert viewport_snapshot.status_code == 200
+    snapshot_payload = viewport_snapshot.json()
+    assert snapshot_payload["ok"] is True
+    assert snapshot_payload["mode"] == "snapshot"
+    assert isinstance(snapshot_payload["items"], list)
+    assert snapshot_payload["removed"] == []
+    assert isinstance(snapshot_payload["cursor"], int)
+    assert isinstance(snapshot_payload["server_time_ms"], int)
+    assert snapshot_payload["server_time_ms"] >= snapshot_payload["cursor"]
+    assert {"online_count", "ghosted_count", "visible_count"}.issubset(snapshot_payload.keys())
+    assert any(item["user_id"] == alice["id"] for item in snapshot_payload["items"])
+
+    bob_ghost = client.post("/me/update", json={"ghost_mode": True}, headers=bob_headers)
+    assert bob_ghost.status_code == 200
+    bob_update = client.post(
+        "/presence/update",
+        json={"lat": 40.76, "lng": -73.98, "heading": 90, "accuracy": 4},
+        headers=bob_headers,
+    )
+    assert bob_update.status_code == 200
+
+    delta_response = client.get(
+        f"/presence/delta?updated_since_ms={snapshot_payload['cursor']}&min_lat=40.70&min_lng=-74.10&max_lat=40.90&max_lng=-73.80&zoom=13",
+        headers=alice_headers,
+    )
+    assert delta_response.status_code == 200
+    delta_payload = delta_response.json()
+    assert delta_payload["ok"] is True
+    assert delta_payload["mode"] == "delta"
+    assert isinstance(delta_payload["items"], list)
+    assert isinstance(delta_payload["removed"], list)
+    assert isinstance(delta_payload["cursor"], int)
+    assert isinstance(delta_payload["server_time_ms"], int)
+    assert any(item["user_id"] == bob["id"] and item["reason"] == "ghost_mode" for item in delta_payload["removed"])
+
+    summary_response = client.get("/presence/summary", headers=alice_headers)
+    assert summary_response.status_code == 200
+    summary_payload = summary_response.json()
+    assert summary_payload["ok"] is True
+    assert summary_payload["online_count"] >= 2
+    assert summary_payload["ghosted_count"] >= 1
+    assert summary_payload["visible_count"] >= 1
+
+    presence_all = client.get(
+        "/presence/all?mode=lite&min_lat=40.70&min_lng=-74.10&max_lat=40.90&max_lng=-73.80&zoom=13",
+        headers=alice_headers,
+    )
+    assert presence_all.status_code == 200
+    all_payload = presence_all.json()
+    assert all_payload["ok"] is True
+    assert isinstance(all_payload["items"], list)
+    assert all_payload["visible_count"] == len(all_payload["items"])
+    assert all(item["user_id"] != bob["id"] for item in all_payload["items"])

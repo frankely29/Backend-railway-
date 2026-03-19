@@ -1945,6 +1945,7 @@ def live_capabilities(request: Request, user=Depends(require_user)):
             "url": _absolute_live_url(request, "/chat/private/events", live_token=private_token),
             "stream": "private",
         },
+        "ttl_seconds": LIVE_TOKEN_TTL_SECONDS,
         "heartbeat_seconds": _SSE_HEARTBEAT_SECONDS,
         "live_token_ttl_seconds": LIVE_TOKEN_TTL_SECONDS,
         "recovery": {
