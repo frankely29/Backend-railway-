@@ -1130,10 +1130,13 @@ def _audio_response(target: Path, mime_type: str, range_header: str | None, head
     stat_result = target.stat()
     file_size = int(stat_result.st_size)
     byte_range = _parse_range_header(range_header, file_size)
+    etag = f'W/"chat-audio-{target.name}-{int(stat_result.st_mtime)}-{file_size}"'
     common_headers = {
         "Accept-Ranges": "bytes",
         "Content-Type": mime_type,
         "Last-Modified": formatdate(stat_result.st_mtime, usegmt=True),
+        "Cache-Control": "private, max-age=300",
+        "ETag": etag,
     }
     if byte_range is None:
         common_headers["Content-Length"] = str(file_size)
