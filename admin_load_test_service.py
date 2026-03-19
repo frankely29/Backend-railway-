@@ -554,6 +554,8 @@ class SyntheticLoadTestManager:
     def _normalized_config(self, payload: AdminLoadTestStartRequest) -> Dict[str, Any]:
         mode_defaults = MODE_DEFAULTS.get(payload.mode, {})
         config = payload.model_dump()
+        config["driver_count"] = config["preset"]
+        config["duration_seconds"] = config["duration_sec"]
         for key, value in mode_defaults.items():
             config[key] = value
         if config.get("seed") is None:
