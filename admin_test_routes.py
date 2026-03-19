@@ -2,8 +2,16 @@ from __future__ import annotations
 
 import sqlite3
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Response, status
 
+from admin_load_test_models import AdminLoadTestStartRequest
+from admin_load_test_service import (
+    get_last_load_test_result,
+    get_load_test_capabilities,
+    get_load_test_status,
+    start_load_test,
+    stop_load_test,
+)
 from admin_security import require_admin_user
 from admin_test_models import AdminDiagnosticResponse
 from admin_test_service import (
@@ -98,3 +106,39 @@ def admin_test_presence_endpoint(admin: sqlite3.Row = Depends(require_admin_user
 @router.get("/pickup-overlay-endpoint", response_model=AdminDiagnosticResponse)
 def admin_test_pickup_overlay_endpoint(admin: sqlite3.Row = Depends(require_admin_user)):
     return test_pickup_overlay_endpoint(admin)
+
+
+@router.get("/load/capabilities", response_model=AdminDiagnosticResponse)
+def admin_load_test_capabilities(admin: sqlite3.Row = Depends(require_admin_user)):
+    _ = admin
+    return get_load_test_capabilities()
+
+
+@router.post("/load/start", response_model=AdminDiagnosticResponse)
+def admin_load_test_start(
+    payload: AdminLoadTestStartRequest,
+    response: Response,
+    admin: sqlite3.Row = Depends(require_admin_user),
+):
+    _ = admin
+    body, status_code = start_load_test(payload)
+    response.status_code = status_code
+    return body
+
+
+@router.get("/load/status", response_model=AdminDiagnosticResponse)
+def admin_load_test_status(admin: sqlite3.Row = Depends(require_admin_user)):
+    _ = admin
+    return get_load_test_status()
+
+
+@router.post("/load/stop", response_model=AdminDiagnosticResponse, status_code=status.HTTP_200_OK)
+def admin_load_test_stop(admin: sqlite3.Row = Depends(require_admin_user)):
+    _ = admin
+    return stop_load_test()
+
+
+@router.get("/load/last", response_model=AdminDiagnosticResponse)
+def admin_load_test_last(admin: sqlite3.Row = Depends(require_admin_user)):
+    _ = admin
+    return get_last_load_test_result()

@@ -15,7 +15,7 @@ def _checked_at() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-def _response(ok: bool, test_name: str, summary: str, details: Dict[str, Any]) -> Dict[str, Any]:
+def build_admin_response(ok: bool, test_name: str, summary: str, details: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "ok": ok,
         "test_name": test_name,
@@ -23,6 +23,10 @@ def _response(ok: bool, test_name: str, summary: str, details: Dict[str, Any]) -
         "summary": summary,
         "details": details,
     }
+
+
+def _response(ok: bool, test_name: str, summary: str, details: Dict[str, Any]) -> Dict[str, Any]:
+    return build_admin_response(ok, test_name, summary, details)
 
 
 def test_backend_status() -> Dict[str, Any]:
