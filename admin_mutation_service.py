@@ -68,7 +68,7 @@ def set_user_suspended(actor_user_id: int, user_id: int, is_suspended: bool) -> 
 def get_admin_user_detail(user_id: int) -> Dict[str, Any]:
     user = _db_query_one(
         """
-        SELECT id, email, display_name, is_admin, is_suspended, ghost_mode, avatar_url, created_at
+        SELECT id, email, display_name, is_admin, is_disabled, is_suspended, ghost_mode, avatar_url, created_at
         FROM users
         WHERE id=?
         LIMIT 1
@@ -124,6 +124,7 @@ def get_admin_user_detail(user_id: int) -> Dict[str, Any]:
         "email": user.get("email"),
         "display_name": user.get("display_name"),
         "is_admin": _flag_to_bool(user.get("is_admin")),
+        "is_disabled": _flag_to_bool(user.get("is_disabled")),
         "is_suspended": _flag_to_bool(user.get("is_suspended")),
         "ghost_mode": _flag_to_bool(user.get("ghost_mode")),
         "avatar_url": user.get("avatar_url"),

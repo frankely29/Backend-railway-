@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
+from psycopg2.pool import ThreadedConnectionPool
 from fastapi import HTTPException, Request
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
@@ -23,14 +24,67 @@ POSTGRES_URL = os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL")
 DB_BACKEND = "postgres" if POSTGRES_URL else "sqlite"
 TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "7"))
 ENFORCE_TRIAL = str(os.environ.get("ENFORCE_TRIAL", "0")).strip().lower() in ("1", "true", "yes", "on")
+POSTGRES_POOL_MIN = max(1, int(os.environ.get("POSTGRES_POOL_MIN", "1")))
+POSTGRES_POOL_MAX = max(POSTGRES_POOL_MIN, int(os.environ.get("POSTGRES_POOL_MAX", "12")))
 
-_db_lock = threading.Lock()
+
+class _DynamicDBLock:
+    def __init__(self) -> None:
+        self._sqlite_lock = threading.RLock()
+
+    def __enter__(self):
+        if DB_BACKEND == "sqlite":
+            self._sqlite_lock.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if DB_BACKEND == "sqlite":
+            self._sqlite_lock.release()
+        return False
+
+
+_db_lock = _DynamicDBLock()
+_postgres_pool_lock = threading.Lock()
+_postgres_pool: Optional[ThreadedConnectionPool] = None
+
+
+class _PooledPostgresConnection:
+    def __init__(self, conn, pool: ThreadedConnectionPool):
+        self._conn = conn
+        self._pool = pool
+        self._closed = False
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._pool.putconn(self._conn)
+
+    def __getattr__(self, item: str):
+        return getattr(self._conn, item)
+
+
+def _postgres_conn_pool() -> ThreadedConnectionPool:
+    global _postgres_pool
+    if _postgres_pool is not None:
+        return _postgres_pool
+    with _postgres_pool_lock:
+        if _postgres_pool is None:
+            _postgres_pool = ThreadedConnectionPool(
+                minconn=POSTGRES_POOL_MIN,
+                maxconn=POSTGRES_POOL_MAX,
+                dsn=POSTGRES_URL,
+                cursor_factory=RealDictCursor,
+            )
+    return _postgres_pool
 
 
 def _db():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     if DB_BACKEND == "postgres":
-        return psycopg2.connect(POSTGRES_URL, cursor_factory=RealDictCursor)
+        pool = _postgres_conn_pool()
+        conn = pool.getconn()
+        return _PooledPostgresConnection(conn, pool)
 
     conn = sqlite3.connect(str(COMMUNITY_DB_PATH), check_same_thread=False)
     conn.row_factory = sqlite3.Row
@@ -49,6 +103,9 @@ def _db_exec(sql: str, params: Tuple[Any, ...] = ()) -> None:
         try:
             conn.cursor().execute(_sql(sql), params)
             conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
         finally:
             conn.close()
 
@@ -136,6 +193,45 @@ def _flag_to_bool(value: Any) -> bool:
         return False
 
 
+def _row_has_key(row: Any, key: str) -> bool:
+    if row is None:
+        return False
+    if hasattr(row, "keys"):
+        try:
+            return key in row.keys()
+        except Exception:
+            pass
+    if isinstance(row, dict):
+        return key in row
+    return False
+
+
+def _user_block_state(row: Any) -> Dict[str, Any]:
+    is_disabled = _flag_to_bool(row["is_disabled"]) if _row_has_key(row, "is_disabled") else False
+    is_suspended = _flag_to_bool(row["is_suspended"]) if _row_has_key(row, "is_suspended") else False
+    reason = None
+    detail = None
+    if is_disabled:
+        reason = "disabled"
+        detail = "Account disabled"
+    elif is_suspended:
+        reason = "suspended"
+        detail = "Account suspended"
+    return {
+        "is_disabled": is_disabled,
+        "is_suspended": is_suspended,
+        "is_blocked": bool(reason),
+        "reason": reason,
+        "detail": detail,
+    }
+
+
+def _enforce_user_not_blocked(row: Any) -> None:
+    state = _user_block_state(row)
+    if state["is_blocked"]:
+        raise HTTPException(status_code=403, detail=state["detail"])
+
+
 def _auth_user_from_request(req: Request) -> sqlite3.Row:
     auth = req.headers.get("authorization", "")
     if not auth.lower().startswith("bearer "):
@@ -146,10 +242,7 @@ def _auth_user_from_request(req: Request) -> sqlite3.Row:
     row = _db_query_one("SELECT * FROM users WHERE id=? LIMIT 1", (uid,))
     if not row:
         raise HTTPException(status_code=401, detail="User not found")
-    if _flag_to_bool(row["is_disabled"]):
-        raise HTTPException(status_code=403, detail="Account disabled")
-    if _flag_to_bool(row["is_suspended"] if "is_suspended" in row.keys() else None):
-        raise HTTPException(status_code=403, detail="Account suspended")
+    _enforce_user_not_blocked(row)
     return row
 
 
@@ -165,15 +258,11 @@ def _enforce_trial_or_admin(user: sqlite3.Row) -> None:
     except Exception:
         trial_expires_at = None
 
-    # Backward-compatibility/self-healing:
-    # some legacy rows can have null/0/invalid trial timestamps after migrations.
-    # Treat those as an uninitialized trial and initialize from "now".
     if trial_expires_at is None or trial_expires_at <= 0:
         trial_expires_at = int(time.time()) + max(1, TRIAL_DAYS) * 86400
         try:
             _db_exec("UPDATE users SET trial_expires_at=? WHERE id=?", (trial_expires_at, int(user["id"])))
         except Exception:
-            # If persistence fails, we still allow this request rather than logging users out.
             return
 
     if int(time.time()) > trial_expires_at:
