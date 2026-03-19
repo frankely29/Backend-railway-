@@ -9,6 +9,7 @@ import queue
 import re
 import threading
 import time
+from urllib.parse import urlencode
 from datetime import datetime, timezone
 from email.utils import formatdate
 from pathlib import Path
@@ -21,14 +22,19 @@ from starlette.responses import StreamingResponse
 from core import (
     DATA_DIR,
     DB_BACKEND,
+    LIVE_TOKEN_TTL_SECONDS,
+    _auth_user_from_request,
     _clean_display_name,
     _db,
     _db_exec,
     _db_lock,
     _db_query_all,
     _db_query_one,
+    _enforce_user_not_blocked,
+    _make_live_token,
     _sql,
     _user_block_state,
+    _verify_live_token,
     require_user,
 )
 
@@ -567,6 +573,56 @@ def _parse_last_event_id(last_event_id: str | None) -> int | None:
     return parsed if parsed >= 0 else None
 
 
+def _live_stream_scope(stream: str) -> str:
+    scope = str(stream or "").strip().lower()
+    if scope not in {"public", "private"}:
+        raise HTTPException(status_code=400, detail="Invalid live stream scope")
+    return scope
+
+
+def _get_live_stream_user(request: Request, *, stream: str):
+    auth = request.headers.get("authorization", "")
+    if auth.strip():
+        return _auth_user_from_request(request)
+
+    live_token = (request.query_params.get("live_token") or "").strip()
+    if not live_token:
+        raise HTTPException(status_code=401, detail="Missing Bearer token or live_token")
+
+    payload = _verify_live_token(live_token, expected_stream=_live_stream_scope(stream))
+    row = _db_query_one("SELECT * FROM users WHERE id=? LIMIT 1", (int(payload["uid"]),))
+    if not row:
+        raise HTTPException(status_code=401, detail="User not found")
+    _enforce_user_not_blocked(row)
+    return row
+
+
+def _assert_live_stream_user_active(user_id: int) -> None:
+    row = _db_query_one("SELECT * FROM users WHERE id=? LIMIT 1", (int(user_id),))
+    if not row:
+        raise HTTPException(status_code=401, detail="User not found")
+    _enforce_user_not_blocked(row)
+
+
+def _absolute_live_url(request: Request, path: str, *, live_token: str) -> str:
+    base = str(request.base_url).rstrip("/")
+    query = urlencode({"live_token": live_token})
+    return f"{base}{path}?{query}"
+
+
+def _not_blocked_user_sql(alias: str = "u") -> str:
+    safe_alias = (alias or "u").strip()
+    if DB_BACKEND == "postgres":
+        return (
+            f"COALESCE({safe_alias}.is_disabled, FALSE) = FALSE "
+            f"AND COALESCE({safe_alias}.is_suspended, FALSE) = FALSE"
+        )
+    return (
+        f"COALESCE(CAST({safe_alias}.is_disabled AS INTEGER), 0) = 0 "
+        f"AND COALESCE(CAST({safe_alias}.is_suspended AS INTEGER), 0) = 0"
+    )
+
+
 def _sse_encode(envelope: dict[str, Any]) -> bytes:
     chunks: list[str] = []
     event_id = envelope.get("id")
@@ -711,6 +767,7 @@ async def _stream_live_channel(
     channel: str,
     connected_payload: dict[str, Any],
     last_event_id: int | None,
+    auth_user_id: int | None = None,
 ) -> StreamingResponse:
     subscriber, replay = _live_event_broker.subscribe(channel, last_event_id)
 
@@ -726,6 +783,11 @@ async def _stream_live_channel(
                     envelope = await asyncio.to_thread(subscriber.get, True, _SSE_HEARTBEAT_SECONDS)
                     yield _sse_encode(envelope)
                 except queue.Empty:
+                    if auth_user_id is not None:
+                        try:
+                            await asyncio.to_thread(_assert_live_stream_user_active, int(auth_user_id))
+                        except HTTPException:
+                            break
                     yield b": keep-alive\n\n"
         finally:
             _live_event_broker.unsubscribe(channel, subscriber)
@@ -758,16 +820,22 @@ def _user_directory_payloads(user_ids: list[int]) -> dict[int, dict[str, Any]]:
         return {}
     placeholders = ", ".join(["?"] * len(user_ids))
     rows = _db_query_all(
-        f"SELECT id, display_name, avatar_url, email FROM users WHERE id IN ({placeholders})",
+        f"""
+        SELECT id, display_name, avatar_url, email, is_disabled, is_suspended
+        FROM users
+        WHERE id IN ({placeholders})
+        """,
         tuple(user_ids),
     )
-    return {
-        int(row["id"]): {
+    payloads: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        if _user_block_state(dict(row))["is_blocked"]:
+            continue
+        payloads[int(row["id"])] = {
             "display_name": _clean_display_name(row["display_name"] or "", row["email"]),
             "avatar_url": row["avatar_url"],
         }
-        for row in rows
-    }
+    return payloads
 
 
 def _fetch_private_conversation(
@@ -928,10 +996,14 @@ def _room_summary(room: str, after: str | None = None) -> dict[str, Any]:
     after_filter = _parse_after(after)
     latest_rows = _db_query_all(
         """
-        SELECT id, room, user_id, display_name, message, created_at, message_type, audio_path, audio_mime_type, audio_duration_ms
-        FROM chat_messages
-        WHERE room=?
-        ORDER BY id DESC
+        SELECT msg.id, msg.room, msg.user_id, msg.display_name, msg.message, msg.created_at, msg.message_type, msg.audio_path, msg.audio_mime_type, msg.audio_duration_ms
+        FROM chat_messages msg
+        JOIN users u ON u.id = msg.user_id
+        WHERE msg.room=?
+          AND """
+        + _not_blocked_user_sql("u")
+        + """
+        ORDER BY msg.id DESC
         LIMIT 1
         """,
         (safe_room,),
@@ -950,11 +1022,17 @@ def _room_summary(room: str, after: str | None = None) -> dict[str, Any]:
             where.append("created_at > ?")
         params.append(int(after_filter.value))
 
+    adjusted_where = " AND ".join(
+        f"msg.{clause}" if clause in {"room = ?", "id > ?", "created_at > ?", "created_at > to_timestamp(?)"} else clause
+        for clause in where
+    )
     unread_row = _db_query_all(
         f"""
         SELECT COUNT(*) AS unread_count
-        FROM chat_messages
-        WHERE {' AND '.join(where)}
+        FROM chat_messages msg
+        JOIN users u ON u.id = msg.user_id
+        WHERE {adjusted_where}
+          AND {_not_blocked_user_sql("u")}
         """,
         tuple(params),
     )
@@ -1683,16 +1761,20 @@ def _list_messages_for_room(room: str, after: str | None, limit: int) -> dict:
         params.append(int(after_filter.value))
 
     select_sql = """
-        SELECT id, room, user_id, display_name, message, created_at, message_type, audio_path, audio_mime_type, audio_duration_ms
-        FROM chat_messages
+        SELECT msg.id, msg.room, msg.user_id, msg.display_name, msg.message, msg.created_at, msg.message_type, msg.audio_path, msg.audio_mime_type, msg.audio_duration_ms
+        FROM chat_messages msg
+        JOIN users u ON u.id = msg.user_id
         WHERE {where_clause}
+          AND """
+    select_sql += _not_blocked_user_sql("u")
+    select_sql += """
     """
     if after_filter.field is None:
         rows = _db_query_all(
             f"""
             SELECT id, room, user_id, display_name, message, created_at, message_type, audio_path, audio_mime_type, audio_duration_ms
             FROM (
-                {select_sql.format(where_clause='room = ?')}
+                {select_sql.format(where_clause='msg.room = ?')}
                 ORDER BY id DESC
                 LIMIT ?
             ) recent
@@ -1701,10 +1783,11 @@ def _list_messages_for_room(room: str, after: str | None, limit: int) -> dict:
             (safe_room, safe_limit),
         )
     else:
+        adjusted_where = " AND ".join(f"msg.{clause}" if clause in {"room = ?", "id > ?", "created_at > ?", "created_at > to_timestamp(?)"} else clause for clause in where)
         rows = _db_query_all(
             f"""
-            {select_sql.format(where_clause=' AND '.join(where))}
-            ORDER BY id ASC
+            {select_sql.format(where_clause=adjusted_where)}
+            ORDER BY msg.id ASC
             LIMIT ?
             """,
             tuple(params + [safe_limit]),
@@ -1747,10 +1830,14 @@ def list_legacy_global_messages(limit: int = 50, after_id: int | None = None) ->
     if after_id is None:
         rows = _db_query_all(
             """
-            SELECT id, user_id, display_name, message, created_at
-            FROM chat_messages
-            WHERE room = ?
-            ORDER BY id DESC
+            SELECT msg.id, msg.user_id, msg.display_name, msg.message, msg.created_at
+            FROM chat_messages msg
+            JOIN users u ON u.id = msg.user_id
+            WHERE msg.room = ?
+              AND """
+            + _not_blocked_user_sql("u")
+            + """
+            ORDER BY msg.id DESC
             LIMIT ?
             """,
             ("global", safe_limit),
@@ -1759,10 +1846,14 @@ def list_legacy_global_messages(limit: int = 50, after_id: int | None = None) ->
     else:
         rows = _db_query_all(
             """
-            SELECT id, user_id, display_name, message, created_at
-            FROM chat_messages
-            WHERE room = ? AND id > ?
-            ORDER BY id ASC
+            SELECT msg.id, msg.user_id, msg.display_name, msg.message, msg.created_at
+            FROM chat_messages msg
+            JOIN users u ON u.id = msg.user_id
+            WHERE msg.room = ? AND msg.id > ?
+              AND """
+            + _not_blocked_user_sql("u")
+            + """
+            ORDER BY msg.id ASC
             LIMIT ?
             """,
             ("global", max(0, int(after_id)), safe_limit),
@@ -1836,13 +1927,44 @@ def public_chat_summary(
     return _room_summary("global", after=after)
 
 
+@router.get("/live/capabilities")
+def live_capabilities(request: Request, user=Depends(require_user)):
+    user_id = int(user["id"])
+    public_token = _make_live_token(user_id=user_id, stream="public")
+    private_token = _make_live_token(user_id=user_id, stream="private")
+    return {
+        "ok": True,
+        "sse_enabled": True,
+        "public": {
+            "enabled": True,
+            "url": _absolute_live_url(request, "/chat/public/events", live_token=public_token),
+            "stream": "public",
+        },
+        "private": {
+            "enabled": True,
+            "url": _absolute_live_url(request, "/chat/private/events", live_token=private_token),
+            "stream": "private",
+        },
+        "heartbeat_seconds": _SSE_HEARTBEAT_SECONDS,
+        "live_token_ttl_seconds": LIVE_TOKEN_TTL_SECONDS,
+        "recovery": {
+            "last_event_id_header": "Last-Event-ID",
+            "public_summary_url": "/chat/public/summary",
+            "private_summary_url": "/chat/private/summary",
+            "dm_thread_summary_url_template": "/chat/dm/{other_user_id}/summary",
+            "strategy": "Use polling summaries to reconcile after disconnects or reset events.",
+        },
+    }
+
+
 @router.get("/public/events")
 async def public_chat_events(
     request: Request,
     last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
-    user=Depends(require_user),
+    live_token: str | None = Query(default=None),
 ):
-    _ = user
+    del live_token
+    user = _get_live_stream_user(request, stream="public")
     maybe_purge_expired_chat_data()
     return await _stream_live_channel(
         request,
@@ -1851,9 +1973,11 @@ async def public_chat_events(
             "type": "connected",
             "scope": "public_room",
             "room": "global",
+            "auth": "bearer-or-short-lived-live-token",
             "recovery": "last-event-id-and-polling-summary",
         },
         last_event_id=_parse_last_event_id(last_event_id),
+        auth_user_id=int(user["id"]),
     )
 
 
@@ -1883,9 +2007,10 @@ async def room_message_events(
     room: str,
     request: Request,
     last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
-    user=Depends(require_user),
+    live_token: str | None = Query(default=None),
 ):
-    _ = user
+    del live_token
+    user = _get_live_stream_user(request, stream="public")
     maybe_purge_expired_chat_data()
     safe_room = _normalize_room(room)
     return await _stream_live_channel(
@@ -1895,9 +2020,11 @@ async def room_message_events(
             "type": "connected",
             "scope": "public_room",
             "room": safe_room,
+            "auth": "bearer-or-short-lived-live-token",
             "recovery": "last-event-id-and-polling-summary",
         },
         last_event_id=_parse_last_event_id(last_event_id),
+        auth_user_id=int(user["id"]),
     )
 
 
@@ -1978,8 +2105,10 @@ def private_summary(user=Depends(require_user)):
 async def private_summary_events(
     request: Request,
     last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
-    user=Depends(require_user),
+    live_token: str | None = Query(default=None),
 ):
+    del live_token
+    user = _get_live_stream_user(request, stream="private")
     maybe_purge_expired_chat_data()
     user_id = int(user["id"])
     return await _stream_live_channel(
@@ -1989,17 +2118,20 @@ async def private_summary_events(
             "type": "connected",
             "scope": "dm_summary",
             "user_id": user_id,
+            "auth": "bearer-or-short-lived-live-token",
             "recovery": "last-event-id-and-private-summary-polling",
         },
         last_event_id=_parse_last_event_id(last_event_id),
+        auth_user_id=user_id,
     )
 
 
 @router.get("/live/status")
-def live_status(user=Depends(require_user)):
-    _ = user
+def live_status(request: Request, user=Depends(require_user)):
+    capabilities = live_capabilities(request, user)
     return {
         "ok": True,
+        "capabilities": capabilities,
         "sse": {
             "heartbeat_seconds": _SSE_HEARTBEAT_SECONDS,
             "history_limit": _SSE_HISTORY_LIMIT,

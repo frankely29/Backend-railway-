@@ -1,26 +1,44 @@
-# Account Control Semantics
+# ACCOUNT CONTROL SEMANTICS
 
-## Canonical blocked-user rule
-A user is considered **blocked** when either of these flags is active:
-- `is_disabled = true/1`
-- `is_suspended = true/1`
+## Canonical helpers
+The backend now centralizes account blocking state through:
+- `_user_block_state(row)`
+- `_enforce_user_not_blocked(row)`
 
-Runtime enforcement now checks both flags through one canonical helper in `core.py`.
+These helpers treat `is_disabled` and `is_suspended` as the canonical blocked states.
 
-## Meaning of each flag
-- **Disabled**: long-lived/admin account disable. The account cannot log in or use authenticated routes.
-- **Suspended**: temporary/admin suspension. The account cannot log in or use authenticated routes.
+## Deterministic meanings
+### Disabled
+- hard block for authentication and downstream use.
+- login returns `403`.
+- authenticated routes using `require_user` reject the user.
+- profile and DM target lookups treat the user as unavailable.
+- visible map presence is removed.
 
-## Backward compatibility
-- Legacy admin disable behavior is preserved through `POST /admin/users/disable`.
-- Newer admin suspension behavior is preserved through `POST /admin-mutations/users/{user_id}/set-suspended`.
-- Both actions now agree with auth enforcement because authenticated requests and login both use the same blocked-user rule.
+### Suspended
+- same request-time blocking behavior as disabled.
+- visible map presence is removed immediately when the admin mutation is applied.
 
-## Token behavior
-The backend remains stateless for JWTs, but blocked users are denied on every authenticated request because the token is re-checked against the current DB row. This prevents stale tokens from continuing to participate after a disable/suspend action.
+### Ghost mode
+- not a login/auth block.
+- not a DM/public-chat/authentication block by itself.
+- only affects map visibility and presence-delta removal behavior.
 
-## Product-facing behavior
-- Blocked users cannot authenticate successfully.
-- Blocked users cannot continue using `/me`, chat, presence, pickup, leaderboard, or admin-protected authenticated flows.
-- Blocked users are hidden from driver profile lookup and DM target resolution.
-- When a user is disabled or suspended through admin controls, their live presence row is removed to stop map participation immediately.
+## Where these semantics are enforced
+- Bearer auth / `require_user`
+- login flow before token issuance
+- driver profile lookup
+- DM target validation
+- SSE connection auth for public/private live streams
+- presence visibility derivation
+
+## Visibility guarantees
+- blocked users do not receive fresh authenticated access.
+- blocked users do not remain visible on the public presence map.
+- blocked users are filtered out of public-chat history reads.
+- blocked users are filtered out of DM thread directory payloads and cannot be selected as new DM targets.
+
+## Admin downstream behavior
+- suspend: updates `users.is_suspended`, deletes current presence row, writes a `presence_runtime_state` removal reason of `suspended`.
+- disable: updates `users.is_disabled`, deletes current presence row, writes a `presence_runtime_state` removal reason of `disabled`.
+- unsuspend / enable: recomputes visibility from ghost-mode + block state rather than blindly re-showing the user.

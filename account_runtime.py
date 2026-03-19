@@ -79,6 +79,7 @@ def delete_account_runtime_data(user_id: int) -> Dict[str, Any]:
 
             delete_specs = [
                 ("presence", "DELETE FROM presence WHERE user_id=?"),
+                ("presence_runtime_state", "DELETE FROM presence_runtime_state WHERE user_id=?"),
                 ("chat_messages", "DELETE FROM chat_messages WHERE user_id=?"),
                 ("private_chat_messages", "DELETE FROM private_chat_messages WHERE sender_user_id=? OR recipient_user_id=?"),
                 ("events", "DELETE FROM events WHERE user_id=?"),
@@ -110,7 +111,7 @@ def delete_account_runtime_data(user_id: int) -> Dict[str, Any]:
         finally:
             conn.close()
 
-    for relative_path in audio_paths:
+    for relative_path in dict.fromkeys(audio_paths):
         _safe_unlink_audio(relative_path)
     _safe_delete_avatar_assets(uid)
 
@@ -120,5 +121,5 @@ def delete_account_runtime_data(user_id: int) -> Dict[str, Any]:
         "deleted": deleted_counts,
         "anonymized": anonymized_counts,
         "avatar_assets_deleted": True,
-        "chat_audio_deleted": len(audio_paths),
+        "chat_audio_deleted": len(dict.fromkeys(audio_paths)),
     }

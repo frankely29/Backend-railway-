@@ -1,59 +1,152 @@
-# API Contract
+# API CONTRACT
 
-This document marks the hot frontend/backend contracts that must remain backward compatible for the live NYC TLC hotspot system.
+## Auth
+### `POST /auth/signup`
+Creates a user and immediately returns a Bearer token.
 
-## Core map/runtime routes
-- `GET /status` returns health, frame readiness, data paths, and performance metrics.
-- `GET /timeline` returns the persisted 20-minute-bin timeline payload from `frames/timeline.json`.
-- `GET /frame/{idx}` returns a single generated frame payload for the same 20-minute timeline contract.
-- `GET /day_tendency/today` and `GET /day_tendency/date/{ymd}` return the separate day-tendency decision layer.
+### `POST /auth/login`
+Returns a Bearer token unless the user is disabled or suspended, in which case the response is `403`.
 
-## Auth + profile
-- `POST /auth/signup` returns `ok`, `created`, `token`, `id`, `email`, `display_name`, `ghost_mode`, `is_admin`, `trial_expires_at`, and `exp`.
-- `POST /auth/login` returns `ok`, `token`, identity fields, and trial expiry metadata.
-- `GET /me` returns the current identity plus `avatar_thumb_url`, `avatar_version`, `map_identity_mode`, `ghost_mode`, `is_admin`, `trial_expires_at`, and `leaderboard_badge_code`.
-- `POST /me/update`, `POST /me/change_password`, and `POST /me/delete_account` remain available.
-- `GET /drivers/{user_id}/profile` keeps returning the nested `user`, `daily`, `weekly`, `monthly`, `yearly`, and `progression` sections expected by the frontend.
+### `GET /me`
+Returns the authenticated profile, avatar/thumb metadata, ghost mode, admin flag, trial expiry, and best leaderboard badge.
 
 ## Presence
-- `POST /presence/update` still accepts `lat`, `lng`, optional `heading`, and optional `accuracy`.
-- `GET /presence/all` still powers map rendering and keeps `mode=full|lite`, viewport filters, zoom, and limit behavior.
-- `GET /presence/summary` still returns online and ghosted counts for authenticated viewers.
-- Ghost-mode users remain counted in summary while hidden from live rendering payloads.
+### Timestamp and cursor unit
+- Presence delta cursors use **milliseconds**.
+- The documented incremental query parameter is `updated_since_ms`.
 
-## Events + pickup overlay
-- `POST /events/pickup` stays guarded by pickup eligibility logic.
-- `GET /events/pickups/recent` still returns recent points plus zone stats / hotspot attachments used by the overlay.
-- Police event/report routes remain intact.
+### `POST /presence/update`
+Body:
+```json
+{
+  "lat": 40.75,
+  "lng": -73.99,
+  "heading": 90,
+  "accuracy": 5
+}
+```
+Response shape:
+```json
+{
+  "ok": true,
+  "cursor": 1710000000000
+}
+```
 
-## Chat
-- New router contracts remain supported:
-  - `GET/POST /chat/rooms/{room}`
-  - `POST /chat/rooms/{room}/voice`
-  - `GET/POST /chat/dm/{other_user_id}`
-  - `POST /chat/dm/{other_user_id}/voice`
-  - `GET /chat/private/threads`
-  - `GET/POST /chat/private/{other_user_id}`
-  - audio fetch routes under `/chat/audio/*`
-- Legacy contracts remain supported and backward compatible:
-  - `POST /chat/send`
-  - `GET /chat/recent`
-  - `GET /chat/since`
+### `GET /presence/all`
+Compatibility snapshot route. Supports bounds and returns:
+- `items`
+- `online_count`
+- `ghosted_count`
+- `visible_count`
 
-## Leaderboard
-- `GET /leaderboard`
-- `GET /leaderboard/me`
-- `GET /leaderboard/badges/me`
-- `GET /leaderboard/overview/me`
-- `GET /leaderboard/progression/me`
-- `GET /leaderboard/ranks`
+### `GET /presence/viewport`
+Two modes:
+- snapshot when `updated_since_ms` is omitted or `0`
+- delta when `updated_since_ms` is provided
 
-## Admin/ops surface
-- Admin summary, users, live, reports, and system routes remain intact.
-- Admin mutation routes remain intact, including suspend and report clear flows.
-- Admin trips and admin test/diagnostic routes remain intact.
+Shared response fields:
+- `items`
+- `removed`
+- `cursor`
+- `server_time_ms`
+- `online_count`
+- `ghosted_count`
+- `visible_count`
 
-## Compatibility notes
-- SQLite fallback remains supported.
-- Postgres and SQLite continue to use the same `?`-style call sites via the compatibility layer.
-- New cleanup/account-control changes are additive and preserve route availability and payload keys used by the frontend.
+### `GET /presence/delta`
+Parameters:
+- `updated_since_ms`
+- `max_age_sec`
+- `min_lat`
+- `min_lng`
+- `max_lat`
+- `max_lng`
+- `zoom`
+- `include_removed`
+- `limit`
+
+Returns only changed visible rows plus tombstones/removals when requested.
+Removal reasons currently include values such as:
+- `ghost_mode`
+- `disabled`
+- `suspended`
+- `stale`
+- `account_deleted`
+
+### `GET /presence/summary`
+Returns aggregate counts only.
+
+## Public chat
+### Compatibility routes
+- `POST /chat/send`
+- `GET /chat/recent`
+- `GET /chat/since`
+
+### Current room routes
+- `GET /chat/rooms/{room}`
+- `GET /chat/rooms/{room}/summary`
+- `POST /chat/rooms/{room}`
+- `POST /chat/rooms/{room}/voice`
+- `GET /chat/public/summary`
+
+Public chat reads filter out disabled/suspended senders.
+
+## Private / DM chat
+- `GET /chat/dm/{other_user_id}`
+- `GET /chat/dm/{other_user_id}/summary`
+- `POST /chat/dm/{other_user_id}`
+- `POST /chat/dm/{other_user_id}/voice`
+- `GET /chat/private/threads`
+- `GET /chat/private/summary`
+- `GET /chat/private/{other_user_id}`
+- `POST /chat/private/{other_user_id}`
+- `POST /chat/private/{other_user_id}/voice`
+
+DM targets must exist and must not be disabled/suspended.
+
+## Safe Phase 2 live chat
+### `GET /chat/live/capabilities`
+Requires normal Bearer auth and returns:
+```json
+{
+  "ok": true,
+  "sse_enabled": true,
+  "public": { "enabled": true, "url": "https://.../chat/public/events?live_token=...", "stream": "public" },
+  "private": { "enabled": true, "url": "https://.../chat/private/events?live_token=...", "stream": "private" },
+  "heartbeat_seconds": 15,
+  "live_token_ttl_seconds": 300,
+  "recovery": {
+    "last_event_id_header": "Last-Event-ID",
+    "public_summary_url": "/chat/public/summary",
+    "private_summary_url": "/chat/private/summary",
+    "dm_thread_summary_url_template": "/chat/dm/{other_user_id}/summary"
+  }
+}
+```
+
+### SSE auth rules
+The SSE endpoints accept either:
+- a normal `Authorization: Bearer ...` header, or
+- a short-lived `live_token` query param generated by `/chat/live/capabilities`.
+
+The long-lived login token is **not** intended to be placed directly into EventSource query strings.
+
+### `GET /chat/public/events`
+Public/global live stream emitting compact `chat.message` events.
+
+### `GET /chat/private/events`
+Per-user DM summary stream emitting compact `dm.thread_updated` and `dm.unread_changed` events.
+
+### `GET /chat/rooms/{room}/events`
+Room-specific additive stream; available but not required for the main frontend contract.
+
+## Other active frontend-facing routes
+- `GET /timeline`
+- `GET /frame/{idx}`
+- `GET /day_tendency/today`
+- `GET /avatars/thumb/{user_id}`
+- `GET /drivers/{user_id}/profile`
+- `/leaderboard/...`
+- pickup overlay/report endpoints
+- police report endpoints
