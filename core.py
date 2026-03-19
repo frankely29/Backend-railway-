@@ -10,12 +10,22 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
-import psycopg2
-from psycopg2.extras import RealDictCursor
-from psycopg2.pool import ThreadedConnectionPool
+try:
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+    from psycopg2.pool import ThreadedConnectionPool
+except ImportError:  # pragma: no cover - exercised in runtime/test import permutations
+    psycopg2 = None
+    RealDictCursor = None
+    ThreadedConnectionPool = None
 from fastapi import HTTPException, Request
+
+if TYPE_CHECKING:
+    from psycopg2.pool import ThreadedConnectionPool as _ThreadedConnectionPool
+else:
+    _ThreadedConnectionPool = Any
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 COMMUNITY_DB_PATH = Path(os.environ.get("COMMUNITY_DB", str(DATA_DIR / "community.db")))
@@ -26,6 +36,7 @@ TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "7"))
 ENFORCE_TRIAL = str(os.environ.get("ENFORCE_TRIAL", "0")).strip().lower() in ("1", "true", "yes", "on")
 POSTGRES_POOL_MIN = max(1, int(os.environ.get("POSTGRES_POOL_MIN", "1")))
 POSTGRES_POOL_MAX = max(POSTGRES_POOL_MIN, int(os.environ.get("POSTGRES_POOL_MAX", "12")))
+LIVE_TOKEN_TTL_SECONDS = max(30, int(os.environ.get("LIVE_TOKEN_TTL_SECONDS", "300")))
 
 
 class _DynamicDBLock:
@@ -45,11 +56,11 @@ class _DynamicDBLock:
 
 _db_lock = _DynamicDBLock()
 _postgres_pool_lock = threading.Lock()
-_postgres_pool: Optional[ThreadedConnectionPool] = None
+_postgres_pool: Optional[_ThreadedConnectionPool] = None
 
 
 class _PooledPostgresConnection:
-    def __init__(self, conn, pool: ThreadedConnectionPool):
+    def __init__(self, conn, pool: _ThreadedConnectionPool):
         self._conn = conn
         self._pool = pool
         self._closed = False
@@ -64,8 +75,17 @@ class _PooledPostgresConnection:
         return getattr(self._conn, item)
 
 
-def _postgres_conn_pool() -> ThreadedConnectionPool:
+def _require_psycopg2_for_postgres() -> None:
+    if psycopg2 is None or ThreadedConnectionPool is None or RealDictCursor is None:
+        raise RuntimeError(
+            "Postgres mode requires psycopg2 to be installed. Either install psycopg2/psycopg2-binary "
+            "or unset DATABASE_URL/POSTGRES_URL to use SQLite mode."
+        )
+
+
+def _postgres_conn_pool() -> _ThreadedConnectionPool:
     global _postgres_pool
+    _require_psycopg2_for_postgres()
     if _postgres_pool is not None:
         return _postgres_pool
     with _postgres_pool_lock:
@@ -82,6 +102,7 @@ def _postgres_conn_pool() -> ThreadedConnectionPool:
 def _db():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     if DB_BACKEND == "postgres":
+        _require_psycopg2_for_postgres()
         pool = _postgres_conn_pool()
         conn = pool.getconn()
         return _PooledPostgresConnection(conn, pool)
@@ -306,3 +327,32 @@ def _make_token(payload: Dict[str, Any]) -> str:
     msg = f"{h}.{p}".encode("utf-8")
     s = _sign(msg)
     return f"{h}.{p}.{s}"
+
+
+def _make_live_token(*, user_id: int, stream: str, ttl_seconds: Optional[int] = None) -> str:
+    now = int(time.time())
+    exp = now + int(ttl_seconds or LIVE_TOKEN_TTL_SECONDS)
+    return _make_token(
+        {
+            "typ": "live",
+            "uid": int(user_id),
+            "scope": str(stream).strip().lower(),
+            "iat": now,
+            "exp": exp,
+        }
+    )
+
+
+def _verify_live_token(token: str, *, expected_stream: Optional[str] = None) -> Dict[str, Any]:
+    payload = _verify_token(token)
+    if str(payload.get("typ") or "").strip().lower() != "live":
+        raise HTTPException(status_code=401, detail="Invalid live token")
+    scope = str(payload.get("scope") or "").strip().lower()
+    if not scope:
+        raise HTTPException(status_code=401, detail="Invalid live token")
+    if expected_stream and scope != str(expected_stream).strip().lower():
+        raise HTTPException(status_code=403, detail="Live token scope mismatch")
+    uid = int(payload.get("uid", 0) or 0)
+    if uid <= 0:
+        raise HTTPException(status_code=401, detail="Invalid live token")
+    return payload

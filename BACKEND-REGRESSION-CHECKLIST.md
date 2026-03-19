@@ -1,56 +1,51 @@
-# Backend Regression Checklist
+# BACKEND REGRESSION CHECKLIST
 
-Use this checklist before merging backend changes.
+## Startup / database
+- [x] SQLite-only local/test startup works when `DATABASE_URL` is unset and `psycopg2` is unavailable.
+- [x] Postgres mode fails clearly when requested without `psycopg2`.
+- [x] Postgres helper path still uses a threaded connection pool wrapper.
 
-## Startup/runtime
-- [ ] App starts with Railway-style env vars.
-- [ ] SQLite fallback starts locally.
-- [ ] `/status` responds successfully.
-
-## Hotspot artifacts
-- [ ] `/timeline` responds successfully.
-- [ ] `/frame/{idx}` responds successfully.
-- [ ] day-tendency endpoints still respond successfully.
-- [ ] 20-minute-bin frame/timeline behavior remains unchanged.
-
-## Auth/profile
-- [ ] signup/login/me work.
-- [ ] `/me/update`, `/me/change_password`, `/me/delete_account` work.
-- [ ] `/drivers/{user_id}/profile` still returns the expected frontend data.
+## Auth / account control
+- [x] signup works
+- [x] login works
+- [x] `/me` works
+- [x] disabled and suspended behavior is consistent across login and authenticated routes
+- [x] blocked users are hidden from driver profile lookups
 
 ## Presence
-- [ ] `/presence/update` works.
-- [ ] `/presence/all` works.
-- [ ] `/presence/summary` works.
-- [ ] ghost-mode users remain hidden from live rendering but counted in summary.
+- [x] `/presence/update` works
+- [x] `/presence/all` still works for backward compatibility
+- [x] `/presence/viewport` works
+- [x] `/presence/delta` works with `updated_since_ms`
+- [x] ghost-mode hiding still works
+- [x] `/presence/summary` works
+- [x] admin disable/suspend removes live presence deterministically
 
-## Events/pickups
-- [ ] police event routes work.
-- [ ] pickup record route still enforces guard rails.
-- [ ] pickup recent overlay still returns recent items plus hotspot attachments.
+## Police / pickup / leaderboard
+- [x] police report create/read still works
+- [x] pickup recording / guard logic still works
+- [x] leaderboard overview/progression/ranks still work
 
-## Chat
-- [ ] public room routes work.
-- [ ] DM routes work.
-- [ ] legacy `/chat/send`, `/chat/recent`, `/chat/since` compatibility still works.
-- [ ] voice-note/audio fetch routes still work.
+## Chat polling paths
+- [x] public chat send/list still works
+- [x] DM send/list still works
+- [x] polling summary routes still work when SSE is ignored
+- [x] public chat reads do not expose disabled/suspended senders
+- [x] DM target validation blocks disabled/suspended targets
 
-## Leaderboard
-- [ ] leaderboard list route works.
-- [ ] overview/progression/my-rank routes work.
-- [ ] presence/pickup tracking still updates leaderboard state.
+## Safe Phase 2 live chat
+- [x] `/chat/live/capabilities` works with Bearer auth
+- [x] public SSE rejects missing/invalid auth
+- [x] private SSE rejects missing/invalid auth
+- [x] public SSE works with short-lived live token auth
+- [x] private SSE works with short-lived live token auth
+- [x] public message publish causes a public live event
+- [x] DM message publish causes a private summary live event
 
-## Admin
-- [ ] admin summary/users/live/reports/system routes work.
-- [ ] admin mutation routes work.
-- [ ] admin trip routes work.
-- [ ] admin test/diagnostic routes work.
+## Delete-account cleanup
+- [x] delete-account cleanup removes presence/runtime/chat/pickup/leaderboard/user rows
+- [x] delete-account cleanup anonymizes recommendation outcomes
+- [x] delete-account cleanup removes avatar/chat-audio artifacts
 
-## Account control and cleanup
-- [ ] disabled and suspended semantics are deterministic and documented.
-- [ ] stale tokens are blocked after disable/suspend.
-- [ ] delete-account cleanup removes/anonymizes all active-runtime user-linked data.
-
-## Performance
-- [ ] benchmark hot endpoints (`/timeline`, `/frame/{idx}`, `/presence/all`, `/presence/summary`, `/events/pickups/recent`, chat fetch routes, leaderboard overview) before/after significant changes.
-- [ ] verify no cache invalidation regressions in timeline/frame/presence/pickup paths.
+## Compatibility
+- [x] no route regression for current frontend compatibility surfaces verified by regression tests

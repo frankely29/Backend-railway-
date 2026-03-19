@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import asyncio
+import builtins
 import importlib
 import json
 import os
@@ -9,6 +10,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
 from fastapi.testclient import TestClient
@@ -62,6 +64,7 @@ def _auth_headers(token: str) -> dict[str, str]:
 
 
 def _make_request(path: str) -> Request:
+    raw_path, _, query = path.partition("?")
     async def _receive():
         return {"type": "http.request", "body": b"", "more_body": False}
 
@@ -71,9 +74,9 @@ def _make_request(path: str) -> Request:
             "http_version": "1.1",
             "method": "GET",
             "scheme": "http",
-            "path": path,
-            "raw_path": path.encode("utf-8"),
-            "query_string": b"",
+            "path": raw_path,
+            "raw_path": raw_path.encode("utf-8"),
+            "query_string": query.encode("utf-8"),
             "headers": [],
             "client": ("testclient", 50000),
             "server": ("testserver", 80),
@@ -92,6 +95,100 @@ def _seed_avatar_png(main_module, user_id: int) -> None:
         "UPDATE users SET avatar_url=?, avatar_version=? WHERE id=?",
         (avatar_data_url, version, int(user_id)),
     )
+
+
+def _reload_module_without_psycopg2(monkeypatch, *, postgres_url: str | None = None):
+    temp_dir = tempfile.TemporaryDirectory(prefix="backend-core-import-")
+    data_dir = Path(temp_dir.name)
+    monkeypatch.setenv("DATA_DIR", str(data_dir))
+    monkeypatch.setenv("COMMUNITY_DB", str(data_dir / "community.db"))
+    monkeypatch.setenv("JWT_SECRET", "test-jwt-secret-abcdefghijklmnopqrstuvwxyz")
+    if postgres_url:
+        monkeypatch.setenv("DATABASE_URL", postgres_url)
+    else:
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+        monkeypatch.delenv("POSTGRES_URL", raising=False)
+
+    real_import = builtins.__import__
+
+    def _blocked_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "psycopg2" or name.startswith("psycopg2."):
+            raise ImportError("blocked for sqlite fallback test")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", _blocked_import)
+    sys.modules.pop("core", None)
+    module = importlib.import_module("core")
+    return module, temp_dir
+
+
+def test_sqlite_core_import_works_without_psycopg2(monkeypatch):
+    core, temp_dir = _reload_module_without_psycopg2(monkeypatch, postgres_url=None)
+    try:
+        assert core.DB_BACKEND == "sqlite"
+        conn = core._db()
+        conn.close()
+        assert core._db_query_one("SELECT 1 AS v")["v"] == 1
+    finally:
+        temp_dir.cleanup()
+
+
+def test_postgres_mode_without_psycopg2_fails_clearly(monkeypatch):
+    core, temp_dir = _reload_module_without_psycopg2(monkeypatch, postgres_url="postgresql://example/test")
+    try:
+        assert core.DB_BACKEND == "postgres"
+        with pytest.raises(RuntimeError, match="Postgres mode requires psycopg2"):
+            core._db()
+    finally:
+        temp_dir.cleanup()
+
+
+def test_postgres_pooling_path_uses_threaded_pool_when_available(monkeypatch):
+    temp_dir = tempfile.TemporaryDirectory(prefix="backend-core-postgres-pool-")
+    data_dir = Path(temp_dir.name)
+    monkeypatch.setenv("DATA_DIR", str(data_dir))
+    monkeypatch.setenv("COMMUNITY_DB", str(data_dir / "community.db"))
+    monkeypatch.setenv("JWT_SECRET", "test-jwt-secret-abcdefghijklmnopqrstuvwxyz")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://example/test")
+    sys.modules.pop("core", None)
+    core = importlib.import_module("core")
+
+    class FakeConnection:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    class FakePool:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.gotten = []
+            self.returned = []
+
+        def getconn(self):
+            conn = FakeConnection()
+            self.gotten.append(conn)
+            return conn
+
+        def putconn(self, conn):
+            self.returned.append(conn)
+
+    try:
+        monkeypatch.setattr(core, "psycopg2", object())
+        monkeypatch.setattr(core, "RealDictCursor", object())
+        monkeypatch.setattr(core, "ThreadedConnectionPool", FakePool)
+        core._postgres_pool = None
+        conn = core._db()
+        try:
+            assert isinstance(conn, core._PooledPostgresConnection)
+            assert conn._pool.kwargs["dsn"] == "postgresql://example/test"
+        finally:
+            conn.close()
+        assert len(conn._pool.gotten) == 1
+        assert conn._pool.returned == conn._pool.gotten
+    finally:
+        temp_dir.cleanup()
 
 
 def test_auth_presence_chat_leaderboard_admin_and_delete_account(app_env):
@@ -371,18 +468,39 @@ def test_chat_sse_requires_auth_and_reports_status(app_env):
     live_status = client.get("/chat/live/status", headers=alice_headers)
     assert live_status.status_code == 200
     assert live_status.json()["sse"]["heartbeat_seconds"] >= 1
+    capabilities = client.get("/chat/live/capabilities", headers=alice_headers)
+    assert capabilities.status_code == 200
+    capabilities_payload = capabilities.json()
+    assert capabilities_payload["public"]["enabled"] is True
+    assert capabilities_payload["private"]["enabled"] is True
+    assert capabilities_payload["live_token_ttl_seconds"] >= 30
 
     chat_module = sys.modules["chat"]
-    user_row = chat_module._db_query_one("SELECT * FROM users WHERE id=? LIMIT 1", (int(alice["id"]),))
+    public_parts = urlsplit(capabilities_payload["public"]["url"])
     public_response = asyncio.run(
-        chat_module.public_chat_events(_make_request("/chat/public/events"), None, user=user_row)
+        chat_module.public_chat_events(
+            _make_request(public_parts.path + "?" + public_parts.query),
+            None,
+            public_parts.query.split("live_token=", 1)[1],
+        )
     )
     assert public_response.media_type == "text/event-stream"
 
+    private_parts = urlsplit(capabilities_payload["private"]["url"])
     private_response = asyncio.run(
-        chat_module.private_summary_events(_make_request("/chat/private/events"), None, user=user_row)
+        chat_module.private_summary_events(
+            _make_request(private_parts.path + "?" + private_parts.query),
+            None,
+            private_parts.query.split("live_token=", 1)[1],
+        )
     )
     assert private_response.media_type == "text/event-stream"
+
+    invalid_public = client.get("/chat/public/events?live_token=bad-token")
+    assert invalid_public.status_code == 401
+
+    invalid_private = client.get("/chat/private/events?live_token=bad-token")
+    assert invalid_private.status_code == 401
 
 
 def test_public_chat_sse_delivers_new_message_and_replay(app_env):

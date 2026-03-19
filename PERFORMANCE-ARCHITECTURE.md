@@ -1,112 +1,73 @@
-# Performance Architecture
+# PERFORMANCE ARCHITECTURE
 
-## Runtime audited before this pass
+## Active database spine
+- The backend supports two runtime modes selected at import time from `DATABASE_URL` / `POSTGRES_URL`:
+  - `sqlite` when neither environment variable is present.
+  - `postgres` when either environment variable is present.
+- SQLite uses a process-local serialized lock around every DB helper call.
+- Postgres uses `psycopg2.pool.ThreadedConnectionPool` through the shared `_db()` helper so existing callers keep the same helper signatures while avoiding a fresh connection per query.
+- SQL placeholder translation still flows through `_sql()` so callers continue to write `?` placeholders even in Postgres mode.
 
-### Active auth / account runtime
-- `POST /auth/signup`, `POST /auth/login`, `GET /me`, `POST /me/update`, `POST /me/change_password`, `POST /me/delete_account` are live in `main.py`.
-- `GET /drivers/{user_id}/profile` is the active profile lookup path.
-- Disabled and suspended users are rejected during authenticated access through shared auth helpers; profile lookups return `404` for blocked targets.
-
-### Active presence runtime
-- Presence write: `POST /presence/update`.
-- Full presence read / compatibility snapshot: `GET /presence/all`.
-- Online summary: `GET /presence/summary`.
-- Legacy SQLAlchemy-only presence module also contains `POST /presence/update` and `GET /presence/nearby` in `presence.py`, but the active FastAPI app uses the `main.py` routes.
-
-### Active chat runtime
-- Legacy global chat compatibility routes in `main.py`: `POST /chat/send`, `GET /chat/recent`, `GET /chat/since`.
-- Active room chat routes in `chat.py`: `GET /chat/rooms/{room}`, `POST /chat/rooms/{room}`, `POST /chat/rooms/{room}/voice`.
-- Active DM compatibility routes in `chat.py`: `GET /chat/dm/{other_user_id}`, `POST /chat/dm/{other_user_id}`, `POST /chat/dm/{other_user_id}/voice`.
-- Active private-thread routes in `chat.py`: `GET /chat/private/threads`, `GET /chat/private/{other_user_id}`, `POST /chat/private/{other_user_id}`, `POST /chat/private/{other_user_id}/voice`.
-- Before this pass there were no dedicated lightweight public unread or DM inbox summary endpoints.
-
-### Active hotspot / timeline runtime
-- `GET /timeline` and `GET /frame/{idx}` serve prebuilt frame artifacts.
-- `GET /day_tendency/today` and `GET /day_tendency/date/{ymd}` serve day tendency artifacts.
-- `GET /events/pickups/recent` is the active pickup / hotspot overlay read path.
-
-### Active pickup / save runtime
-- `POST /events/pickup` forwards to pickup record creation.
-- Pickup guard / save logic lives in `pickup_recording_feature.py` and is initialized at startup.
-- Admin pickup recording tools remain live under `/admin/pickup-recording/...`.
-
-### Active admin / moderation runtime
-- Legacy admin disable and password reset routes remain live in `main.py`: `POST /admin/users/disable`, `POST /admin/users/reset_password`.
-- Current admin read tools remain live in `admin_routes.py` under `/admin/...`.
-- Current admin mutation tools remain live in `admin_mutation_routes.py` under `/admin/users/{user_id}/set-admin`, `/admin/users/{user_id}/set-suspended`, and report clear paths.
-
-### Current delete-account cleanup path
-- `POST /me/delete_account` calls `delete_account_runtime_data()`.
-- Cleanup deletes presence, public chat rows, private chat rows, events, pickup logs, pickup guard state, driver work state, daily stats, leaderboard badges, and the user row; recommendation outcomes are anonymized; avatar thumbs and chat audio files are removed from storage.
-
-### DB helper / connection behavior audited
-- `core.py` uses per-call SQLite connections guarded by a re-entrant lock.
-- When `DATABASE_URL` / `POSTGRES_URL` is present, `core.py` uses a shared `ThreadedConnectionPool` and returns pooled connections.
-- Query helpers `_db_exec`, `_db_query_one`, and `_db_query_all` open a connection per operation and close / return it immediately.
-
-## Hot paths identified
-1. Presence writes through `POST /presence/update`.
-2. Full or viewport presence reads through `GET /presence/all`.
-3. Presence summary reads through `GET /presence/summary`.
-4. Global room history polling through `/chat/recent`, `/chat/since`, and `/chat/rooms/{room}`.
-5. Private thread list polling through `/chat/private/threads`.
-6. DM thread polling through `/chat/dm/{other_user_id}` and `/chat/private/{other_user_id}`.
-7. Pickup overlay reads through `GET /events/pickups/recent`.
-8. Timeline / frame artifact serving through `GET /timeline` and `GET /frame/{idx}`.
-
-## Compatibility / legacy routes kept live
-- `POST /chat/send`, `GET /chat/recent`, and `GET /chat/since` remain intact for legacy frontend behavior.
-- `GET /presence/all` remains the full compatibility route.
-- Existing room chat, DM, profile, pickup, leaderboard, and admin routes remain live.
-- No legacy frontend route was removed in this pass.
-
-## Optimized routes added in this pass
-
+## Hot paths
 ### Presence
-- `GET /presence/viewport`
-  - Additive optimized presence snapshot endpoint.
-  - Supports viewport bounds, zoom-based buffering, optional padding, optional limit, and optional delta mode via `updated_since_ms`.
-- `GET /presence/delta`
-  - Additive optimized delta endpoint.
-  - Supports `updated_since_ms`, viewport filtering, removed/tombstone payloads, compact marker payloads, and stable server cursors.
+- `POST /presence/update` writes a single `presence` row, updates `presence_runtime_state`, records leaderboard heartbeat data, and updates pickup-guard movement state.
+- `GET /presence/all` remains the compatibility route.
+- `GET /presence/viewport` serves viewport snapshots and can switch into delta mode when `updated_since_ms` is supplied.
+- `GET /presence/delta` reads only changed rows from `presence_runtime_state` and returns `items`, `removed`, `cursor`, `server_time_ms`, `online_count`, `ghosted_count`, and `visible_count`.
+- `GET /presence/summary` reads aggregate counts only.
+- `presence_runtime_state.changed_at_ms` is the delta cursor in milliseconds.
 
-### Chat lightweight summary / unread paths
-- `GET /chat/public/summary`
-  - Global public chat unread/check-since summary.
-- `GET /chat/rooms/{room}/summary`
-  - Room-level public chat unread/check-since summary.
-- `GET /chat/private/summary`
-  - Inbox summary with total unread and per-thread minimal metadata.
-- `GET /chat/dm/{other_user_id}/summary`
-  - DM thread-level latest message and unread/check-since metadata.
+### Chat
+- Public chat remains DB-backed with additive in-process SSE fanout.
+- Writes always persist first, then publish a compact live event.
+- Live event broker keeps:
+  - bounded per-subscriber queues,
+  - bounded replay history,
+  - disconnect cleanup via unsubscribe in the generator `finally` block.
+- SSE is additive only; polling routes remain the fallback.
 
-## Query / schema optimizations in this pass
-- Added `presence_runtime_state` to track additive presence cursors and removals without breaking existing presence rows.
-- Added presence indexes for `(updated_at, user_id)` plus `(updated_at, lat, lng)` to support freshness-first and viewport-filtered reads.
-- Added chat indexes for room + created ordering and sender/recipient recent lookups.
-- Added pickup `user_id + created_at` index.
-- Added leaderboard `nyc_date + user_id`, `user_id + updated_at`, and `driver_work_state.updated_at` indexes.
-- Reused existing artifact caching / gzip paths for timeline and frame serving; no breaking contract changes were introduced there.
+### Pickup / leaderboard / admin
+- Pickup guard logic uses `pickup_guard_state` plus recent pickup log lookups.
+- Leaderboard progression and badge reads flow from `driver_daily_stats`, `driver_work_state`, and `leaderboard_badges_current`.
+- Admin summary endpoints aggregate directly from active runtime tables.
 
-## Presence correctness rules preserved
-- Self presence writes are still accepted through the existing write path.
-- Ghost mode users stay hidden from map-visible presence payloads.
-- Ghost mode users still contribute to online summary counts when their presence row is fresh.
-- Disabled / suspended users are removed from map presence and blocked from authenticated runtime access.
-- Delta payloads return tombstones for ghosting, moderation removals, deletes, and viewport exits after a tracked change.
+## Active indexes and hot-table coverage
+- Presence:
+  - `presence(updated_at)`
+  - `presence(updated_at DESC, user_id)`
+  - `presence(updated_at DESC, lat, lng)`
+  - `presence_runtime_state(changed_at_ms DESC, user_id)`
+- Public chat:
+  - `chat_messages(id)`
+  - `chat_messages(room, id)`
+  - `chat_messages(created_at)`
+  - `chat_messages(room, created_at DESC, id DESC)`
+- Private chat:
+  - `private_chat_messages(sender_user_id, recipient_user_id, created_at, id)`
+  - `private_chat_messages(created_at)`
+  - `private_chat_messages(sender_user_id, created_at DESC, id DESC)`
+  - `private_chat_messages(recipient_user_id, created_at DESC, id DESC)`
+  - `private_chat_messages(recipient_user_id, sender_user_id, read_at)`
+- Pickup:
+  - `pickup_logs(created_at DESC)`
+  - `pickup_logs(zone_id, created_at DESC)`
+  - `pickup_logs(user_id, created_at DESC)`
+- Recommendation outcomes:
+  - `recommendation_outcomes(recommended_at DESC)`
+- Leaderboard:
+  - `leaderboard_badges_current(user_id, is_current, period, metric)`
+  - `driver_daily_stats(nyc_date, user_id)`
+  - `driver_daily_stats(user_id, updated_at DESC)`
+  - `driver_work_state(updated_at DESC)`
 
-## Chat correctness rules preserved
-- Existing full history endpoints remain the source for open room / thread views.
-- New summary endpoints only add lightweight unread / latest-message metadata.
-- DM target validation still rejects disabled / suspended users.
-- Existing message identity, ordering, and timestamps are preserved.
+## Caching and bounded runtime state
+- Presence viewport responses are short-lived cached snapshots keyed by viewport inputs.
+- Pickup recent overlays and pickup hotspot bundles use in-memory TTL caches.
+- Timeline and frame artifacts use small in-process caches.
+- Live SSE replay is intentionally short and bounded; clients are expected to reconcile with summary routes after resets or reconnect gaps.
 
-## SSE status
-- SSE was intentionally deferred in this pass to avoid a risky deployment-level rewrite.
-- The new summary helpers and stable cursor-style lightweight endpoints create a cleaner boundary for a future SSE layer without requiring another large backend refactor.
-
-## Fallback compatibility guarantees
-- Frontend clients can continue using old presence and chat routes unchanged.
-- New optimized routes are additive and optional.
-- Presence delta / viewport payloads are compact but do not alter the legacy snapshot response contract.
-- Moderation, ghost mode, delete-account cleanup, pickup recording, profile, leaderboard, and admin flows remain on their current routes.
+## Diagnostic helpers
+- `scripts/benchmark_hot_endpoints.py` provides reproducible timing checks for hot HTTP routes.
+- `scripts/load_test_presence.py` exercises presence update/read behavior.
+- `scripts/chat_voice_sanity.py` validates chat voice-note paths.
+- `/admin/performance/metrics` exposes server-side counters for cache/gzip behavior.

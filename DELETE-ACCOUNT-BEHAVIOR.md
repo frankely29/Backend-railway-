@@ -1,11 +1,15 @@
-# Delete Account Behavior
+# DELETE ACCOUNT BEHAVIOR
 
-`POST /me/delete_account` now performs comprehensive active-runtime cleanup inside one DB transaction, followed by filesystem cleanup.
+## Route
+- `POST /me/delete_account`
+- Requires authenticated, non-blocked user access.
 
-## Deleted rows
-When the corresponding table exists, the backend deletes user-linked rows from:
-- `users`
+## Runtime policy implemented now
+This endpoint performs runtime cleanup rather than silently deleting only the user row.
+
+## Deleted DB data
 - `presence`
+- `presence_runtime_state`
 - `chat_messages`
 - `private_chat_messages`
 - `events`
@@ -14,26 +18,25 @@ When the corresponding table exists, the backend deletes user-linked rows from:
 - `driver_work_state`
 - `driver_daily_stats`
 - `leaderboard_badges_current`
+- `users`
 
-## Anonymized rows
-To preserve aggregate recommendation analytics without keeping the user identity attached:
-- `recommendation_outcomes.user_id` is set to `NULL` for the deleted user.
+## Anonymized DB data
+- `recommendation_outcomes.user_id` is set to `NULL` when present.
 
-## Filesystem cleanup
-After DB commit, the backend removes:
-- stored chat audio files owned by public/private messages deleted for the user
-- avatar thumbnail files under `DATA_DIR/avatar_thumbs/{user_id}`
+## Deleted filesystem/runtime artifacts
+- avatar thumbnails under `DATA_DIR/avatar_thumbs/{user_id}`
+- owned chat audio files referenced by deleted public/private chat rows
 
-## Intentional non-actions
-- `leaderboard_badges_refresh_state` is not user-linked and is left intact.
-- hotspot experiment bin tables are aggregate/system tables and are left intact.
+## Presence side effects
+Before deleting rows, the backend writes a `presence_runtime_state` tombstone with reason `account_deleted` so delta clients can remove the user deterministically.
 
-## Response shape
-The route still returns `ok: true`, and now also returns a nested `cleanup` object with:
-- `user_id`
-- `deleted` row counts by table
-- `anonymized` row counts by table
+## Result shape
+The route returns a cleanup summary containing:
+- `deleted` counts by table
+- `anonymized` counts by table
 - `avatar_assets_deleted`
 - `chat_audio_deleted`
 
-This addition is backward compatible because the original top-level success flag remains unchanged.
+## Current non-goals
+- This pass does not rewrite historical product policy beyond runtime correctness.
+- Non-user-keyed aggregate state such as global refresh markers is not touched.

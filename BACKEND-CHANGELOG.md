@@ -1,23 +1,38 @@
-# Backend Changelog
+# BACKEND CHANGELOG
 
-## 2026-03-19
+## Current pass: clean Phase 1 + safe Phase 2
 
-### Performance and scalability
-- Reworked `core.py` so SQLite keeps serialized access while Postgres uses a thread-safe connection pool instead of opening a brand-new connection for every single query.
-- Preserved the existing helper signatures and `?` placeholder translation used across the codebase.
+### Database/runtime spine
+- Made `psycopg2` optional for SQLite-only imports and startup.
+- Added a clear Postgres-only runtime error when Postgres mode is requested without `psycopg2`.
+- Kept helper signatures `_db`, `_db_exec`, `_db_query_one`, `_db_query_all`, and `_sql` intact.
+- Kept Postgres pooling on the shared `ThreadedConnectionPool` path.
 
-### Correctness and consistency
-- Added one canonical blocked-user rule in `core.py` so login and authenticated routes agree on disabled vs suspended behavior.
-- Updated driver-profile and DM-target checks to respect the same blocked-user rule.
-- Made admin disable flow clear presence immediately, matching suspension behavior.
+### Account control
+- Preserved the canonical `_user_block_state` / `_enforce_user_not_blocked` helpers as the single source of disabled/suspended truth.
+- Extended blocked-user enforcement to the new SSE auth path and to chat/profile visibility paths.
 
-### Delete-account safety
-- Added `account_runtime.py` to perform comprehensive active-runtime cleanup and recommendation anonymization.
-- Extended `/me/delete_account` to return cleanup details while preserving `ok: true`.
+### Presence
+- Kept `/presence/all` for backward compatibility.
+- Preserved and documented `/presence/viewport`, `/presence/delta`, and `/presence/summary`.
+- Kept delta cursors in milliseconds via `presence_runtime_state.changed_at_ms`.
+- Preserved ghost-mode hiding semantics and deterministic removal reasons.
 
-### Chat consolidation
-- Reused `chat.py` helper logic for legacy global chat send/recent/since routes to reduce drift between the legacy and current chat paths.
+### Delete-account cleanup
+- Expanded runtime cleanup to include `presence_runtime_state` along with chat, pickup, leaderboard, and generated assets.
+- Deduplicated filesystem chat-audio cleanup accounting.
 
-### Regression coverage and docs
-- Added targeted regression tests for auth, presence, chat, leaderboard, admin routes, pickup guard evaluation, and delete-account cleanup.
-- Added active-runtime/API/account-control/delete-account documentation.
+### Safe Phase 2 live chat
+- Added `/chat/live/capabilities` as the frontend-safe entry point for live-chat discovery.
+- Added short-lived signed `live_token` URLs for EventSource usage.
+- Updated public/private SSE endpoints to accept either Bearer auth or short-lived live tokens.
+- Kept polling routes unchanged as the supported fallback.
+- Preserved the existing in-process bounded SSE broker and replay behavior.
+
+### Regression coverage
+- Added focused tests for:
+  - SQLite import/startup without `psycopg2`
+  - Postgres-mode clear failure without `psycopg2`
+  - Postgres pool wrapper path
+  - live capabilities route
+  - live-token SSE auth contract
