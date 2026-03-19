@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hmac
 import hashlib
+import gzip
 import json
 import math
 import os
@@ -17,22 +18,29 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Depends
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Depends, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from pyproj import Transformer
 from shapely.geometry import MultiPolygon, Point, Polygon, mapping, shape
 from shapely.ops import transform, unary_union
+from starlette.middleware.base import BaseHTTPMiddleware
 
-from build_hotspot import ensure_zones_geojson, build_hotspots_frames
-from build_day_tendency import build_day_tendency_model
 from hotspot_experiments import (
     log_recommendation_outcome,
     log_zone_bins,
     prune_experiment_tables,
 )
 from hotspot_scoring import score_zones
+from avatar_assets import (
+    AVATAR_THUMB_MIME,
+    avatar_thumb_path,
+    avatar_thumb_url,
+    avatar_version_for_data_url,
+    normalize_avatar_data_url,
+    persist_avatar_thumb,
+)
 from admin_routes import router as admin_router
 from admin_mutation_routes import router as admin_mutation_router
 from admin_test_routes import router as admin_test_router
@@ -84,6 +92,11 @@ PRESENCE_STALE_SECONDS = int(os.environ.get("PRESENCE_STALE_SECONDS", "300"))  #
 EVENT_DEFAULT_WINDOW_SECONDS = int(os.environ.get("EVENT_DEFAULT_WINDOW_SECONDS", str(24 * 3600)))  # 24h
 MAX_AVATAR_DATA_URL_LENGTH = int(os.environ.get("MAX_AVATAR_DATA_URL_LENGTH", "20000"))
 ALLOWED_MAP_IDENTITY_MODES = {"name", "avatar"}
+RESPONSE_GZIP_MIN_BYTES = int(os.environ.get("RESPONSE_GZIP_MIN_BYTES", "1024"))
+PRESENCE_VIEWPORT_CACHE_TTL_SECONDS = float(os.environ.get("PRESENCE_VIEWPORT_CACHE_TTL_SECONDS", "3"))
+PRESENCE_VIEWPORT_CACHE_MAX = int(os.environ.get("PRESENCE_VIEWPORT_CACHE_MAX", "128"))
+AVATAR_THUMB_IMMUTABLE_CACHE_SECONDS = int(os.environ.get("AVATAR_THUMB_IMMUTABLE_CACHE_SECONDS", str(30 * 24 * 3600)))
+AVATAR_BACKFILL_BATCH_SIZE = int(os.environ.get("AVATAR_BACKFILL_BATCH_SIZE", "25"))
 
 PICKUP_ZONE_HOTSPOT_MIN_POINTS = 5  # Keep 5-dot minimum to avoid pickup noise.
 PICKUP_ZONE_HOTSPOT_MAX_POINTS = 100
@@ -104,11 +117,9 @@ _pickup_zone_geom_parse_warned = False
 _pickup_zone_hotspot_feature_cache: Dict[int, Dict[str, Any]] = {}
 _pickup_zone_score_cache: Dict[int, float] = {}
 _pickup_zone_hotspot_cache_lock = threading.Lock()
-_timeline_cache_data: Optional[Dict[str, Any]] = None
-_timeline_cache_mtime: Optional[float] = None
+_timeline_cache_entry: Dict[str, Any] = {}
 _timeline_cache_lock = threading.Lock()
 _frame_cache: Dict[int, Dict[str, Any]] = {}
-_frame_cache_meta: Dict[int, float] = {}
 _frame_cache_order: deque[int] = deque()
 _frame_cache_lock = threading.Lock()
 FRAME_CACHE_MAX = 8
@@ -125,6 +136,11 @@ _pickup_zone_score_bundle_cache: Dict[str, Dict[str, Any]] = {}
 _pickup_zone_score_bundle_lock = threading.Lock()
 _pickup_zone_maintenance_lock = threading.Lock()
 _pickup_last_experiment_prune_monotonic = 0.0
+_presence_viewport_cache: Dict[str, Dict[str, Any]] = {}
+_presence_viewport_cache_lock = threading.Lock()
+_avatar_backfill_started = False
+_perf_metrics_lock = threading.Lock()
+_perf_metrics: Dict[str, int] = defaultdict(int)
 _to_3857 = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
 _to_4326 = Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
 
@@ -168,6 +184,70 @@ def _debug_log(*args: Any) -> None:
         print(*args)
 
 
+def _record_perf_metric(name: str, increment: int = 1) -> None:
+    with _perf_metrics_lock:
+        _perf_metrics[name] += int(increment)
+
+
+def _perf_metric_snapshot() -> Dict[str, int]:
+    with _perf_metrics_lock:
+        return dict(_perf_metrics)
+
+
+class SelectiveGZipMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+
+        accept_encoding = request.headers.get("accept-encoding", "")
+        if "gzip" not in accept_encoding.lower():
+            return response
+        if request.method.upper() == "HEAD":
+            return response
+        if request.url.path.startswith("/chat/audio/"):
+            return response
+        if response.status_code < 200 or response.status_code in {204, 206, 304}:
+            return response
+        if response.headers.get("content-encoding"):
+            return response
+        if response.headers.get("accept-ranges"):
+            return response
+
+        body = b""
+        async for chunk in response.body_iterator:
+            body += chunk
+
+        if len(body) < RESPONSE_GZIP_MIN_BYTES:
+            response.headers.setdefault("Vary", "Accept-Encoding")
+            return Response(
+                content=body,
+                status_code=response.status_code,
+                headers=dict(response.headers),
+                media_type=response.media_type,
+            )
+
+        content_type = (response.headers.get("content-type") or "").lower()
+        if content_type.startswith("audio/"):
+            return Response(
+                content=body,
+                status_code=response.status_code,
+                headers=dict(response.headers),
+                media_type=response.media_type,
+            )
+
+        compressed = gzip.compress(body)
+        headers = dict(response.headers)
+        headers["Content-Encoding"] = "gzip"
+        headers["Content-Length"] = str(len(compressed))
+        headers["Vary"] = "Accept-Encoding"
+        _record_perf_metric("gzip.responses")
+        return Response(
+            content=compressed,
+            status_code=response.status_code,
+            headers=headers,
+            media_type=response.media_type,
+        )
+
+
 def _cors_allow_origins() -> list[str]:
     configured = _split_env_origins(
         "CORS_ALLOW_ORIGINS",
@@ -197,6 +277,7 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["Content-Type", "Content-Length", "Accept-Ranges", "Content-Range"],
 )
+app.add_middleware(SelectiveGZipMiddleware)
 
 app.include_router(admin_router)
 app.include_router(admin_mutation_router)
@@ -223,20 +304,52 @@ def _read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _json_cached_response(payload: Any, cache_control: str = ARTIFACT_CACHE_CONTROL) -> JSONResponse:
-    return JSONResponse(content=payload, headers={"Cache-Control": cache_control})
+def _etag_for_path(path: Path, mtime: float, size: int) -> str:
+    return f'W/"{path.name}-{int(mtime)}-{int(size)}"'
+
+
+def _request_etag_matches(request: Request, etag: Optional[str]) -> bool:
+    if not etag:
+        return False
+    raw = request.headers.get("if-none-match", "")
+    if not raw:
+        return False
+    for candidate in raw.split(","):
+        if candidate.strip() == etag:
+            return True
+    return False
+
+
+def _json_cached_response(
+    request: Request,
+    payload: Any,
+    *,
+    cache_control: str = ARTIFACT_CACHE_CONTROL,
+    etag: Optional[str] = None,
+) -> Response:
+    headers = {"Cache-Control": cache_control}
+    if etag:
+        headers["ETag"] = etag
+    if _request_etag_matches(request, etag):
+        return Response(status_code=304, headers=headers)
+    return JSONResponse(content=payload, headers=headers)
 
 
 def _read_timeline_cached() -> Dict[str, Any]:
-    global _timeline_cache_data, _timeline_cache_mtime
-    mtime = TIMELINE_PATH.stat().st_mtime
+    stat_result = TIMELINE_PATH.stat()
+    mtime = stat_result.st_mtime
+    size = int(stat_result.st_size)
+    etag = _etag_for_path(TIMELINE_PATH, mtime, size)
     with _timeline_cache_lock:
-        if _timeline_cache_data is not None and _timeline_cache_mtime == mtime:
-            return _timeline_cache_data
+        cached = _timeline_cache_entry
+        if cached and cached.get("mtime") == mtime and cached.get("size") == size:
+            _record_perf_metric("timeline.cache_hit")
+            return cached
+        _record_perf_metric("timeline.cache_miss")
         data = _read_json(TIMELINE_PATH)
-        _timeline_cache_data = data
-        _timeline_cache_mtime = mtime
-        return data
+        _timeline_cache_entry.clear()
+        _timeline_cache_entry.update({"data": data, "mtime": mtime, "size": size, "etag": etag})
+        return dict(_timeline_cache_entry)
 
 
 def _read_frame_cached(idx: int) -> Dict[str, Any]:
@@ -244,10 +357,14 @@ def _read_frame_cached(idx: int) -> Dict[str, Any]:
     if not frame_path.exists():
         raise HTTPException(status_code=404, detail=f"frame not found: {idx}")
 
-    mtime = frame_path.stat().st_mtime
+    stat_result = frame_path.stat()
+    mtime = stat_result.st_mtime
+    size = int(stat_result.st_size)
+    etag = _etag_for_path(frame_path, mtime, size)
     with _frame_cache_lock:
         cached = _frame_cache.get(idx)
-        if cached is not None and _frame_cache_meta.get(idx) == mtime:
+        if cached is not None and cached.get("mtime") == mtime and cached.get("size") == size:
+            _record_perf_metric("frame.cache_hit")
             try:
                 _frame_cache_order.remove(idx)
             except ValueError:
@@ -255,9 +372,9 @@ def _read_frame_cached(idx: int) -> Dict[str, Any]:
             _frame_cache_order.append(idx)
             return cached
 
+        _record_perf_metric("frame.cache_miss")
         data = _read_json(frame_path)
-        _frame_cache[idx] = data
-        _frame_cache_meta[idx] = mtime
+        _frame_cache[idx] = {"data": data, "mtime": mtime, "size": size, "etag": etag}
         try:
             _frame_cache_order.remove(idx)
         except ValueError:
@@ -266,8 +383,7 @@ def _read_frame_cached(idx: int) -> Dict[str, Any]:
         while len(_frame_cache_order) > FRAME_CACHE_MAX:
             evicted_idx = _frame_cache_order.popleft()
             _frame_cache.pop(evicted_idx, None)
-            _frame_cache_meta.pop(evicted_idx, None)
-        return data
+        return _frame_cache[idx]
 
 
 def _has_day_tendency_model() -> bool:
@@ -629,6 +745,9 @@ def _resolve_day_tendency_payload(
 
 
 def _build_day_tendency_only(bin_minutes: int = DEFAULT_BIN_MINUTES) -> Dict[str, Any]:
+    from build_day_tendency import build_day_tendency_model
+    from build_hotspot import ensure_zones_geojson
+
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     DAY_TENDENCY_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -673,6 +792,9 @@ def _get_state() -> Dict[str, Any]:
 
 
 def _generate_worker(bin_minutes: int, min_trips_per_window: int) -> None:
+    from build_day_tendency import build_day_tendency_model
+    from build_hotspot import ensure_zones_geojson, build_hotspots_frames
+
     start = time.time()
     _set_state(
         state="running",
@@ -972,6 +1094,10 @@ def _db_init() -> None:
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url TEXT;",
         )
         _try_alter(
+            "ALTER TABLE users ADD COLUMN avatar_version TEXT;",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_version TEXT;",
+        )
+        _try_alter(
             "ALTER TABLE users ADD COLUMN map_identity_mode TEXT NOT NULL DEFAULT 'name';",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS map_identity_mode TEXT NOT NULL DEFAULT 'name';",
         )
@@ -1028,6 +1154,7 @@ def _db_init() -> None:
             """
         )
         _db_exec("CREATE INDEX IF NOT EXISTS idx_presence_updated_at ON presence(updated_at);")
+        _db_exec("CREATE INDEX IF NOT EXISTS idx_presence_updated_at_user ON presence(updated_at DESC, user_id);")
         _db_exec(
             """
             CREATE TABLE IF NOT EXISTS events (
@@ -1230,6 +1357,7 @@ def _db_init() -> None:
     _try_alter("ALTER TABLE users ADD COLUMN display_name TEXT;")
     _try_alter("ALTER TABLE users ADD COLUMN ghost_mode INTEGER NOT NULL DEFAULT 0;")
     _try_alter("ALTER TABLE users ADD COLUMN avatar_url TEXT;")
+    _try_alter("ALTER TABLE users ADD COLUMN avatar_version TEXT;")
     _try_alter("ALTER TABLE users ADD COLUMN map_identity_mode TEXT NOT NULL DEFAULT 'name';")
     _try_alter("ALTER TABLE users ADD COLUMN is_suspended INTEGER NOT NULL DEFAULT 0;")
 
@@ -1262,6 +1390,7 @@ def _db_init() -> None:
         """
     )
     _db_exec("CREATE INDEX IF NOT EXISTS idx_presence_updated_at ON presence(updated_at);")
+    _db_exec("CREATE INDEX IF NOT EXISTS idx_presence_updated_at_user ON presence(updated_at DESC, user_id);")
     _db_exec(
         """
         CREATE TABLE IF NOT EXISTS events (
@@ -1467,18 +1596,83 @@ def _normalize_map_identity_mode(value: Optional[str]) -> str:
 
 
 def _normalize_avatar_url(value: Optional[str]) -> Optional[str]:
-    if value is None:
+    try:
+        return normalize_avatar_data_url(value, MAX_AVATAR_DATA_URL_LENGTH)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _avatar_thumb_headers(user_id: int, version: str) -> Dict[str, str]:
+    return {
+        "Cache-Control": f"public, max-age={AVATAR_THUMB_IMMUTABLE_CACHE_SECONDS}, immutable",
+        "ETag": f'"avatar-{int(user_id)}-{version}"',
+    }
+
+
+def _avatar_version_for_row(row: Any) -> Optional[str]:
+    if row is None:
         return None
-    avatar = value.strip()
-    if avatar == "":
+    stored = row["avatar_version"] if "avatar_version" in row.keys() else row.get("avatar_version")
+    if stored:
+        return str(stored)
+    avatar_data_url = row["avatar_url"] if "avatar_url" in row.keys() else row.get("avatar_url")
+    if not avatar_data_url:
         return None
-    if len(avatar) > MAX_AVATAR_DATA_URL_LENGTH:
-        raise HTTPException(status_code=400, detail="avatar_url is too large")
-    if not avatar.startswith("data:image/"):
-        raise HTTPException(status_code=400, detail="avatar_url must be an image data URL")
-    if "," not in avatar:
-        raise HTTPException(status_code=400, detail="avatar_url must be a valid data URL")
-    return avatar
+    return avatar_version_for_data_url(str(avatar_data_url))
+
+
+def _avatar_thumb_url_for_row(row: Any) -> Optional[str]:
+    user_id = row["id"] if "id" in row.keys() else row.get("id")
+    if user_id is None:
+        user_id = row["user_id"] if "user_id" in row.keys() else row.get("user_id")
+    if user_id is None:
+        return None
+    return avatar_thumb_url(int(user_id), _avatar_version_for_row(row))
+
+
+def _ensure_avatar_thumb_materialized(user_id: int, avatar_data_url: Optional[str], avatar_version: Optional[str]) -> Optional[str]:
+    if not avatar_data_url:
+        return None
+    resolved_version = avatar_version or avatar_version_for_data_url(avatar_data_url)
+    if not resolved_version:
+        return None
+    persist_avatar_thumb(DATA_DIR, int(user_id), avatar_data_url, resolved_version)
+    return resolved_version
+
+
+def _backfill_avatar_assets_worker() -> None:
+    while True:
+        rows = _db_query_all(
+            """
+            SELECT id, avatar_url, avatar_version
+            FROM users
+            WHERE avatar_url IS NOT NULL AND trim(avatar_url) <> ''
+              AND (avatar_version IS NULL OR trim(avatar_version) = '')
+            ORDER BY id ASC
+            LIMIT ?
+            """,
+            (AVATAR_BACKFILL_BATCH_SIZE,),
+        )
+        if not rows:
+            return
+        for row in rows:
+            avatar_data_url = row["avatar_url"]
+            if not avatar_data_url:
+                continue
+            try:
+                version = _ensure_avatar_thumb_materialized(int(row["id"]), str(avatar_data_url), None)
+                if version:
+                    _db_exec("UPDATE users SET avatar_version=? WHERE id=?", (version, int(row["id"])))
+            except Exception:
+                _debug_log("[debug] avatar backfill failed", int(row["id"]))
+
+
+def _start_avatar_asset_backfill() -> None:
+    global _avatar_backfill_started
+    if _avatar_backfill_started:
+        return
+    _avatar_backfill_started = True
+    threading.Thread(target=_backfill_avatar_assets_worker, name="avatar-thumb-backfill", daemon=True).start()
 
 
 def _ensure_admin_seed() -> None:
@@ -1586,6 +1780,10 @@ def startup():
         traceback.print_exc()
     try:
         start_chat_retention_sweeper()
+    except Exception:
+        traceback.print_exc()
+    try:
+        _start_avatar_asset_backfill()
     except Exception:
         traceback.print_exc()
 
@@ -1713,6 +1911,35 @@ def status():
         "trial_days": TRIAL_DAYS,
         "trial_enforced": ENFORCE_TRIAL,
         "auth_enabled": bool(JWT_SECRET and len(JWT_SECRET) >= 24),
+        "performance_metrics": _perf_metric_snapshot(),
+    }
+
+
+@app.get("/admin/performance/metrics")
+def admin_performance_metrics(admin: sqlite3.Row = Depends(require_admin)):
+    _ = admin
+    metrics = _perf_metric_snapshot()
+
+    def ratio(hit_key: str, miss_key: str) -> Optional[float]:
+        hits = int(metrics.get(hit_key, 0))
+        misses = int(metrics.get(miss_key, 0))
+        total = hits + misses
+        if total <= 0:
+            return None
+        return round(hits / total, 4)
+
+    return {
+        "ok": True,
+        "counters": metrics,
+        "ratios": {
+            "timeline_cache_hit_rate": ratio("timeline.cache_hit", "timeline.cache_miss"),
+            "frame_cache_hit_rate": ratio("frame.cache_hit", "frame.cache_miss"),
+            "presence_cache_hit_rate": ratio("presence.cache_hit", "presence.cache_miss"),
+            "pickup_recent_cache_hit_rate": ratio("pickup_recent.cache_hit", "pickup_recent.cache_miss"),
+            "avatar_thumb_cache_hit_rate": ratio("avatar_thumb.cache_hit", "avatar_thumb.cache_miss"),
+            "pickup_hotspot_cache_hit_rate": ratio("pickup_hotspot.cache_hit", "pickup_hotspot.cache_miss"),
+            "pickup_score_bundle_hit_rate": ratio("pickup_score_bundle.cache_hit", "pickup_score_bundle.cache_miss"),
+        },
     }
 
 
@@ -1786,17 +2013,19 @@ def day_tendency_for_date(
 
 
 @app.get("/timeline")
-def timeline():
+def timeline(request: Request):
     if not _has_frames():
         raise HTTPException(status_code=409, detail="timeline not ready. Call /generate first.")
-    return _json_cached_response(_read_timeline_cached())
+    cached = _read_timeline_cached()
+    return _json_cached_response(request, cached["data"], etag=cached.get("etag"))
 
 
 @app.get("/frame/{idx}")
-def frame(idx: int):
+def frame(idx: int, request: Request):
     if not _has_frames():
         raise HTTPException(status_code=409, detail="timeline not ready. Call /generate first.")
-    return _json_cached_response(_read_frame_cached(idx))
+    cached = _read_frame_cached(idx)
+    return _json_cached_response(request, cached["data"], etag=cached.get("etag"))
 
 
 @app.post("/upload_zones_geojson")
@@ -2002,6 +2231,8 @@ def me(user: sqlite3.Row = Depends(require_user)):
         "email": user["email"],
         "display_name": dn,
         "avatar_url": user["avatar_url"] if "avatar_url" in user.keys() else None,
+        "avatar_thumb_url": _avatar_thumb_url_for_row(user),
+        "avatar_version": _avatar_version_for_row(user),
         "map_identity_mode": map_identity_mode,
         "ghost_mode": ghost,
         "is_admin": bool(_flag_to_int(user["is_admin"])),
@@ -2014,7 +2245,7 @@ def me(user: sqlite3.Row = Depends(require_user)):
 def driver_profile(user_id: int, viewer: sqlite3.Row = Depends(require_user)):
     _ = viewer
     target = _db_query_one(
-        "SELECT id, email, display_name, avatar_url, is_disabled FROM users WHERE id=? LIMIT 1",
+        "SELECT id, email, display_name, avatar_url, avatar_version, is_disabled FROM users WHERE id=? LIMIT 1",
         (int(user_id),),
     )
     if not target or _flag_to_int(target["is_disabled"]) == 1:
@@ -2042,6 +2273,8 @@ def driver_profile(user_id: int, viewer: sqlite3.Row = Depends(require_user)):
             "id": target_user_id,
             "display_name": display_name,
             "avatar_url": target["avatar_url"] if target["avatar_url"] else None,
+            "avatar_thumb_url": _avatar_thumb_url_for_row(target),
+            "avatar_version": _avatar_version_for_row(target),
             "leaderboard_badge_code": best_badge.get("leaderboard_badge_code"),
         },
         "daily": {
@@ -2068,6 +2301,42 @@ def driver_profile(user_id: int, viewer: sqlite3.Row = Depends(require_user)):
         },
         "progression": progression,
     }
+
+
+@app.get("/avatars/thumb/{user_id}")
+def avatar_thumb_asset(user_id: int, request: Request):
+    row = _db_query_one(
+        "SELECT id, avatar_url, avatar_version FROM users WHERE id=? LIMIT 1",
+        (int(user_id),),
+    )
+    if not row or not row["avatar_url"]:
+        raise HTTPException(status_code=404, detail="Avatar not found")
+
+    avatar_data_url = str(row["avatar_url"])
+    version = _avatar_version_for_row(row)
+    if not version:
+        _record_perf_metric("avatar_thumb.cache_miss")
+        version = _ensure_avatar_thumb_materialized(int(user_id), avatar_data_url, None)
+        if version:
+            _db_exec("UPDATE users SET avatar_version=? WHERE id=?", (version, int(user_id)))
+    else:
+        target = avatar_thumb_path(DATA_DIR, int(user_id), version)
+        if not target.exists():
+            _record_perf_metric("avatar_thumb.cache_miss")
+            _ensure_avatar_thumb_materialized(int(user_id), avatar_data_url, version)
+        else:
+            _record_perf_metric("avatar_thumb.cache_hit")
+
+    if not version:
+        raise HTTPException(status_code=404, detail="Avatar not found")
+    target = avatar_thumb_path(DATA_DIR, int(user_id), version)
+    if not target.exists():
+        raise HTTPException(status_code=404, detail="Avatar not found")
+
+    headers = _avatar_thumb_headers(int(user_id), version)
+    if _request_etag_matches(request, headers["ETag"]):
+        return Response(status_code=304, headers=headers)
+    return Response(content=target.read_bytes(), media_type=AVATAR_THUMB_MIME, headers=headers)
 
 
 class MeUpdatePayload(BaseModel):
@@ -2112,9 +2381,13 @@ def me_update(payload: MeUpdatePayload, user: sqlite3.Row = Depends(require_user
     if new_ghost is not None:
         updates.append("ghost_mode=?")
         args.append(new_ghost)
+    avatar_version: Optional[str] = None
     if update_avatar:
         updates.append("avatar_url=?")
         args.append(new_avatar)
+        avatar_version = avatar_version_for_data_url(new_avatar)
+        updates.append("avatar_version=?")
+        args.append(avatar_version)
     if update_map_identity_mode:
         updates.append("map_identity_mode=?")
         args.append(new_map_identity_mode)
@@ -2123,7 +2396,15 @@ def me_update(payload: MeUpdatePayload, user: sqlite3.Row = Depends(require_user
         args.append(int(user["id"]))
         _db_exec(f"UPDATE users SET {', '.join(updates)} WHERE id=?", tuple(args))
 
-    row = _db_query_one("SELECT id, email, display_name, ghost_mode, avatar_url, map_identity_mode, is_admin, trial_expires_at FROM users WHERE id=? LIMIT 1", (int(user["id"]),))
+    if update_avatar and new_avatar:
+        _ensure_avatar_thumb_materialized(int(user["id"]), new_avatar, avatar_version)
+    elif update_avatar and not new_avatar:
+        avatar_dir = DATA_DIR / "avatar_thumbs" / str(int(user["id"]))
+        if avatar_dir.exists():
+            for thumb in avatar_dir.glob("*.png"):
+                thumb.unlink(missing_ok=True)
+
+    row = _db_query_one("SELECT id, email, display_name, ghost_mode, avatar_url, avatar_version, map_identity_mode, is_admin, trial_expires_at FROM users WHERE id=? LIMIT 1", (int(user["id"]),))
     if not row:
         return {"ok": True, "updated": True}
 
@@ -2138,6 +2419,8 @@ def me_update(payload: MeUpdatePayload, user: sqlite3.Row = Depends(require_user
         "email": row["email"],
         "display_name": (row["display_name"] or _clean_display_name("", row["email"])),
         "avatar_url": row["avatar_url"],
+        "avatar_thumb_url": _avatar_thumb_url_for_row(row),
+        "avatar_version": _avatar_version_for_row(row),
         "map_identity_mode": map_identity_mode,
         "ghost_mode": bool(_flag_to_int(row["ghost_mode"])) if row["ghost_mode"] is not None else False,
     }
@@ -2206,25 +2489,69 @@ def presence_update(payload: PresencePayload, user: sqlite3.Row = Depends(requir
     )
     record_presence_heartbeat(int(user["id"]), float(payload.lat), float(payload.lng), payload.heading)
     record_pickup_presence_heartbeat(int(user["id"]), float(payload.lat), float(payload.lng), now)
+    with _presence_viewport_cache_lock:
+        _presence_viewport_cache.clear()
     return {"ok": True}
 
 
 @app.get("/presence/all")
 def presence_all(
     max_age_sec: int = PRESENCE_STALE_SECONDS,
+    min_lat: Optional[float] = None,
+    min_lng: Optional[float] = None,
+    max_lat: Optional[float] = None,
+    max_lng: Optional[float] = None,
+    zoom: Optional[int] = None,
+    mode: str = "full",
+    limit: Optional[int] = None,
     viewer: sqlite3.Row = Depends(require_user),  # REQUIRE AUTH (frontend already sends token)
 ):
+    del viewer
     cutoff = int(time.time()) - max(5, min(3600, int(max_age_sec)))
+    safe_mode = (mode or "full").strip().lower()
+    if safe_mode not in {"full", "lite"}:
+        raise HTTPException(status_code=400, detail="mode must be 'full' or 'lite'")
+    safe_limit = None if limit is None else max(1, min(500, int(limit)))
+    buffered_bbox = _presence_bbox_with_buffer(min_lat, min_lng, max_lat, max_lng, zoom)
+    cache_key = _presence_cache_key(
+        max_age_sec=max_age_sec,
+        mode=safe_mode,
+        limit=safe_limit,
+        bbox=buffered_bbox,
+        zoom=zoom,
+    )
+    now_monotonic = time.monotonic()
+    with _presence_viewport_cache_lock:
+        _purge_presence_viewport_cache(now_monotonic)
+        cached = _presence_viewport_cache.get(cache_key)
+        if cached and float(cached.get("expires_at_monotonic") or 0.0) > now_monotonic:
+            cached["last_access_monotonic"] = now_monotonic
+            _record_perf_metric("presence.cache_hit")
+            return copy.deepcopy(cached["payload"])
+    _record_perf_metric("presence.cache_miss")
+
     # Filter out ghost_mode enabled users.
     ghost_visible = _ghost_visible_sql("u.ghost_mode")
     try:
+        where_clauses = ["p.updated_at >= ?", ghost_visible]
+        params: List[Any] = [cutoff]
+        if buffered_bbox is not None:
+            lo_lat, lo_lng, hi_lat, hi_lng = buffered_bbox
+            where_clauses.append("p.lat BETWEEN ? AND ?")
+            where_clauses.append("p.lng BETWEEN ? AND ?")
+            params.extend([lo_lat, hi_lat, lo_lng, hi_lng])
+        limit_sql = ""
+        if safe_limit is not None:
+            limit_sql = " LIMIT ?"
+            params.append(safe_limit)
         rows = _db_query_all(
             f"""
             SELECT
               p.user_id,
+              u.id,
               u.email,
               u.display_name,
-              u.avatar_url,
+              u.avatar_version,
               u.map_identity_mode,
               u.ghost_mode,
               p.lat,
@@ -2234,10 +2561,11 @@ def presence_all(
               p.updated_at
             FROM presence p
             LEFT JOIN users u ON u.id = p.user_id
-            WHERE p.updated_at >= ?
-              AND {ghost_visible}
+            WHERE {' AND '.join(where_clauses)}
+            ORDER BY p.updated_at DESC
+            {limit_sql}
             """,
-            (cutoff,),
+            tuple(params),
         )
     except Exception:
         raise
@@ -2257,25 +2585,28 @@ def presence_all(
         items.append(
             {
                 "user_id": int(r["user_id"]),
-                "email": email,
                 "display_name": dn,
-                "avatar_url": r["avatar_url"],
+                "avatar_url": _avatar_thumb_url_for_row(r),
+                "avatar_thumb_url": _avatar_thumb_url_for_row(r),
+                "avatar_version": _avatar_version_for_row(r),
                 "map_identity_mode": (str(r["map_identity_mode"]).strip().lower() if r["map_identity_mode"] is not None and str(r["map_identity_mode"]).strip().lower() in ALLOWED_MAP_IDENTITY_MODES else "name"),
                 "lat": float(r["lat"]),
                 "lng": float(r["lng"]),
                 "heading": float(r["heading"]) if r["heading"] is not None else None,
-                "accuracy": float(r["accuracy"]) if r["accuracy"] is not None else None,
                 "updated_at": int(r["updated_at"]),
                 "updated_at_unix": int(r["updated_at"]),
                 "leaderboard_badge_code": best_badge.get("leaderboard_badge_code"),
             }
         )
+        if safe_mode == "full":
+            items[-1]["email"] = email
+            items[-1]["accuracy"] = float(r["accuracy"]) if r["accuracy"] is not None else None
     snapshot = _presence_visibility_snapshot(max_age_sec)
     if snapshot.get("ok"):
         online_count = int(snapshot.get("online_count") or online_count)
         ghosted_count = int(snapshot.get("ghosted_count") or 0)
     visible_count = len(items)
-    return {
+    response = {
         "ok": True,
         "count": visible_count,
         "items": items,
@@ -2283,6 +2614,14 @@ def presence_all(
         "ghosted_count": ghosted_count,
         "visible_count": visible_count,
     }
+    with _presence_viewport_cache_lock:
+        _presence_viewport_cache[cache_key] = {
+            "payload": copy.deepcopy(response),
+            "expires_at_monotonic": now_monotonic + PRESENCE_VIEWPORT_CACHE_TTL_SECONDS,
+            "last_access_monotonic": now_monotonic,
+        }
+        _purge_presence_viewport_cache(now_monotonic)
+    return response
 
 
 @app.get("/presence/summary")
@@ -3136,6 +3475,83 @@ def _rounded_bbox_key(
     )
 
 
+def _presence_bbox_with_buffer(
+    min_lat: Optional[float],
+    min_lng: Optional[float],
+    max_lat: Optional[float],
+    max_lng: Optional[float],
+    zoom: Optional[int],
+) -> Optional[Tuple[float, float, float, float]]:
+    bbox_key = _rounded_bbox_key(min_lat, min_lng, max_lat, max_lng)
+    if bbox_key is None:
+        return None
+    lo_lat, lo_lng, hi_lat, hi_lng = bbox_key
+    lat_span = max(0.002, hi_lat - lo_lat)
+    lng_span = max(0.002, hi_lng - lo_lng)
+    zoom_value = int(zoom or 0)
+    if zoom_value >= 14:
+        factor = 0.12
+    elif zoom_value >= 11:
+        factor = 0.22
+    else:
+        factor = 0.35
+    buffer_lat = max(0.0025, lat_span * factor)
+    buffer_lng = max(0.0025, lng_span * factor)
+    return (
+        round(lo_lat - buffer_lat, 5),
+        round(lo_lng - buffer_lng, 5),
+        round(hi_lat + buffer_lat, 5),
+        round(hi_lng + buffer_lng, 5),
+    )
+
+
+def _zoom_bucket(zoom: Optional[int]) -> int:
+    value = int(zoom or 0)
+    if value <= 0:
+        return 0
+    if value <= 10:
+        return 10
+    if value <= 13:
+        return 13
+    return 16
+
+
+def _presence_cache_key(
+    *,
+    max_age_sec: int,
+    mode: str,
+    limit: Optional[int],
+    bbox: Optional[Tuple[float, float, float, float]],
+    zoom: Optional[int],
+) -> str:
+    return "|".join(
+        [
+            f"max_age={int(max_age_sec)}",
+            f"mode={mode}",
+            f"limit={int(limit) if limit is not None else 'all'}",
+            f"bbox={bbox!r}",
+            f"zoom_bucket={_zoom_bucket(zoom)}",
+        ]
+    )
+
+
+def _purge_presence_viewport_cache(now_monotonic: Optional[float] = None) -> None:
+    now_value = now_monotonic if now_monotonic is not None else time.monotonic()
+    expired = [
+        key
+        for key, value in _presence_viewport_cache.items()
+        if float(value.get("expires_at_monotonic") or 0.0) <= now_value
+    ]
+    for key in expired:
+        _presence_viewport_cache.pop(key, None)
+    while len(_presence_viewport_cache) > PRESENCE_VIEWPORT_CACHE_MAX:
+        oldest_key = min(
+            _presence_viewport_cache.items(),
+            key=lambda item: float(item[1].get("last_access_monotonic") or 0.0),
+        )[0]
+        _presence_viewport_cache.pop(oldest_key, None)
+
+
 def _pickup_recent_cache_key(
     *,
     limit: int,
@@ -3342,8 +3758,10 @@ def _pickup_zone_hotspots_with_debug(
 
     zone_scores: Dict[int, Any] = {}
     if score_bundle_fresh:
+        _record_perf_metric("pickup_score_bundle.cache_hit")
         zone_scores = score_bundle.get("zone_scores") or {}
     else:
+        _record_perf_metric("pickup_score_bundle.cache_miss")
         try:
             historical_support = _pickup_zone_historical_support(clean_zone_ids, now_ts)
             same_timeslot_support = _pickup_zone_same_timeslot_support(clean_zone_ids, now_ts)
@@ -3430,6 +3848,9 @@ def _pickup_zone_hotspots_with_debug(
                 cached["last_access_monotonic"] = now_monotonic
                 zone_features = copy.deepcopy(cached["features"])
                 cached_hit = True
+                _record_perf_metric("pickup_hotspot.cache_hit")
+        if not cached_hit:
+            _record_perf_metric("pickup_hotspot.cache_miss")
         if zone_debug is not None and cached_hit:
             zone_debug["cached_hit"] = True
             zone_debug["hotspot_method"] = "cache"
@@ -3714,7 +4135,9 @@ def _recent_pickups_payload(
             cached = _pickup_recent_cache.get(cache_key)
             if cached and float(cached.get("expires_at_monotonic") or 0.0) > now_monotonic:
                 cached["last_access_monotonic"] = now_monotonic
+                _record_perf_metric("pickup_recent.cache_hit")
                 return copy.deepcopy(cached["payload"])
+    _record_perf_metric("pickup_recent.cache_miss")
 
     sql = f"""
         SELECT id, lat, lng, zone_id, zone_name, borough, frame_time, created_at
