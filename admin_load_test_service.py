@@ -13,7 +13,7 @@ from typing import Any, Deque, Dict, List, Optional, Tuple
 from admin_load_test_models import AdminLoadTestStartRequest
 from admin_test_service import build_admin_response
 
-SUPPORTED_PRESETS = [100, 300, 500, 1000]
+SUPPORTED_PRESETS = [100, 300, 500, 1000, 1500, 2000]
 SUPPORTED_MODES = ["map_core", "map_plus_chat", "custom"]
 SUPPORTED_DURATIONS = [30, 45, 60, 90]
 SNAPSHOT_INTERVAL_SEC = 5.0
@@ -98,6 +98,26 @@ THRESHOLDS: Dict[int, Dict[str, float]] = {
         "rss_growth_mb": 260.0,
         "chat_send_p95_ms": 900.0,
         "chat_read_p95_ms": 1000.0,
+    },
+    1500: {
+        "overall_error_rate": 3.5,
+        "presence_write_p95_ms": 1000.0,
+        "viewport_read_p95_ms": 1500.0,
+        "summary_read_p95_ms": 450.0,
+        "delta_read_p95_ms": 700.0,
+        "rss_growth_mb": 340.0,
+        "chat_send_p95_ms": 1000.0,
+        "chat_read_p95_ms": 1100.0,
+    },
+    2000: {
+        "overall_error_rate": 4.0,
+        "presence_write_p95_ms": 1200.0,
+        "viewport_read_p95_ms": 1800.0,
+        "summary_read_p95_ms": 520.0,
+        "delta_read_p95_ms": 850.0,
+        "rss_growth_mb": 420.0,
+        "chat_send_p95_ms": 1100.0,
+        "chat_read_p95_ms": 1200.0,
     },
 }
 
@@ -552,12 +572,11 @@ class SyntheticLoadTestManager:
         return result
 
     def _normalized_config(self, payload: AdminLoadTestStartRequest) -> Dict[str, Any]:
+        raw = payload.model_dump()
         mode_defaults = MODE_DEFAULTS.get(payload.mode, {})
-        config = payload.model_dump()
+        config = {**mode_defaults, **raw}
         config["driver_count"] = config["preset"]
         config["duration_seconds"] = config["duration_sec"]
-        for key, value in mode_defaults.items():
-            config[key] = value
         if config.get("seed") is None:
             config["seed"] = int(time.time())
         if config.get("viewport_count") is None:
