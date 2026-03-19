@@ -119,6 +119,38 @@ def test_auth_presence_chat_leaderboard_admin_and_delete_account(app_env):
     assert any(item["user_id"] == alice["id"] for item in presence_items)
     assert all(item["user_id"] != bob["id"] for item in presence_items)
 
+    viewport_snapshot = client.get(
+        "/presence/viewport?min_lat=40.70&min_lng=-74.10&max_lat=40.90&max_lng=-73.80&zoom=13",
+        headers=alice_headers,
+    )
+    assert viewport_snapshot.status_code == 200
+    viewport_payload = viewport_snapshot.json()
+    assert viewport_payload["mode"] == "snapshot"
+    assert any(item["user_id"] == alice["id"] for item in viewport_payload["items"])
+    assert all(item["user_id"] != bob["id"] for item in viewport_payload["items"])
+    viewport_cursor = viewport_payload["cursor"]
+
+    bob_unghost = client.post("/me/update", json={"ghost_mode": False}, headers=bob_headers)
+    assert bob_unghost.status_code == 200
+    viewport_delta_visible = client.get(
+        f"/presence/delta?updated_since_ms={viewport_cursor}&min_lat=40.70&min_lng=-74.10&max_lat=40.90&max_lng=-73.80&zoom=13",
+        headers=alice_headers,
+    )
+    assert viewport_delta_visible.status_code == 200
+    viewport_delta_visible_payload = viewport_delta_visible.json()
+    assert any(item["user_id"] == bob["id"] for item in viewport_delta_visible_payload["items"])
+    visible_cursor = viewport_delta_visible_payload["cursor"]
+
+    bob_ghost_again = client.post("/me/update", json={"ghost_mode": True}, headers=bob_headers)
+    assert bob_ghost_again.status_code == 200
+    viewport_delta_removed = client.get(
+        f"/presence/viewport?updated_since_ms={visible_cursor}&min_lat=40.70&min_lng=-74.10&max_lat=40.90&max_lng=-73.80&zoom=13",
+        headers=alice_headers,
+    )
+    assert viewport_delta_removed.status_code == 200
+    removed_payload = viewport_delta_removed.json()
+    assert any(item["user_id"] == bob["id"] and item["reason"] == 'ghost_mode' for item in removed_payload["removed"])
+
     presence_summary = client.get("/presence/summary", headers=alice_headers)
     assert presence_summary.status_code == 200
     summary_payload = presence_summary.json()
@@ -136,6 +168,10 @@ def test_auth_presence_chat_leaderboard_admin_and_delete_account(app_env):
     since_chat = client.get("/chat/since?after_id=0", headers=alice_headers)
     assert since_chat.status_code == 200
     assert len(since_chat.json()["items"]) >= 2
+    public_summary = client.get("/chat/public/summary?after=1", headers=alice_headers)
+    assert public_summary.status_code == 200
+    assert public_summary.json()["room"] == "global"
+    assert public_summary.json()["latest_message"]["text"] == "room hello"
 
     time.sleep(2.05)
     dm_send = client.post(f"/chat/dm/{bob['id']}", json={"text": "dm hello"}, headers=alice_headers)
@@ -143,9 +179,16 @@ def test_auth_presence_chat_leaderboard_admin_and_delete_account(app_env):
     dm_recent = client.get(f"/chat/dm/{bob['id']}", headers=alice_headers)
     assert dm_recent.status_code == 200
     assert dm_recent.json()["messages"][0]["text"] == "dm hello"
+    private_summary = client.get("/chat/private/summary", headers=bob_headers)
+    assert private_summary.status_code == 200
+    assert private_summary.json()["total_unread_count"] >= 1
+    assert any(thread["other_user_id"] == alice["id"] for thread in private_summary.json()["threads"])
     private_dm = client.get(f"/chat/private/{alice['id']}", headers=bob_headers)
     assert private_dm.status_code == 200
     assert private_dm.json()["messages"][0]["text"] == "dm hello"
+    dm_summary = client.get(f"/chat/dm/{bob['id']}/summary?after=0", headers=alice_headers)
+    assert dm_summary.status_code == 200
+    assert dm_summary.json()["latest_message"]["text"] == "dm hello"
 
     leaderboard_overview = client.get("/leaderboard/overview/me", headers=alice_headers)
     assert leaderboard_overview.status_code == 200
@@ -191,6 +234,12 @@ def test_auth_presence_chat_leaderboard_admin_and_delete_account(app_env):
     assert suspended_me.status_code == 403
     suspended_profile = client.get(f"/drivers/{bob['id']}/profile", headers=alice_headers)
     assert suspended_profile.status_code == 404
+    suspended_presence_delta = client.get(
+        f"/presence/delta?updated_since_ms={visible_cursor}&min_lat=40.70&min_lng=-74.10&max_lat=40.90&max_lng=-73.80&zoom=13",
+        headers=alice_headers,
+    )
+    assert suspended_presence_delta.status_code == 200
+    assert any(item["user_id"] == bob["id"] and item["reason"] == "suspended" for item in suspended_presence_delta.json()["removed"])
 
     disable_alice = client.post("/admin/users/disable", json={"user_id": alice["id"], "disabled": True}, headers=admin_headers)
     assert disable_alice.status_code == 200

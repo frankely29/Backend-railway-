@@ -97,6 +97,7 @@ ALLOWED_MAP_IDENTITY_MODES = {"name", "avatar"}
 RESPONSE_GZIP_MIN_BYTES = int(os.environ.get("RESPONSE_GZIP_MIN_BYTES", "1024"))
 PRESENCE_VIEWPORT_CACHE_TTL_SECONDS = float(os.environ.get("PRESENCE_VIEWPORT_CACHE_TTL_SECONDS", "3"))
 PRESENCE_VIEWPORT_CACHE_MAX = int(os.environ.get("PRESENCE_VIEWPORT_CACHE_MAX", "128"))
+PRESENCE_DELTA_MAX_LIMIT = int(os.environ.get("PRESENCE_DELTA_MAX_LIMIT", "500"))
 AVATAR_THUMB_IMMUTABLE_CACHE_SECONDS = int(os.environ.get("AVATAR_THUMB_IMMUTABLE_CACHE_SECONDS", str(30 * 24 * 3600)))
 AVATAR_BACKFILL_BATCH_SIZE = int(os.environ.get("AVATAR_BACKFILL_BATCH_SIZE", "25"))
 
@@ -934,6 +935,7 @@ def _ghost_visible_sql(column_name: str) -> str:
 def _presence_visibility_snapshot(max_age_sec: int) -> Dict[str, Any]:
     cutoff = int(time.time()) - max(5, min(3600, int(max_age_sec)))
     ghost_visible = _ghost_visible_sql("u.ghost_mode")
+    online_visible = _presence_online_where_sql()
     sql_mode = "postgres_boolean" if DB_BACKEND == "postgres" else "sqlite_cast_integer"
     try:
         visible_count_row = _db_query_one(
@@ -943,6 +945,7 @@ def _presence_visibility_snapshot(max_age_sec: int) -> Dict[str, Any]:
             LEFT JOIN users u ON u.id = p.user_id
             WHERE p.updated_at >= ?
               AND {ghost_visible}
+              AND {online_visible}
             """,
             (cutoff,),
         )
@@ -954,19 +957,21 @@ def _presence_visibility_snapshot(max_age_sec: int) -> Dict[str, Any]:
             LEFT JOIN users u ON u.id = p.user_id
             WHERE p.updated_at >= ?
               AND {ghost_visible}
+              AND {online_visible}
             ORDER BY p.updated_at DESC
             LIMIT 5
             """,
             (cutoff,),
         )
         counts = _db_query_one(
-            """
+            f"""
             SELECT
               COUNT(*) AS online_count,
               SUM(CASE WHEN COALESCE(u.ghost_mode, FALSE) THEN 1 ELSE 0 END) AS ghosted_count
             FROM presence p
             LEFT JOIN users u ON u.id = p.user_id
             WHERE p.updated_at >= ?
+              AND {online_visible}
             """,
             (cutoff,),
         )
@@ -1005,6 +1010,218 @@ def _presence_visibility_snapshot(max_age_sec: int) -> Dict[str, Any]:
         "sample_display_names": sample_display_names,
         "sql_mode": sql_mode,
         "ok": True,
+    }
+
+
+def _presence_change_cursor_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _presence_runtime_state_upsert(user_id: int, *, is_visible: bool, reason: Optional[str] = None, changed_at_ms: Optional[int] = None) -> int:
+    cursor_value = int(changed_at_ms if changed_at_ms is not None else _presence_change_cursor_ms())
+    safe_reason = None if is_visible else (reason or "hidden")
+    _db_exec(
+        """
+        INSERT INTO presence_runtime_state(user_id, changed_at_ms, is_visible, reason)
+        VALUES(?,?,?,?)
+        ON CONFLICT(user_id) DO UPDATE SET
+          changed_at_ms=excluded.changed_at_ms,
+          is_visible=excluded.is_visible,
+          reason=excluded.reason
+        """,
+        (int(user_id), cursor_value, 1 if is_visible else 0, safe_reason),
+    )
+    return cursor_value
+
+
+def _presence_remove_runtime_visibility(user_id: int, *, reason: str, changed_at_ms: Optional[int] = None) -> int:
+    return _presence_runtime_state_upsert(int(user_id), is_visible=False, reason=reason, changed_at_ms=changed_at_ms)
+
+
+def _presence_visible_where_sql() -> str:
+    return " AND ".join(
+        [
+            _ghost_visible_sql("u.ghost_mode"),
+            "COALESCE(CAST(u.is_disabled AS INTEGER), 0) = 0" if DB_BACKEND != "postgres" else "COALESCE(u.is_disabled, FALSE) = FALSE",
+            "COALESCE(CAST(u.is_suspended AS INTEGER), 0) = 0" if DB_BACKEND != "postgres" else "COALESCE(u.is_suspended, FALSE) = FALSE",
+        ]
+    )
+
+
+def _presence_online_where_sql() -> str:
+    return " AND ".join(
+        [
+            "COALESCE(CAST(u.is_disabled AS INTEGER), 0) = 0" if DB_BACKEND != "postgres" else "COALESCE(u.is_disabled, FALSE) = FALSE",
+            "COALESCE(CAST(u.is_suspended AS INTEGER), 0) = 0" if DB_BACKEND != "postgres" else "COALESCE(u.is_suspended, FALSE) = FALSE",
+        ]
+    )
+
+
+def _presence_state_from_user_row(user: Any) -> Tuple[bool, Optional[str]]:
+    block_state = _user_block_state(user)
+    if block_state["is_blocked"]:
+        return False, str(block_state["reason"] or "blocked")
+    ghost = bool(_flag_to_int(user["ghost_mode"])) if "ghost_mode" in user.keys() and user["ghost_mode"] is not None else False
+    if ghost:
+        return False, "ghost_mode"
+    return True, None
+
+
+def _presence_row_payloads(rows: List[Any], *, include_full_fields: bool) -> List[Dict[str, Any]]:
+    badge_by_user = get_best_current_badges_for_users([int(r["user_id"]) for r in rows])
+    items: List[Dict[str, Any]] = []
+    for r in rows:
+        best_badge = badge_by_user.get(int(r["user_id"]), {})
+        email = (r["email"] or "").strip()
+        dn = (r["display_name"] or "").strip()
+        if not dn:
+            dn = _clean_display_name("", email or "Driver")
+        payload = {
+            "user_id": int(r["user_id"]),
+            "display_name": dn,
+            "avatar_url": _avatar_thumb_url_for_row(r),
+            "avatar_thumb_url": _avatar_thumb_url_for_row(r),
+            "avatar_version": _avatar_version_for_row(r),
+            "map_identity_mode": (
+                str(r["map_identity_mode"]).strip().lower()
+                if r["map_identity_mode"] is not None and str(r["map_identity_mode"]).strip().lower() in ALLOWED_MAP_IDENTITY_MODES
+                else "name"
+            ),
+            "lat": float(r["lat"]),
+            "lng": float(r["lng"]),
+            "heading": float(r["heading"]) if r["heading"] is not None else None,
+            "updated_at": int(r["updated_at"]),
+            "updated_at_unix": int(r["updated_at"]),
+            "leaderboard_badge_code": best_badge.get("leaderboard_badge_code"),
+        }
+        if include_full_fields:
+            payload["email"] = email
+            payload["accuracy"] = float(r["accuracy"]) if r["accuracy"] is not None else None
+        items.append(payload)
+    return items
+
+
+def _presence_rows_for_viewport(
+    *,
+    cutoff: int,
+    bbox: Optional[Tuple[float, float, float, float]],
+    limit: Optional[int],
+) -> List[Any]:
+    where_clauses = ["p.updated_at >= ?", _presence_visible_where_sql()]
+    params: List[Any] = [cutoff]
+    if bbox is not None:
+        lo_lat, lo_lng, hi_lat, hi_lng = bbox
+        where_clauses.append("p.lat BETWEEN ? AND ?")
+        where_clauses.append("p.lng BETWEEN ? AND ?")
+        params.extend([lo_lat, hi_lat, lo_lng, hi_lng])
+    limit_sql = ""
+    if limit is not None:
+        limit_sql = " LIMIT ?"
+        params.append(int(limit))
+    return _db_query_all(
+        f"""
+        SELECT
+          p.user_id,
+          u.id,
+          u.email,
+          u.display_name,
+          u.avatar_version,
+          u.map_identity_mode,
+          u.ghost_mode,
+          p.lat,
+          p.lng,
+          p.heading,
+          p.accuracy,
+          p.updated_at
+        FROM presence p
+        JOIN users u ON u.id = p.user_id
+        WHERE {' AND '.join(where_clauses)}
+        ORDER BY p.updated_at DESC, p.user_id DESC
+        {limit_sql}
+        """,
+        tuple(params),
+    )
+
+
+def _presence_delta_payload(
+    *,
+    updated_since_ms: int,
+    max_age_sec: int,
+    bbox: Optional[Tuple[float, float, float, float]],
+    limit: Optional[int],
+    include_removed: bool,
+) -> Dict[str, Any]:
+    safe_limit = max(1, min(PRESENCE_DELTA_MAX_LIMIT, int(limit or PRESENCE_DELTA_MAX_LIMIT)))
+    cutoff = int(time.time()) - max(5, min(3600, int(max_age_sec)))
+    params: List[Any] = [int(updated_since_ms)]
+    rows = _db_query_all(
+        f"""
+        SELECT
+          prs.user_id AS runtime_user_id,
+          prs.changed_at_ms,
+          prs.is_visible,
+          prs.reason,
+          p.user_id,
+          u.id,
+          u.email,
+          u.display_name,
+          u.avatar_version,
+          u.map_identity_mode,
+          u.ghost_mode,
+          p.lat,
+          p.lng,
+          p.heading,
+          p.accuracy,
+          p.updated_at
+        FROM presence_runtime_state prs
+        LEFT JOIN presence p ON p.user_id = prs.user_id
+        LEFT JOIN users u ON u.id = prs.user_id
+        WHERE prs.changed_at_ms > ?
+        ORDER BY prs.changed_at_ms ASC, prs.user_id ASC
+        LIMIT ?
+        """,
+        tuple(params + [safe_limit]),
+    )
+
+    changed_rows: List[Any] = []
+    removed: List[Dict[str, Any]] = []
+    next_cursor = int(updated_since_ms)
+    for row in rows:
+        next_cursor = max(next_cursor, int(row["changed_at_ms"] or updated_since_ms))
+        row_is_visible = int(row["is_visible"] or 0) == 1
+        has_presence = row["user_id"] is not None and row["updated_at"] is not None
+        is_fresh = has_presence and int(row["updated_at"]) >= cutoff
+        in_viewport = True
+        if bbox is not None and has_presence:
+            lo_lat, lo_lng, hi_lat, hi_lng = bbox
+            lat = float(row["lat"])
+            lng = float(row["lng"])
+            in_viewport = lo_lat <= lat <= hi_lat and lo_lng <= lng <= hi_lng
+        if row_is_visible and is_fresh and in_viewport:
+            changed_rows.append(row)
+            continue
+        if include_removed:
+            reason = row["reason"]
+            if row_is_visible and not is_fresh:
+                reason = "stale"
+            removed.append(
+                {
+                    "user_id": int(row["user_id"]) if row["user_id"] is not None else int(row["runtime_user_id"]),
+                    "removed_at_ms": int(row["changed_at_ms"]),
+                    "reason": reason or ("outside_viewport" if row_is_visible and is_fresh and not in_viewport else "hidden"),
+                }
+            )
+
+    items = _presence_row_payloads(changed_rows, include_full_fields=False)
+    return {
+        "ok": True,
+        "mode": "delta",
+        "count": len(items),
+        "items": items,
+        "removed": removed if include_removed else [],
+        "cursor": next_cursor,
+        "server_time_ms": _presence_change_cursor_ms(),
+        "has_more": len(rows) >= safe_limit,
     }
 
 
@@ -1177,6 +1394,45 @@ def _db_init() -> None:
         )
         _db_exec("CREATE INDEX IF NOT EXISTS idx_presence_updated_at ON presence(updated_at);")
         _db_exec("CREATE INDEX IF NOT EXISTS idx_presence_updated_at_user ON presence(updated_at DESC, user_id);")
+        _db_exec("CREATE INDEX IF NOT EXISTS idx_presence_updated_at_lat_lng ON presence(updated_at DESC, lat, lng);")
+        _db_exec(
+            """
+            CREATE TABLE IF NOT EXISTS presence_runtime_state (
+              user_id BIGINT PRIMARY KEY,
+              changed_at_ms BIGINT NOT NULL,
+              is_visible BOOLEAN NOT NULL DEFAULT TRUE,
+              reason TEXT
+            );
+            """
+        )
+        _db_exec("CREATE INDEX IF NOT EXISTS idx_presence_runtime_state_changed ON presence_runtime_state(changed_at_ms DESC, user_id);")
+        _db_exec(
+            """
+            INSERT INTO presence_runtime_state(user_id, changed_at_ms, is_visible, reason)
+            SELECT
+              p.user_id,
+              CASE
+                WHEN p.updated_at > 1000000000000 THEN p.updated_at
+                ELSE p.updated_at * 1000
+              END,
+              CASE
+                WHEN COALESCE(u.is_disabled, FALSE) = TRUE OR COALESCE(u.is_suspended, FALSE) = TRUE OR COALESCE(u.ghost_mode, FALSE) = TRUE THEN FALSE
+                ELSE TRUE
+              END,
+              CASE
+                WHEN COALESCE(u.is_disabled, FALSE) = TRUE THEN 'disabled'
+                WHEN COALESCE(u.is_suspended, FALSE) = TRUE THEN 'suspended'
+                WHEN COALESCE(u.ghost_mode, FALSE) = TRUE THEN 'ghost_mode'
+                ELSE NULL
+              END
+            FROM presence p
+            JOIN users u ON u.id = p.user_id
+            ON CONFLICT(user_id) DO UPDATE SET
+              changed_at_ms=excluded.changed_at_ms,
+              is_visible=excluded.is_visible,
+              reason=excluded.reason
+            """
+        )
         _db_exec(
             """
             CREATE TABLE IF NOT EXISTS events (
@@ -1214,6 +1470,7 @@ def _db_init() -> None:
         )
         _db_exec("CREATE INDEX IF NOT EXISTS idx_pickup_logs_created_at ON pickup_logs(created_at DESC);")
         _db_exec("CREATE INDEX IF NOT EXISTS idx_pickup_logs_zone_time ON pickup_logs(zone_id, created_at DESC);")
+        _db_exec("CREATE INDEX IF NOT EXISTS idx_pickup_logs_user_time ON pickup_logs(user_id, created_at DESC);")
 
         _db_exec(
             """
@@ -1312,6 +1569,7 @@ def _db_init() -> None:
         _db_exec("CREATE INDEX IF NOT EXISTS idx_chat_messages_id ON chat_messages(id);")
         _db_exec("CREATE INDEX IF NOT EXISTS idx_chat_messages_room_id ON chat_messages(room, id);")
         _db_exec("CREATE INDEX IF NOT EXISTS idx_chat_messages_created_at ON chat_messages(created_at);")
+        _db_exec("CREATE INDEX IF NOT EXISTS idx_chat_messages_room_created_at ON chat_messages(room, created_at DESC, id DESC);")
 
         _db_exec(
             """
@@ -1352,6 +1610,12 @@ def _db_init() -> None:
             "CREATE INDEX IF NOT EXISTS idx_private_chat_pair_created ON private_chat_messages(sender_user_id, recipient_user_id, created_at, id);"
         )
         _db_exec("CREATE INDEX IF NOT EXISTS idx_private_chat_messages_created_at ON private_chat_messages(created_at);")
+        _db_exec(
+            "CREATE INDEX IF NOT EXISTS idx_private_chat_sender_created ON private_chat_messages(sender_user_id, created_at DESC, id DESC);"
+        )
+        _db_exec(
+            "CREATE INDEX IF NOT EXISTS idx_private_chat_recipient_created ON private_chat_messages(recipient_user_id, created_at DESC, id DESC);"
+        )
         _db_exec(
             "CREATE INDEX IF NOT EXISTS idx_private_chat_recipient_read ON private_chat_messages(recipient_user_id, sender_user_id, read_at);"
         )
@@ -1413,6 +1677,45 @@ def _db_init() -> None:
     )
     _db_exec("CREATE INDEX IF NOT EXISTS idx_presence_updated_at ON presence(updated_at);")
     _db_exec("CREATE INDEX IF NOT EXISTS idx_presence_updated_at_user ON presence(updated_at DESC, user_id);")
+    _db_exec("CREATE INDEX IF NOT EXISTS idx_presence_updated_at_lat_lng ON presence(updated_at DESC, lat, lng);")
+    _db_exec(
+        """
+        CREATE TABLE IF NOT EXISTS presence_runtime_state (
+          user_id INTEGER PRIMARY KEY,
+          changed_at_ms INTEGER NOT NULL,
+          is_visible INTEGER NOT NULL DEFAULT 1,
+          reason TEXT
+        );
+        """
+    )
+    _db_exec("CREATE INDEX IF NOT EXISTS idx_presence_runtime_state_changed ON presence_runtime_state(changed_at_ms DESC, user_id);")
+    _db_exec(
+        """
+        INSERT INTO presence_runtime_state(user_id, changed_at_ms, is_visible, reason)
+        SELECT
+          p.user_id,
+          CASE
+            WHEN p.updated_at > 1000000000000 THEN p.updated_at
+            ELSE p.updated_at * 1000
+          END,
+          CASE
+            WHEN COALESCE(CAST(u.is_disabled AS INTEGER), 0) = 1 OR COALESCE(CAST(u.is_suspended AS INTEGER), 0) = 1 OR COALESCE(CAST(u.ghost_mode AS INTEGER), 0) = 1 THEN 0
+            ELSE 1
+          END,
+          CASE
+            WHEN COALESCE(CAST(u.is_disabled AS INTEGER), 0) = 1 THEN 'disabled'
+            WHEN COALESCE(CAST(u.is_suspended AS INTEGER), 0) = 1 THEN 'suspended'
+            WHEN COALESCE(CAST(u.ghost_mode AS INTEGER), 0) = 1 THEN 'ghost_mode'
+            ELSE NULL
+          END
+        FROM presence p
+        JOIN users u ON u.id = p.user_id
+        ON CONFLICT(user_id) DO UPDATE SET
+          changed_at_ms=excluded.changed_at_ms,
+          is_visible=excluded.is_visible,
+          reason=excluded.reason
+        """
+    )
     _db_exec(
         """
         CREATE TABLE IF NOT EXISTS events (
@@ -1450,6 +1753,7 @@ def _db_init() -> None:
     )
     _db_exec("CREATE INDEX IF NOT EXISTS idx_pickup_logs_created_at ON pickup_logs(created_at DESC);")
     _db_exec("CREATE INDEX IF NOT EXISTS idx_pickup_logs_zone_time ON pickup_logs(zone_id, created_at DESC);")
+    _db_exec("CREATE INDEX IF NOT EXISTS idx_pickup_logs_user_time ON pickup_logs(user_id, created_at DESC);")
 
     _db_exec(
         """
@@ -1530,6 +1834,7 @@ def _db_init() -> None:
     _db_exec("CREATE INDEX IF NOT EXISTS idx_chat_messages_id ON chat_messages(id);")
     _db_exec("CREATE INDEX IF NOT EXISTS idx_chat_messages_room_id ON chat_messages(room, id);")
     _db_exec("CREATE INDEX IF NOT EXISTS idx_chat_messages_created_at ON chat_messages(created_at);")
+    _db_exec("CREATE INDEX IF NOT EXISTS idx_chat_messages_room_created_at ON chat_messages(room, created_at DESC, id DESC);")
 
     _db_exec(
         """
@@ -1555,6 +1860,8 @@ def _db_init() -> None:
         "CREATE INDEX IF NOT EXISTS idx_private_chat_pair_created ON private_chat_messages(sender_user_id, recipient_user_id, created_at, id);"
     )
     _db_exec("CREATE INDEX IF NOT EXISTS idx_private_chat_messages_created_at ON private_chat_messages(created_at);")
+    _db_exec("CREATE INDEX IF NOT EXISTS idx_private_chat_sender_created ON private_chat_messages(sender_user_id, created_at DESC, id DESC);")
+    _db_exec("CREATE INDEX IF NOT EXISTS idx_private_chat_recipient_created ON private_chat_messages(recipient_user_id, created_at DESC, id DESC);")
     _db_exec(
         "CREATE INDEX IF NOT EXISTS idx_private_chat_recipient_read ON private_chat_messages(recipient_user_id, sender_user_id, read_at);"
     )
@@ -2385,6 +2692,7 @@ class ChangePasswordPayload(BaseModel):
 @app.post("/me/update")
 def me_update(payload: MeUpdatePayload, user: sqlite3.Row = Depends(require_user)):
     # optional endpoint (safe): update username and/or ghost mode
+    change_cursor_ms: Optional[int] = None
     new_dn = None
     if payload.display_name is not None:
         new_dn = _clean_display_name(payload.display_name, user["email"])
@@ -2439,6 +2747,17 @@ def me_update(payload: MeUpdatePayload, user: sqlite3.Row = Depends(require_user
     if not row:
         return {"ok": True, "updated": True}
 
+    if payload.ghost_mode is not None:
+        is_visible, reason = _presence_state_from_user_row(row)
+        change_cursor_ms = _presence_runtime_state_upsert(
+            int(user["id"]),
+            is_visible=is_visible,
+            reason=reason,
+            changed_at_ms=_presence_change_cursor_ms(),
+        )
+        with _presence_viewport_cache_lock:
+            _presence_viewport_cache.clear()
+
     map_identity_mode = (row["map_identity_mode"] or "").strip().lower() if row["map_identity_mode"] is not None else "name"
     if map_identity_mode not in ALLOWED_MAP_IDENTITY_MODES:
         map_identity_mode = "name"
@@ -2454,6 +2773,7 @@ def me_update(payload: MeUpdatePayload, user: sqlite3.Row = Depends(require_user
         "avatar_version": _avatar_version_for_row(row),
         "map_identity_mode": map_identity_mode,
         "ghost_mode": bool(_flag_to_int(row["ghost_mode"])) if row["ghost_mode"] is not None else False,
+        "presence_cursor": change_cursor_ms,
     }
 
 
@@ -2477,6 +2797,7 @@ async def change_password(payload: ChangePasswordPayload, user: dict = Depends(r
 
 @app.post("/me/delete_account")
 async def delete_account(user: dict = Depends(require_user)):
+    _presence_remove_runtime_visibility(int(user["id"]), reason="account_deleted")
     cleanup = delete_account_runtime_data(int(user["id"]))
     return {"ok": True, "cleanup": cleanup}
 
@@ -2494,6 +2815,7 @@ class PresencePayload(BaseModel):
 @app.post("/presence/update")
 def presence_update(payload: PresencePayload, user: sqlite3.Row = Depends(require_user)):
     now = int(time.time())
+    changed_at_ms = _presence_change_cursor_ms()
 
     if payload.accuracy is not None and float(payload.accuracy) > 50:
         return {"ok": True}
@@ -2512,11 +2834,13 @@ def presence_update(payload: PresencePayload, user: sqlite3.Row = Depends(requir
         """,
         (int(user["id"]), float(payload.lat), float(payload.lng), payload.heading, payload.accuracy, now),
     )
+    is_visible, reason = _presence_state_from_user_row(user)
+    _presence_runtime_state_upsert(int(user["id"]), is_visible=is_visible, reason=reason, changed_at_ms=changed_at_ms)
     record_presence_heartbeat(int(user["id"]), float(payload.lat), float(payload.lng), payload.heading)
     record_pickup_presence_heartbeat(int(user["id"]), float(payload.lat), float(payload.lng), now)
     with _presence_viewport_cache_lock:
         _presence_viewport_cache.clear()
-    return {"ok": True}
+    return {"ok": True, "cursor": changed_at_ms}
 
 
 @app.get("/presence/all")
@@ -2555,77 +2879,10 @@ def presence_all(
             return copy.deepcopy(cached["payload"])
     _record_perf_metric("presence.cache_miss")
 
-    # Filter out ghost_mode enabled users.
-    ghost_visible = _ghost_visible_sql("u.ghost_mode")
-    try:
-        where_clauses = ["p.updated_at >= ?", ghost_visible]
-        params: List[Any] = [cutoff]
-        if buffered_bbox is not None:
-            lo_lat, lo_lng, hi_lat, hi_lng = buffered_bbox
-            where_clauses.append("p.lat BETWEEN ? AND ?")
-            where_clauses.append("p.lng BETWEEN ? AND ?")
-            params.extend([lo_lat, hi_lat, lo_lng, hi_lng])
-        limit_sql = ""
-        if safe_limit is not None:
-            limit_sql = " LIMIT ?"
-            params.append(safe_limit)
-        rows = _db_query_all(
-            f"""
-            SELECT
-              p.user_id,
-              u.id,
-              u.email,
-              u.display_name,
-              u.avatar_version,
-              u.map_identity_mode,
-              u.ghost_mode,
-              p.lat,
-              p.lng,
-              p.heading,
-              p.accuracy,
-              p.updated_at
-            FROM presence p
-            LEFT JOIN users u ON u.id = p.user_id
-            WHERE {' AND '.join(where_clauses)}
-            ORDER BY p.updated_at DESC
-            {limit_sql}
-            """,
-            tuple(params),
-        )
-    except Exception:
-        raise
-
-    badge_by_user = get_best_current_badges_for_users([int(r["user_id"]) for r in rows])
+    rows = _presence_rows_for_viewport(cutoff=cutoff, bbox=buffered_bbox, limit=safe_limit)
     online_count = len(rows)
     ghosted_count = 0
-
-    items: List[Dict[str, Any]] = []
-    for r in rows:
-        best_badge = badge_by_user.get(int(r["user_id"]), {})
-        email = (r["email"] or "").strip()
-        dn = (r["display_name"] or "").strip()
-        if not dn:
-            dn = _clean_display_name("", email or "Driver")
-
-        items.append(
-            {
-                "user_id": int(r["user_id"]),
-                "display_name": dn,
-                "avatar_url": _avatar_thumb_url_for_row(r),
-                "avatar_thumb_url": _avatar_thumb_url_for_row(r),
-                "avatar_version": _avatar_version_for_row(r),
-                "map_identity_mode": (str(r["map_identity_mode"]).strip().lower() if r["map_identity_mode"] is not None and str(r["map_identity_mode"]).strip().lower() in ALLOWED_MAP_IDENTITY_MODES else "name"),
-                "lat": float(r["lat"]),
-                "lng": float(r["lng"]),
-                "heading": float(r["heading"]) if r["heading"] is not None else None,
-                "updated_at": int(r["updated_at"]),
-                "updated_at_unix": int(r["updated_at"]),
-                "leaderboard_badge_code": best_badge.get("leaderboard_badge_code"),
-            }
-        )
-        if safe_mode == "full":
-            items[-1]["email"] = email
-            items[-1]["accuracy"] = float(r["accuracy"]) if r["accuracy"] is not None else None
+    items = _presence_row_payloads(rows, include_full_fields=(safe_mode == "full"))
     snapshot = _presence_visibility_snapshot(max_age_sec)
     if snapshot.get("ok"):
         online_count = int(snapshot.get("online_count") or online_count)
@@ -2647,6 +2904,91 @@ def presence_all(
         }
         _purge_presence_viewport_cache(now_monotonic)
     return response
+
+
+@app.get("/presence/viewport")
+def presence_viewport(
+    max_age_sec: int = PRESENCE_STALE_SECONDS,
+    min_lat: Optional[float] = None,
+    min_lng: Optional[float] = None,
+    max_lat: Optional[float] = None,
+    max_lng: Optional[float] = None,
+    zoom: Optional[int] = None,
+    padding_ratio: float = 0.0,
+    updated_since_ms: Optional[int] = None,
+    include_removed: bool = True,
+    limit: int = PRESENCE_DELTA_MAX_LIMIT,
+    viewer: sqlite3.Row = Depends(require_user),
+):
+    del viewer
+    safe_limit = max(1, min(PRESENCE_DELTA_MAX_LIMIT, int(limit)))
+    buffered_bbox = _presence_bbox_with_buffer(min_lat, min_lng, max_lat, max_lng, zoom)
+    if buffered_bbox is not None and padding_ratio > 0:
+        lo_lat, lo_lng, hi_lat, hi_lng = buffered_bbox
+        lat_pad = max(0.0, (hi_lat - lo_lat) * min(1.0, float(padding_ratio)))
+        lng_pad = max(0.0, (hi_lng - lo_lng) * min(1.0, float(padding_ratio)))
+        buffered_bbox = (
+            round(lo_lat - lat_pad, 5),
+            round(lo_lng - lng_pad, 5),
+            round(hi_lat + lat_pad, 5),
+            round(hi_lng + lng_pad, 5),
+        )
+    if updated_since_ms is not None and int(updated_since_ms) > 0:
+        return _presence_delta_payload(
+            updated_since_ms=int(updated_since_ms),
+            max_age_sec=max_age_sec,
+            bbox=buffered_bbox,
+            limit=safe_limit,
+            include_removed=bool(include_removed),
+        )
+
+    cutoff = int(time.time()) - max(5, min(3600, int(max_age_sec)))
+    rows = _presence_rows_for_viewport(cutoff=cutoff, bbox=buffered_bbox, limit=safe_limit)
+    items = _presence_row_payloads(rows, include_full_fields=False)
+    cursor_row = _db_query_one("SELECT COALESCE(MAX(changed_at_ms), 0) AS cursor FROM presence_runtime_state")
+    snapshot = _presence_visibility_snapshot(max_age_sec)
+    return {
+        "ok": True,
+        "mode": "snapshot",
+        "count": len(items),
+        "items": items,
+        "removed": [],
+        "cursor": int(cursor_row["cursor"] or 0) if cursor_row else 0,
+        "server_time_ms": _presence_change_cursor_ms(),
+        "online_count": int(snapshot.get("online_count") or 0),
+        "ghosted_count": int(snapshot.get("ghosted_count") or 0),
+        "visible_count": len(items),
+        "viewport": {
+            "min_lat": buffered_bbox[0] if buffered_bbox else None,
+            "min_lng": buffered_bbox[1] if buffered_bbox else None,
+            "max_lat": buffered_bbox[2] if buffered_bbox else None,
+            "max_lng": buffered_bbox[3] if buffered_bbox else None,
+        },
+    }
+
+
+@app.get("/presence/delta")
+def presence_delta(
+    updated_since_ms: int = 0,
+    max_age_sec: int = PRESENCE_STALE_SECONDS,
+    min_lat: Optional[float] = None,
+    min_lng: Optional[float] = None,
+    max_lat: Optional[float] = None,
+    max_lng: Optional[float] = None,
+    zoom: Optional[int] = None,
+    include_removed: bool = True,
+    limit: int = PRESENCE_DELTA_MAX_LIMIT,
+    viewer: sqlite3.Row = Depends(require_user),
+):
+    del viewer
+    buffered_bbox = _presence_bbox_with_buffer(min_lat, min_lng, max_lat, max_lng, zoom)
+    return _presence_delta_payload(
+        updated_since_ms=max(0, int(updated_since_ms)),
+        max_age_sec=max_age_sec,
+        bbox=buffered_bbox,
+        limit=limit,
+        include_removed=bool(include_removed),
+    )
 
 
 @app.get("/presence/summary")
@@ -4240,6 +4582,17 @@ def admin_disable_user(payload: AdminDisablePayload, admin: sqlite3.Row = Depend
     _db_exec("UPDATE users SET is_disabled=? WHERE id=?", (disabled_value, int(payload.user_id)))
     if bool(payload.disabled):
         _db_exec("DELETE FROM presence WHERE user_id=?", (int(payload.user_id),))
+        _presence_remove_runtime_visibility(int(payload.user_id), reason="disabled")
+    else:
+        row = _db_query_one(
+            "SELECT id, ghost_mode, is_disabled, is_suspended FROM users WHERE id=? LIMIT 1",
+            (int(payload.user_id),),
+        )
+        if row:
+            is_visible, reason = _presence_state_from_user_row(row)
+            _presence_runtime_state_upsert(int(payload.user_id), is_visible=is_visible, reason=reason)
+    with _presence_viewport_cache_lock:
+        _presence_viewport_cache.clear()
     return {"ok": True}
 
 

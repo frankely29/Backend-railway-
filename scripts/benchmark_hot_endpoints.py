@@ -44,6 +44,10 @@ def main() -> None:
         "timeline": f"{base}/timeline",
         "frame": f"{base}/frame/{int(args.frame_index)}",
         "presence": f"{base}/presence/all?mode=lite&zoom=14&limit=250&min_lat=40.70&min_lng=-74.03&max_lat=40.82&max_lng=-73.90",
+        "presence_viewport": f"{base}/presence/viewport?zoom=14&limit=250&min_lat=40.70&min_lng=-74.03&max_lat=40.82&max_lng=-73.90",
+        "presence_delta": f"{base}/presence/delta?updated_since_ms=0&zoom=14&limit=250&min_lat=40.70&min_lng=-74.03&max_lat=40.82&max_lng=-73.90",
+        "public_chat_summary": f"{base}/chat/public/summary?after=0",
+        "private_chat_summary": f"{base}/chat/private/summary",
         "pickups": f"{base}/events/pickups/recent?limit=50&zone_sample_limit=40&min_lat=40.70&min_lng=-74.03&max_lat=40.82&max_lng=-73.90",
     }
 

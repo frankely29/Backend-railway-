@@ -51,7 +51,7 @@ def set_user_admin(actor_user_id: int, user_id: int, is_admin: bool) -> Dict[str
 
 
 def set_user_suspended(actor_user_id: int, user_id: int, is_suspended: bool) -> Dict[str, Any]:
-    target = _db_query_one("SELECT id FROM users WHERE id=? LIMIT 1", (int(user_id),))
+    target = _db_query_one("SELECT id, ghost_mode, is_disabled, is_suspended FROM users WHERE id=? LIMIT 1", (int(user_id),))
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
 
@@ -59,8 +59,33 @@ def set_user_suspended(actor_user_id: int, user_id: int, is_suspended: bool) -> 
         raise HTTPException(status_code=400, detail="Admins cannot suspend themselves")
 
     _db_exec("UPDATE users SET is_suspended=? WHERE id=?", (_bool_db_value(is_suspended), int(user_id)))
+    changed_at_ms = int(time.time() * 1000)
     if bool(is_suspended):
         _db_exec("DELETE FROM presence WHERE user_id=?", (int(user_id),))
+        _db_exec(
+            """
+            INSERT INTO presence_runtime_state(user_id, changed_at_ms, is_visible, reason)
+            VALUES(?,?,?,?)
+            ON CONFLICT(user_id) DO UPDATE SET
+              changed_at_ms=excluded.changed_at_ms,
+              is_visible=excluded.is_visible,
+              reason=excluded.reason
+            """,
+            (int(user_id), changed_at_ms, _bool_db_value(False), "suspended"),
+        )
+    else:
+        is_visible = not _flag_to_bool(target.get("ghost_mode")) and not _flag_to_bool(target.get("is_disabled"))
+        _db_exec(
+            """
+            INSERT INTO presence_runtime_state(user_id, changed_at_ms, is_visible, reason)
+            VALUES(?,?,?,?)
+            ON CONFLICT(user_id) DO UPDATE SET
+              changed_at_ms=excluded.changed_at_ms,
+              is_visible=excluded.is_visible,
+              reason=excluded.reason
+            """,
+            (int(user_id), changed_at_ms, _bool_db_value(is_visible), None if is_visible else "hidden"),
+        )
 
     return {"ok": True, "user_id": int(user_id), "is_suspended": bool(is_suspended)}
 
