@@ -12,13 +12,16 @@
 ### Presence
 - `POST /presence/update` writes a single `presence` row, updates `presence_runtime_state`, records leaderboard heartbeat data, and updates pickup-guard movement state.
 - `GET /presence/all` remains the compatibility route.
-- `GET /presence/viewport` serves viewport snapshots and can switch into delta mode when `updated_since_ms` is supplied.
-- `GET /presence/delta` reads only changed rows from `presence_runtime_state` and returns `items`, `removed`, `cursor`, `server_time_ms`, `online_count`, `ghosted_count`, and `visible_count`.
+- `GET /presence/viewport` is the preferred snapshot contract and can switch into delta mode when `updated_since_ms` is supplied.
+- `GET /presence/delta` is the preferred incremental contract and reads only changed rows from `presence_runtime_state`, returning `items`, `removed`, `cursor`, `server_time_ms`, `online_count`, `ghosted_count`, and `visible_count`.
 - `GET /presence/summary` reads aggregate counts only.
 - `presence_runtime_state.changed_at_ms` is the delta cursor in milliseconds.
+- Ghost-mode users still write presence heartbeats but surface through `removed` tombstones or count fields instead of visible marker payloads.
 
 ### Chat
 - Public chat remains DB-backed with additive in-process SSE fanout.
+- Browser EventSource clients authenticate by calling `/chat/live/capabilities` with Bearer auth, then reconnect with short-lived signed `live_token` URLs.
+- Signed SSE tickets are HMAC/JWT-style tokens scoped to a user id plus stream type and clamped to a short 30-90 second initiation TTL.
 - Writes always persist first, then publish a compact live event.
 - Live event broker keeps:
   - bounded per-subscriber queues,
@@ -65,6 +68,7 @@
 - Pickup recent overlays and pickup hotspot bundles use in-memory TTL caches.
 - Timeline and frame artifacts use small in-process caches.
 - Live SSE replay is intentionally short and bounded; clients are expected to reconcile with summary routes after resets or reconnect gaps.
+- `Last-Event-ID` works only within that bounded in-memory history, so polling summaries remain the recovery truth source.
 
 ## Diagnostic helpers
 - `scripts/benchmark_hot_endpoints.py` provides reproducible timing checks for hot HTTP routes.

@@ -10,6 +10,7 @@ Use this checklist for backend verification after deploying SAFE PHASE 2.
 - [x] Current room history still works: `GET /chat/rooms/{room}`
 - [x] Public summary still works: `GET /chat/public/summary`
 - [x] Room summary still works: `GET /chat/rooms/{room}/summary`
+- [x] `GET /chat/live/capabilities` requires Bearer auth and returns signed short-lived SSE URLs
 - [x] Public SSE connect works for valid authenticated users: `GET /chat/public/events`
 - [x] Room SSE connect works for valid authenticated users: `GET /chat/rooms/{room}/events`
 - [x] New public message publishes compact live event with stable identifiers
@@ -30,6 +31,7 @@ Use this checklist for backend verification after deploying SAFE PHASE 2.
 ## Auth / moderation / account safety
 - [x] Auth still enforced on polling routes
 - [x] Auth still enforced on SSE routes
+- [x] Invalid/expired signed SSE tickets fail cleanly
 - [x] Disabled users still cannot use chat after auth checks
 - [x] Suspended users still cannot use chat after auth checks
 - [x] DM target validity still rejects blocked/deleted targets
@@ -49,5 +51,6 @@ Use this checklist for backend verification after deploying SAFE PHASE 2.
 
 ## Diagnostics / recovery
 - [x] `GET /chat/live/status` reports active SSE configuration/channel counts
+- [x] Signed SSE ticket TTL/reconnect behavior is documented
 - [x] Last-Event-ID replay is bounded and documented
 - [x] Replay miss falls back to polling via a compact `reset` event and existing summary/history endpoints
