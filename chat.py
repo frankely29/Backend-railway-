@@ -568,15 +568,26 @@ def _list_private_threads(me: int) -> list[dict]:
     thread_rows = _db_query_all(
         """
         SELECT
-            CASE
-                WHEN sender_user_id=? THEN recipient_user_id
-                ELSE sender_user_id
-            END AS other_user_id,
-            MAX(created_at) AS last_message_at
-        FROM private_chat_messages
-        WHERE sender_user_id=? OR recipient_user_id=?
-        GROUP BY other_user_id
-        ORDER BY last_message_at DESC
+            thread.other_user_id,
+            msg.id,
+            msg.sender_user_id,
+            msg.recipient_user_id,
+            msg.text,
+            msg.created_at,
+            msg.message_type
+        FROM (
+            SELECT
+                CASE
+                    WHEN sender_user_id=? THEN recipient_user_id
+                    ELSE sender_user_id
+                END AS other_user_id,
+                MAX(id) AS last_message_id
+            FROM private_chat_messages
+            WHERE sender_user_id=? OR recipient_user_id=?
+            GROUP BY other_user_id
+        ) thread
+        JOIN private_chat_messages msg ON msg.id = thread.last_message_id
+        ORDER BY msg.created_at DESC, msg.id DESC
         """,
         (int(me), int(me), int(me)),
     )
@@ -602,22 +613,10 @@ def _list_private_threads(me: int) -> list[dict]:
     threads: list[dict] = []
     for row in thread_rows:
         other_user_id = int(row["other_user_id"])
-        latest = _db_query_all(
-            """
-            SELECT id, sender_user_id, recipient_user_id, text, created_at, message_type
-            FROM private_chat_messages
-            WHERE (sender_user_id=? AND recipient_user_id=?) OR (sender_user_id=? AND recipient_user_id=?)
-            ORDER BY created_at DESC, id DESC
-            LIMIT 1
-            """,
-            (int(me), other_user_id, other_user_id, int(me)),
-        )
-        if not latest:
-            continue
         user_payload = users.get(other_user_id)
         if user_payload is None:
             continue
-        last_message = dict(latest[0])
+        last_message = dict(row)
         preview = _preview_text(last_message.get("text"), last_message.get("message_type") or "text")
         created_at = _timestamp_to_iso(last_message["created_at"])
         threads.append(
@@ -638,6 +637,132 @@ def _list_private_threads(me: int) -> list[dict]:
 
     threads.sort(key=lambda item: item["last_message_at"], reverse=True)
     return threads
+
+
+def _room_summary(room: str, after: str | None = None) -> dict[str, Any]:
+    safe_room = _normalize_room(room)
+    after_filter = _parse_after(after)
+    latest_rows = _db_query_all(
+        """
+        SELECT id, room, user_id, display_name, message, created_at, message_type, audio_path, audio_mime_type, audio_duration_ms
+        FROM chat_messages
+        WHERE room=?
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (safe_room,),
+    )
+    latest_message = _serialize_public_message(dict(latest_rows[0])) if latest_rows else None
+
+    where = ["room = ?"]
+    params: list[int | str] = [safe_room]
+    if after_filter.field == "id" and after_filter.value is not None:
+        where.append("id > ?")
+        params.append(int(after_filter.value))
+    elif after_filter.field == "created_at" and after_filter.value is not None:
+        if DB_BACKEND == "postgres":
+            where.append("created_at > to_timestamp(?)")
+        else:
+            where.append("created_at > ?")
+        params.append(int(after_filter.value))
+
+    unread_row = _db_query_all(
+        f"""
+        SELECT COUNT(*) AS unread_count
+        FROM chat_messages
+        WHERE {' AND '.join(where)}
+        """,
+        tuple(params),
+    )
+    unread_count = int(unread_row[0]["unread_count"]) if unread_row else 0
+    latest_id = int(latest_rows[0]["id"]) if latest_rows else None
+    return {
+        "ok": True,
+        "room": safe_room,
+        "latest_message_id": latest_id,
+        "latest_created_at": latest_message["created_at"] if latest_message else None,
+        "latest_message": latest_message,
+        "has_newer": bool(unread_count > 0),
+        "unread_count": unread_count,
+    }
+
+
+def _private_thread_summary(me: int, other_user_id: int, after: str | None = None) -> dict[str, Any]:
+    _ensure_dm_target_exists(int(other_user_id))
+    after_filter = _parse_after(after)
+    latest_rows = _db_query_all(
+        """
+        SELECT id, sender_user_id, recipient_user_id, text, created_at, message_type, audio_path, audio_mime_type, audio_duration_ms
+        FROM private_chat_messages
+        WHERE (sender_user_id=? AND recipient_user_id=?) OR (sender_user_id=? AND recipient_user_id=?)
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        """,
+        (int(me), int(other_user_id), int(other_user_id), int(me)),
+    )
+    latest_message = _serialize_private_message(dict(latest_rows[0])) if latest_rows else None
+    where = ["((sender_user_id=? AND recipient_user_id=?) OR (sender_user_id=? AND recipient_user_id=?))"]
+    params: list[int | str] = [int(me), int(other_user_id), int(other_user_id), int(me)]
+    if after_filter.field == "id" and after_filter.value is not None:
+        where.append("id > ?")
+        params.append(int(after_filter.value))
+    elif after_filter.field == "created_at" and after_filter.value is not None:
+        if DB_BACKEND == "postgres":
+            where.append("created_at > to_timestamp(?)")
+        else:
+            where.append("strftime('%s', created_at) > ?")
+        params.append(int(after_filter.value))
+    unread_row = _db_query_all(
+        f"""
+        SELECT COUNT(*) AS unread_count
+        FROM private_chat_messages
+        WHERE {' AND '.join(where)}
+        """,
+        tuple(params),
+    )
+    incoming_unread_row = _db_query_all(
+        """
+        SELECT COUNT(*) AS unread_count
+        FROM private_chat_messages
+        WHERE sender_user_id=? AND recipient_user_id=? AND read_at IS NULL
+        """,
+        (int(other_user_id), int(me)),
+    )
+    unread_count = int(unread_row[0]["unread_count"]) if unread_row else 0
+    latest_id = int(latest_rows[0]["id"]) if latest_rows else None
+    return {
+        "ok": True,
+        "other_user_id": int(other_user_id),
+        "latest_message_id": latest_id,
+        "latest_created_at": latest_message["created_at"] if latest_message else None,
+        "latest_message": latest_message,
+        "has_newer": bool(unread_count > 0),
+        "unread_count": unread_count,
+        "incoming_unread_count": int(incoming_unread_row[0]["unread_count"]) if incoming_unread_row else 0,
+    }
+
+
+def _private_inbox_summary(me: int) -> dict[str, Any]:
+    threads = _list_private_threads(int(me))
+    items = [
+        {
+            "other_user_id": int(thread["other_user_id"]),
+            "display_name": thread["display_name"],
+            "avatar_url": thread.get("avatar_url"),
+            "last_message_at": thread["last_message_at"],
+            "last_message_sender_user_id": int(thread["last_message_sender_user_id"]),
+            "preview_text": thread["preview_text"],
+            "unread_count": int(thread["unread_count"]),
+            "has_newer": bool(int(thread["unread_count"]) > 0),
+        }
+        for thread in threads
+    ]
+    return {
+        "ok": True,
+        "thread_count": len(items),
+        "total_unread_count": sum(int(item["unread_count"]) for item in items),
+        "threads": items,
+    }
 
 
 def _insert_private_message(
@@ -1396,6 +1521,27 @@ def list_room_messages(
     return _list_messages_for_room(room, after, limit)
 
 
+@router.get("/rooms/{room}/summary")
+def room_summary(
+    room: str,
+    after: str | None = None,
+    user=Depends(require_user),
+):
+    _ = user
+    maybe_purge_expired_chat_data()
+    return _room_summary(room, after=after)
+
+
+@router.get("/public/summary")
+def public_chat_summary(
+    after: str | None = None,
+    user=Depends(require_user),
+):
+    _ = user
+    maybe_purge_expired_chat_data()
+    return _room_summary("global", after=after)
+
+
 @router.post("/rooms/{room}")
 def create_room_message(room: str, payload: ChatMessagePayload, user=Depends(require_user)):
     maybe_purge_expired_chat_data()
@@ -1434,6 +1580,19 @@ def list_dm_messages(
     return _list_dm_messages_payload(my_user_id, int(other_user_id), after, limit, mark_read, since_id=since_id)
 
 
+@router.get("/dm/{other_user_id}/summary")
+def dm_thread_summary(
+    other_user_id: int,
+    after: str | None = None,
+    user=Depends(require_user),
+):
+    my_user_id = int(user["id"])
+    maybe_purge_expired_chat_data()
+    if int(other_user_id) == my_user_id:
+        raise HTTPException(status_code=400, detail="Cannot message yourself")
+    return _private_thread_summary(my_user_id, int(other_user_id), after=after)
+
+
 @router.post("/dm/{other_user_id}")
 def create_dm_message(other_user_id: int, payload: ChatMessagePayload, user=Depends(require_user)):
     my_user_id = int(user["id"])
@@ -1469,6 +1628,12 @@ def create_dm_voice_message(
 def list_private_threads(user=Depends(require_user)):
     maybe_purge_expired_chat_data()
     return {"threads": _list_private_threads(int(user["id"]))}
+
+
+@router.get("/private/summary")
+def private_summary(user=Depends(require_user)):
+    maybe_purge_expired_chat_data()
+    return _private_inbox_summary(int(user["id"]))
 
 
 @router.get("/private/{other_user_id}", response_model=PrivateChatMessagesResponse)

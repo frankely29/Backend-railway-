@@ -61,6 +61,15 @@ def init_leaderboard_schema() -> None:
             "CREATE INDEX IF NOT EXISTS idx_leaderboard_badges_lookup ON leaderboard_badges_current(user_id, is_current, period, metric);"
         )
         _db_exec(
+            "CREATE INDEX IF NOT EXISTS idx_driver_daily_stats_date_user ON driver_daily_stats(nyc_date, user_id);"
+        )
+        _db_exec(
+            "CREATE INDEX IF NOT EXISTS idx_driver_daily_stats_user_updated ON driver_daily_stats(user_id, updated_at DESC);"
+        )
+        _db_exec(
+            "CREATE INDEX IF NOT EXISTS idx_driver_work_state_updated ON driver_work_state(updated_at DESC);"
+        )
+        _db_exec(
             """
             DELETE FROM leaderboard_badges_current t
             USING (
@@ -143,6 +152,15 @@ def init_leaderboard_schema() -> None:
     )
     _db_exec(
         "CREATE INDEX IF NOT EXISTS idx_leaderboard_badges_lookup ON leaderboard_badges_current(user_id, is_current, period, metric);"
+    )
+    _db_exec(
+        "CREATE INDEX IF NOT EXISTS idx_driver_daily_stats_date_user ON driver_daily_stats(nyc_date, user_id);"
+    )
+    _db_exec(
+        "CREATE INDEX IF NOT EXISTS idx_driver_daily_stats_user_updated ON driver_daily_stats(user_id, updated_at DESC);"
+    )
+    _db_exec(
+        "CREATE INDEX IF NOT EXISTS idx_driver_work_state_updated ON driver_work_state(updated_at DESC);"
     )
     _db_exec(
         """
