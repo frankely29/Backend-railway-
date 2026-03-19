@@ -30,7 +30,7 @@ def app_env(monkeypatch):
     monkeypatch.delenv("DATABASE_URL", raising=False)
     monkeypatch.delenv("POSTGRES_URL", raising=False)
 
-    for name in ["core", "chat", "leaderboard_db", "leaderboard_service", "leaderboard_tracker", "pickup_recording_feature", "admin_service", "admin_mutation_service", "main"]:
+    for name in ["core", "chat", "leaderboard_db", "leaderboard_service", "leaderboard_tracker", "pickup_recording_feature", "admin_service", "admin_mutation_service", "admin_security", "admin_test_routes", "admin_test_service", "admin_load_test_service", "admin_load_test_models", "main"]:
         sys.modules.pop(name, None)
 
     main = importlib.import_module("main")
@@ -673,3 +673,84 @@ def test_presence_contract_shapes_remain_stable(app_env):
     assert isinstance(all_payload["items"], list)
     assert all_payload["visible_count"] == len(all_payload["items"])
     assert all(item["user_id"] != bob["id"] for item in all_payload["items"])
+
+
+def test_admin_load_test_control_plane(app_env):
+    _main, client, _data_dir = app_env
+    load_service = importlib.import_module("admin_load_test_service")
+    manager = load_service.get_load_test_manager()
+    manager.reset_for_tests()
+
+    admin_login = client.post("/auth/login", json={"email": "admin@example.com", "password": "password123"})
+    assert admin_login.status_code == 200
+    admin_headers = _auth_headers(admin_login.json()["token"])
+
+    user = _signup(client, "load-user@example.com", display_name="Load User")
+    user_headers = _auth_headers(user["token"])
+
+    denied = client.get("/admin/tests/load/capabilities", headers=user_headers)
+    assert denied.status_code == 403
+
+    capabilities = client.get("/admin/tests/load/capabilities", headers=admin_headers)
+    assert capabilities.status_code == 200
+    capabilities_payload = capabilities.json()
+    assert capabilities_payload["ok"] is True
+    assert capabilities_payload["details"]["supported_presets"] == [100, 300, 500, 1000]
+
+    start_payload = {
+        "preset": 100,
+        "duration_sec": 30,
+        "mode": "map_core",
+        "include_presence_writes": True,
+        "include_presence_viewport_reads": True,
+        "include_presence_summary_reads": True,
+        "include_presence_delta_reads": True,
+        "notes": "regression test",
+        "seed": 12345,
+    }
+    started = client.post("/admin/tests/load/start", json=start_payload, headers=admin_headers)
+    assert started.status_code == 200, started.text
+    started_payload = started.json()
+    assert started_payload["ok"] is True
+    assert started_payload["details"]["status"] == "running"
+
+    second_start = client.post("/admin/tests/load/start", json=start_payload, headers=admin_headers)
+    assert second_start.status_code == 409
+    second_payload = second_start.json()
+    assert second_payload["ok"] is False
+    assert "already active" in second_payload["details"]["message"].lower()
+
+    running_status = client.get("/admin/tests/load/status", headers=admin_headers)
+    assert running_status.status_code == 200
+    running_details = running_status.json()["details"]
+    assert running_details["status"] == "running"
+    assert running_details["active_run_id"]
+
+    stop_response = client.post("/admin/tests/load/stop", headers=admin_headers)
+    assert stop_response.status_code == 200
+    assert stop_response.json()["ok"] is True
+
+    last_status = None
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        poll = client.get("/admin/tests/load/status", headers=admin_headers)
+        assert poll.status_code == 200
+        details = poll.json()["details"]
+        if details["status"] in {"stopped", "pass", "fail", "error"} and details["last_result"] is not None:
+            last_status = details["last_result"]
+            break
+        time.sleep(0.1)
+    assert last_status is not None
+    assert last_status["status"] in {"stopped", "pass", "fail"}
+    assert last_status["summary"]
+    assert isinstance(last_status["checks"], list)
+    assert isinstance(last_status["debug"], dict)
+    assert "metrics" in last_status["debug"]
+
+    last_response = client.get("/admin/tests/load/last", headers=admin_headers)
+    assert last_response.status_code == 200
+    last_payload = last_response.json()
+    assert last_payload["ok"] is True
+    assert last_payload["details"]["last_result"]["run_id"] == last_status["run_id"]
+
+    manager.reset_for_tests()
