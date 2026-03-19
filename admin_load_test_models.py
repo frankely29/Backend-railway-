@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, Field
 
 
-LoadTestPreset = Literal[100, 300, 500, 1000]
+LoadTestPreset = Literal[100, 300, 500, 1000, 1500, 2000]
 LoadTestDuration = Literal[30, 45, 60, 90]
 LoadTestMode = Literal["map_core", "map_plus_chat", "custom"]
 LoadTestStatus = Literal["idle", "running", "pass", "fail", "stopped", "error"]
