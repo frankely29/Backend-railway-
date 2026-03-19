@@ -20,7 +20,6 @@ from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Depends, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from pyproj import Transformer
 from shapely.geometry import MultiPolygon, Point, Polygon, mapping, shape
@@ -194,7 +193,25 @@ def _perf_metric_snapshot() -> Dict[str, int]:
         return dict(_perf_metrics)
 
 
+def _merge_vary_header(existing: Optional[str], value: str) -> str:
+    vary_values = [item.strip() for item in (existing or "").split(",") if item.strip()]
+    lowered = {item.lower() for item in vary_values}
+    if value.lower() not in lowered:
+        vary_values.append(value)
+    return ", ".join(vary_values) if vary_values else value
+
+
 class SelectiveGZipMiddleware(BaseHTTPMiddleware):
+    @staticmethod
+    def _rebuilt_headers(headers: Dict[str, str], *, gzip_applied: bool) -> Dict[str, str]:
+        rebuilt = dict(headers)
+        rebuilt.pop("Content-Length", None)
+        rebuilt.pop("content-length", None)
+        rebuilt["Vary"] = _merge_vary_header(rebuilt.get("Vary") or rebuilt.get("vary"), "Accept-Encoding")
+        if gzip_applied:
+            rebuilt["Content-Encoding"] = "gzip"
+        return rebuilt
+
     async def dispatch(self, request: Request, call_next):
         response = await call_next(request)
 
@@ -216,35 +233,18 @@ class SelectiveGZipMiddleware(BaseHTTPMiddleware):
         async for chunk in response.body_iterator:
             body += chunk
 
-        if len(body) < RESPONSE_GZIP_MIN_BYTES:
-            response.headers.setdefault("Vary", "Accept-Encoding")
-            return Response(
-                content=body,
-                status_code=response.status_code,
-                headers=dict(response.headers),
-                media_type=response.media_type,
-            )
-
         content_type = (response.headers.get("content-type") or "").lower()
-        if content_type.startswith("audio/"):
-            return Response(
-                content=body,
-                status_code=response.status_code,
-                headers=dict(response.headers),
-                media_type=response.media_type,
-            )
+        should_compress = len(body) >= RESPONSE_GZIP_MIN_BYTES and not content_type.startswith("audio/")
+        payload = gzip.compress(body) if should_compress else body
+        headers = self._rebuilt_headers(dict(response.headers), gzip_applied=should_compress)
+        if should_compress:
+            _record_perf_metric("gzip.responses")
 
-        compressed = gzip.compress(body)
-        headers = dict(response.headers)
-        headers["Content-Encoding"] = "gzip"
-        headers["Content-Length"] = str(len(compressed))
-        headers["Vary"] = "Accept-Encoding"
-        _record_perf_metric("gzip.responses")
         return Response(
-            content=compressed,
+            content=payload,
             status_code=response.status_code,
             headers=headers,
-            media_type=response.media_type,
+            media_type=None,
         )
 
 
@@ -320,6 +320,17 @@ def _request_etag_matches(request: Request, etag: Optional[str]) -> bool:
     return False
 
 
+def _build_json_bytes(payload: Any) -> bytes:
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def _log_artifact_response(path: str, status_code: int, gzip_requested: bool, body_length: int, content_length: Optional[str]) -> None:
+    print(
+        f"[artifact-response] path={path} status={status_code} gzip_requested={str(gzip_requested).lower()} "
+        f"body_len={body_length} content_length={content_length or '-'}"
+    )
+
+
 def _json_cached_response(
     request: Request,
     payload: Any,
@@ -330,9 +341,17 @@ def _json_cached_response(
     headers = {"Cache-Control": cache_control}
     if etag:
         headers["ETag"] = etag
+
+    gzip_requested = "gzip" in (request.headers.get("accept-encoding", "").lower())
     if _request_etag_matches(request, etag):
-        return Response(status_code=304, headers=headers)
-    return JSONResponse(content=payload, headers=headers)
+        response = Response(status_code=304, headers=headers)
+        _log_artifact_response(request.url.path, response.status_code, gzip_requested, 0, response.headers.get("content-length"))
+        return response
+
+    body = _build_json_bytes(payload)
+    response = Response(content=body, media_type="application/json", headers=headers)
+    _log_artifact_response(request.url.path, response.status_code, gzip_requested, len(body), response.headers.get("content-length"))
+    return response
 
 
 def _read_timeline_cached() -> Dict[str, Any]:
