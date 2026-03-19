@@ -197,7 +197,7 @@ def get_admin_summary() -> Dict[str, Any]:
 def get_admin_users(limit: int = 500) -> List[Dict[str, Any]]:
     rows = _db_query_all(
         """
-        SELECT id, email, display_name, is_admin, is_suspended, ghost_mode, avatar_url, created_at
+        SELECT id, email, display_name, is_admin, is_disabled, is_suspended, ghost_mode, avatar_url, created_at
         FROM users
         ORDER BY id DESC
         LIMIT ?
@@ -213,6 +213,7 @@ def get_admin_users(limit: int = 500) -> List[Dict[str, Any]]:
                 "email": row.get("email"),
                 "display_name": row.get("display_name"),
                 "is_admin": _flag_to_bool(row.get("is_admin")),
+                "is_disabled": _flag_to_bool(row.get("is_disabled")),
                 "is_suspended": _flag_to_bool(row.get("is_suspended")),
                 "ghost_mode": _flag_to_bool(row.get("ghost_mode")),
                 "avatar_url": row.get("avatar_url"),

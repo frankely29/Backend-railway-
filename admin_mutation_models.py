@@ -25,6 +25,7 @@ class AdminUserDetailResponse(BaseModel):
     email: str
     display_name: Optional[str] = None
     is_admin: bool
+    is_disabled: bool = False
     is_suspended: bool
     ghost_mode: bool
     avatar_url: Optional[str] = None

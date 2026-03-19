@@ -22,6 +22,7 @@ from core import (
     _db_lock,
     _db_query_all,
     _sql,
+    _user_block_state,
     require_user,
 )
 
@@ -459,14 +460,13 @@ def _serialize_private_message(row: dict, include_legacy_aliases: bool = False) 
 
 def _ensure_dm_target_exists(other_user_id: int) -> None:
     row = _db_query_all(
-        "SELECT id, is_disabled FROM users WHERE id=? LIMIT 1",
+        "SELECT id, is_disabled, is_suspended FROM users WHERE id=? LIMIT 1",
         (int(other_user_id),),
     )
     if not row:
         raise HTTPException(status_code=404, detail="User not found")
     target = dict(row[0])
-    is_disabled = bool(target["is_disabled"]) if DB_BACKEND == "postgres" else int(target["is_disabled"] or 0) == 1
-    if is_disabled:
+    if _user_block_state(target)["is_blocked"]:
         raise HTTPException(status_code=404, detail="User not found")
 
 
@@ -1302,6 +1302,54 @@ def _create_message_for_room(room: str, payload: ChatMessagePayload, user) -> di
     _enforce_rate_limit(int(user["id"]))
     row = _insert_public_message(room, user, _validate_text(payload.text), message_type="text")
     return _serialize_public_message(row)
+
+
+def send_legacy_global_text_message(user, text: str) -> dict:
+    _enforce_rate_limit(int(user["id"]))
+    row = _insert_public_message("global", user, _validate_text(text), message_type="text")
+    created_at = row.get("created_at")
+    if hasattr(created_at, "timestamp"):
+        created_at = int(created_at.timestamp())
+    else:
+        try:
+            created_at = int(created_at)
+        except Exception:
+            created_at = int(time.time())
+    return {
+        "ok": True,
+        "id": int(row["id"]),
+        "created_at": created_at,
+        "display_name": row.get("display_name"),
+    }
+
+
+def list_legacy_global_messages(limit: int = 50, after_id: int | None = None) -> list[dict[str, Any]]:
+    safe_limit = max(1, min(200, int(limit)))
+    if after_id is None:
+        rows = _db_query_all(
+            """
+            SELECT id, user_id, display_name, message, created_at
+            FROM chat_messages
+            WHERE room = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            ("global", safe_limit),
+        )
+        iterable = reversed(rows)
+    else:
+        rows = _db_query_all(
+            """
+            SELECT id, user_id, display_name, message, created_at
+            FROM chat_messages
+            WHERE room = ? AND id > ?
+            ORDER BY id ASC
+            LIMIT ?
+            """,
+            ("global", max(0, int(after_id)), safe_limit),
+        )
+        iterable = rows
+    return [dict(row) for row in iterable]
 
 
 def _list_dm_messages_payload(

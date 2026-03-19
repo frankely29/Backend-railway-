@@ -41,6 +41,7 @@ from avatar_assets import (
     persist_avatar_thumb,
 )
 from admin_routes import router as admin_router
+from account_runtime import delete_account_runtime_data
 from admin_mutation_routes import router as admin_mutation_router
 from admin_test_routes import router as admin_test_router
 from admin_trips_routes import router as admin_trips_router
@@ -52,10 +53,12 @@ from core import (
     _db_lock,
     _db_query_all,
     _db_query_one,
+    _enforce_user_not_blocked,
     _hash_password,
     _sql,
     DB_BACKEND,
     _make_token,
+    _user_block_state,
     _require_jwt_secret,
     ENFORCE_TRIAL,
     require_user,
@@ -1628,22 +1631,32 @@ def _avatar_thumb_headers(user_id: int, version: str) -> Dict[str, str]:
     }
 
 
+def _row_value(row: Any, key: str) -> Any:
+    if row is None:
+        return None
+    if hasattr(row, "keys") and key in row.keys():
+        return row[key]
+    if isinstance(row, dict):
+        return row.get(key)
+    return None
+
+
 def _avatar_version_for_row(row: Any) -> Optional[str]:
     if row is None:
         return None
-    stored = row["avatar_version"] if "avatar_version" in row.keys() else row.get("avatar_version")
+    stored = _row_value(row, "avatar_version")
     if stored:
         return str(stored)
-    avatar_data_url = row["avatar_url"] if "avatar_url" in row.keys() else row.get("avatar_url")
+    avatar_data_url = _row_value(row, "avatar_url")
     if not avatar_data_url:
         return None
     return avatar_version_for_data_url(str(avatar_data_url))
 
 
 def _avatar_thumb_url_for_row(row: Any) -> Optional[str]:
-    user_id = row["id"] if "id" in row.keys() else row.get("id")
+    user_id = _row_value(row, "id")
     if user_id is None:
-        user_id = row["user_id"] if "user_id" in row.keys() else row.get("user_id")
+        user_id = _row_value(row, "user_id")
     if user_id is None:
         return None
     return avatar_thumb_url(int(user_id), _avatar_version_for_row(row))
@@ -1756,7 +1769,9 @@ def _ensure_admin_seed() -> None:
 
 from chat import (
     _purge_expired_chat_data,
+    list_legacy_global_messages,
     router as chat_router,
+    send_legacy_global_text_message,
     start_chat_retention_sweeper,
 )
 from leaderboard_db import init_leaderboard_schema
@@ -2186,10 +2201,7 @@ def auth_login(payload: LoginPayload):
     row = _db_query_one("SELECT * FROM users WHERE lower(email)=lower(?) LIMIT 1", (email,))
     if not row:
         raise HTTPException(status_code=401, detail="Invalid email or password")
-    if _flag_to_int(row["is_disabled"]) == 1:
-        raise HTTPException(status_code=403, detail="Account disabled")
-    if _flag_to_int(row["is_suspended"] if "is_suspended" in row.keys() else 0) == 1:
-        raise HTTPException(status_code=403, detail="Account suspended")
+    _enforce_user_not_blocked(row)
 
     # Trim any whitespace/newlines on stored salt and hash; some databases
     # (notably Postgres) may store trailing spaces, causing a mismatch.
@@ -2264,10 +2276,10 @@ def me(user: sqlite3.Row = Depends(require_user)):
 def driver_profile(user_id: int, viewer: sqlite3.Row = Depends(require_user)):
     _ = viewer
     target = _db_query_one(
-        "SELECT id, email, display_name, avatar_url, avatar_version, is_disabled FROM users WHERE id=? LIMIT 1",
+        "SELECT id, email, display_name, avatar_url, avatar_version, is_disabled, is_suspended FROM users WHERE id=? LIMIT 1",
         (int(user_id),),
     )
-    if not target or _flag_to_int(target["is_disabled"]) == 1:
+    if not target or _user_block_state(target)["is_blocked"]:
         raise HTTPException(status_code=404, detail="Driver not found")
 
     target_user_id = int(target["id"])
@@ -2465,14 +2477,8 @@ async def change_password(payload: ChangePasswordPayload, user: dict = Depends(r
 
 @app.post("/me/delete_account")
 async def delete_account(user: dict = Depends(require_user)):
-    uid = user["id"]
-    # Remove related data
-    _db_exec("DELETE FROM presence WHERE user_id=?", (uid,))
-    _db_exec("DELETE FROM chat_messages WHERE user_id=?", (uid,))
-    _db_exec("DELETE FROM events WHERE user_id=?", (uid,))
-    # Finally remove the user
-    _db_exec("DELETE FROM users WHERE id=?", (uid,))
-    return {"ok": True}
+    cleanup = delete_account_runtime_data(int(user["id"]))
+    return {"ok": True, "cleanup": cleanup}
 
 
 # =========================================================
@@ -2696,69 +2702,19 @@ def _clean_chat_message(message: str) -> str:
 
 @app.post("/chat/send")
 def chat_send(payload: ChatSendPayload, user: sqlite3.Row = Depends(require_user)):
-    now = int(time.time())
-    message = _clean_chat_message(payload.message)
-    display_name = _clean_display_name(user["display_name"] or "", user["email"])
-
-    with _db_lock:
-        conn = _db()
-        try:
-            cur = conn.cursor()
-            insert_sql = """
-                INSERT INTO chat_messages(room, user_id, display_name, message, created_at)
-                VALUES (?, ?, ?, ?, ?)
-            """
-            if DB_BACKEND == "postgres":
-                insert_sql = """
-                    INSERT INTO chat_messages(room, user_id, display_name, message, created_at)
-                    VALUES (?, ?, ?, ?, to_timestamp(?))
-                """
-                cur.execute(_sql(insert_sql + " RETURNING id"), ("global", int(user["id"]), display_name, message, now))
-                row = cur.fetchone()
-                new_id = int(row["id"])
-            else:
-                cur.execute(_sql(insert_sql), ("global", int(user["id"]), display_name, message, now))
-                new_id = int(cur.lastrowid)
-            conn.commit()
-        finally:
-            conn.close()
-
-    return {"ok": True, "id": new_id, "created_at": now, "display_name": display_name}
+    return send_legacy_global_text_message(user, _clean_chat_message(payload.message))
 
 
 @app.get("/chat/recent")
 def chat_recent(limit: int = 50, user: sqlite3.Row = Depends(require_user)):
-    safe_limit = max(1, min(200, int(limit)))
-    rows = _db_query_all(
-        """
-        SELECT id, user_id, display_name, message, created_at
-        FROM chat_messages
-        WHERE room = ?
-        ORDER BY id DESC
-        LIMIT ?
-        """,
-        ("global", safe_limit),
-    )
-    items = [dict(r) for r in reversed(rows)]
-    return {"ok": True, "items": items}
+    _ = user
+    return {"ok": True, "items": list_legacy_global_messages(limit=limit)}
 
 
 @app.get("/chat/since")
 def chat_since(after_id: int = 0, limit: int = 50, user: sqlite3.Row = Depends(require_user)):
-    safe_after_id = max(0, int(after_id))
-    safe_limit = max(1, min(200, int(limit)))
-    rows = _db_query_all(
-        """
-        SELECT id, user_id, display_name, message, created_at
-        FROM chat_messages
-        WHERE room = ? AND id > ?
-        ORDER BY id ASC
-        LIMIT ?
-        """,
-        ("global", safe_after_id, safe_limit),
-    )
-    items = [dict(r) for r in rows]
-    return {"ok": True, "items": items}
+    _ = user
+    return {"ok": True, "items": list_legacy_global_messages(limit=limit, after_id=after_id)}
 
 
 @app.post("/events/police")
@@ -4282,6 +4238,8 @@ def admin_disable_user(payload: AdminDisablePayload, admin: sqlite3.Row = Depend
     disabled_is_bool = _is_bool_column("users", "is_disabled")
     disabled_value = bool(payload.disabled) if disabled_is_bool else (1 if payload.disabled else 0)
     _db_exec("UPDATE users SET is_disabled=? WHERE id=?", (disabled_value, int(payload.user_id)))
+    if bool(payload.disabled):
+        _db_exec("DELETE FROM presence WHERE user_id=?", (int(payload.user_id),))
     return {"ok": True}
 
 
