@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import asyncio
 import importlib
 import json
 import os
@@ -11,6 +12,7 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from starlette.requests import Request
 
 
 @pytest.fixture()
@@ -57,6 +59,28 @@ def _signup(client: TestClient, email: str, password: str = "password123", displ
 
 def _auth_headers(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
+
+
+def _make_request(path: str) -> Request:
+    async def _receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    return Request(
+        {
+            "type": "http",
+            "http_version": "1.1",
+            "method": "GET",
+            "scheme": "http",
+            "path": path,
+            "raw_path": path.encode("utf-8"),
+            "query_string": b"",
+            "headers": [],
+            "client": ("testclient", 50000),
+            "server": ("testserver", 80),
+            "root_path": "",
+        },
+        receive=_receive,
+    )
 
 
 def _seed_avatar_png(main_module, user_id: int) -> None:
@@ -331,3 +355,94 @@ def test_pickup_guard_evaluation_and_driver_profile_contract(app_env):
     guard = evaluate_pickup_guard(user_id=int(dana["id"]), lat=40.73, lng=-73.99, now_ts=int(time.time()))
     assert guard["ok"] is False
     assert guard["code"] in {"pickup_needs_recent_driving", "pickup_same_position", "pickup_cooldown_active"}
+
+
+def test_chat_sse_requires_auth_and_reports_status(app_env):
+    _, client, _ = app_env
+    alice = _signup(client, "alice-sse@example.com", display_name="Alice SSE")
+    alice_headers = _auth_headers(alice["token"])
+
+    no_auth_public = client.get("/chat/public/events")
+    assert no_auth_public.status_code == 401
+
+    no_auth_private = client.get("/chat/private/events")
+    assert no_auth_private.status_code == 401
+
+    live_status = client.get("/chat/live/status", headers=alice_headers)
+    assert live_status.status_code == 200
+    assert live_status.json()["sse"]["heartbeat_seconds"] >= 1
+
+    chat_module = sys.modules["chat"]
+    user_row = chat_module._db_query_one("SELECT * FROM users WHERE id=? LIMIT 1", (int(alice["id"]),))
+    public_response = asyncio.run(
+        chat_module.public_chat_events(_make_request("/chat/public/events"), None, user=user_row)
+    )
+    assert public_response.media_type == "text/event-stream"
+
+    private_response = asyncio.run(
+        chat_module.private_summary_events(_make_request("/chat/private/events"), None, user=user_row)
+    )
+    assert private_response.media_type == "text/event-stream"
+
+
+def test_public_chat_sse_delivers_new_message_and_replay(app_env):
+    _, client, _ = app_env
+    chat_module = sys.modules["chat"]
+    alice = _signup(client, "alice-public-sse@example.com", display_name="Alice Public")
+    bob = _signup(client, "bob-public-sse@example.com", display_name="Bob Public")
+    alice_headers = _auth_headers(alice["token"])
+    bob_headers = _auth_headers(bob["token"])
+
+    subscriber, _ = chat_module._live_event_broker.subscribe(chat_module._public_channel("global"), None)
+    try:
+        send_response = client.post("/chat/send", json={"message": "sse hello"}, headers=bob_headers)
+        assert send_response.status_code == 200
+        message_event = subscriber.get(timeout=2)
+    finally:
+        chat_module._live_event_broker.unsubscribe(chat_module._public_channel("global"), subscriber)
+
+    assert message_event["id"]
+    assert message_event["event"] == "chat.message"
+    assert message_event["data"]["type"] == "chat.message"
+    assert message_event["data"]["room"] == "global"
+    assert message_event["data"]["text"] == "sse hello"
+    assert message_event["data"]["sender_user_id"] == bob["id"]
+
+    replay_subscriber, replay = chat_module._live_event_broker.subscribe(
+        chat_module._public_channel("global"),
+        int(message_event["id"]) - 1,
+    )
+    try:
+        assert replay
+        replay_event = replay[-1]
+    finally:
+        chat_module._live_event_broker.unsubscribe(chat_module._public_channel("global"), replay_subscriber)
+
+    assert replay_event["id"] == message_event["id"]
+    assert replay_event["data"]["message_id"] == message_event["data"]["message_id"]
+
+
+def test_private_chat_sse_delivers_dm_summary_updates(app_env):
+    _, client, _ = app_env
+    chat_module = sys.modules["chat"]
+    alice = _signup(client, "alice-dm-sse@example.com", display_name="Alice DM")
+    bob = _signup(client, "bob-dm-sse@example.com", display_name="Bob DM")
+    alice_headers = _auth_headers(alice["token"])
+    bob_headers = _auth_headers(bob["token"])
+
+    subscriber, _ = chat_module._live_event_broker.subscribe(chat_module._dm_summary_channel(bob["id"]), None)
+    try:
+        dm_send = client.post(f"/chat/dm/{bob['id']}", json={"text": "dm sse hello"}, headers=alice_headers)
+        assert dm_send.status_code == 200
+        dm_event = subscriber.get(timeout=2)
+    finally:
+        chat_module._live_event_broker.unsubscribe(chat_module._dm_summary_channel(bob["id"]), subscriber)
+
+    assert dm_event["id"]
+    assert dm_event["event"] == "dm.thread_updated"
+    assert dm_event["data"]["type"] == "dm.thread_updated"
+    assert dm_event["data"]["other_user_id"] == alice["id"]
+    assert dm_event["data"]["sender_user_id"] == alice["id"]
+    assert dm_event["data"]["recipient_user_id"] == bob["id"]
+    assert dm_event["data"]["text_preview"] == "dm sse hello"
+    assert dm_event["data"]["unread_count"] >= 1

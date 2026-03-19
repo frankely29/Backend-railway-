@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import json
 import logging
 import os
+import queue
 import re
 import threading
 import time
@@ -10,8 +14,9 @@ from email.utils import formatdate
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, Response, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, Request, Response, UploadFile
 from pydantic import BaseModel
+from starlette.responses import StreamingResponse
 
 from core import (
     DATA_DIR,
@@ -21,6 +26,7 @@ from core import (
     _db_exec,
     _db_lock,
     _db_query_all,
+    _db_query_one,
     _sql,
     _user_block_state,
     require_user,
@@ -51,6 +57,88 @@ _retention_state_lock = threading.Lock()
 _retention_purge_lock = threading.Lock()
 _retention_last_run_monotonic = 0.0
 _retention_sweeper_started = False
+_SSE_HEARTBEAT_SECONDS = float(os.environ.get("CHAT_SSE_HEARTBEAT_SECONDS", "15"))
+_SSE_HISTORY_LIMIT = max(50, int(os.environ.get("CHAT_SSE_HISTORY_LIMIT", "250")))
+_SSE_SUBSCRIBER_QUEUE_SIZE = max(10, int(os.environ.get("CHAT_SSE_SUBSCRIBER_QUEUE_SIZE", "100")))
+
+
+class _LiveEventBroker:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._next_event_id = 1
+        self._subscribers: dict[str, set[queue.Queue[dict[str, Any]]]] = {}
+        self._history: dict[str, list[dict[str, Any]]] = {}
+
+    def publish(self, channel: str, event: str, data: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            event_id = self._next_event_id
+            self._next_event_id += 1
+            envelope = {
+                "id": str(event_id),
+                "event": event,
+                "data": data,
+            }
+            history = self._history.setdefault(channel, [])
+            history.append(envelope)
+            if len(history) > _SSE_HISTORY_LIMIT:
+                del history[: len(history) - _SSE_HISTORY_LIMIT]
+            subscribers = list(self._subscribers.get(channel, set()))
+
+        for subscriber in subscribers:
+            self._offer(subscriber, envelope)
+        return envelope
+
+    def subscribe(self, channel: str, last_event_id: int | None) -> tuple[queue.Queue[dict[str, Any]], list[dict[str, Any]]]:
+        subscriber: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=_SSE_SUBSCRIBER_QUEUE_SIZE)
+        replay: list[dict[str, Any]] = []
+        with self._lock:
+            self._subscribers.setdefault(channel, set()).add(subscriber)
+            history = list(self._history.get(channel, []))
+
+        if last_event_id is not None and history:
+            oldest_id = int(history[0]["id"])
+            if last_event_id < oldest_id:
+                replay.append(
+                    {
+                        "event": "reset",
+                        "data": {
+                            "type": "reset",
+                            "reason": "last_event_id_too_old",
+                            "channel": channel,
+                            "oldest_available_event_id": history[0]["id"],
+                        },
+                    }
+                )
+            replay.extend(event for event in history if int(event["id"]) > last_event_id)
+        return subscriber, replay
+
+    def unsubscribe(self, channel: str, subscriber: queue.Queue[dict[str, Any]]) -> None:
+        with self._lock:
+            subscribers = self._subscribers.get(channel)
+            if not subscribers:
+                return
+            subscribers.discard(subscriber)
+            if not subscribers:
+                self._subscribers.pop(channel, None)
+
+    def stats(self) -> dict[str, int]:
+        with self._lock:
+            return {channel: len(subscribers) for channel, subscribers in self._subscribers.items() if subscribers}
+
+    @staticmethod
+    def _offer(subscriber: queue.Queue[dict[str, Any]], envelope: dict[str, Any]) -> None:
+        try:
+            subscriber.put_nowait(envelope)
+            return
+        except queue.Full:
+            pass
+        with contextlib.suppress(queue.Empty):
+            subscriber.get_nowait()
+        with contextlib.suppress(queue.Full):
+            subscriber.put_nowait(envelope)
+
+
+_live_event_broker = _LiveEventBroker()
 
 
 class ChatMessagePayload(BaseModel):
@@ -458,6 +546,201 @@ def _serialize_private_message(row: dict, include_legacy_aliases: bool = False) 
     return payload
 
 
+def _public_channel(room: str) -> str:
+    return f"chat:room:{_normalize_room(room)}"
+
+
+def _dm_summary_channel(user_id: int) -> str:
+    return f"chat:dm-summary:{int(user_id)}"
+
+
+def _parse_last_event_id(last_event_id: str | None) -> int | None:
+    if last_event_id is None:
+        return None
+    text = str(last_event_id).strip()
+    if not text:
+        return None
+    try:
+        parsed = int(text)
+    except ValueError:
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _sse_encode(envelope: dict[str, Any]) -> bytes:
+    chunks: list[str] = []
+    event_id = envelope.get("id")
+    if event_id is not None:
+        chunks.append(f"id: {event_id}")
+    event_name = str(envelope.get("event") or "message")
+    chunks.append(f"event: {event_name}")
+    payload = json.dumps(envelope.get("data") or {}, separators=(",", ":"), ensure_ascii=False)
+    for line in payload.splitlines() or ["{}"]:
+        chunks.append(f"data: {line}")
+    chunks.append("")
+    chunks.append("")
+    return "\n".join(chunks).encode("utf-8")
+
+
+def _thread_unread_count(user_id: int, other_user_id: int) -> int:
+    row = _db_query_one(
+        """
+        SELECT COUNT(*) AS unread_count
+        FROM private_chat_messages
+        WHERE recipient_user_id=? AND sender_user_id=? AND read_at IS NULL
+        """,
+        (int(user_id), int(other_user_id)),
+    )
+    return int(row["unread_count"]) if row else 0
+
+
+def _total_unread_count(user_id: int) -> int:
+    row = _db_query_one(
+        """
+        SELECT COUNT(*) AS unread_count
+        FROM private_chat_messages
+        WHERE recipient_user_id=? AND read_at IS NULL
+        """,
+        (int(user_id),),
+    )
+    return int(row["unread_count"]) if row else 0
+
+
+def _publish_public_message_event(message: dict[str, Any]) -> dict[str, Any]:
+    room = _normalize_room(str(message["room"]))
+    payload = {
+        "type": "chat.message",
+        "scope": "public_room",
+        "room": room,
+        "message_id": int(message["id"]),
+        "sender_user_id": int(message["user_id"]),
+        "display_name": message.get("display_name"),
+        "text": message.get("text") or "",
+        "message_type": message.get("message_type") or "text",
+        "created_at": message.get("created_at"),
+        "audio_url": message.get("audio_url"),
+        "audio_duration_ms": message.get("audio_duration_ms"),
+        "audio_mime_type": message.get("audio_mime_type"),
+    }
+    envelope = _live_event_broker.publish(_public_channel(room), "chat.message", payload)
+    payload["event_id"] = envelope["id"]
+    return payload
+
+
+def _build_dm_summary_event(
+    *,
+    viewer_user_id: int,
+    other_user_id: int,
+    message: dict[str, Any] | None,
+    event_type: str,
+) -> dict[str, Any]:
+    payload = {
+        "type": event_type,
+        "scope": "dm_summary",
+        "user_id": int(viewer_user_id),
+        "other_user_id": int(other_user_id),
+        "thread_key": _dm_room_for_users(int(viewer_user_id), int(other_user_id)),
+        "unread_count": _thread_unread_count(int(viewer_user_id), int(other_user_id)),
+        "total_unread_count": _total_unread_count(int(viewer_user_id)),
+    }
+    if message is not None:
+        payload.update(
+            {
+                "message_id": int(message["id"]),
+                "sender_user_id": int(message["sender_user_id"]),
+                "recipient_user_id": int(message["recipient_user_id"]),
+                "text_preview": _preview_text(message.get("text"), str(message.get("message_type") or "text")),
+                "message_type": message.get("message_type") or "text",
+                "created_at": message.get("created_at"),
+                "audio_url": message.get("audio_url"),
+                "audio_duration_ms": message.get("audio_duration_ms"),
+                "audio_mime_type": message.get("audio_mime_type"),
+            }
+        )
+    return payload
+
+
+def _publish_dm_summary_events(message: dict[str, Any], *, event_type: str = "dm.thread_updated") -> None:
+    sender_user_id = int(message["sender_user_id"])
+    recipient_user_id = int(message["recipient_user_id"])
+    sender_payload = _build_dm_summary_event(
+        viewer_user_id=sender_user_id,
+        other_user_id=recipient_user_id,
+        message=message,
+        event_type=event_type,
+    )
+    sender_envelope = _live_event_broker.publish(
+        _dm_summary_channel(sender_user_id),
+        "dm.thread_updated",
+        sender_payload,
+    )
+    sender_payload["event_id"] = sender_envelope["id"]
+
+    recipient_payload = _build_dm_summary_event(
+        viewer_user_id=recipient_user_id,
+        other_user_id=sender_user_id,
+        message=message,
+        event_type=event_type,
+    )
+    recipient_envelope = _live_event_broker.publish(
+        _dm_summary_channel(recipient_user_id),
+        "dm.thread_updated",
+        recipient_payload,
+    )
+    recipient_payload["event_id"] = recipient_envelope["id"]
+
+
+def _publish_dm_read_event(viewer_user_id: int, other_user_id: int) -> None:
+    payload = _build_dm_summary_event(
+        viewer_user_id=int(viewer_user_id),
+        other_user_id=int(other_user_id),
+        message=None,
+        event_type="dm.unread_changed",
+    )
+    envelope = _live_event_broker.publish(
+        _dm_summary_channel(int(viewer_user_id)),
+        "dm.unread_changed",
+        payload,
+    )
+    payload["event_id"] = envelope["id"]
+
+
+async def _stream_live_channel(
+    request: Request,
+    *,
+    channel: str,
+    connected_payload: dict[str, Any],
+    last_event_id: int | None,
+) -> StreamingResponse:
+    subscriber, replay = _live_event_broker.subscribe(channel, last_event_id)
+
+    async def event_generator():
+        try:
+            yield _sse_encode({"event": "connected", "data": connected_payload})
+            for envelope in replay:
+                yield _sse_encode(envelope)
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    envelope = await asyncio.to_thread(subscriber.get, True, _SSE_HEARTBEAT_SECONDS)
+                    yield _sse_encode(envelope)
+                except queue.Empty:
+                    yield b": keep-alive\n\n"
+        finally:
+            _live_event_broker.unsubscribe(channel, subscriber)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 def _ensure_dm_target_exists(other_user_id: int) -> None:
     row = _db_query_all(
         "SELECT id, is_disabled, is_suspended FROM users WHERE id=? LIMIT 1",
@@ -562,6 +845,7 @@ def _mark_private_read(me: int, other: int) -> None:
             """,
             (int(other), int(me)),
         )
+    _publish_dm_read_event(int(me), int(other))
 
 
 def _list_private_threads(me: int) -> list[dict]:
@@ -1086,7 +1370,9 @@ def _persist_public_voice_message(room: str, user, upload: UploadFile, duration_
             )
             row = dict(cur.fetchone())
             conn.commit()
-        return _serialize_public_message(row)
+        message = _serialize_public_message(row)
+        _publish_public_message_event(message)
+        return message
     except Exception:
         if conn is not None:
             conn.rollback()
@@ -1195,7 +1481,9 @@ def _persist_private_voice_message(
             )
             row = dict(cur.fetchone())
             conn.commit()
-        return _serialize_private_message(row)
+        message = _serialize_private_message(row)
+        _publish_dm_summary_events(message)
+        return message
     except Exception:
         if conn is not None:
             conn.rollback()
@@ -1361,7 +1649,9 @@ def _create_private_text_message(sender_user_id: int, recipient_user_id: int, te
     clean_text = _validate_text(text)
     _enforce_rate_limit(int(sender_user_id))
     row = _insert_private_message(sender_user_id, recipient_user_id, clean_text, message_type="text")
-    return _serialize_private_message(row)
+    message = _serialize_private_message(row)
+    _publish_dm_summary_events(message)
+    return message
 
 
 def _with_sender_legacy_fields(message: dict, sender_user_id: int, other_user_id: int) -> dict:
@@ -1426,12 +1716,16 @@ def _list_messages_for_room(room: str, after: str | None, limit: int) -> dict:
 def _create_message_for_room(room: str, payload: ChatMessagePayload, user) -> dict:
     _enforce_rate_limit(int(user["id"]))
     row = _insert_public_message(room, user, _validate_text(payload.text), message_type="text")
-    return _serialize_public_message(row)
+    message = _serialize_public_message(row)
+    _publish_public_message_event(message)
+    return message
 
 
 def send_legacy_global_text_message(user, text: str) -> dict:
     _enforce_rate_limit(int(user["id"]))
     row = _insert_public_message("global", user, _validate_text(text), message_type="text")
+    message = _serialize_public_message(row)
+    _publish_public_message_event(message)
     created_at = row.get("created_at")
     if hasattr(created_at, "timestamp"):
         created_at = int(created_at.timestamp())
@@ -1542,6 +1836,27 @@ def public_chat_summary(
     return _room_summary("global", after=after)
 
 
+@router.get("/public/events")
+async def public_chat_events(
+    request: Request,
+    last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
+    user=Depends(require_user),
+):
+    _ = user
+    maybe_purge_expired_chat_data()
+    return await _stream_live_channel(
+        request,
+        channel=_public_channel("global"),
+        connected_payload={
+            "type": "connected",
+            "scope": "public_room",
+            "room": "global",
+            "recovery": "last-event-id-and-polling-summary",
+        },
+        last_event_id=_parse_last_event_id(last_event_id),
+    )
+
+
 @router.post("/rooms/{room}")
 def create_room_message(room: str, payload: ChatMessagePayload, user=Depends(require_user)):
     maybe_purge_expired_chat_data()
@@ -1561,6 +1876,29 @@ def create_room_voice_message(
     maybe_purge_expired_chat_data()
     upload = _resolve_voice_upload(request, file, audio)
     return _persist_public_voice_message(room, user, upload, duration_ms, text)
+
+
+@router.get("/rooms/{room}/events")
+async def room_message_events(
+    room: str,
+    request: Request,
+    last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
+    user=Depends(require_user),
+):
+    _ = user
+    maybe_purge_expired_chat_data()
+    safe_room = _normalize_room(room)
+    return await _stream_live_channel(
+        request,
+        channel=_public_channel(safe_room),
+        connected_payload={
+            "type": "connected",
+            "scope": "public_room",
+            "room": safe_room,
+            "recovery": "last-event-id-and-polling-summary",
+        },
+        last_event_id=_parse_last_event_id(last_event_id),
+    )
 
 
 @router.get("/dm/{other_user_id}")
@@ -1634,6 +1972,40 @@ def list_private_threads(user=Depends(require_user)):
 def private_summary(user=Depends(require_user)):
     maybe_purge_expired_chat_data()
     return _private_inbox_summary(int(user["id"]))
+
+
+@router.get("/private/events")
+async def private_summary_events(
+    request: Request,
+    last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
+    user=Depends(require_user),
+):
+    maybe_purge_expired_chat_data()
+    user_id = int(user["id"])
+    return await _stream_live_channel(
+        request,
+        channel=_dm_summary_channel(user_id),
+        connected_payload={
+            "type": "connected",
+            "scope": "dm_summary",
+            "user_id": user_id,
+            "recovery": "last-event-id-and-private-summary-polling",
+        },
+        last_event_id=_parse_last_event_id(last_event_id),
+    )
+
+
+@router.get("/live/status")
+def live_status(user=Depends(require_user)):
+    _ = user
+    return {
+        "ok": True,
+        "sse": {
+            "heartbeat_seconds": _SSE_HEARTBEAT_SECONDS,
+            "history_limit": _SSE_HISTORY_LIMIT,
+            "channels": _live_event_broker.stats(),
+        },
+    }
 
 
 @router.get("/private/{other_user_id}", response_model=PrivateChatMessagesResponse)
