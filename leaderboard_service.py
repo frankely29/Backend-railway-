@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import bisect
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -15,13 +16,69 @@ PROGRESSION_XP_PER_MILE = 8
 PROGRESSION_XP_PER_HOUR = 30
 PROGRESSION_XP_PER_REPORTED_PICKUP = 20
 PROGRESSION_MAX_PICKUP_REPORTS_PER_DAY_FOR_XP = 25
+MAX_LEVEL = 1000
+RANK_BAND_SIZE = 10
+TOTAL_RANK_BANDS = MAX_LEVEL // RANK_BAND_SIZE
+
+_RANK_FAMILIES = [
+    "Recruit",
+    "Scout",
+    "Ranger",
+    "Courier",
+    "Pilot",
+    "Marshal",
+    "Captain",
+    "Commander",
+    "Sentinel",
+    "Legend",
+]
+_RANK_TIERS = [
+    "Bronze",
+    "Iron",
+    "Steel",
+    "Silver",
+    "Gold",
+    "Platinum",
+    "Diamond",
+    "Master",
+    "Grandmaster",
+    "Mythic",
+]
+_LEGACY_RANK_ICON_KEY_TO_BAND = {
+    "recruit": "band_001",
+    "private": "band_001",
+    "corporal": "band_002",
+    "sergeant": "band_002",
+    "staff_sergeant": "band_003",
+    "sergeant_first_class": "band_003",
+    "master_sergeant": "band_004",
+    "lieutenant": "band_005",
+    "captain": "band_006",
+    "major": "band_007",
+    "colonel": "band_008",
+    "brigadier": "band_009",
+    "major_general": "band_010",
+    "lieutenant_general": "band_010",
+    "general": "band_010",
+    "commander": "band_010",
+    "road_legend": "band_010",
+}
 
 
-def _build_level_xp_thresholds() -> List[int]:
+def _build_level_xp_thresholds(max_level: int = MAX_LEVEL) -> List[int]:
+    """
+    Preserve the original feel through level 100, then continue with a smooth
+    long-tail growth curve that remains reachable over time instead of exploding.
+    """
     thresholds = [0]
     total_xp = 0
-    for level_index in range(2, 101):
-        step_xp = round(120 + ((level_index - 1) * 26) + (((level_index - 1) ** 1.28) * 7))
+    for level_index in range(2, int(max_level) + 1):
+        if level_index <= 100:
+            step_xp = round(120 + ((level_index - 1) * 26) + (((level_index - 1) ** 1.28) * 7))
+        else:
+            over_100 = level_index - 100
+            level_100_step = round(120 + (99 * 26) + ((99 ** 1.28) * 7))
+            step_xp = round(level_100_step + (over_100 * 18) + ((over_100 ** 1.12) * 5))
         total_xp += int(step_xp)
         thresholds.append(total_xp)
     return thresholds
@@ -29,46 +86,44 @@ def _build_level_xp_thresholds() -> List[int]:
 
 LEVEL_XP_THRESHOLDS = _build_level_xp_thresholds()
 
-RANK_LADDER = [
-    (1, 4, "Recruit", "recruit"),
-    (5, 8, "Private", "private"),
-    (9, 12, "Corporal", "corporal"),
-    (13, 16, "Sergeant", "sergeant"),
-    (17, 20, "Staff Sergeant", "staff_sergeant"),
-    (21, 24, "Sergeant First Class", "sergeant_first_class"),
-    (25, 28, "Master Sergeant", "master_sergeant"),
-    (29, 32, "Lieutenant", "lieutenant"),
-    (33, 36, "Captain", "captain"),
-    (37, 40, "Major", "major"),
-    (41, 44, "Colonel", "colonel"),
-    (45, 52, "Brigadier", "brigadier"),
-    (53, 60, "Major General", "major_general"),
-    (61, 70, "Lieutenant General", "lieutenant_general"),
-    (71, 82, "General", "general"),
-    (83, 92, "Commander", "commander"),
-    (93, 100, "Road Legend", "road_legend"),
-]
+
+def _build_rank_ladder() -> List[tuple[int, int, str, str]]:
+    ladder: List[tuple[int, int, str, str]] = []
+    for band_index in range(1, TOTAL_RANK_BANDS + 1):
+        start_level = ((band_index - 1) * RANK_BAND_SIZE) + 1
+        end_level = min(MAX_LEVEL, band_index * RANK_BAND_SIZE)
+        family = _RANK_FAMILIES[(band_index - 1) // 10]
+        tier = _RANK_TIERS[(band_index - 1) % 10]
+        ladder.append((start_level, end_level, f"{tier} {family}", f"band_{band_index:03d}"))
+    return ladder
+
+
+RANK_LADDER = _build_rank_ladder()
 
 
 def get_rank_ladder() -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
-    for start, end, rank_name, rank_icon_key in RANK_LADDER:
-        rows.append(
-            {
-                "start_level": start,
-                "end_level": end,
-                "rank_name": rank_name,
-                "rank_icon_key": rank_icon_key,
-            }
-        )
-    return rows
+    return [
+        {
+            "start_level": start,
+            "end_level": end,
+            "rank_name": rank_name,
+            "rank_icon_key": rank_icon_key,
+        }
+        for start, end, rank_name, rank_icon_key in RANK_LADDER
+    ]
+
+
+def normalize_rank_icon_key(rank_icon_key: str | None) -> str:
+    raw = (rank_icon_key or "").strip().lower()
+    if raw.startswith("band_") and len(raw) == 8:
+        return raw
+    return _LEGACY_RANK_ICON_KEY_TO_BAND.get(raw, "band_001")
 
 
 def _bool_db_value(flag: bool):
     if DB_BACKEND == "postgres":
         return bool(flag)
     return 1 if flag else 0
-
 
 
 @dataclass
@@ -79,8 +134,6 @@ class PeriodBounds:
 
 
 def _today_nyc() -> date:
-    # Match leaderboard_tracker.py business-day logic:
-    # the leaderboard “day” runs from 4 AM NYC to 3:59:59 AM NYC next day.
     return (datetime.now(timezone.utc).astimezone(NYC_TZ) - timedelta(hours=4)).date()
 
 
@@ -120,8 +173,6 @@ def _badge_for_rank(rank: int) -> Optional[str]:
 
 
 def _normalized_badge_code(rank_position: int, badge_code: Optional[str] = None) -> Optional[str]:
-    # Always derive the podium badge from current rank position so stale legacy
-    # values can never leak crown to rank #2/#3 and non-podium ranks are null.
     return _badge_for_rank(int(rank_position))
 
 
@@ -132,29 +183,27 @@ def _display_name(row: Dict) -> str:
 
 
 def _rank_for_level(level: int) -> Dict[str, str]:
-    clamped = max(1, min(100, int(level)))
-    for start, end, rank_name, rank_icon_key in RANK_LADDER:
-        if start <= clamped <= end:
-            return {"rank_name": rank_name, "rank_icon_key": rank_icon_key}
-    return {"rank_name": "Recruit", "rank_icon_key": "recruit"}
+    clamped = max(1, min(MAX_LEVEL, int(level)))
+    band_index = min(TOTAL_RANK_BANDS, ((clamped - 1) // RANK_BAND_SIZE) + 1)
+    start, end, rank_name, rank_icon_key = RANK_LADDER[band_index - 1]
+    return {
+        "start_level": start,
+        "end_level": end,
+        "rank_name": rank_name,
+        "rank_icon_key": rank_icon_key,
+    }
 
 
 def get_level_from_lifetime_xp(total_xp: int) -> int:
     xp = max(0, int(total_xp or 0))
-    if xp >= LEVEL_XP_THRESHOLDS[-1]:
-        return 100
-    level = 1
-    for idx, threshold in enumerate(LEVEL_XP_THRESHOLDS):
-        if xp >= threshold:
-            level = idx + 1
-        else:
-            break
-    return min(100, max(1, level))
+    level_index = bisect.bisect_right(LEVEL_XP_THRESHOLDS, xp) - 1
+    level = max(0, min(MAX_LEVEL - 1, level_index)) + 1
+    return max(1, min(MAX_LEVEL, level))
 
 
 def get_next_level_xp(level: int) -> Optional[int]:
-    clamped = max(1, min(100, int(level)))
-    if clamped >= 100:
+    clamped = max(1, min(MAX_LEVEL, int(level)))
+    if clamped >= MAX_LEVEL:
         return None
     return int(LEVEL_XP_THRESHOLDS[clamped])
 
@@ -175,11 +224,46 @@ def get_level_progress_from_lifetime_xp(total_xp: int) -> Dict[str, Any]:
         "current_level_xp": current_level_xp,
         "next_level_xp": next_level_xp,
         "xp_to_next_level": xp_to_next_level,
-        "max_level_reached": level == 100,
+        "max_level_reached": level == MAX_LEVEL,
     }
 
 
-def _build_progression_from_daily_stats_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+def get_progression_snapshot_for_total_xp(total_xp: int) -> Dict[str, Any]:
+    return get_level_progress_from_lifetime_xp(int(total_xp or 0))
+
+
+def get_game_xp_for_users(user_ids: List[int]) -> Dict[int, int]:
+    clean_user_ids = [int(uid) for uid in user_ids]
+    if not clean_user_ids:
+        return {}
+    placeholders = ",".join(["?" for _ in clean_user_ids])
+    try:
+        rows = _db_query_all(
+            f"""
+            SELECT user_id, COALESCE(SUM(xp_awarded), 0) AS game_xp
+            FROM (
+              SELECT winner_user_id AS user_id, winner_xp_awarded AS xp_awarded
+              FROM game_matches
+              WHERE winner_user_id IS NOT NULL AND status IN ('completed', 'forfeited')
+              UNION ALL
+              SELECT loser_user_id AS user_id, loser_xp_awarded AS xp_awarded
+              FROM game_matches
+              WHERE loser_user_id IS NOT NULL AND status IN ('completed', 'forfeited')
+            ) battle_xp
+            WHERE user_id IN ({placeholders})
+            GROUP BY user_id
+            """,
+            tuple(clean_user_ids),
+        )
+    except Exception:
+        return {uid: 0 for uid in clean_user_ids}
+    result = {uid: 0 for uid in clean_user_ids}
+    for row in rows:
+        result[int(row["user_id"])] = int(row["game_xp"] or 0)
+    return result
+
+
+def build_progression_from_daily_stats_rows(rows: List[Dict[str, Any]], *, game_xp: int = 0) -> Dict[str, Any]:
     lifetime_miles = 0.0
     lifetime_hours = 0.0
     lifetime_pickups_recorded = 0
@@ -202,7 +286,8 @@ def _build_progression_from_daily_stats_rows(rows: List[Dict[str, Any]]) -> Dict
         hours_xp += round(hours * PROGRESSION_XP_PER_HOUR)
         report_xp += pickup_count_for_xp * PROGRESSION_XP_PER_REPORTED_PICKUP
 
-    total_xp = int(miles_xp + hours_xp + report_xp)
+    total_game_xp = max(0, int(game_xp or 0))
+    total_xp = int(miles_xp + hours_xp + report_xp + total_game_xp)
     progression = get_level_progress_from_lifetime_xp(total_xp)
     progression["lifetime_miles"] = round(lifetime_miles, 4)
     progression["lifetime_hours"] = round(lifetime_hours, 4)
@@ -211,6 +296,7 @@ def _build_progression_from_daily_stats_rows(rows: List[Dict[str, Any]]) -> Dict
         "miles_xp": int(miles_xp),
         "hours_xp": int(hours_xp),
         "report_xp": int(report_xp),
+        "game_xp": int(total_game_xp),
     }
     return progression
 
@@ -236,7 +322,7 @@ def get_lifetime_totals_for_user(user_id: int) -> Dict[str, float]:
 
 def get_progression_for_user(user_id: int) -> Dict[str, Any]:
     by_user = get_progression_for_users([int(user_id)])
-    return by_user.get(int(user_id), _build_progression_from_daily_stats_rows([]))
+    return by_user.get(int(user_id), build_progression_from_daily_stats_rows([], game_xp=0))
 
 
 def get_progression_for_users(user_ids: List[int]) -> Dict[int, Dict[str, Any]]:
@@ -260,7 +346,33 @@ def get_progression_for_users(user_ids: List[int]) -> Dict[int, Dict[str, Any]]:
     rows_by_user: Dict[int, List[Dict[str, Any]]] = {uid: [] for uid in clean_user_ids}
     for row in rows:
         rows_by_user.setdefault(int(row["user_id"]), []).append(dict(row))
-    return {uid: _build_progression_from_daily_stats_rows(rows_by_user.get(uid, [])) for uid in clean_user_ids}
+    game_xp_by_user = get_game_xp_for_users(clean_user_ids)
+    return {
+        uid: build_progression_from_daily_stats_rows(rows_by_user.get(uid, []), game_xp=game_xp_by_user.get(uid, 0))
+        for uid in clean_user_ids
+    }
+
+
+def build_reward_contract(progression_after: Dict[str, Any], xp_awarded: int) -> Dict[str, Any]:
+    total_xp_after = int(progression_after.get("total_xp") or 0)
+    awarded = max(0, int(xp_awarded or 0))
+    previous_total_xp = max(0, total_xp_after - awarded)
+    before = get_progression_snapshot_for_total_xp(previous_total_xp)
+    return {
+        "level": int(progression_after.get("level") or 1),
+        "rank_name": str(progression_after.get("rank_name") or "Bronze Recruit"),
+        "rank_icon_key": str(progression_after.get("rank_icon_key") or "band_001"),
+        "total_xp": total_xp_after,
+        "current_level_xp": int(progression_after.get("current_level_xp") or 0),
+        "next_level_xp": progression_after.get("next_level_xp"),
+        "xp_to_next_level": int(progression_after.get("xp_to_next_level") or 0),
+        "xp_awarded": awarded,
+        "previous_level": int(before.get("level") or 1),
+        "new_level": int(progression_after.get("level") or 1),
+        "leveled_up": int(progression_after.get("level") or 1) > int(before.get("level") or 1),
+        "xp_breakdown": progression_after.get("xp_breakdown") or {},
+        "max_level_reached": bool(progression_after.get("max_level_reached")),
+    }
 
 
 def _enrich_rows_with_progression(rows: List[Dict]) -> None:
@@ -294,14 +406,13 @@ def _aggregate_rows(metric: LeaderboardMetric, period: LeaderboardPeriod) -> Dic
     )
     ranked: List[Dict] = []
     for idx, row in enumerate(rows, start=1):
-        badge_code = _badge_for_rank(idx)
         ranked.append(
             {
                 "user_id": int(row["user_id"]),
                 "display_name": _display_name(dict(row)),
                 "metric_value": round(float(row["metric_value"] or 0.0), 4),
                 "rank_position": idx,
-                "badge_code": badge_code,
+                "badge_code": _badge_for_rank(idx),
             }
         )
     return {"metric": metric, "period": period, "period_key": bounds.period_key, "rows": ranked}
@@ -371,8 +482,6 @@ def get_my_rank(user_id: int, metric: LeaderboardMetric, period: LeaderboardPeri
 
 def refresh_current_badges() -> None:
     now = int(time.time())
-
-    # Current badges must be DAILY miles only.
     _db_exec(
         "DELETE FROM leaderboard_badges_current WHERE metric<>? OR period<>?",
         (LeaderboardMetric.miles.value, LeaderboardPeriod.daily.value),
@@ -487,7 +596,6 @@ def get_current_badges_for_user(user_id: int) -> List[Dict]:
         if item["badge_code"]:
             normalized_rows.append(item)
     return normalized_rows
-
 
 
 def get_best_current_badge_for_user(user_id: int) -> Dict:

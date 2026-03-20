@@ -683,6 +683,24 @@ def _publish_public_message_event(message: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def publish_public_system_event(event_name: str, payload: dict[str, Any], *, room: str = "global") -> dict[str, Any]:
+    normalized_room = _normalize_room(room)
+    data = dict(payload or {})
+    data.setdefault("type", event_name)
+    data.setdefault("scope", "public_system")
+    data["room"] = normalized_room
+    envelope = _live_event_broker.publish(_public_channel(normalized_room), event_name, data)
+    data["event_id"] = envelope["id"]
+    return data
+
+
+def publish_public_battle_notification(payload: dict[str, Any]) -> dict[str, Any]:
+    battle_payload = dict(payload or {})
+    battle_payload.setdefault("type", "battle_result")
+    battle_payload.setdefault("scope", "public_battle")
+    return publish_public_system_event("battle_result", battle_payload, room="global")
+
+
 def _build_dm_summary_event(
     *,
     viewer_user_id: int,
