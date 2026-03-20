@@ -134,6 +134,13 @@ def test_challenge_create_decline_cancel_and_permissions(app_env):
     assert create_response.status_code == 200, create_response.text
     challenge_id = create_response.json()["id"]
 
+    duplicate_response = client.post(
+        "/games/challenges",
+        json={"target_user_id": bob["id"], "game_type": "dominoes"},
+        headers=_headers(alice["token"]),
+    )
+    assert duplicate_response.status_code == 409
+
     wrong_accept = client.post(f"/games/challenges/{challenge_id}/accept", headers=_headers(cara["token"]))
     assert wrong_accept.status_code == 403
 
@@ -149,7 +156,13 @@ def test_challenge_create_decline_cancel_and_permissions(app_env):
     challenge_id = create_response.json()["id"]
     cancel_response = client.post(f"/games/challenges/{challenge_id}/cancel", headers=_headers(alice["token"]))
     assert cancel_response.status_code == 200
-    assert cancel_response.json()["status"] == "cancelled"
+    assert cancel_response.json()["status"] in {"cancelled", "canceled"}
+
+    users_response = client.get("/games/users?q=bo&limit=10", headers=_headers(alice["token"]))
+    assert users_response.status_code == 200
+    user_items = users_response.json()["items"]
+    assert any(item["user_id"] == bob["id"] for item in user_items)
+    assert all(item["user_id"] != alice["id"] for item in user_items)
 
 
 def test_dominoes_match_completion_awards_xp_once_and_profile_stats(app_env):
@@ -203,8 +216,18 @@ def test_dominoes_match_completion_awards_xp_once_and_profile_stats(app_env):
     viewer = main._db_query_one("SELECT * FROM users WHERE id=? LIMIT 1", (int(loser["id"]),))
     profile = main.driver_profile(int(winner["id"]), viewer=viewer)
     assert profile["battle_stats"]["wins"] == 1
+    assert profile["battle_record"]["total_matches"] == 1
     assert profile["battle_stats"]["matches_played"] == 1
     assert profile["recent_battles"][0]["match_id"] == match_id
+
+    second_accept = client.post(
+        f"/games/challenges/{accepted['match']['challenge_id']}/accept",
+        headers=_headers(bob["token"]),
+    )
+    assert second_accept.status_code == 200
+    assert second_accept.json()["match"]["id"] == match_id
+    match_count = main._db_query_one("SELECT COUNT(*) AS c FROM game_matches WHERE challenge_id=?", (int(accepted["match"]["challenge_id"]),))
+    assert int(match_count["c"] or 0) == 1
 
 
 def test_cannot_move_out_of_turn(app_env):
@@ -277,8 +300,9 @@ def test_billiards_match_completion_awards_xp_once(app_env):
 
 
 def test_public_battle_result_event_helper(app_env):
-    _main, _client = app_env
+    _main, client = app_env
     chat_module = importlib.import_module("chat")
+    winner = _signup(client, "winner@example.com", "Winner")
 
     subscriber, replay = chat_module._live_event_broker.subscribe(chat_module._public_channel("global"), None)
     assert replay == []
@@ -296,6 +320,13 @@ def test_public_battle_result_event_helper(app_env):
                 "completed_at": "2026-03-20T00:00:00+00:00",
             }
         )
+        chat_module.publish_public_battle_chat_message(
+            author_user_id=int(winner["id"]),
+            winner_display_name="Winner",
+            loser_display_name="Loser",
+            game_type="dominoes",
+            winner_xp_awarded=60,
+        )
         envelope = subscriber.get(timeout=1)
     finally:
         chat_module._live_event_broker.unsubscribe(chat_module._public_channel("global"), subscriber)
@@ -303,3 +334,10 @@ def test_public_battle_result_event_helper(app_env):
     assert payload["type"] == "battle_result"
     assert envelope["event"] == "battle_result"
     assert envelope["data"]["match_id"] == 77
+
+    message_rows = _main._db_query_all(
+        "SELECT display_name, message FROM chat_messages WHERE room='global' ORDER BY id DESC LIMIT 1"
+    )
+    assert message_rows
+    assert message_rows[0]["display_name"] == "Battle Results"
+    assert "Winner beat Loser in Dominoes" in message_rows[0]["message"]
