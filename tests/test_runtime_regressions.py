@@ -603,7 +603,7 @@ def test_chat_live_tokens_expire_and_respect_block_state(app_env):
 
 
 def test_presence_contract_shapes_remain_stable(app_env):
-    _, client, _ = app_env
+    main, client, _ = app_env
     alice = _signup(client, "alice-presence-contract@example.com", display_name="Alice Presence Contract")
     bob = _signup(client, "bob-presence-contract@example.com", display_name="Bob Presence Contract")
     alice_headers = _auth_headers(alice["token"])
@@ -628,6 +628,7 @@ def test_presence_contract_shapes_remain_stable(app_env):
     assert snapshot_payload["removed"] == []
     assert isinstance(snapshot_payload["cursor"], int)
     assert isinstance(snapshot_payload["server_time_ms"], int)
+    assert snapshot_payload["stale_after_sec"] >= 5
     assert snapshot_payload["server_time_ms"] >= snapshot_payload["cursor"]
     assert {"online_count", "ghosted_count", "visible_count"}.issubset(snapshot_payload.keys())
     assert any(item["user_id"] == alice["id"] for item in snapshot_payload["items"])
@@ -653,6 +654,7 @@ def test_presence_contract_shapes_remain_stable(app_env):
     assert isinstance(delta_payload["removed"], list)
     assert isinstance(delta_payload["cursor"], int)
     assert isinstance(delta_payload["server_time_ms"], int)
+    assert delta_payload["stale_after_sec"] >= 5
     assert any(item["user_id"] == bob["id"] and item["reason"] == "ghost_mode" for item in delta_payload["removed"])
 
     summary_response = client.get("/presence/summary", headers=alice_headers)
@@ -662,6 +664,7 @@ def test_presence_contract_shapes_remain_stable(app_env):
     assert summary_payload["online_count"] >= 2
     assert summary_payload["ghosted_count"] >= 1
     assert summary_payload["visible_count"] >= 1
+    assert summary_payload["stale_after_sec"] >= 5
 
     presence_all = client.get(
         "/presence/all?mode=lite&min_lat=40.70&min_lng=-74.10&max_lat=40.90&max_lng=-73.80&zoom=13",
@@ -672,7 +675,27 @@ def test_presence_contract_shapes_remain_stable(app_env):
     assert all_payload["ok"] is True
     assert isinstance(all_payload["items"], list)
     assert all_payload["visible_count"] == len(all_payload["items"])
+    assert all_payload["stale_after_sec"] >= 5
     assert all(item["user_id"] != bob["id"] for item in all_payload["items"])
+
+    _seed_avatar_png(main, int(bob["id"]))
+    main._db_exec("UPDATE users SET avatar_version=NULL WHERE id=?", (int(bob["id"]),))
+    bob_unghost = client.post("/me/update", json={"ghost_mode": False}, headers=bob_headers)
+    assert bob_unghost.status_code == 200
+    bob_update_again = client.post(
+        "/presence/update",
+        json={"lat": 40.761, "lng": -73.981, "heading": 95, "accuracy": 4},
+        headers=bob_headers,
+    )
+    assert bob_update_again.status_code == 200
+    presence_with_avatar = client.get(
+        "/presence/all?mode=lite&min_lat=40.70&min_lng=-74.10&max_lat=40.90&max_lng=-73.80&zoom=13",
+        headers=alice_headers,
+    )
+    assert presence_with_avatar.status_code == 200
+    bob_item = next(item for item in presence_with_avatar.json()["items"] if item["user_id"] == bob["id"])
+    assert bob_item["avatar_thumb_url"].startswith("/avatars/thumb/")
+    assert bob_item["avatar_version"]
 
 
 def test_admin_load_test_control_plane(app_env):

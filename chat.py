@@ -701,6 +701,26 @@ def publish_public_battle_notification(payload: dict[str, Any]) -> dict[str, Any
     return publish_public_system_event("battle_result", battle_payload, room="global")
 
 
+def publish_public_battle_chat_message(
+    *,
+    author_user_id: int,
+    winner_display_name: str,
+    loser_display_name: str,
+    game_type: str,
+    winner_xp_awarded: int,
+) -> dict[str, Any]:
+    safe_winner = (winner_display_name or "Driver").strip() or "Driver"
+    safe_loser = (loser_display_name or "Driver").strip() or "Driver"
+    normalized_game = (game_type or "battle").strip().lower()
+    game_label = "Dominoes" if normalized_game == "dominoes" else "Billiards" if normalized_game == "billiards" else normalized_game.title()
+    message = f"🎮 {safe_winner} beat {safe_loser} in {game_label} • +{max(0, int(winner_xp_awarded or 0))} XP"
+    system_user = {"id": int(author_user_id), "display_name": "Battle Results", "email": "battle-results@system.local"}
+    row = _insert_public_message("global", system_user, message, message_type="text")
+    serialized = _serialize_public_message(row)
+    _publish_public_message_event(serialized)
+    return serialized
+
+
 def _build_dm_summary_event(
     *,
     viewer_user_id: int,

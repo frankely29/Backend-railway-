@@ -121,3 +121,8 @@ class MatchResponse(BaseModel):
 class HistoryResponse(BaseModel):
     ok: bool = True
     items: List[RecentBattleRow] = Field(default_factory=list)
+
+
+class ChallengeUsersResponse(BaseModel):
+    ok: bool = True
+    items: List[Dict[str, Any]] = Field(default_factory=list)

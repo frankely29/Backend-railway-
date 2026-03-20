@@ -1013,6 +1013,10 @@ def _presence_visibility_snapshot(max_age_sec: int) -> Dict[str, Any]:
     }
 
 
+def _effective_presence_stale_after_sec(max_age_sec: int) -> int:
+    return max(5, min(3600, int(max_age_sec)))
+
+
 def _presence_change_cursor_ms() -> int:
     return int(time.time() * 1000)
 
@@ -1125,6 +1129,7 @@ def _presence_rows_for_viewport(
           u.id,
           u.email,
           u.display_name,
+          u.avatar_url,
           u.avatar_version,
           u.map_identity_mode,
           u.ghost_mode,
@@ -1165,6 +1170,7 @@ def _presence_delta_payload(
           u.id,
           u.email,
           u.display_name,
+          u.avatar_url,
           u.avatar_version,
           u.map_identity_mode,
           u.ghost_mode,
@@ -1221,6 +1227,7 @@ def _presence_delta_payload(
         "removed": removed if include_removed else [],
         "cursor": next_cursor,
         "server_time_ms": _presence_change_cursor_ms(),
+        "stale_after_sec": _effective_presence_stale_after_sec(max_age_sec),
         "has_more": len(rows) >= safe_limit,
     }
 
@@ -2582,6 +2589,7 @@ def me(user: sqlite3.Row = Depends(require_user)):
         "trial_expires_at": int(user["trial_expires_at"]),
         "leaderboard_badge_code": best_badge.get("leaderboard_badge_code"),
         "battle_stats": battle_stats,
+        "battle_record": battle_stats,
     }
 
 
@@ -2647,6 +2655,7 @@ def driver_profile(user_id: int, viewer: sqlite3.Row = Depends(require_user)):
         },
         "progression": progression,
         "battle_stats": battle_stats,
+        "battle_record": battle_stats,
         "recent_battles": recent_battles,
     }
 
@@ -2866,7 +2875,8 @@ def presence_all(
     viewer: sqlite3.Row = Depends(require_user),  # REQUIRE AUTH (frontend already sends token)
 ):
     del viewer
-    cutoff = int(time.time()) - max(5, min(3600, int(max_age_sec)))
+    stale_after_sec = _effective_presence_stale_after_sec(max_age_sec)
+    cutoff = int(time.time()) - stale_after_sec
     safe_mode = (mode or "full").strip().lower()
     if safe_mode not in {"full", "lite"}:
         raise HTTPException(status_code=400, detail="mode must be 'full' or 'lite'")
@@ -2905,6 +2915,7 @@ def presence_all(
         "online_count": online_count,
         "ghosted_count": ghosted_count,
         "visible_count": visible_count,
+        "stale_after_sec": stale_after_sec,
     }
     with _presence_viewport_cache_lock:
         _presence_viewport_cache[cache_key] = {
@@ -2952,7 +2963,8 @@ def presence_viewport(
             include_removed=bool(include_removed),
         )
 
-    cutoff = int(time.time()) - max(5, min(3600, int(max_age_sec)))
+    stale_after_sec = _effective_presence_stale_after_sec(max_age_sec)
+    cutoff = int(time.time()) - stale_after_sec
     rows = _presence_rows_for_viewport(cutoff=cutoff, bbox=buffered_bbox, limit=safe_limit)
     items = _presence_row_payloads(rows, include_full_fields=False)
     cursor_row = _db_query_one("SELECT COALESCE(MAX(changed_at_ms), 0) AS cursor FROM presence_runtime_state")
@@ -2965,6 +2977,7 @@ def presence_viewport(
         "removed": [],
         "cursor": int(cursor_row["cursor"] or 0) if cursor_row else 0,
         "server_time_ms": _presence_change_cursor_ms(),
+        "stale_after_sec": stale_after_sec,
         "online_count": int(snapshot.get("online_count") or 0),
         "ghosted_count": int(snapshot.get("ghosted_count") or 0),
         "visible_count": len(items),
@@ -3018,6 +3031,7 @@ def presence_summary(
         "online_count": online_count,
         "ghosted_count": ghosted_count,
         "visible_count": max(0, visible_count),
+        "stale_after_sec": _effective_presence_stale_after_sec(max_age_sec),
     }
 
 

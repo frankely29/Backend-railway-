@@ -5,7 +5,7 @@ import sqlite3
 from fastapi import APIRouter, Depends
 
 from core import require_user
-from games_models import ChallengeListResponse, ChallengeRow, GameChallengeCreateIn, GameMoveIn, HistoryResponse, MatchResponse
+from games_models import ChallengeListResponse, ChallengeRow, ChallengeUsersResponse, GameChallengeCreateIn, GameMoveIn, HistoryResponse, MatchResponse
 from games_service import (
     accept_challenge,
     cancel_challenge,
@@ -15,7 +15,10 @@ from games_service import (
     get_active_match_for_user,
     get_history_for_user,
     get_match_detail,
+    list_challengeable_users,
     list_challenges_for_user,
+    list_incoming_challenges_for_user,
+    list_outgoing_challenges_for_user,
     submit_move,
 )
 
@@ -26,6 +29,16 @@ router = APIRouter(prefix="/games", tags=["games"])
 def game_challenges(user: sqlite3.Row = Depends(require_user)):
     data = list_challenges_for_user(int(user["id"]))
     return {"ok": True, **data}
+
+
+@router.get("/challenges/incoming", response_model=ChallengeUsersResponse)
+def incoming_game_challenges(user: sqlite3.Row = Depends(require_user)):
+    return {"ok": True, "items": list_incoming_challenges_for_user(int(user["id"]))}
+
+
+@router.get("/challenges/outgoing", response_model=ChallengeUsersResponse)
+def outgoing_game_challenges(user: sqlite3.Row = Depends(require_user)):
+    return {"ok": True, "items": list_outgoing_challenges_for_user(int(user["id"]))}
 
 
 @router.post("/challenges", response_model=ChallengeRow)
@@ -46,6 +59,11 @@ def decline_game_challenge(challenge_id: int, user: sqlite3.Row = Depends(requir
 @router.post("/challenges/{challenge_id}/cancel", response_model=ChallengeRow)
 def cancel_game_challenge(challenge_id: int, user: sqlite3.Row = Depends(require_user)):
     return cancel_challenge(int(challenge_id), int(user["id"]))
+
+
+@router.get("/users", response_model=ChallengeUsersResponse)
+def game_users(q: str = "", limit: int = 25, user: sqlite3.Row = Depends(require_user)):
+    return {"ok": True, "items": list_challengeable_users(int(user["id"]), q=q, limit=limit)}
 
 
 @router.get("/matches/active/me", response_model=MatchResponse | None)

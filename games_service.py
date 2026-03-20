@@ -10,15 +10,22 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from fastapi import HTTPException
 
-from chat import publish_public_battle_notification
+from avatar_assets import avatar_thumb_url, avatar_version_for_data_url
+from chat import publish_public_battle_chat_message, publish_public_battle_notification
 from core import DB_BACKEND, _clean_display_name, _db, _db_lock, _db_query_all, _db_query_one, _sql
-from leaderboard_service import build_reward_contract, get_progression_for_user, get_progression_snapshot_for_total_xp
+from leaderboard_service import (
+    build_reward_contract,
+    get_best_current_badges_for_users,
+    get_progression_for_user,
+    get_progression_snapshot_for_total_xp,
+)
 
 ALLOWED_GAME_TYPES = {"dominoes", "billiards"}
 CHALLENGE_EXPIRATION_SECONDS = 15 * 60
 WINNER_XP_AWARD = 60
 LOSER_XP_AWARD = 20
 MAX_RECENT_BATTLES = 5
+MAX_CHALLENGEABLE_USERS = 100
 DOMINO_SET: list[tuple[int, int]] = [(a, b) for a in range(7) for b in range(a, 7)]
 BILLIARDS_TARGETS_TO_CLEAR = 3
 
@@ -151,8 +158,24 @@ def ensure_games_schema() -> None:
                   FOREIGN KEY(actor_user_id) REFERENCES users(id)
                 )
                 """,
+                """
+                CREATE TABLE IF NOT EXISTS user_game_stats (
+                  user_id BIGINT PRIMARY KEY,
+                  total_matches INTEGER NOT NULL DEFAULT 0,
+                  total_wins INTEGER NOT NULL DEFAULT 0,
+                  total_losses INTEGER NOT NULL DEFAULT 0,
+                  dominoes_wins INTEGER NOT NULL DEFAULT 0,
+                  dominoes_losses INTEGER NOT NULL DEFAULT 0,
+                  billiards_wins INTEGER NOT NULL DEFAULT 0,
+                  billiards_losses INTEGER NOT NULL DEFAULT 0,
+                  game_xp_earned INTEGER NOT NULL DEFAULT 0,
+                  updated_at BIGINT NOT NULL DEFAULT 0,
+                  FOREIGN KEY(user_id) REFERENCES users(id)
+                )
+                """,
                 "CREATE INDEX IF NOT EXISTS idx_game_challenges_incoming ON game_challenges(challenged_user_id, status, created_at DESC)",
                 "CREATE INDEX IF NOT EXISTS idx_game_challenges_outgoing ON game_challenges(challenger_user_id, status, created_at DESC)",
+                "CREATE INDEX IF NOT EXISTS idx_game_challenges_pending_pairs ON game_challenges(game_type, challenger_user_id, challenged_user_id, status)",
                 "CREATE INDEX IF NOT EXISTS idx_game_matches_p1_status ON game_matches(player_one_user_id, status, updated_at DESC)",
                 "CREATE INDEX IF NOT EXISTS idx_game_matches_p2_status ON game_matches(player_two_user_id, status, updated_at DESC)",
                 "CREATE INDEX IF NOT EXISTS idx_game_match_moves_lookup ON game_match_moves(match_id, move_number)",
@@ -225,8 +248,24 @@ def ensure_games_schema() -> None:
               FOREIGN KEY(actor_user_id) REFERENCES users(id)
             )
             """,
+            """
+            CREATE TABLE IF NOT EXISTS user_game_stats (
+              user_id INTEGER PRIMARY KEY,
+              total_matches INTEGER NOT NULL DEFAULT 0,
+              total_wins INTEGER NOT NULL DEFAULT 0,
+              total_losses INTEGER NOT NULL DEFAULT 0,
+              dominoes_wins INTEGER NOT NULL DEFAULT 0,
+              dominoes_losses INTEGER NOT NULL DEFAULT 0,
+              billiards_wins INTEGER NOT NULL DEFAULT 0,
+              billiards_losses INTEGER NOT NULL DEFAULT 0,
+              game_xp_earned INTEGER NOT NULL DEFAULT 0,
+              updated_at INTEGER NOT NULL DEFAULT 0,
+              FOREIGN KEY(user_id) REFERENCES users(id)
+            )
+            """,
             "CREATE INDEX IF NOT EXISTS idx_game_challenges_incoming ON game_challenges(challenged_user_id, status, created_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_game_challenges_outgoing ON game_challenges(challenger_user_id, status, created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_game_challenges_pending_pairs ON game_challenges(game_type, challenger_user_id, challenged_user_id, status)",
             "CREATE INDEX IF NOT EXISTS idx_game_matches_p1_status ON game_matches(player_one_user_id, status, updated_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_game_matches_p2_status ON game_matches(player_two_user_id, status, updated_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_game_match_moves_lookup ON game_match_moves(match_id, move_number)",
@@ -391,6 +430,118 @@ def _serialize_match_summary(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _upsert_user_game_stats(
+    cur,
+    *,
+    user_id: int,
+    is_win: bool,
+    game_type: str,
+    xp_earned: int,
+) -> None:
+    now = _now_ts()
+    normalized_game_type = str(game_type or "").strip().lower()
+    dominoes_win = 1 if is_win and normalized_game_type == "dominoes" else 0
+    dominoes_loss = 1 if (not is_win) and normalized_game_type == "dominoes" else 0
+    billiards_win = 1 if is_win and normalized_game_type == "billiards" else 0
+    billiards_loss = 1 if (not is_win) and normalized_game_type == "billiards" else 0
+    _exec_cur(
+        cur,
+        """
+        INSERT INTO user_game_stats(
+          user_id, total_matches, total_wins, total_losses,
+          dominoes_wins, dominoes_losses, billiards_wins, billiards_losses,
+          game_xp_earned, updated_at
+        ) VALUES(?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(user_id) DO UPDATE SET
+          total_matches=user_game_stats.total_matches + excluded.total_matches,
+          total_wins=user_game_stats.total_wins + excluded.total_wins,
+          total_losses=user_game_stats.total_losses + excluded.total_losses,
+          dominoes_wins=user_game_stats.dominoes_wins + excluded.dominoes_wins,
+          dominoes_losses=user_game_stats.dominoes_losses + excluded.dominoes_losses,
+          billiards_wins=user_game_stats.billiards_wins + excluded.billiards_wins,
+          billiards_losses=user_game_stats.billiards_losses + excluded.billiards_losses,
+          game_xp_earned=user_game_stats.game_xp_earned + excluded.game_xp_earned,
+          updated_at=excluded.updated_at
+        """,
+        (
+            int(user_id),
+            1,
+            1 if is_win else 0,
+            0 if is_win else 1,
+            dominoes_win,
+            dominoes_loss,
+            billiards_win,
+            billiards_loss,
+            max(0, int(xp_earned or 0)),
+            now,
+        ),
+    )
+
+
+def list_challengeable_users(user_id: int, *, q: str = "", limit: int = 25, stale_after_sec: int = 300) -> list[dict[str, Any]]:
+    safe_limit = max(1, min(MAX_CHALLENGEABLE_USERS, int(limit or 25)))
+    cutoff = _now_ts() - max(5, int(stale_after_sec or 300))
+    normalized_q = (q or "").strip().lower()
+    params: list[Any] = [int(user_id)]
+    where = [
+        "u.id <> ?",
+        "COALESCE(CAST(u.is_disabled AS INTEGER), 0) = 0" if DB_BACKEND != "postgres" else "COALESCE(u.is_disabled, FALSE) = FALSE",
+        "COALESCE(CAST(u.is_suspended AS INTEGER), 0) = 0" if DB_BACKEND != "postgres" else "COALESCE(u.is_suspended, FALSE) = FALSE",
+    ]
+    if normalized_q:
+        like = f"%{normalized_q}%"
+        where.append("(LOWER(COALESCE(u.display_name, '')) LIKE ? OR LOWER(COALESCE(u.email, '')) LIKE ?)")
+        params.extend([like, like])
+    params.extend([cutoff, safe_limit])
+    rows = _db_query_all(
+        f"""
+        SELECT
+          u.id,
+          u.email,
+          u.display_name,
+          u.avatar_url,
+          u.avatar_version,
+          MAX(p.updated_at) AS presence_updated_at
+        FROM users u
+        LEFT JOIN presence p ON p.user_id = u.id
+        WHERE {' AND '.join(where)}
+        GROUP BY u.id, u.email, u.display_name, u.avatar_url, u.avatar_version
+        ORDER BY
+          CASE WHEN MAX(p.updated_at) >= ? THEN 0 ELSE 1 END ASC,
+          LOWER(COALESCE(u.display_name, '')) ASC,
+          u.id ASC
+        LIMIT ?
+        """,
+        tuple(params),
+    )
+    clean_user_ids = [int(row["id"]) for row in rows]
+    badges = get_best_current_badges_for_users(clean_user_ids)
+    progressions = {uid: get_progression_for_user(uid) for uid in clean_user_ids}
+    items: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        uid = int(item["id"])
+        progression = progressions.get(uid, {})
+        presence_updated_at = item.get("presence_updated_at")
+        display_name = _display_name_for_user(item)
+        items.append(
+            {
+                "user_id": uid,
+                "display_name": display_name,
+                "avatar_thumb_url": None
+                if not item.get("avatar_url")
+                else avatar_thumb_url(uid, item.get("avatar_version") or avatar_version_for_data_url(str(item.get("avatar_url") or ""))),
+                "avatar_version": item.get("avatar_version") or avatar_version_for_data_url(str(item.get("avatar_url") or "")),
+                "level": int(progression.get("level") or 1),
+                "rank_icon_key": str(progression.get("rank_icon_key") or "band_001"),
+                "leaderboard_badge_code": (badges.get(uid) or {}).get("leaderboard_badge_code"),
+                "online": bool(presence_updated_at is not None and int(presence_updated_at) >= cutoff),
+                "presence_updated_at": int(presence_updated_at) if presence_updated_at is not None else None,
+            }
+        )
+    return items
+
+
 def list_challenges_for_user(user_id: int) -> dict[str, Any]:
     expire_stale_challenges()
     incoming_rows = _db_query_all(
@@ -438,6 +589,14 @@ def list_challenges_for_user(user_id: int) -> dict[str, Any]:
         "outgoing": [_with_names(row) for row in outgoing_rows],
         "active_match": _serialize_match_summary(dict(active_match_row)) if active_match_row else None,
     }
+
+
+def list_incoming_challenges_for_user(user_id: int) -> list[dict[str, Any]]:
+    return list_challenges_for_user(int(user_id)).get("incoming", [])
+
+
+def list_outgoing_challenges_for_user(user_id: int) -> list[dict[str, Any]]:
+    return list_challenges_for_user(int(user_id)).get("outgoing", [])
 
 
 def _seed_for_match(match_id: int) -> int:
@@ -718,6 +877,22 @@ def _finalize_match(cur, match_row: dict[str, Any], state: dict[str, Any], winne
         ),
     )
     updated_match = _query_one_cur(cur, "SELECT * FROM game_matches WHERE id=? LIMIT 1", (int(match_row["id"]),))
+    if not updated_match:
+        raise HTTPException(status_code=500, detail="Failed to finalize match")
+    _upsert_user_game_stats(
+        cur,
+        user_id=int(winner_user_id),
+        is_win=True,
+        game_type=str(updated_match.get("game_type") or match_row.get("game_type") or ""),
+        xp_earned=WINNER_XP_AWARD,
+    )
+    _upsert_user_game_stats(
+        cur,
+        user_id=int(loser_user_id),
+        is_win=False,
+        game_type=str(updated_match.get("game_type") or match_row.get("game_type") or ""),
+        xp_earned=LOSER_XP_AWARD,
+    )
     winner_after = dict(winner_before)
     winner_after.update(get_progression_snapshot_for_total_xp(int(winner_before.get("total_xp") or 0) + WINNER_XP_AWARD))
     winner_after["xp_breakdown"] = dict(winner_before.get("xp_breakdown") or {})
@@ -754,6 +929,13 @@ def _maybe_publish_match_result(match_row: dict[str, Any]) -> None:
             "completed_at": _iso(match_row.get("completed_at")),
         }
     )
+    publish_public_battle_chat_message(
+        author_user_id=winner_id,
+        winner_display_name=_display_name_for_user(winner or {"email": "winner"}),
+        loser_display_name=_display_name_for_user(loser or {"email": "loser"}),
+        game_type=str(match_row.get("game_type") or ""),
+        winner_xp_awarded=int(match_row.get("winner_xp_awarded") or 0),
+    )
     with _db_lock:
         conn = _db()
         try:
@@ -773,12 +955,42 @@ def _accept_challenge(challenge_id: int, user_id: int) -> tuple[dict[str, Any], 
             challenge = _query_one_cur(cur, "SELECT * FROM game_challenges WHERE id=? LIMIT 1", (int(challenge_id),))
             if not challenge:
                 raise HTTPException(status_code=404, detail="Challenge not found")
+            if challenge["status"] == "accepted" and challenge.get("completed_match_id") is not None:
+                existing_match = _query_one_cur(cur, "SELECT * FROM game_matches WHERE id=? LIMIT 1", (int(challenge["completed_match_id"]),))
+                if existing_match:
+                    conn.commit()
+                    return challenge, existing_match
             if challenge["status"] != "pending":
                 raise HTTPException(status_code=409, detail="Challenge is no longer pending")
             if int(challenge["challenged_user_id"]) != int(user_id):
                 raise HTTPException(status_code=403, detail="Only the challenged user can accept this challenge")
             now = _now_ts()
             player_one, player_two = sorted((int(challenge["challenger_user_id"]), int(challenge["challenged_user_id"])))
+            existing_match = _query_one_cur(
+                cur,
+                """
+                SELECT * FROM game_matches
+                WHERE challenge_id=? OR (
+                  status='active' AND
+                  ((player_one_user_id=? AND player_two_user_id=?) OR (player_one_user_id=? AND player_two_user_id=?))
+                )
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (int(challenge_id), player_one, player_two, player_two, player_one),
+            )
+            if existing_match:
+                _exec_cur(
+                    cur,
+                    """
+                    UPDATE game_challenges
+                    SET status='accepted', updated_at=?, responded_at=COALESCE(responded_at, ?), accepted_at=COALESCE(accepted_at, ?), completed_match_id=COALESCE(completed_match_id, ?)
+                    WHERE id=?
+                    """,
+                    (now, now, now, int(existing_match["id"]), int(challenge_id)),
+                )
+                conn.commit()
+                return challenge, existing_match
             match_id = _insert_and_get_id(
                 cur,
                 """
@@ -1072,10 +1284,12 @@ def get_recent_battles_for_user(user_id: int, limit: int = MAX_RECENT_BATTLES) -
             {
                 "match_id": int(item["id"]),
                 "game_type": item["game_type"],
+                "game_key": item["game_type"],
                 "result": result,
                 "opponent_user_id": opponent_id,
                 "opponent_display_name": names.get(opponent_id, f"Driver {opponent_id}"),
                 "xp_awarded": xp_awarded,
+                "xp_delta": xp_awarded,
                 "completed_at": _iso(item.get("completed_at")),
             }
         )
@@ -1089,29 +1303,24 @@ def get_game_battle_stats_for_users(user_ids: list[int]) -> dict[int, dict[str, 
     placeholders = ",".join(["?" for _ in clean_user_ids])
     rows = _db_query_all(
         f"""
-        SELECT user_id,
-               COUNT(*) AS matches_played,
-               SUM(CASE WHEN result='win' THEN 1 ELSE 0 END) AS wins,
-               SUM(CASE WHEN result='loss' THEN 1 ELSE 0 END) AS losses,
-               SUM(CASE WHEN result='win' AND game_type='dominoes' THEN 1 ELSE 0 END) AS dominoes_wins,
-               SUM(CASE WHEN result='loss' AND game_type='dominoes' THEN 1 ELSE 0 END) AS dominoes_losses,
-               SUM(CASE WHEN result='win' AND game_type='billiards' THEN 1 ELSE 0 END) AS billiards_wins,
-               SUM(CASE WHEN result='loss' AND game_type='billiards' THEN 1 ELSE 0 END) AS billiards_losses,
-               COALESCE(SUM(xp_awarded), 0) AS game_xp_earned
-        FROM (
-          SELECT winner_user_id AS user_id, 'win' AS result, game_type, winner_xp_awarded AS xp_awarded
-          FROM game_matches WHERE status IN ('completed', 'forfeited') AND winner_user_id IS NOT NULL
-          UNION ALL
-          SELECT loser_user_id AS user_id, 'loss' AS result, game_type, loser_xp_awarded AS xp_awarded
-          FROM game_matches WHERE status IN ('completed', 'forfeited') AND loser_user_id IS NOT NULL
-        ) battle_rows
+        SELECT
+          user_id,
+          total_matches,
+          total_wins,
+          total_losses,
+          dominoes_wins,
+          dominoes_losses,
+          billiards_wins,
+          billiards_losses,
+          game_xp_earned
+        FROM user_game_stats
         WHERE user_id IN ({placeholders})
-        GROUP BY user_id
         """,
         tuple(clean_user_ids),
     )
     result = {
         uid: {
+            "total_matches": 0,
             "wins": 0,
             "losses": 0,
             "matches_played": 0,
@@ -1124,13 +1333,16 @@ def get_game_battle_stats_for_users(user_ids: list[int]) -> dict[int, dict[str, 
         }
         for uid in clean_user_ids
     }
+    seen_user_ids: set[int] = set()
     for row in rows:
         item = dict(row)
         uid = int(item["user_id"])
-        matches_played = int(item.get("matches_played") or 0)
-        wins = int(item.get("wins") or 0)
-        losses = int(item.get("losses") or 0)
+        seen_user_ids.add(uid)
+        matches_played = int(item.get("total_matches") or 0)
+        wins = int(item.get("total_wins") or 0)
+        losses = int(item.get("total_losses") or 0)
         result[uid] = {
+            "total_matches": matches_played,
             "wins": wins,
             "losses": losses,
             "matches_played": matches_played,
@@ -1141,6 +1353,50 @@ def get_game_battle_stats_for_users(user_ids: list[int]) -> dict[int, dict[str, 
             "billiards_losses": int(item.get("billiards_losses") or 0),
             "game_xp_earned": int(item.get("game_xp_earned") or 0),
         }
+    missing_user_ids = [uid for uid in clean_user_ids if uid not in seen_user_ids]
+    if missing_user_ids:
+        fallback_placeholders = ",".join(["?" for _ in missing_user_ids])
+        fallback_rows = _db_query_all(
+            f"""
+            SELECT user_id,
+                   COUNT(*) AS matches_played,
+                   SUM(CASE WHEN result='win' THEN 1 ELSE 0 END) AS wins,
+                   SUM(CASE WHEN result='loss' THEN 1 ELSE 0 END) AS losses,
+                   SUM(CASE WHEN result='win' AND game_type='dominoes' THEN 1 ELSE 0 END) AS dominoes_wins,
+                   SUM(CASE WHEN result='loss' AND game_type='dominoes' THEN 1 ELSE 0 END) AS dominoes_losses,
+                   SUM(CASE WHEN result='win' AND game_type='billiards' THEN 1 ELSE 0 END) AS billiards_wins,
+                   SUM(CASE WHEN result='loss' AND game_type='billiards' THEN 1 ELSE 0 END) AS billiards_losses,
+                   COALESCE(SUM(xp_awarded), 0) AS game_xp_earned
+            FROM (
+              SELECT winner_user_id AS user_id, 'win' AS result, game_type, winner_xp_awarded AS xp_awarded
+              FROM game_matches WHERE status IN ('completed', 'forfeited') AND winner_user_id IS NOT NULL
+              UNION ALL
+              SELECT loser_user_id AS user_id, 'loss' AS result, game_type, loser_xp_awarded AS xp_awarded
+              FROM game_matches WHERE status IN ('completed', 'forfeited') AND loser_user_id IS NOT NULL
+            ) battle_rows
+            WHERE user_id IN ({fallback_placeholders})
+            GROUP BY user_id
+            """,
+            tuple(missing_user_ids),
+        )
+        for row in fallback_rows:
+            item = dict(row)
+            uid = int(item["user_id"])
+            matches_played = int(item.get("matches_played") or 0)
+            wins = int(item.get("wins") or 0)
+            losses = int(item.get("losses") or 0)
+            result[uid] = {
+                "total_matches": matches_played,
+                "wins": wins,
+                "losses": losses,
+                "matches_played": matches_played,
+                "win_rate": round((wins / matches_played) if matches_played else 0.0, 4),
+                "dominoes_wins": int(item.get("dominoes_wins") or 0),
+                "dominoes_losses": int(item.get("dominoes_losses") or 0),
+                "billiards_wins": int(item.get("billiards_wins") or 0),
+                "billiards_losses": int(item.get("billiards_losses") or 0),
+                "game_xp_earned": int(item.get("game_xp_earned") or 0),
+            }
     return result
 
 
