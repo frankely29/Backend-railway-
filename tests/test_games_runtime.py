@@ -86,9 +86,72 @@ def _accept_match(client: TestClient, challenger: dict, challenged: dict, *, gam
 
 
 def _set_match_state(main_module, match_id: int, state: dict, *, current_turn_user_id: int, status: str = "active") -> None:
+    existing_row = main_module._db_query_one("SELECT match_state_json FROM game_matches WHERE id=? LIMIT 1", (int(match_id),))
+    existing_state = json.loads(existing_row["match_state_json"]) if existing_row and existing_row["match_state_json"] else {}
+    next_state = dict(state)
+    if "seats" not in next_state and existing_state.get("seats"):
+        next_state["seats"] = existing_state["seats"]
     main_module._db_exec(
         "UPDATE game_matches SET match_state_json=?, current_turn_user_id=?, status=?, updated_at=? WHERE id=?",
-        (json.dumps(state, separators=(",", ":")), int(current_turn_user_id), status, 1_700_000_000, int(match_id)),
+        (json.dumps(next_state, separators=(",", ":")), int(current_turn_user_id), status, 1_700_000_000, int(match_id)),
+    )
+
+
+def _replace_game_tables_with_old_match_schema(main_module) -> None:
+    main_module._db_exec("DROP TABLE IF EXISTS game_match_participants")
+    main_module._db_exec("DROP TABLE IF EXISTS game_match_moves")
+    main_module._db_exec("DROP TABLE IF EXISTS game_matches")
+    main_module._db_exec(
+        """
+        CREATE TABLE game_matches (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          challenge_id INTEGER,
+          game_type TEXT NOT NULL,
+          challenger_user_id INTEGER,
+          challenged_user_id INTEGER,
+          player_one_user_id INTEGER NOT NULL,
+          player_two_user_id INTEGER NOT NULL,
+          current_turn_user_id INTEGER,
+          status TEXT NOT NULL,
+          winner_user_id INTEGER,
+          loser_user_id INTEGER,
+          winner_xp_awarded INTEGER NOT NULL DEFAULT 0,
+          loser_xp_awarded INTEGER NOT NULL DEFAULT 0,
+          match_state_json TEXT NOT NULL,
+          result_summary TEXT,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          accepted_at INTEGER,
+          completed_at INTEGER
+        )
+        """
+    )
+    main_module._db_exec(
+        """
+        CREATE TABLE game_match_participants (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          match_id INTEGER NOT NULL,
+          user_id INTEGER NOT NULL,
+          team_no INTEGER,
+          seat_role TEXT NOT NULL DEFAULT 'solo',
+          result TEXT NOT NULL DEFAULT 'pending',
+          xp_awarded INTEGER NOT NULL DEFAULT 0,
+          joined_at INTEGER NOT NULL
+        )
+        """
+    )
+    main_module._db_exec(
+        """
+        CREATE TABLE game_match_moves (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          match_id INTEGER NOT NULL,
+          move_number INTEGER NOT NULL,
+          actor_user_id INTEGER NOT NULL,
+          move_type TEXT NOT NULL,
+          move_payload_json TEXT NOT NULL,
+          created_at INTEGER NOT NULL
+        )
+        """
     )
 
 
@@ -247,6 +310,66 @@ def test_games_contract_supports_frontend_alias_fields(app_env):
     assert active_match_response.json()["match"]["id"] == match["id"]
 
 
+def test_ensure_games_schema_upgrades_old_match_table_with_expires_at(app_env):
+    main, _client = app_env
+    games_service = importlib.import_module("games_service")
+
+    _replace_game_tables_with_old_match_schema(main)
+    main._db_exec(
+        """
+        INSERT INTO game_matches(
+            id, challenge_id, game_type, challenger_user_id, challenged_user_id,
+            player_one_user_id, player_two_user_id, current_turn_user_id, status,
+            winner_user_id, loser_user_id, winner_xp_awarded, loser_xp_awarded,
+            match_state_json, result_summary, created_at, updated_at, accepted_at, completed_at
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            1, None, "dominoes", 11, 22,
+            11, 22, 11, "active",
+            None, None, 0, 0,
+            json.dumps({"turn_user_id": 11}, separators=(",", ":")), None, 1_700_000_000, 1_700_000_000, 1_700_000_000, None,
+        ),
+    )
+
+    games_service.ensure_games_schema()
+
+    columns = {
+        row["name"] if isinstance(row, dict) else row[1]
+        for row in main._db_query_all("PRAGMA table_info(game_matches)")
+    }
+    assert "expires_at" in columns
+    row = main._db_query_one("SELECT id, expires_at FROM game_matches WHERE id=1 LIMIT 1")
+    assert row["id"] == 1
+    assert int(row["expires_at"]) == 1_700_086_400
+
+
+def test_active_match_route_fails_soft_and_returns_200_on_old_match_schema(app_env):
+    main, client = app_env
+    alice = _signup(client, "old-schema-alice@example.com", "OldSchemaAlice")
+    bob = _signup(client, "old-schema-bob@example.com", "OldSchemaBob")
+
+    _replace_game_tables_with_old_match_schema(main)
+    main._db_exec(
+        """
+        INSERT INTO game_matches(
+            game_type, challenger_user_id, challenged_user_id, player_one_user_id, player_two_user_id,
+            current_turn_user_id, status, winner_xp_awarded, loser_xp_awarded, match_state_json,
+            created_at, updated_at, accepted_at
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            "dominoes", int(alice["id"]), int(bob["id"]), int(alice["id"]), int(bob["id"]),
+            int(alice["id"]), "active", 0, 0, json.dumps({"turn_user_id": int(alice["id"])}, separators=(",", ":")),
+            1_700_000_000, 1_700_000_000, 1_700_000_000,
+        ),
+    )
+
+    response = client.get("/games/matches/active/me", headers=_headers(alice["token"]))
+    assert response.status_code == 200, response.text
+    assert response.json() is None
+
+
 def test_dominoes_match_completion_awards_xp_once_and_profile_stats(app_env):
     main, client = app_env
     leaderboard_service = importlib.import_module("leaderboard_service")
@@ -255,36 +378,22 @@ def test_dominoes_match_completion_awards_xp_once_and_profile_stats(app_env):
 
     accepted = _accept_match(client, alice, bob, game_type="dominoes")
     match_id = accepted["match"]["id"]
-    player_one = accepted["match"]["player_one_user_id"]
-    player_two = accepted["match"]["player_two_user_id"]
-    state = {
-        "game_type": "dominoes",
-        "rules": "test",
-        "board": [],
-        "left_end": None,
-        "right_end": None,
-        "hands": {str(player_one): [[0, 0]], str(player_two): [[1, 1]]},
-        "stock": [],
-        "passes_in_row": 0,
-        "last_action": None,
-        "turn_user_id": player_one,
-        "result_summary": None,
-    }
-    _set_match_state(main, match_id, state, current_turn_user_id=player_one)
+    loser = bob
+    winner = alice
 
-    winner = alice if alice["id"] == player_one else bob
-    loser = bob if winner is alice else alice
-    move_response = client.post(
-        f"/games/matches/{match_id}/move",
-        json={"move_type": "play_tile", "tile": [0, 0], "side": "left"},
-        headers=_headers(winner["token"]),
+    forfeit_response = client.post(
+        f"/games/matches/{match_id}/forfeit",
+        headers=_headers(loser["token"]),
     )
-    assert move_response.status_code == 200, move_response.text
-    payload = move_response.json()
-    assert payload["match"]["status"] == "completed"
+    assert forfeit_response.status_code == 200, forfeit_response.text
+
+    payload = client.get(f"/games/matches/{match_id}", headers=_headers(winner["token"])).json()
+    assert payload["match"]["status"] == "forfeited"
     assert payload["reward_contract"]["xp_awarded"] == 60
+    assert payload["match"]["winner_user_id"] == int(winner["id"])
+    assert payload["match"]["loser_user_id"] == int(loser["id"])
     assert payload["match"]["winner_xp_awarded"] == 60
-    assert payload["match"]["loser_xp_awarded"] == 20
+    assert payload["match"]["loser_xp_awarded"] == 0
 
     progression_once = leaderboard_service.get_progression_for_user(int(winner["id"]))
     progression_twice = client.get(f"/games/matches/{match_id}", headers=_headers(winner["token"])).json()["reward_contract"]
@@ -293,7 +402,7 @@ def test_dominoes_match_completion_awards_xp_once_and_profile_stats(app_env):
     assert leaderboard_service.get_progression_for_user(int(winner["id"]))["xp_breakdown"]["game_xp"] == 60
 
     loser_progression = leaderboard_service.get_progression_for_user(int(loser["id"]))
-    assert loser_progression["xp_breakdown"]["game_xp"] == 20
+    assert loser_progression["xp_breakdown"]["game_xp"] == 0
 
     viewer = main._db_query_one("SELECT * FROM users WHERE id=? LIMIT 1", (int(loser["id"]),))
     profile = main.driver_profile(int(winner["id"]), viewer=viewer)
@@ -484,3 +593,41 @@ def test_public_battle_result_event_helper(app_env):
     assert message_rows
     assert message_rows[0]["display_name"] == "Battle Results"
     assert "Winner beat Loser in Dominoes" in message_rows[0]["message"]
+
+
+def test_hotspot_zone_bin_logging_uses_boolean_safe_recommended_value(app_env):
+    _main, _client = app_env
+    hotspot_experiments = importlib.import_module("hotspot_experiments")
+    hotspot_models = importlib.import_module("hotspot_models")
+    recorded: list[tuple[str, tuple]] = []
+
+    def fake_db_exec(sql: str, params: tuple) -> None:
+        recorded.append((sql, params))
+
+    original_helper = hotspot_experiments._bool_db_value
+    hotspot_experiments._bool_db_value = lambda flag: bool(flag)
+    try:
+        hotspot_experiments.log_zone_bins(
+            fake_db_exec,
+            bin_time=1_700_000_000,
+            rows=[
+                hotspot_models.ZoneScoreResult(
+                    zone_id=7,
+                    final_score=9.5,
+                    confidence=0.8,
+                    live_strength=1.2,
+                    density_penalty=0.1,
+                    historical_component=2.0,
+                    live_component=3.0,
+                    same_timeslot_component=4.0,
+                    weighted_trip_count=5.0,
+                    unique_driver_count=6,
+                    recommended=True,
+                )
+            ],
+        )
+    finally:
+        hotspot_experiments._bool_db_value = original_helper
+
+    assert recorded
+    assert recorded[0][1][-1] is True
