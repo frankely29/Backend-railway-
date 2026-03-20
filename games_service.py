@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import math
 import sqlite3
 import time
@@ -36,6 +37,7 @@ MAX_RECENT_BATTLES = 5
 MAX_CHALLENGEABLE_USERS = 100
 BILLIARDS_GROUPS = {"solids": [1, 2, 3, 4, 5, 6, 7], "stripes": [9, 10, 11, 12, 13, 14, 15]}
 FINAL_EIGHT_BALL = 8
+LOGGER = logging.getLogger(__name__)
 
 
 def _iso(ts: Any | None) -> Optional[str]:
@@ -225,12 +227,24 @@ def _ensure_sqlite_column(cur, table: str, column: str, ddl: str) -> None:
 
 
 def _ensure_postgres_column(cur, table: str, column: str, ddl: str) -> None:
-    cur.execute(
-        "SELECT 1 FROM information_schema.columns WHERE table_name=%s AND column_name=%s LIMIT 1",
-        (table, column),
+    cur.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {ddl}")
+
+
+def _is_schema_compatibility_error(exc: Exception) -> bool:
+    message = str(exc or "").lower()
+    if "undefinedcolumn" in exc.__class__.__name__.lower():
+        return True
+    if "datatype mismatch" in message:
+        return True
+    return (
+        "column" in message
+        and (
+            "does not exist" in message
+            or "no such column" in message
+            or "undefined column" in message
+            or "schema" in message
+        )
     )
-    if not cur.fetchone():
-        cur.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
 
 
 def ensure_games_schema() -> None:
@@ -348,6 +362,7 @@ def ensure_games_schema() -> None:
                 cur.execute(statement)
             for table, column, ddl in [
                 ("game_challenges", "accepted_at", "accepted_at BIGINT"),
+                ("game_challenges", "responded_at", "responded_at BIGINT"),
                 ("game_challenges", "category", "category TEXT"),
                 ("game_challenges", "battle_type", "battle_type TEXT"),
                 ("game_challenges", "format", "format TEXT"),
@@ -366,10 +381,19 @@ def ensure_games_schema() -> None:
                 ("game_matches", "format", "format TEXT"),
                 ("game_matches", "challenger_user_id", "challenger_user_id BIGINT"),
                 ("game_matches", "challenged_user_id", "challenged_user_id BIGINT"),
+                ("game_matches", "current_turn_user_id", "current_turn_user_id BIGINT"),
+                ("game_matches", "winner_user_id", "winner_user_id BIGINT"),
+                ("game_matches", "loser_user_id", "loser_user_id BIGINT"),
+                ("game_matches", "winner_xp_awarded", "winner_xp_awarded INTEGER NOT NULL DEFAULT 0"),
+                ("game_matches", "loser_xp_awarded", "loser_xp_awarded INTEGER NOT NULL DEFAULT 0"),
+                ("game_matches", "match_state_json", "match_state_json TEXT NOT NULL DEFAULT '{}'"),
+                ("game_matches", "created_at", "created_at BIGINT"),
+                ("game_matches", "updated_at", "updated_at BIGINT"),
                 ("game_matches", "accepted_at", "accepted_at BIGINT"),
                 ("game_matches", "expires_at", "expires_at BIGINT"),
                 ("game_matches", "last_action_at", "last_action_at BIGINT"),
                 ("game_matches", "result_summary", "result_summary TEXT"),
+                ("game_matches", "completed_at", "completed_at BIGINT"),
                 ("game_matches", "reward_announced_at", "reward_announced_at BIGINT"),
                 ("user_game_stats", "work_battle_wins", "work_battle_wins INTEGER NOT NULL DEFAULT 0"),
                 ("user_game_stats", "work_battle_losses", "work_battle_losses INTEGER NOT NULL DEFAULT 0"),
@@ -486,6 +510,7 @@ def ensure_games_schema() -> None:
                 cur.execute(statement)
             for table, column, ddl in [
                 ("game_challenges", "accepted_at", "accepted_at INTEGER"),
+                ("game_challenges", "responded_at", "responded_at INTEGER"),
                 ("game_challenges", "category", "category TEXT"),
                 ("game_challenges", "battle_type", "battle_type TEXT"),
                 ("game_challenges", "format", "format TEXT"),
@@ -504,10 +529,19 @@ def ensure_games_schema() -> None:
                 ("game_matches", "format", "format TEXT"),
                 ("game_matches", "challenger_user_id", "challenger_user_id INTEGER"),
                 ("game_matches", "challenged_user_id", "challenged_user_id INTEGER"),
+                ("game_matches", "current_turn_user_id", "current_turn_user_id INTEGER"),
+                ("game_matches", "winner_user_id", "winner_user_id INTEGER"),
+                ("game_matches", "loser_user_id", "loser_user_id INTEGER"),
+                ("game_matches", "winner_xp_awarded", "winner_xp_awarded INTEGER NOT NULL DEFAULT 0"),
+                ("game_matches", "loser_xp_awarded", "loser_xp_awarded INTEGER NOT NULL DEFAULT 0"),
+                ("game_matches", "match_state_json", "match_state_json TEXT NOT NULL DEFAULT '{}'"),
+                ("game_matches", "created_at", "created_at INTEGER"),
+                ("game_matches", "updated_at", "updated_at INTEGER"),
                 ("game_matches", "accepted_at", "accepted_at INTEGER"),
                 ("game_matches", "expires_at", "expires_at INTEGER"),
                 ("game_matches", "last_action_at", "last_action_at INTEGER"),
                 ("game_matches", "result_summary", "result_summary TEXT"),
+                ("game_matches", "completed_at", "completed_at INTEGER"),
                 ("game_matches", "reward_announced_at", "reward_announced_at INTEGER"),
                 ("user_game_stats", "work_battle_wins", "work_battle_wins INTEGER NOT NULL DEFAULT 0"),
                 ("user_game_stats", "work_battle_losses", "work_battle_losses INTEGER NOT NULL DEFAULT 0"),
@@ -560,14 +594,34 @@ def expire_stale_challenges(cur=None, *, now_ts: int | None = None) -> int:
 
 def expire_or_finalize_due_matches() -> None:
     now = _now_ts()
-    rows = _db_query_all(
-        """
-        SELECT * FROM game_matches
-        WHERE status='active' AND expires_at IS NOT NULL AND expires_at <= ?
-        ORDER BY id ASC
-        """,
-        (now,),
-    )
+    try:
+        rows = _db_query_all(
+            """
+            SELECT * FROM game_matches
+            WHERE status='active' AND expires_at IS NOT NULL AND expires_at <= ?
+            ORDER BY id ASC
+            """,
+            (now,),
+        )
+    except Exception as exc:
+        if not _is_schema_compatibility_error(exc):
+            raise
+        LOGGER.warning("Games schema mismatch during match expiry scan; attempting additive schema repair: %s", exc)
+        try:
+            ensure_games_schema()
+            rows = _db_query_all(
+                """
+                SELECT * FROM game_matches
+                WHERE status='active' AND expires_at IS NOT NULL AND expires_at <= ?
+                ORDER BY id ASC
+                """,
+                (now,),
+            )
+        except Exception as repair_exc:
+            if not _is_schema_compatibility_error(repair_exc):
+                raise
+            LOGGER.warning("Games schema repair did not complete before expiry scan; skipping fail-soft: %s", repair_exc)
+            return
     for row in rows:
         match_row = dict(row)
         battle_type = _match_battle_type(match_row)
