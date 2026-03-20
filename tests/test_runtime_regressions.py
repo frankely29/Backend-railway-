@@ -777,3 +777,110 @@ def test_admin_load_test_control_plane(app_env):
     assert last_payload["details"]["last_result"]["run_id"] == last_status["run_id"]
 
     manager.reset_for_tests()
+
+
+def test_presence_all_and_viewport_accept_float_zoom(app_env):
+    _main, client, _data_dir = app_env
+    alice = _signup(client, "float-zoom@example.com", display_name="Float Zoom")
+    alice_headers = _auth_headers(alice["token"])
+
+    presence_update = client.post(
+        "/presence/update",
+        json={"lat": 40.75, "lng": -73.99, "heading": 90, "accuracy": 5},
+        headers=alice_headers,
+    )
+    assert presence_update.status_code == 200
+
+    presence_all = client.get(
+        "/presence/all?mode=full&min_lat=40.70&min_lng=-74.10&max_lat=40.90&max_lng=-73.80&zoom=8.83",
+        headers=alice_headers,
+    )
+    assert presence_all.status_code == 200, presence_all.text
+    assert presence_all.json()["ok"] is True
+
+    presence_viewport = client.get(
+        "/presence/viewport?min_lat=40.70&min_lng=-74.10&max_lat=40.90&max_lng=-73.80&zoom=8.83",
+        headers=alice_headers,
+    )
+    assert presence_viewport.status_code == 200, presence_viewport.text
+    assert presence_viewport.json()["ok"] is True
+
+
+def test_presence_runtime_state_upsert_uses_boolean_visibility(app_env, monkeypatch):
+    main, client, _data_dir = app_env
+    alice = _signup(client, "boolean-visible@example.com", display_name="Boolean Visible")
+    alice_headers = _auth_headers(alice["token"])
+
+    captured_calls: list[tuple[str, tuple[object, ...] | None]] = []
+    original_db_exec = main._db_exec
+
+    def recording_db_exec(sql, params=None):
+        captured_calls.append((sql, params))
+        return original_db_exec(sql, params)
+
+    monkeypatch.setattr(main, "_db_exec", recording_db_exec)
+
+    response = client.post(
+        "/presence/update",
+        json={"lat": 40.75, "lng": -73.99, "heading": 90, "accuracy": 5},
+        headers=alice_headers,
+    )
+    assert response.status_code == 200, response.text
+
+    runtime_state_params = next(
+        params
+        for sql, params in captured_calls
+        if sql and "INSERT INTO presence_runtime_state" in sql
+    )
+    assert runtime_state_params is not None
+    assert runtime_state_params[2] is True
+
+    state_row = main._db_query_one(
+        "SELECT user_id, changed_at_ms, is_visible, reason FROM presence_runtime_state WHERE user_id=?",
+        (int(alice["id"]),),
+    )
+    assert state_row is not None
+    assert bool(state_row["is_visible"]) is True
+    assert state_row["reason"] is None
+
+
+def test_presence_update_ghost_mode_stores_false_visibility_boolean(app_env, monkeypatch):
+    main, client, _data_dir = app_env
+    ghost = _signup(client, "boolean-hidden@example.com", display_name="Boolean Hidden")
+    ghost_headers = _auth_headers(ghost["token"])
+
+    toggle_ghost = client.post("/me/update", json={"ghost_mode": True}, headers=ghost_headers)
+    assert toggle_ghost.status_code == 200, toggle_ghost.text
+
+    captured_calls: list[tuple[str, tuple[object, ...] | None]] = []
+    original_db_exec = main._db_exec
+
+    def recording_db_exec(sql, params=None):
+        captured_calls.append((sql, params))
+        return original_db_exec(sql, params)
+
+    monkeypatch.setattr(main, "_db_exec", recording_db_exec)
+
+    response = client.post(
+        "/presence/update",
+        json={"lat": 40.76, "lng": -73.98, "heading": 120, "accuracy": 5},
+        headers=ghost_headers,
+    )
+    assert response.status_code == 200, response.text
+
+    runtime_state_params = next(
+        params
+        for sql, params in captured_calls
+        if sql and "INSERT INTO presence_runtime_state" in sql
+    )
+    assert runtime_state_params is not None
+    assert runtime_state_params[2] is False
+    assert runtime_state_params[3] == "ghost_mode"
+
+    state_row = main._db_query_one(
+        "SELECT user_id, changed_at_ms, is_visible, reason FROM presence_runtime_state WHERE user_id=?",
+        (int(ghost["id"]),),
+    )
+    assert state_row is not None
+    assert bool(state_row["is_visible"]) is False
+    assert state_row["reason"] == "ghost_mode"
