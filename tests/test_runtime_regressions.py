@@ -30,7 +30,7 @@ def app_env(monkeypatch):
     monkeypatch.delenv("DATABASE_URL", raising=False)
     monkeypatch.delenv("POSTGRES_URL", raising=False)
 
-    for name in ["core", "chat", "leaderboard_db", "leaderboard_service", "leaderboard_tracker", "pickup_recording_feature", "admin_service", "admin_mutation_service", "admin_security", "admin_test_routes", "admin_test_service", "admin_load_test_service", "admin_load_test_models", "main"]:
+    for name in ["core", "chat", "account_runtime", "leaderboard_db", "leaderboard_routes", "leaderboard_service", "leaderboard_tracker", "pickup_recording_feature", "games_models", "games_service", "games_routes", "admin_routes", "admin_trips_routes", "admin_trips_service", "admin_mutation_routes", "admin_service", "admin_mutation_service", "admin_security", "admin_test_routes", "admin_test_service", "admin_load_test_service", "admin_load_test_models", "main"]:
         sys.modules.pop(name, None)
 
     main = importlib.import_module("main")
@@ -718,7 +718,7 @@ def test_admin_load_test_control_plane(app_env):
     assert capabilities.status_code == 200
     capabilities_payload = capabilities.json()
     assert capabilities_payload["ok"] is True
-    assert capabilities_payload["details"]["supported_presets"] == [100, 300, 500, 1000]
+    assert capabilities_payload["details"]["supported_presets"] == [100, 300, 500, 1000, 1500, 2000]
 
     start_payload = {
         "preset": 100,

@@ -1080,12 +1080,13 @@ def _presence_row_payloads(rows: List[Any], *, include_full_fields: bool) -> Lis
         dn = (r["display_name"] or "").strip()
         if not dn:
             dn = _clean_display_name("", email or "Driver")
+        avatar_thumb_url_value, avatar_version = _resolve_avatar_thumb_for_row(r)
         payload = {
             "user_id": int(r["user_id"]),
             "display_name": dn,
-            "avatar_url": _avatar_thumb_url_for_row(r),
-            "avatar_thumb_url": _avatar_thumb_url_for_row(r),
-            "avatar_version": _avatar_version_for_row(r),
+            "avatar_url": avatar_thumb_url_value,
+            "avatar_thumb_url": avatar_thumb_url_value,
+            "avatar_version": avatar_version,
             "map_identity_mode": (
                 str(r["map_identity_mode"]).strip().lower()
                 if r["map_identity_mode"] is not None and str(r["map_identity_mode"]).strip().lower() in ALLOWED_MAP_IDENTITY_MODES
@@ -1967,13 +1968,39 @@ def _avatar_version_for_row(row: Any) -> Optional[str]:
     return avatar_version_for_data_url(str(avatar_data_url))
 
 
-def _avatar_thumb_url_for_row(row: Any) -> Optional[str]:
+def _resolve_avatar_thumb_for_row(row: Any, *, persist_version: bool = True) -> Tuple[Optional[str], Optional[str]]:
+    if row is None:
+        return None, None
     user_id = _row_value(row, "id")
     if user_id is None:
         user_id = _row_value(row, "user_id")
     if user_id is None:
-        return None
-    return avatar_thumb_url(int(user_id), _avatar_version_for_row(row))
+        return None, None
+    avatar_data_url = _row_value(row, "avatar_url")
+    if not avatar_data_url:
+        return None, None
+    resolved_version = _avatar_version_for_row(row)
+    if not resolved_version:
+        resolved_version = avatar_version_for_data_url(str(avatar_data_url))
+        if not resolved_version:
+            return None, None
+        target = avatar_thumb_path(DATA_DIR, int(user_id), resolved_version)
+        if not target.exists():
+            persist_avatar_thumb(DATA_DIR, int(user_id), str(avatar_data_url), resolved_version)
+        if persist_version:
+            _db_exec(
+                "UPDATE users SET avatar_version=? WHERE id=? AND (avatar_version IS NULL OR trim(avatar_version)='')",
+                (resolved_version, int(user_id)),
+            )
+        return avatar_thumb_url(int(user_id), resolved_version), resolved_version
+    target = avatar_thumb_path(DATA_DIR, int(user_id), resolved_version)
+    if not target.exists():
+        persist_avatar_thumb(DATA_DIR, int(user_id), str(avatar_data_url), resolved_version)
+    return avatar_thumb_url(int(user_id), resolved_version), resolved_version
+
+
+def _avatar_thumb_url_for_row(row: Any) -> Optional[str]:
+    return _resolve_avatar_thumb_for_row(row)[0]
 
 
 def _ensure_avatar_thumb_materialized(user_id: int, avatar_data_url: Optional[str], avatar_version: Optional[str]) -> Optional[str]:
@@ -2100,7 +2127,7 @@ from leaderboard_service import (
 )
 from leaderboard_tracker import increment_pickup_count, record_presence_heartbeat
 from games_routes import router as games_router
-from games_service import ensure_games_schema, get_game_battle_stats_for_users, get_recent_battles_for_user
+from games_service import ensure_games_schema, get_game_battle_stats_for_users, get_profile_game_context, get_recent_battles_for_user
 from pickup_recording_feature import (
     router as pickup_recording_router,
     ensure_pickup_recording_schema,
@@ -2574,6 +2601,7 @@ def me(user: sqlite3.Row = Depends(require_user)):
 
     best_badge = get_best_current_badge_for_user(int(user["id"]))
     battle_stats = get_game_battle_stats_for_users([int(user["id"])]).get(int(user["id"]), {})
+    avatar_thumb, avatar_version = _resolve_avatar_thumb_for_row(user)
 
     return {
         "ok": True,
@@ -2581,8 +2609,8 @@ def me(user: sqlite3.Row = Depends(require_user)):
         "email": user["email"],
         "display_name": dn,
         "avatar_url": user["avatar_url"] if "avatar_url" in user.keys() else None,
-        "avatar_thumb_url": _avatar_thumb_url_for_row(user),
-        "avatar_version": _avatar_version_for_row(user),
+        "avatar_thumb_url": avatar_thumb,
+        "avatar_version": avatar_version,
         "map_identity_mode": map_identity_mode,
         "ghost_mode": ghost,
         "is_admin": bool(_flag_to_int(user["is_admin"])),
@@ -2595,9 +2623,8 @@ def me(user: sqlite3.Row = Depends(require_user)):
 
 @app.get("/drivers/{user_id}/profile")
 def driver_profile(user_id: int, viewer: sqlite3.Row = Depends(require_user)):
-    _ = viewer
     target = _db_query_one(
-        "SELECT id, email, display_name, avatar_url, avatar_version, is_disabled, is_suspended FROM users WHERE id=? LIMIT 1",
+        "SELECT id, email, display_name, avatar_url, avatar_version, is_disabled, is_suspended, map_identity_mode FROM users WHERE id=? LIMIT 1",
         (int(user_id),),
     )
     if not target or _user_block_state(target)["is_blocked"]:
@@ -2617,6 +2644,7 @@ def driver_profile(user_id: int, viewer: sqlite3.Row = Depends(require_user)):
     progression = get_progression_for_user(target_user_id)
     battle_stats = get_game_battle_stats_for_users([target_user_id]).get(target_user_id, {})
     recent_battles = get_recent_battles_for_user(target_user_id)
+    relationship = get_profile_game_context(int(viewer["id"]), target_user_id)
 
     miles_rank = miles_rank_data.get("row", {}).get("rank_position") if miles_rank_data.get("row") else None
     hours_rank = hours_rank_data.get("row", {}).get("rank_position") if hours_rank_data.get("row") else None
@@ -2628,8 +2656,12 @@ def driver_profile(user_id: int, viewer: sqlite3.Row = Depends(require_user)):
             "display_name": display_name,
             "avatar_url": target["avatar_url"] if target["avatar_url"] else None,
             "avatar_thumb_url": _avatar_thumb_url_for_row(target),
-            "avatar_version": _avatar_version_for_row(target),
+            "avatar_version": _resolve_avatar_thumb_for_row(target)[1],
+            "map_identity_mode": target["map_identity_mode"] if "map_identity_mode" in target.keys() else None,
             "leaderboard_badge_code": best_badge.get("leaderboard_badge_code"),
+            "level": progression.get("level"),
+            "rank_name": progression.get("rank_name"),
+            "rank_icon_key": progression.get("rank_icon_key"),
         },
         "daily": {
             "miles": daily.get("miles", 0),
@@ -2657,6 +2689,9 @@ def driver_profile(user_id: int, viewer: sqlite3.Row = Depends(require_user)):
         "battle_stats": battle_stats,
         "battle_record": battle_stats,
         "recent_battles": recent_battles,
+        "active_match_summary": relationship.get("active_match_summary"),
+        "challenge_state_with_viewer": relationship.get("challenge_state_with_viewer"),
+        "viewer_game_relationship": relationship.get("viewer_game_relationship"),
     }
 
 
