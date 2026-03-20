@@ -1013,10 +1013,6 @@ def _presence_visibility_snapshot(max_age_sec: int) -> Dict[str, Any]:
     }
 
 
-def _effective_presence_stale_after_sec(max_age_sec: int) -> int:
-    return max(5, min(3600, int(max_age_sec)))
-
-
 def _presence_change_cursor_ms() -> int:
     return int(time.time() * 1000)
 
@@ -1033,7 +1029,7 @@ def _presence_runtime_state_upsert(user_id: int, *, is_visible: bool, reason: Op
           is_visible=excluded.is_visible,
           reason=excluded.reason
         """,
-        (int(user_id), cursor_value, bool(is_visible), safe_reason),
+        (int(user_id), cursor_value, 1 if is_visible else 0, safe_reason),
     )
     return cursor_value
 
@@ -1080,13 +1076,12 @@ def _presence_row_payloads(rows: List[Any], *, include_full_fields: bool) -> Lis
         dn = (r["display_name"] or "").strip()
         if not dn:
             dn = _clean_display_name("", email or "Driver")
-        avatar_thumb_url_value, avatar_version = _resolve_avatar_thumb_for_row(r)
         payload = {
             "user_id": int(r["user_id"]),
             "display_name": dn,
-            "avatar_url": r["avatar_url"],
-            "avatar_thumb_url": avatar_thumb_url_value,
-            "avatar_version": avatar_version,
+            "avatar_url": _avatar_thumb_url_for_row(r),
+            "avatar_thumb_url": _avatar_thumb_url_for_row(r),
+            "avatar_version": _avatar_version_for_row(r),
             "map_identity_mode": (
                 str(r["map_identity_mode"]).strip().lower()
                 if r["map_identity_mode"] is not None and str(r["map_identity_mode"]).strip().lower() in ALLOWED_MAP_IDENTITY_MODES
@@ -1130,7 +1125,6 @@ def _presence_rows_for_viewport(
           u.id,
           u.email,
           u.display_name,
-          u.avatar_url,
           u.avatar_version,
           u.map_identity_mode,
           u.ghost_mode,
@@ -1171,7 +1165,6 @@ def _presence_delta_payload(
           u.id,
           u.email,
           u.display_name,
-          u.avatar_url,
           u.avatar_version,
           u.map_identity_mode,
           u.ghost_mode,
@@ -1228,7 +1221,6 @@ def _presence_delta_payload(
         "removed": removed if include_removed else [],
         "cursor": next_cursor,
         "server_time_ms": _presence_change_cursor_ms(),
-        "stale_after_sec": _effective_presence_stale_after_sec(max_age_sec),
         "has_more": len(rows) >= safe_limit,
     }
 
@@ -1968,26 +1960,13 @@ def _avatar_version_for_row(row: Any) -> Optional[str]:
     return avatar_version_for_data_url(str(avatar_data_url))
 
 
-def _resolve_avatar_thumb_for_row(row: Any, *, persist_version: bool = True) -> Tuple[Optional[str], Optional[str]]:
-    if row is None:
-        return None, None
-    from games_service import resolve_avatar_thumb_for_user_row
-
+def _avatar_thumb_url_for_row(row: Any) -> Optional[str]:
     user_id = _row_value(row, "id")
     if user_id is None:
         user_id = _row_value(row, "user_id")
     if user_id is None:
-        return None, None
-    row_dict = {
-        "id": int(user_id),
-        "avatar_url": _row_value(row, "avatar_url"),
-        "avatar_version": _avatar_version_for_row(row),
-    }
-    return resolve_avatar_thumb_for_user_row(row_dict, persist_version=persist_version)
-
-
-def _avatar_thumb_url_for_row(row: Any) -> Optional[str]:
-    return _resolve_avatar_thumb_for_row(row)[0]
+        return None
+    return avatar_thumb_url(int(user_id), _avatar_version_for_row(row))
 
 
 def _ensure_avatar_thumb_materialized(user_id: int, avatar_data_url: Optional[str], avatar_version: Optional[str]) -> Optional[str]:
@@ -2113,8 +2092,6 @@ from leaderboard_service import (
     get_overview_for_user,
 )
 from leaderboard_tracker import increment_pickup_count, record_presence_heartbeat
-from games_routes import router as games_router
-from games_service import ensure_games_schema, get_game_battle_stats_for_users, get_profile_game_context, get_recent_battles_for_user
 from pickup_recording_feature import (
     router as pickup_recording_router,
     ensure_pickup_recording_schema,
@@ -2125,7 +2102,6 @@ from pickup_recording_feature import (
 
 app.include_router(chat_router)
 app.include_router(leaderboard_router)
-app.include_router(games_router)
 app.include_router(pickup_recording_router)
 
 # =========================================================
@@ -2137,7 +2113,6 @@ def startup():
     FRAMES_DIR.mkdir(parents=True, exist_ok=True)
     _db_init()
     init_leaderboard_schema()
-    ensure_games_schema()
     ensure_pickup_recording_schema()
     _ensure_admin_seed()
     try:
@@ -2587,8 +2562,6 @@ def me(user: sqlite3.Row = Depends(require_user)):
         map_identity_mode = "name"
 
     best_badge = get_best_current_badge_for_user(int(user["id"]))
-    battle_stats = get_game_battle_stats_for_users([int(user["id"])]).get(int(user["id"]), {})
-    avatar_thumb, avatar_version = _resolve_avatar_thumb_for_row(user)
 
     return {
         "ok": True,
@@ -2596,22 +2569,21 @@ def me(user: sqlite3.Row = Depends(require_user)):
         "email": user["email"],
         "display_name": dn,
         "avatar_url": user["avatar_url"] if "avatar_url" in user.keys() else None,
-        "avatar_thumb_url": avatar_thumb,
-        "avatar_version": avatar_version,
+        "avatar_thumb_url": _avatar_thumb_url_for_row(user),
+        "avatar_version": _avatar_version_for_row(user),
         "map_identity_mode": map_identity_mode,
         "ghost_mode": ghost,
         "is_admin": bool(_flag_to_int(user["is_admin"])),
         "trial_expires_at": int(user["trial_expires_at"]),
         "leaderboard_badge_code": best_badge.get("leaderboard_badge_code"),
-        "battle_stats": battle_stats,
-        "battle_record": battle_stats,
     }
 
 
 @app.get("/drivers/{user_id}/profile")
 def driver_profile(user_id: int, viewer: sqlite3.Row = Depends(require_user)):
+    _ = viewer
     target = _db_query_one(
-        "SELECT id, email, display_name, avatar_url, avatar_version, is_disabled, is_suspended, map_identity_mode FROM users WHERE id=? LIMIT 1",
+        "SELECT id, email, display_name, avatar_url, avatar_version, is_disabled, is_suspended FROM users WHERE id=? LIMIT 1",
         (int(user_id),),
     )
     if not target or _user_block_state(target)["is_blocked"]:
@@ -2629,9 +2601,6 @@ def driver_profile(user_id: int, viewer: sqlite3.Row = Depends(require_user)):
     hours_rank_data = get_my_rank(target_user_id, LeaderboardMetric.hours, LeaderboardPeriod.daily)
     best_badge = get_best_current_badge_for_user(target_user_id)
     progression = get_progression_for_user(target_user_id)
-    battle_stats = get_game_battle_stats_for_users([target_user_id]).get(target_user_id, {})
-    recent_battles = get_recent_battles_for_user(target_user_id)
-    relationship = get_profile_game_context(int(viewer["id"]), target_user_id)
 
     miles_rank = miles_rank_data.get("row", {}).get("rank_position") if miles_rank_data.get("row") else None
     hours_rank = hours_rank_data.get("row", {}).get("rank_position") if hours_rank_data.get("row") else None
@@ -2643,12 +2612,8 @@ def driver_profile(user_id: int, viewer: sqlite3.Row = Depends(require_user)):
             "display_name": display_name,
             "avatar_url": target["avatar_url"] if target["avatar_url"] else None,
             "avatar_thumb_url": _avatar_thumb_url_for_row(target),
-            "avatar_version": _resolve_avatar_thumb_for_row(target)[1],
-            "map_identity_mode": target["map_identity_mode"] if "map_identity_mode" in target.keys() else None,
+            "avatar_version": _avatar_version_for_row(target),
             "leaderboard_badge_code": best_badge.get("leaderboard_badge_code"),
-            "level": progression.get("level"),
-            "rank_name": progression.get("rank_name"),
-            "rank_icon_key": progression.get("rank_icon_key"),
         },
         "daily": {
             "miles": daily.get("miles", 0),
@@ -2673,12 +2638,6 @@ def driver_profile(user_id: int, viewer: sqlite3.Row = Depends(require_user)):
             "pickups": yearly.get("pickups", 0),
         },
         "progression": progression,
-        "battle_stats": battle_stats,
-        "battle_record": battle_stats,
-        "recent_battles": recent_battles,
-        "active_match_summary": relationship.get("active_match_summary"),
-        "challenge_state_with_viewer": relationship.get("challenge_state_with_viewer"),
-        "viewer_game_relationship": relationship.get("viewer_game_relationship"),
     }
 
 
@@ -2891,14 +2850,13 @@ def presence_all(
     min_lng: Optional[float] = None,
     max_lat: Optional[float] = None,
     max_lng: Optional[float] = None,
-    zoom: Optional[float] = None,
+    zoom: Optional[int] = None,
     mode: str = "full",
     limit: Optional[int] = None,
     viewer: sqlite3.Row = Depends(require_user),  # REQUIRE AUTH (frontend already sends token)
 ):
     del viewer
-    stale_after_sec = _effective_presence_stale_after_sec(max_age_sec)
-    cutoff = int(time.time()) - stale_after_sec
+    cutoff = int(time.time()) - max(5, min(3600, int(max_age_sec)))
     safe_mode = (mode or "full").strip().lower()
     if safe_mode not in {"full", "lite"}:
         raise HTTPException(status_code=400, detail="mode must be 'full' or 'lite'")
@@ -2937,7 +2895,6 @@ def presence_all(
         "online_count": online_count,
         "ghosted_count": ghosted_count,
         "visible_count": visible_count,
-        "stale_after_sec": stale_after_sec,
     }
     with _presence_viewport_cache_lock:
         _presence_viewport_cache[cache_key] = {
@@ -2956,7 +2913,7 @@ def presence_viewport(
     min_lng: Optional[float] = None,
     max_lat: Optional[float] = None,
     max_lng: Optional[float] = None,
-    zoom: Optional[float] = None,
+    zoom: Optional[int] = None,
     padding_ratio: float = 0.0,
     updated_since_ms: Optional[int] = None,
     include_removed: bool = True,
@@ -2985,8 +2942,7 @@ def presence_viewport(
             include_removed=bool(include_removed),
         )
 
-    stale_after_sec = _effective_presence_stale_after_sec(max_age_sec)
-    cutoff = int(time.time()) - stale_after_sec
+    cutoff = int(time.time()) - max(5, min(3600, int(max_age_sec)))
     rows = _presence_rows_for_viewport(cutoff=cutoff, bbox=buffered_bbox, limit=safe_limit)
     items = _presence_row_payloads(rows, include_full_fields=False)
     cursor_row = _db_query_one("SELECT COALESCE(MAX(changed_at_ms), 0) AS cursor FROM presence_runtime_state")
@@ -2999,7 +2955,6 @@ def presence_viewport(
         "removed": [],
         "cursor": int(cursor_row["cursor"] or 0) if cursor_row else 0,
         "server_time_ms": _presence_change_cursor_ms(),
-        "stale_after_sec": stale_after_sec,
         "online_count": int(snapshot.get("online_count") or 0),
         "ghosted_count": int(snapshot.get("ghosted_count") or 0),
         "visible_count": len(items),
@@ -3020,7 +2975,7 @@ def presence_delta(
     min_lng: Optional[float] = None,
     max_lat: Optional[float] = None,
     max_lng: Optional[float] = None,
-    zoom: Optional[float] = None,
+    zoom: Optional[int] = None,
     include_removed: bool = True,
     limit: int = PRESENCE_DELTA_MAX_LIMIT,
     viewer: sqlite3.Row = Depends(require_user),
@@ -3053,7 +3008,6 @@ def presence_summary(
         "online_count": online_count,
         "ghosted_count": ghosted_count,
         "visible_count": max(0, visible_count),
-        "stale_after_sec": _effective_presence_stale_after_sec(max_age_sec),
     }
 
 
@@ -3843,7 +3797,7 @@ def _presence_bbox_with_buffer(
     min_lng: Optional[float],
     max_lat: Optional[float],
     max_lng: Optional[float],
-    zoom: Optional[float],
+    zoom: Optional[int],
 ) -> Optional[Tuple[float, float, float, float]]:
     bbox_key = _rounded_bbox_key(min_lat, min_lng, max_lat, max_lng)
     if bbox_key is None:
@@ -3868,7 +3822,7 @@ def _presence_bbox_with_buffer(
     )
 
 
-def _zoom_bucket(zoom: Optional[float]) -> int:
+def _zoom_bucket(zoom: Optional[int]) -> int:
     value = int(zoom or 0)
     if value <= 0:
         return 0
@@ -3885,7 +3839,7 @@ def _presence_cache_key(
     mode: str,
     limit: Optional[int],
     bbox: Optional[Tuple[float, float, float, float]],
-    zoom: Optional[float],
+    zoom: Optional[int],
 ) -> str:
     return "|".join(
         [
