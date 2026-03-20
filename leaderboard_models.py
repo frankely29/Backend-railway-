@@ -81,6 +81,7 @@ class ProgressionXpBreakdown(BaseModel):
     miles_xp: int
     hours_xp: int
     report_xp: int
+    game_xp: int = 0
 
 
 class ProgressionPayload(BaseModel):

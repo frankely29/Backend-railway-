@@ -12,12 +12,9 @@ from pydantic import BaseModel
 
 from core import DB_BACKEND, _db, _db_exec, _db_lock, _db_query_all, _db_query_one, _sql, require_user
 from leaderboard_service import (
-    LEVEL_XP_THRESHOLDS,
-    PROGRESSION_MAX_PICKUP_REPORTS_PER_DAY_FOR_XP,
-    PROGRESSION_XP_PER_HOUR,
-    PROGRESSION_XP_PER_MILE,
-    PROGRESSION_XP_PER_REPORTED_PICKUP,
-    RANK_LADDER,
+    build_progression_from_daily_stats_rows,
+    build_reward_contract,
+    get_game_xp_for_users,
 )
 
 router = APIRouter()
@@ -346,60 +343,8 @@ def _pickup_progression_rows_for_user(user_id: int, cur=None) -> List[Dict[str, 
 
 def get_pickup_progression_for_user(user_id: int, cur=None) -> Dict[str, Any]:
     rows = _pickup_progression_rows_for_user(int(user_id), cur=cur)
-    lifetime_miles = 0.0
-    lifetime_hours = 0.0
-    lifetime_pickups_recorded = 0
-    miles_xp = 0
-    hours_xp = 0
-    report_xp = 0
-    for row in rows:
-        miles = float(row.get("miles_worked") or 0.0)
-        hours = float(row.get("hours_worked") or 0.0)
-        pickups = int(row.get("pickups_recorded") or 0)
-        lifetime_miles += miles
-        lifetime_hours += hours
-        lifetime_pickups_recorded += max(0, pickups)
-        miles_xp += round(miles * PROGRESSION_XP_PER_MILE)
-        hours_xp += round(hours * PROGRESSION_XP_PER_HOUR)
-        report_xp += min(max(0, pickups), PROGRESSION_MAX_PICKUP_REPORTS_PER_DAY_FOR_XP) * PROGRESSION_XP_PER_REPORTED_PICKUP
-
-    total_xp = int(miles_xp + hours_xp + report_xp)
-    level = 1
-    for idx, threshold in enumerate(LEVEL_XP_THRESHOLDS):
-        if total_xp >= threshold:
-            level = idx + 1
-        else:
-            break
-    level = max(1, min(100, level))
-    rank_name = "Recruit"
-    rank_icon_key = "recruit"
-    for start, end, rname, rkey in RANK_LADDER:
-        if start <= level <= end:
-            rank_name = rname
-            rank_icon_key = rkey
-            break
-    current_level_xp = int(LEVEL_XP_THRESHOLDS[level - 1])
-    next_level_xp = None if level >= 100 else int(LEVEL_XP_THRESHOLDS[level])
-    xp_to_next_level = 0 if next_level_xp is None else max(0, next_level_xp - total_xp)
-    return {
-        "level": level,
-        "rank_name": rank_name,
-        "rank_icon_key": rank_icon_key,
-        "title": rank_name,
-        "total_xp": total_xp,
-        "current_level_xp": current_level_xp,
-        "next_level_xp": next_level_xp,
-        "xp_to_next_level": int(xp_to_next_level),
-        "max_level_reached": level == 100,
-        "lifetime_miles": round(lifetime_miles, 4),
-        "lifetime_hours": round(lifetime_hours, 4),
-        "lifetime_pickups_recorded": int(lifetime_pickups_recorded),
-        "xp_breakdown": {
-            "miles_xp": int(miles_xp),
-            "hours_xp": int(hours_xp),
-            "report_xp": int(report_xp),
-        },
-    }
+    game_xp = get_game_xp_for_users([int(user_id)]).get(int(user_id), 0)
+    return build_progression_from_daily_stats_rows(rows, game_xp=game_xp)
 
 
 def _increment_pickup_count_tx(cur, user_id: int, now_ts: int, amount: int = 1) -> None:
@@ -716,15 +661,7 @@ def admin_pickup_tests_simulate_save(payload: AdminSimulateSavePayload, admin: A
         "would_save": True,
         "cooldown_until_unix": int(guard.get("cooldown_until_unix") or (now_ts + PICKUP_SAVE_COOLDOWN_SECONDS)),
         "accepted_guard_reason": str(guard.get("accepted_guard_reason") or ""),
-        "reward_contract": {
-            "level": int(progression.get("level") or 1),
-            "rank_name": str(progression.get("rank_name") or "Recruit"),
-            "rank_icon_key": str(progression.get("rank_icon_key") or "recruit"),
-            "total_xp": int(progression.get("total_xp") or 0),
-            "current_level_xp": int(progression.get("current_level_xp") or 0),
-            "next_level_xp": progression.get("next_level_xp"),
-            "xp_to_next_level": int(progression.get("xp_to_next_level") or 0),
-        },
+        "reward_contract": build_reward_contract(progression, 0),
     }
 
 

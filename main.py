@@ -2092,6 +2092,8 @@ from leaderboard_service import (
     get_overview_for_user,
 )
 from leaderboard_tracker import increment_pickup_count, record_presence_heartbeat
+from games_routes import router as games_router
+from games_service import ensure_games_schema, get_game_battle_stats_for_users, get_recent_battles_for_user
 from pickup_recording_feature import (
     router as pickup_recording_router,
     ensure_pickup_recording_schema,
@@ -2102,6 +2104,7 @@ from pickup_recording_feature import (
 
 app.include_router(chat_router)
 app.include_router(leaderboard_router)
+app.include_router(games_router)
 app.include_router(pickup_recording_router)
 
 # =========================================================
@@ -2113,6 +2116,7 @@ def startup():
     FRAMES_DIR.mkdir(parents=True, exist_ok=True)
     _db_init()
     init_leaderboard_schema()
+    ensure_games_schema()
     ensure_pickup_recording_schema()
     _ensure_admin_seed()
     try:
@@ -2562,6 +2566,7 @@ def me(user: sqlite3.Row = Depends(require_user)):
         map_identity_mode = "name"
 
     best_badge = get_best_current_badge_for_user(int(user["id"]))
+    battle_stats = get_game_battle_stats_for_users([int(user["id"])]).get(int(user["id"]), {})
 
     return {
         "ok": True,
@@ -2576,6 +2581,7 @@ def me(user: sqlite3.Row = Depends(require_user)):
         "is_admin": bool(_flag_to_int(user["is_admin"])),
         "trial_expires_at": int(user["trial_expires_at"]),
         "leaderboard_badge_code": best_badge.get("leaderboard_badge_code"),
+        "battle_stats": battle_stats,
     }
 
 
@@ -2601,6 +2607,8 @@ def driver_profile(user_id: int, viewer: sqlite3.Row = Depends(require_user)):
     hours_rank_data = get_my_rank(target_user_id, LeaderboardMetric.hours, LeaderboardPeriod.daily)
     best_badge = get_best_current_badge_for_user(target_user_id)
     progression = get_progression_for_user(target_user_id)
+    battle_stats = get_game_battle_stats_for_users([target_user_id]).get(target_user_id, {})
+    recent_battles = get_recent_battles_for_user(target_user_id)
 
     miles_rank = miles_rank_data.get("row", {}).get("rank_position") if miles_rank_data.get("row") else None
     hours_rank = hours_rank_data.get("row", {}).get("rank_position") if hours_rank_data.get("row") else None
@@ -2638,6 +2646,8 @@ def driver_profile(user_id: int, viewer: sqlite3.Row = Depends(require_user)):
             "pickups": yearly.get("pickups", 0),
         },
         "progression": progression,
+        "battle_stats": battle_stats,
+        "recent_battles": recent_battles,
     }
 
 
