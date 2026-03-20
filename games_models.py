@@ -24,16 +24,20 @@ class BattleStatsPayload(BaseModel):
 class RecentBattleRow(BaseModel):
     match_id: int
     game_type: GameType
+    game_key: GameType
     result: Literal["win", "loss"]
     opponent_user_id: int
     opponent_display_name: str
     xp_awarded: int
+    xp_delta: int = 0
     completed_at: str
 
 
 class GameChallengeCreateIn(BaseModel):
-    target_user_id: int
-    game_type: GameType
+    target_user_id: Optional[int] = None
+    challenged_user_id: Optional[int] = None
+    game_type: Optional[GameType] = None
+    game_key: Optional[GameType] = None
 
 
 class GameMoveIn(BaseModel):
@@ -47,11 +51,16 @@ class GameMoveIn(BaseModel):
 class ChallengeRow(BaseModel):
     id: int
     game_type: GameType
+    game_key: GameType
     status: ChallengeStatus
     challenger_user_id: int
     challenger_display_name: str
     challenged_user_id: int
     challenged_display_name: str
+    other_user_id: Optional[int] = None
+    other_user_display_name: Optional[str] = None
+    opponent_user_id: Optional[int] = None
+    opponent_display_name: Optional[str] = None
     created_at: str
     updated_at: str
     expires_at: str
@@ -65,6 +74,7 @@ class ChallengeRow(BaseModel):
 class MatchSummary(BaseModel):
     id: int
     game_type: GameType
+    game_key: GameType
     status: MatchStatus
     current_turn_user_id: Optional[int] = None
     player_one_user_id: int
@@ -83,6 +93,12 @@ class ChallengeListResponse(BaseModel):
     incoming: List[ChallengeRow] = Field(default_factory=list)
     outgoing: List[ChallengeRow] = Field(default_factory=list)
     active_match: Optional[MatchSummary] = None
+    activeMatch: Optional[MatchSummary] = None
+
+
+class ChallengeRowsResponse(BaseModel):
+    ok: bool = True
+    items: List[ChallengeRow] = Field(default_factory=list)
 
 
 class MoveRow(BaseModel):
@@ -97,10 +113,13 @@ class MatchDetail(BaseModel):
     id: int
     challenge_id: Optional[int] = None
     game_type: GameType
+    game_key: GameType
     status: MatchStatus
     player_one_user_id: int
     player_two_user_id: int
     current_turn_user_id: Optional[int] = None
+    opponent_user_id: Optional[int] = None
+    opponent_display_name: Optional[str] = None
     winner_user_id: Optional[int] = None
     loser_user_id: Optional[int] = None
     winner_xp_awarded: int = 0
@@ -109,6 +128,7 @@ class MatchDetail(BaseModel):
     updated_at: str
     completed_at: Optional[str] = None
     match_state: Dict[str, Any] = Field(default_factory=dict)
+    result_summary: Optional[Dict[str, Any]] = None
     moves: List[MoveRow] = Field(default_factory=list)
 
 

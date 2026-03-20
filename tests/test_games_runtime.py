@@ -113,6 +113,32 @@ def test_progression_reaches_level_1000_and_rank_bands(app_env):
     assert rows[-1]["rank_icon_key"] == "band_100"
 
 
+def test_progression_endpoint_keeps_rank_icon_separate_from_podium_badges(app_env):
+    _main, client = app_env
+    alice = _signup(client, "prog-alice@example.com", "ProgAlice")
+
+    progression_response = client.get("/leaderboard/progression/me", headers=_headers(alice["token"]))
+    assert progression_response.status_code == 200, progression_response.text
+    progression = progression_response.json()["progression"]
+    assert progression["level"] == 1
+    assert progression["rank_name"]
+    assert progression["title"] == progression["rank_name"]
+    assert progression["rank_icon_key"] == "band_001"
+    assert progression["rank_icon_key"] not in {"crown", "silver", "bronze"}
+    for field in [
+        "total_xp",
+        "current_level_xp",
+        "next_level_xp",
+        "xp_to_next_level",
+        "max_level_reached",
+    ]:
+        assert field in progression
+
+    badges_response = client.get("/leaderboard/badges/me", headers=_headers(alice["token"]))
+    assert badges_response.status_code == 200, badges_response.text
+    assert "badges" in badges_response.json()
+
+
 def test_challenge_create_decline_cancel_and_permissions(app_env):
     _main, client = app_env
     alice = _signup(client, "alice@example.com", "Alice")
@@ -163,6 +189,61 @@ def test_challenge_create_decline_cancel_and_permissions(app_env):
     user_items = users_response.json()["items"]
     assert any(item["user_id"] == bob["id"] for item in user_items)
     assert all(item["user_id"] != alice["id"] for item in user_items)
+
+
+def test_games_contract_supports_frontend_alias_fields(app_env):
+    _main, client = app_env
+    alice = _signup(client, "alias-alice@example.com", "AliasAlice")
+    bob = _signup(client, "alias-bob@example.com", "AliasBob")
+
+    users_response = client.get("/games/users?q=alias&limit=10", headers=_headers(alice["token"]))
+    assert users_response.status_code == 200, users_response.text
+    bob_row = next(item for item in users_response.json()["items"] if item["user_id"] == bob["id"])
+    assert bob_row["rank_icon_key"].startswith("band_")
+    assert "avatar_thumb_url" in bob_row
+    assert "avatar_url" in bob_row
+    assert "leaderboard_badge_code" in bob_row
+
+    challenge_response = client.post(
+        "/games/challenges",
+        json={"challenged_user_id": bob["id"], "game_key": "dominoes"},
+        headers=_headers(alice["token"]),
+    )
+    assert challenge_response.status_code == 200, challenge_response.text
+    challenge = challenge_response.json()
+    assert challenge["game_key"] == "dominoes"
+    assert challenge["opponent_user_id"] == bob["id"]
+    assert challenge["other_user_display_name"] == "AliasBob"
+
+    outgoing_response = client.get("/games/challenges/outgoing", headers=_headers(alice["token"]))
+    assert outgoing_response.status_code == 200, outgoing_response.text
+    outgoing_item = outgoing_response.json()["items"][0]
+    assert outgoing_item["game_key"] == "dominoes"
+    assert outgoing_item["challenged_display_name"] == "AliasBob"
+    assert outgoing_item["opponent_display_name"] == "AliasBob"
+
+    incoming_response = client.get("/games/challenges/incoming", headers=_headers(bob["token"]))
+    assert incoming_response.status_code == 200, incoming_response.text
+    incoming_item = incoming_response.json()["items"][0]
+    assert incoming_item["game_key"] == "dominoes"
+    assert incoming_item["challenger_display_name"] == "AliasAlice"
+    assert incoming_item["other_user_display_name"] == "AliasAlice"
+
+    dashboard_response = client.get("/games/challenges", headers=_headers(bob["token"]))
+    assert dashboard_response.status_code == 200, dashboard_response.text
+    assert "activeMatch" in dashboard_response.json()
+
+    accept_response = client.post(f"/games/challenges/{challenge['id']}/accept", headers=_headers(bob["token"]))
+    assert accept_response.status_code == 200, accept_response.text
+    match = accept_response.json()["match"]
+    assert match["game_key"] == "dominoes"
+    assert match["opponent_user_id"] == alice["id"]
+    assert match["opponent_display_name"] == "AliasAlice"
+    assert "result_summary" in match
+
+    active_match_response = client.get("/games/matches/active/me", headers=_headers(alice["token"]))
+    assert active_match_response.status_code == 200, active_match_response.text
+    assert active_match_response.json()["match"]["id"] == match["id"]
 
 
 def test_dominoes_match_completion_awards_xp_once_and_profile_stats(app_env):
