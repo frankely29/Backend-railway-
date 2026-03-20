@@ -18,6 +18,7 @@ from games_service import (
     list_challengeable_users,
     list_challenges_for_user,
     list_incoming_challenges_for_user,
+    list_public_battle_notifications,
     list_outgoing_challenges_for_user,
     submit_move,
 )
@@ -33,7 +34,7 @@ def _challenge_target_user_id(payload: GameChallengeCreateIn) -> int:
 
 
 def _challenge_game_type(payload: GameChallengeCreateIn) -> str:
-    game_type = payload.game_type or payload.game_key
+    game_type = payload.battle_type or payload.game_type or payload.game_key
     if game_type is None:
         raise HTTPException(status_code=422, detail="game_type or game_key is required")
     return str(game_type)
@@ -57,7 +58,16 @@ def outgoing_game_challenges(user: sqlite3.Row = Depends(require_user)):
 
 @router.post("/challenges", response_model=ChallengeRow)
 def create_game_challenge(payload: GameChallengeCreateIn, user: sqlite3.Row = Depends(require_user)):
-    return create_challenge(int(user["id"]), _challenge_target_user_id(payload), _challenge_game_type(payload))
+    return create_challenge(
+        int(user["id"]),
+        _challenge_target_user_id(payload),
+        _challenge_game_type(payload),
+        category=payload.category,
+        fmt=payload.format,
+        challenger_teammate_user_id=payload.challenger_teammate_user_id,
+        challenged_teammate_user_id=payload.challenged_teammate_user_id,
+        metadata=payload.metadata,
+    )
 
 
 @router.post("/challenges/{challenge_id}/accept", response_model=MatchResponse)
@@ -103,3 +113,8 @@ def match_forfeit(match_id: int, user: sqlite3.Row = Depends(require_user)):
 @router.get("/history/me", response_model=HistoryResponse)
 def match_history(user: sqlite3.Row = Depends(require_user)):
     return get_history_for_user(int(user["id"]))
+
+
+@router.get("/notifications")
+def game_notifications(since_id: int | None = None, limit: int = 25, user: sqlite3.Row = Depends(require_user)):
+    return list_public_battle_notifications(since_id=since_id, limit=limit)

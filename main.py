@@ -1084,7 +1084,7 @@ def _presence_row_payloads(rows: List[Any], *, include_full_fields: bool) -> Lis
         payload = {
             "user_id": int(r["user_id"]),
             "display_name": dn,
-            "avatar_url": avatar_thumb_url_value,
+            "avatar_url": r["avatar_url"],
             "avatar_thumb_url": avatar_thumb_url_value,
             "avatar_version": avatar_version,
             "map_identity_mode": (
@@ -1971,32 +1971,19 @@ def _avatar_version_for_row(row: Any) -> Optional[str]:
 def _resolve_avatar_thumb_for_row(row: Any, *, persist_version: bool = True) -> Tuple[Optional[str], Optional[str]]:
     if row is None:
         return None, None
+    from games_service import resolve_avatar_thumb_for_user_row
+
     user_id = _row_value(row, "id")
     if user_id is None:
         user_id = _row_value(row, "user_id")
     if user_id is None:
         return None, None
-    avatar_data_url = _row_value(row, "avatar_url")
-    if not avatar_data_url:
-        return None, None
-    resolved_version = _avatar_version_for_row(row)
-    if not resolved_version:
-        resolved_version = avatar_version_for_data_url(str(avatar_data_url))
-        if not resolved_version:
-            return None, None
-        target = avatar_thumb_path(DATA_DIR, int(user_id), resolved_version)
-        if not target.exists():
-            persist_avatar_thumb(DATA_DIR, int(user_id), str(avatar_data_url), resolved_version)
-        if persist_version:
-            _db_exec(
-                "UPDATE users SET avatar_version=? WHERE id=? AND (avatar_version IS NULL OR trim(avatar_version)='')",
-                (resolved_version, int(user_id)),
-            )
-        return avatar_thumb_url(int(user_id), resolved_version), resolved_version
-    target = avatar_thumb_path(DATA_DIR, int(user_id), resolved_version)
-    if not target.exists():
-        persist_avatar_thumb(DATA_DIR, int(user_id), str(avatar_data_url), resolved_version)
-    return avatar_thumb_url(int(user_id), resolved_version), resolved_version
+    row_dict = {
+        "id": int(user_id),
+        "avatar_url": _row_value(row, "avatar_url"),
+        "avatar_version": _avatar_version_for_row(row),
+    }
+    return resolve_avatar_thumb_for_user_row(row_dict, persist_version=persist_version)
 
 
 def _avatar_thumb_url_for_row(row: Any) -> Optional[str]:
