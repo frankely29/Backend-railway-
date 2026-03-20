@@ -1033,7 +1033,7 @@ def _presence_runtime_state_upsert(user_id: int, *, is_visible: bool, reason: Op
           is_visible=excluded.is_visible,
           reason=excluded.reason
         """,
-        (int(user_id), cursor_value, 1 if is_visible else 0, safe_reason),
+        (int(user_id), cursor_value, bool(is_visible), safe_reason),
     )
     return cursor_value
 
@@ -2869,7 +2869,7 @@ def presence_all(
     min_lng: Optional[float] = None,
     max_lat: Optional[float] = None,
     max_lng: Optional[float] = None,
-    zoom: Optional[int] = None,
+    zoom: Optional[float] = None,
     mode: str = "full",
     limit: Optional[int] = None,
     viewer: sqlite3.Row = Depends(require_user),  # REQUIRE AUTH (frontend already sends token)
@@ -2934,7 +2934,7 @@ def presence_viewport(
     min_lng: Optional[float] = None,
     max_lat: Optional[float] = None,
     max_lng: Optional[float] = None,
-    zoom: Optional[int] = None,
+    zoom: Optional[float] = None,
     padding_ratio: float = 0.0,
     updated_since_ms: Optional[int] = None,
     include_removed: bool = True,
@@ -2998,7 +2998,7 @@ def presence_delta(
     min_lng: Optional[float] = None,
     max_lat: Optional[float] = None,
     max_lng: Optional[float] = None,
-    zoom: Optional[int] = None,
+    zoom: Optional[float] = None,
     include_removed: bool = True,
     limit: int = PRESENCE_DELTA_MAX_LIMIT,
     viewer: sqlite3.Row = Depends(require_user),
@@ -3821,7 +3821,7 @@ def _presence_bbox_with_buffer(
     min_lng: Optional[float],
     max_lat: Optional[float],
     max_lng: Optional[float],
-    zoom: Optional[int],
+    zoom: Optional[float],
 ) -> Optional[Tuple[float, float, float, float]]:
     bbox_key = _rounded_bbox_key(min_lat, min_lng, max_lat, max_lng)
     if bbox_key is None:
@@ -3846,7 +3846,7 @@ def _presence_bbox_with_buffer(
     )
 
 
-def _zoom_bucket(zoom: Optional[int]) -> int:
+def _zoom_bucket(zoom: Optional[float]) -> int:
     value = int(zoom or 0)
     if value <= 0:
         return 0
@@ -3863,7 +3863,7 @@ def _presence_cache_key(
     mode: str,
     limit: Optional[int],
     bbox: Optional[Tuple[float, float, float, float]],
-    zoom: Optional[int],
+    zoom: Optional[float],
 ) -> str:
     return "|".join(
         [
