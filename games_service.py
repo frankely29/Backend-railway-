@@ -310,14 +310,25 @@ def _validate_target_user(target_user_id: int, *, cur=None) -> dict[str, Any]:
 
 
 def _challenge_row_to_payload(row: dict[str, Any]) -> dict[str, Any]:
+    challenger_user_id = int(row["challenger_user_id"])
+    challenged_user_id = int(row["challenged_user_id"])
+    viewer_user_id = row.get("viewer_user_id")
+    viewer_is_challenger = viewer_user_id is not None and int(viewer_user_id) == challenger_user_id
+    other_user_id = challenged_user_id if viewer_is_challenger else challenger_user_id
+    other_user_display_name = row["challenged_display_name"] if viewer_is_challenger else row["challenger_display_name"]
     return {
         "id": int(row["id"]),
         "game_type": row["game_type"],
+        "game_key": row["game_type"],
         "status": row["status"],
-        "challenger_user_id": int(row["challenger_user_id"]),
+        "challenger_user_id": challenger_user_id,
         "challenger_display_name": row["challenger_display_name"],
-        "challenged_user_id": int(row["challenged_user_id"]),
+        "challenged_user_id": challenged_user_id,
         "challenged_display_name": row["challenged_display_name"],
+        "other_user_id": other_user_id,
+        "other_user_display_name": other_user_display_name,
+        "opponent_user_id": other_user_id,
+        "opponent_display_name": other_user_display_name,
         "created_at": _iso(row.get("created_at")),
         "updated_at": _iso(row.get("updated_at")),
         "expires_at": _iso(row.get("expires_at")),
@@ -391,11 +402,16 @@ def create_challenge(challenger_user_id: int, target_user_id: int, game_type: st
             return {
                 "id": challenge_id,
                 "game_type": normalized_game_type,
+                "game_key": normalized_game_type,
                 "status": "pending",
                 "challenger_user_id": int(challenger_user_id),
                 "challenger_display_name": _display_name_for_user(challenger),
                 "challenged_user_id": int(target_user_id),
                 "challenged_display_name": _display_name_for_user(target),
+                "other_user_id": int(target_user_id),
+                "other_user_display_name": _display_name_for_user(target),
+                "opponent_user_id": int(target_user_id),
+                "opponent_display_name": _display_name_for_user(target),
                 "created_at": _iso(now),
                 "updated_at": _iso(now),
                 "expires_at": _iso(now + CHALLENGE_EXPIRATION_SECONDS),
@@ -416,6 +432,7 @@ def _serialize_match_summary(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": int(row["id"]),
         "game_type": row["game_type"],
+        "game_key": row["game_type"],
         "status": row["status"],
         "current_turn_user_id": int(row["current_turn_user_id"]) if row.get("current_turn_user_id") is not None else None,
         "player_one_user_id": int(row["player_one_user_id"]),
@@ -524,13 +541,15 @@ def list_challengeable_users(user_id: int, *, q: str = "", limit: int = 25, stal
         progression = progressions.get(uid, {})
         presence_updated_at = item.get("presence_updated_at")
         display_name = _display_name_for_user(item)
+        avatar_thumb = None
+        if item.get("avatar_url"):
+            avatar_thumb = avatar_thumb_url(uid, item.get("avatar_version") or avatar_version_for_data_url(str(item.get("avatar_url") or "")))
         items.append(
             {
                 "user_id": uid,
                 "display_name": display_name,
-                "avatar_thumb_url": None
-                if not item.get("avatar_url")
-                else avatar_thumb_url(uid, item.get("avatar_version") or avatar_version_for_data_url(str(item.get("avatar_url") or ""))),
+                "avatar_thumb_url": avatar_thumb,
+                "avatar_url": avatar_thumb,
                 "avatar_version": item.get("avatar_version") or avatar_version_for_data_url(str(item.get("avatar_url") or "")),
                 "level": int(progression.get("level") or 1),
                 "rank_icon_key": str(progression.get("rank_icon_key") or "band_001"),
@@ -582,12 +601,15 @@ def list_challenges_for_user(user_id: int) -> dict[str, Any]:
         item = dict(row)
         item["challenger_display_name"] = _clean_display_name(item.get("challenger_display_name_raw") or "", item.get("challenger_email") or "Driver")
         item["challenged_display_name"] = _clean_display_name(item.get("challenged_display_name_raw") or "", item.get("challenged_email") or "Driver")
+        item["viewer_user_id"] = int(user_id)
         return _challenge_row_to_payload(item)
 
+    active_match = _serialize_match_summary(dict(active_match_row)) if active_match_row else None
     return {
         "incoming": [_with_names(row) for row in incoming_rows],
         "outgoing": [_with_names(row) for row in outgoing_rows],
-        "active_match": _serialize_match_summary(dict(active_match_row)) if active_match_row else None,
+        "active_match": active_match,
+        "activeMatch": active_match,
     }
 
 
@@ -1075,6 +1097,7 @@ def _transition_challenge(challenge_id: int, user_id: int, *, action: str) -> di
             challenged = _user_row(int(challenge["challenged_user_id"])) or {"email": "Driver"}
             challenge["challenger_display_name"] = _display_name_for_user(challenger)
             challenge["challenged_display_name"] = _display_name_for_user(challenged)
+            challenge["viewer_user_id"] = int(user_id)
             return _challenge_row_to_payload(challenge)
         except Exception:
             conn.rollback()
@@ -1127,6 +1150,9 @@ def get_match_detail(match_id: int, user_id: int) -> dict[str, Any]:
         (int(match_id),),
     )
     reward_contract = None
+    opponent_user_id = int(match_row["player_one_user_id"]) if int(match_row["player_two_user_id"]) == int(user_id) else int(match_row["player_two_user_id"])
+    opponent = _user_row(opponent_user_id) or {"email": f"user{opponent_user_id}@example.com"}
+    match_state = _load_json(match_row.get("match_state_json"), {})
     if match_row["status"] in {"completed", "forfeited"}:
         if int(user_id) == int(match_row.get("winner_user_id") or 0):
             reward_contract = build_reward_contract(get_progression_for_user(int(user_id)), int(match_row.get("winner_xp_awarded") or 0))
@@ -1139,10 +1165,13 @@ def get_match_detail(match_id: int, user_id: int) -> dict[str, Any]:
             "id": int(match_row["id"]),
             "challenge_id": int(match_row["challenge_id"]) if match_row.get("challenge_id") is not None else None,
             "game_type": match_row["game_type"],
+            "game_key": match_row["game_type"],
             "status": match_row["status"],
             "player_one_user_id": int(match_row["player_one_user_id"]),
             "player_two_user_id": int(match_row["player_two_user_id"]),
             "current_turn_user_id": int(match_row["current_turn_user_id"]) if match_row.get("current_turn_user_id") is not None else None,
+            "opponent_user_id": opponent_user_id,
+            "opponent_display_name": _display_name_for_user(opponent),
             "winner_user_id": int(match_row["winner_user_id"]) if match_row.get("winner_user_id") is not None else None,
             "loser_user_id": int(match_row["loser_user_id"]) if match_row.get("loser_user_id") is not None else None,
             "winner_xp_awarded": int(match_row.get("winner_xp_awarded") or 0),
@@ -1150,7 +1179,8 @@ def get_match_detail(match_id: int, user_id: int) -> dict[str, Any]:
             "created_at": _iso(match_row.get("created_at")),
             "updated_at": _iso(match_row.get("updated_at")),
             "completed_at": _iso(match_row.get("completed_at")),
-            "match_state": _load_json(match_row.get("match_state_json"), {}),
+            "match_state": match_state,
+            "result_summary": match_state.get("result_summary"),
             "moves": [
                 {
                     "move_number": int(dict(move)["move_number"]),

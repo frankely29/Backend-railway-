@@ -88,6 +88,7 @@ class ProgressionPayload(BaseModel):
     level: int
     rank_name: str
     rank_icon_key: str
+    title: str
     total_xp: int
     current_level_xp: int
     next_level_xp: Optional[int] = None

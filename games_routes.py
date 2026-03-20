@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import sqlite3
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 
 from core import require_user
-from games_models import ChallengeListResponse, ChallengeRow, ChallengeUsersResponse, GameChallengeCreateIn, GameMoveIn, HistoryResponse, MatchResponse
+from games_models import ChallengeListResponse, ChallengeRow, ChallengeRowsResponse, ChallengeUsersResponse, GameChallengeCreateIn, GameMoveIn, HistoryResponse, MatchResponse
 from games_service import (
     accept_challenge,
     cancel_challenge,
@@ -25,25 +25,39 @@ from games_service import (
 router = APIRouter(prefix="/games", tags=["games"])
 
 
+def _challenge_target_user_id(payload: GameChallengeCreateIn) -> int:
+    target_user_id = payload.target_user_id if payload.target_user_id is not None else payload.challenged_user_id
+    if target_user_id is None:
+        raise HTTPException(status_code=422, detail="target_user_id or challenged_user_id is required")
+    return int(target_user_id)
+
+
+def _challenge_game_type(payload: GameChallengeCreateIn) -> str:
+    game_type = payload.game_type or payload.game_key
+    if game_type is None:
+        raise HTTPException(status_code=422, detail="game_type or game_key is required")
+    return str(game_type)
+
+
 @router.get("/challenges", response_model=ChallengeListResponse)
 def game_challenges(user: sqlite3.Row = Depends(require_user)):
     data = list_challenges_for_user(int(user["id"]))
     return {"ok": True, **data}
 
 
-@router.get("/challenges/incoming", response_model=ChallengeUsersResponse)
+@router.get("/challenges/incoming", response_model=ChallengeRowsResponse)
 def incoming_game_challenges(user: sqlite3.Row = Depends(require_user)):
     return {"ok": True, "items": list_incoming_challenges_for_user(int(user["id"]))}
 
 
-@router.get("/challenges/outgoing", response_model=ChallengeUsersResponse)
+@router.get("/challenges/outgoing", response_model=ChallengeRowsResponse)
 def outgoing_game_challenges(user: sqlite3.Row = Depends(require_user)):
     return {"ok": True, "items": list_outgoing_challenges_for_user(int(user["id"]))}
 
 
 @router.post("/challenges", response_model=ChallengeRow)
 def create_game_challenge(payload: GameChallengeCreateIn, user: sqlite3.Row = Depends(require_user)):
-    return create_challenge(int(user["id"]), int(payload.target_user_id), payload.game_type)
+    return create_challenge(int(user["id"]), _challenge_target_user_id(payload), _challenge_game_type(payload))
 
 
 @router.post("/challenges/{challenge_id}/accept", response_model=MatchResponse)
