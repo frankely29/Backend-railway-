@@ -2091,6 +2091,8 @@ from leaderboard_service import (
     get_my_rank,
     get_overview_for_user,
 )
+from work_battles_routes import router as work_battles_router
+from work_battles_service import ensure_work_battles_schema
 from leaderboard_tracker import increment_pickup_count, record_presence_heartbeat
 from pickup_recording_feature import (
     router as pickup_recording_router,
@@ -2103,6 +2105,7 @@ from pickup_recording_feature import (
 app.include_router(chat_router)
 app.include_router(leaderboard_router)
 app.include_router(pickup_recording_router)
+app.include_router(work_battles_router)
 
 # =========================================================
 # Startup
@@ -2114,6 +2117,7 @@ def startup():
     _db_init()
     init_leaderboard_schema()
     ensure_pickup_recording_schema()
+    ensure_work_battles_schema()
     _ensure_admin_seed()
     try:
         _purge_expired_chat_data(force=True)
