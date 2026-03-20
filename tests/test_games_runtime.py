@@ -28,6 +28,7 @@ def app_env(monkeypatch):
         "core",
         "chat",
         "leaderboard_db",
+        "leaderboard_routes",
         "leaderboard_service",
         "leaderboard_tracker",
         "pickup_recording_feature",
@@ -378,6 +379,67 @@ def test_billiards_match_completion_awards_xp_once(app_env):
     assert payload["match"]["winner_xp_awarded"] == 60
     assert payload["reward_contract"]["xp_awarded"] == 60
     assert leaderboard_service.get_progression_for_user(int(winner["id"]))["xp_breakdown"]["game_xp"] == 60
+
+
+def test_billiards_result_state_contract_and_profile_relationship(app_env):
+    main, client = app_env
+    alice = _signup(client, "profile-alice@example.com", "ProfileAlice")
+    bob = _signup(client, "profile-bob@example.com", "ProfileBob")
+
+    challenge = client.post(
+        "/games/challenges",
+        json={"target_user_id": bob["id"], "game_type": "billiards"},
+        headers=_headers(alice["token"]),
+    ).json()
+    bob_view_of_alice = client.get(f"/drivers/{alice['id']}/profile", headers=_headers(bob["token"]))
+    assert bob_view_of_alice.status_code == 200, bob_view_of_alice.text
+    relationship = bob_view_of_alice.json()["viewer_game_relationship"]
+    assert relationship["status"] == "incoming_challenge"
+    assert relationship["challenge_id"] == challenge["id"]
+
+    accepted = client.post(f"/games/challenges/{challenge['id']}/accept", headers=_headers(bob["token"])).json()
+    match_id = accepted["match"]["id"]
+    challenger_user_id = accepted["match"]["challenger_user_id"]
+    challenged_user_id = accepted["match"]["challenged_user_id"]
+    state = {
+        "game_type": "billiards",
+        "turn_user_id": challenger_user_id,
+        "turn_count": 4,
+        "table_open": False,
+        "assignments": {str(challenger_user_id): "solids", str(challenged_user_id): "stripes"},
+        "remaining_balls": {"solids": [], "stripes": [9, 10], "eight": [8]},
+        "pocketed_balls": [1, 2, 3, 4, 5, 6, 7, 11, 12, 13, 14, 15],
+        "foul_flags": [],
+        "players": {
+            str(challenger_user_id): {"group": "solids", "targets_remaining": 0, "targets_cleared": 7, "black_unlocked": True},
+            str(challenged_user_id): {"group": "stripes", "targets_remaining": 2, "targets_cleared": 5, "black_unlocked": False},
+        },
+        "last_shot": None,
+        "result_summary": None,
+    }
+    _set_match_state(main, match_id, state, current_turn_user_id=challenger_user_id)
+
+    active_profile = client.get(f"/drivers/{alice['id']}/profile", headers=_headers(bob["token"]))
+    assert active_profile.status_code == 200, active_profile.text
+    active_profile_payload = active_profile.json()
+    assert active_profile_payload["viewer_game_relationship"]["status"] == "active_match"
+    assert active_profile_payload["active_match_summary"]["id"] == match_id
+
+    winner = alice if alice["id"] == challenger_user_id else bob
+    move_response = client.post(
+        f"/games/matches/{match_id}/move",
+        json={
+            "move_type": "shot",
+            "shot_input": {"angle": 0.45, "power": 0.81, "english": 0.1},
+            "result_state": {"pocketed_balls": [8], "current_turn_user_id": challenger_user_id, "winner_user_id": challenger_user_id},
+        },
+        headers=_headers(winner["token"]),
+    )
+    assert move_response.status_code == 200, move_response.text
+    payload = move_response.json()
+    assert payload["match"]["status"] == "completed"
+    assert payload["match"]["result_summary"]["reason"] == "eight_ball_pocketed"
+    assert payload["public_notification"]["type"] == "battle_result"
 
 
 def test_public_battle_result_event_helper(app_env):

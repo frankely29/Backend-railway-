@@ -5,13 +5,15 @@ from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, Field
 
 GameType = Literal["dominoes", "billiards"]
-ChallengeStatus = Literal["pending", "accepted", "declined", "cancelled", "expired", "completed"]
-MatchStatus = Literal["active", "completed", "forfeited", "void"]
+ChallengeStatus = Literal["pending", "accepted", "declined", "canceled", "expired"]
+MatchStatus = Literal["active", "completed", "forfeited", "abandoned"]
+RelationshipStatus = Literal["none", "incoming_challenge", "outgoing_challenge", "active_match"]
 
 
 class BattleStatsPayload(BaseModel):
     wins: int = 0
     losses: int = 0
+    total_matches: int = 0
     matches_played: int = 0
     win_rate: float = 0.0
     dominoes_wins: int = 0
@@ -46,6 +48,9 @@ class GameMoveIn(BaseModel):
     side: Optional[Literal["left", "right"]] = None
     angle: Optional[float] = None
     power: Optional[float] = None
+    english: Optional[float] = None
+    shot_input: Optional[Dict[str, Any]] = None
+    result_state: Optional[Dict[str, Any]] = None
 
 
 class ChallengeRow(BaseModel):
@@ -62,12 +67,10 @@ class ChallengeRow(BaseModel):
     opponent_user_id: Optional[int] = None
     opponent_display_name: Optional[str] = None
     created_at: str
-    updated_at: str
     expires_at: str
-    responded_at: Optional[str] = None
     accepted_at: Optional[str] = None
-    cancelled_at: Optional[str] = None
     declined_at: Optional[str] = None
+    canceled_at: Optional[str] = None
     completed_match_id: Optional[int] = None
 
 
@@ -76,6 +79,8 @@ class MatchSummary(BaseModel):
     game_type: GameType
     game_key: GameType
     status: MatchStatus
+    challenger_user_id: int
+    challenged_user_id: int
     current_turn_user_id: Optional[int] = None
     player_one_user_id: int
     player_two_user_id: int
@@ -109,12 +114,22 @@ class MoveRow(BaseModel):
     created_at: str
 
 
+class ViewerGameRelationship(BaseModel):
+    status: RelationshipStatus = "none"
+    game_type: Optional[GameType] = None
+    challenge_id: Optional[int] = None
+    match_id: Optional[int] = None
+
+
 class MatchDetail(BaseModel):
     id: int
     challenge_id: Optional[int] = None
+    source_challenge_id: Optional[int] = None
     game_type: GameType
     game_key: GameType
     status: MatchStatus
+    challenger_user_id: int
+    challenged_user_id: int
     player_one_user_id: int
     player_two_user_id: int
     current_turn_user_id: Optional[int] = None
@@ -136,6 +151,7 @@ class MatchResponse(BaseModel):
     ok: bool = True
     match: MatchDetail
     reward_contract: Optional[Dict[str, Any]] = None
+    public_notification: Optional[Dict[str, Any]] = None
 
 
 class HistoryResponse(BaseModel):

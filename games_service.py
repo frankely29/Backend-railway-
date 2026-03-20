@@ -1,22 +1,25 @@
 from __future__ import annotations
 
+import copy
 import json
 import math
-import random
 import sqlite3
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Iterable, Optional
 
 from fastapi import HTTPException
 
-from avatar_assets import avatar_thumb_url, avatar_version_for_data_url
+from avatar_assets import avatar_thumb_path, avatar_thumb_url, avatar_version_for_data_url, persist_avatar_thumb
 from chat import publish_public_battle_chat_message, publish_public_battle_notification
-from core import DB_BACKEND, _clean_display_name, _db, _db_lock, _db_query_all, _db_query_one, _sql
+from core import DATA_DIR, DB_BACKEND, _clean_display_name, _db, _db_lock, _db_query_all, _db_query_one, _sql
+from games_dominoes_engine import apply_move as apply_dominoes_move
+from games_dominoes_engine import create_initial_state as create_dominoes_state
 from leaderboard_service import (
     build_reward_contract,
     get_best_current_badges_for_users,
     get_progression_for_user,
+    get_progression_for_users,
     get_progression_snapshot_for_total_xp,
 )
 
@@ -26,14 +29,8 @@ WINNER_XP_AWARD = 60
 LOSER_XP_AWARD = 20
 MAX_RECENT_BATTLES = 5
 MAX_CHALLENGEABLE_USERS = 100
-DOMINO_SET: list[tuple[int, int]] = [(a, b) for a in range(7) for b in range(a, 7)]
-BILLIARDS_TARGETS_TO_CLEAR = 3
-
-
-def _bool_db_value(flag: bool):
-    if DB_BACKEND == "postgres":
-        return bool(flag)
-    return 1 if flag else 0
+BILLIARDS_GROUPS = {"solids": [1, 2, 3, 4, 5, 6, 7], "stripes": [9, 10, 11, 12, 13, 14, 15]}
+FINAL_EIGHT_BALL = 8
 
 
 def _iso(ts: Any | None) -> Optional[str]:
@@ -50,13 +47,13 @@ def _now_ts() -> int:
 
 def _load_json(value: Any, fallback: Any) -> Any:
     if not value:
-        return fallback
+        return copy.deepcopy(fallback)
     if isinstance(value, (dict, list)):
-        return value
+        return copy.deepcopy(value)
     try:
         return json.loads(value)
     except Exception:
-        return fallback
+        return copy.deepcopy(fallback)
 
 
 def _dump_json(value: Any) -> str:
@@ -69,7 +66,7 @@ def _query_one_cur(cur, sql: str, params: tuple = ()) -> Optional[dict]:
     return dict(row) if row else None
 
 
-def _query_all_cur(cur, sql: str, params: tuple = ()) -> List[dict]:
+def _query_all_cur(cur, sql: str, params: tuple = ()) -> list[dict]:
     cur.execute(_sql(sql), params)
     return [dict(row) for row in cur.fetchall()]
 
@@ -87,8 +84,22 @@ def _insert_and_get_id(cur, sql: str, params: tuple = ()) -> int:
     return int(cur.lastrowid)
 
 
+def _normalize_challenge_status(status: Any) -> str:
+    raw = str(status or "pending").strip().lower()
+    if raw == "cancelled":
+        return "canceled"
+    return raw
+
+
+def _normalize_match_status(status: Any) -> str:
+    raw = str(status or "active").strip().lower()
+    if raw == "void":
+        return "abandoned"
+    return raw
+
+
 def _user_row(user_id: int, cur=None) -> Optional[dict]:
-    sql = "SELECT id, email, display_name, is_disabled, is_suspended FROM users WHERE id=? LIMIT 1"
+    sql = "SELECT id, email, display_name, avatar_url, avatar_version, is_disabled, is_suspended, map_identity_mode FROM users WHERE id=? LIMIT 1"
     row = _query_one_cur(cur, sql, (int(user_id),)) if cur is not None else _db_query_one(sql, (int(user_id),))
     return dict(row) if row else None
 
@@ -97,26 +108,70 @@ def _display_name_for_user(row: dict[str, Any]) -> str:
     return _clean_display_name((row.get("display_name") or "").strip(), row.get("email") or "Driver")
 
 
+def _avatar_thumb_for_user_row(row: dict[str, Any] | None, *, persist_version: bool = False, cur=None) -> tuple[Optional[str], Optional[str]]:
+    if not row:
+        return None, None
+    user_id = int(row["id"])
+    avatar_url_value = row.get("avatar_url")
+    avatar_version = row.get("avatar_version")
+    if not avatar_url_value:
+        return None, None
+    resolved_version = str(avatar_version).strip() if avatar_version else None
+    if not resolved_version:
+        resolved_version = avatar_version_for_data_url(str(avatar_url_value))
+        if resolved_version:
+            if not avatar_thumb_path(DATA_DIR, user_id, resolved_version).exists():
+                persist_avatar_thumb(DATA_DIR, user_id, str(avatar_url_value), resolved_version)
+            if persist_version:
+                if cur is not None:
+                    _exec_cur(cur, "UPDATE users SET avatar_version=? WHERE id=? AND (avatar_version IS NULL OR trim(avatar_version)='')", (resolved_version, user_id))
+                else:
+                    from core import _db_exec
+
+                    _db_exec("UPDATE users SET avatar_version=? WHERE id=? AND (avatar_version IS NULL OR trim(avatar_version)='')", (resolved_version, user_id))
+        return avatar_thumb_url(user_id, resolved_version), resolved_version
+    if not avatar_thumb_path(DATA_DIR, user_id, resolved_version).exists():
+        persist_avatar_thumb(DATA_DIR, user_id, str(avatar_url_value), resolved_version)
+    return avatar_thumb_url(user_id, resolved_version), resolved_version
+
+
+def _ensure_sqlite_column(cur, table: str, column: str, ddl: str) -> None:
+    cur.execute(f"PRAGMA table_info({table})")
+    existing = {str(row[1]) for row in cur.fetchall()}
+    if column not in existing:
+        cur.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+
+
+def _ensure_postgres_column(cur, table: str, column: str, ddl: str) -> None:
+    cur.execute(
+        "SELECT 1 FROM information_schema.columns WHERE table_name=%s AND column_name=%s LIMIT 1",
+        (table, column),
+    )
+    if not cur.fetchone():
+        cur.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+
+
 def ensure_games_schema() -> None:
-    if DB_BACKEND == "postgres":
-        conn = _db()
-        try:
-            cur = conn.cursor()
+    conn = _db()
+    try:
+        cur = conn.cursor()
+        if DB_BACKEND == "postgres":
             statements = [
                 """
                 CREATE TABLE IF NOT EXISTS game_challenges (
                   id BIGSERIAL PRIMARY KEY,
-                  game_type TEXT NOT NULL,
                   challenger_user_id BIGINT NOT NULL,
                   challenged_user_id BIGINT NOT NULL,
+                  game_type TEXT NOT NULL,
                   status TEXT NOT NULL,
                   created_at BIGINT NOT NULL,
                   updated_at BIGINT NOT NULL,
                   expires_at BIGINT NOT NULL,
-                  responded_at BIGINT,
                   accepted_at BIGINT,
-                  cancelled_at BIGINT,
                   declined_at BIGINT,
+                  canceled_at BIGINT,
+                  cancelled_at BIGINT,
+                  responded_at BIGINT,
                   completed_match_id BIGINT,
                   FOREIGN KEY(challenger_user_id) REFERENCES users(id),
                   FOREIGN KEY(challenged_user_id) REFERENCES users(id)
@@ -125,8 +180,11 @@ def ensure_games_schema() -> None:
                 """
                 CREATE TABLE IF NOT EXISTS game_matches (
                   id BIGSERIAL PRIMARY KEY,
+                  source_challenge_id BIGINT,
                   challenge_id BIGINT,
                   game_type TEXT NOT NULL,
+                  challenger_user_id BIGINT,
+                  challenged_user_id BIGINT,
                   player_one_user_id BIGINT NOT NULL,
                   player_two_user_id BIGINT NOT NULL,
                   current_turn_user_id BIGINT,
@@ -136,10 +194,12 @@ def ensure_games_schema() -> None:
                   winner_xp_awarded INTEGER NOT NULL DEFAULT 0,
                   loser_xp_awarded INTEGER NOT NULL DEFAULT 0,
                   match_state_json TEXT NOT NULL,
+                  result_summary TEXT,
                   created_at BIGINT NOT NULL,
                   updated_at BIGINT NOT NULL,
                   completed_at BIGINT,
                   reward_announced_at BIGINT,
+                  FOREIGN KEY(source_challenge_id) REFERENCES game_challenges(id),
                   FOREIGN KEY(challenge_id) REFERENCES game_challenges(id),
                   FOREIGN KEY(player_one_user_id) REFERENCES users(id),
                   FOREIGN KEY(player_two_user_id) REFERENCES users(id)
@@ -173,106 +233,129 @@ def ensure_games_schema() -> None:
                   FOREIGN KEY(user_id) REFERENCES users(id)
                 )
                 """,
-                "CREATE INDEX IF NOT EXISTS idx_game_challenges_incoming ON game_challenges(challenged_user_id, status, created_at DESC)",
-                "CREATE INDEX IF NOT EXISTS idx_game_challenges_outgoing ON game_challenges(challenger_user_id, status, created_at DESC)",
-                "CREATE INDEX IF NOT EXISTS idx_game_challenges_pending_pairs ON game_challenges(game_type, challenger_user_id, challenged_user_id, status)",
-                "CREATE INDEX IF NOT EXISTS idx_game_matches_p1_status ON game_matches(player_one_user_id, status, updated_at DESC)",
-                "CREATE INDEX IF NOT EXISTS idx_game_matches_p2_status ON game_matches(player_two_user_id, status, updated_at DESC)",
-                "CREATE INDEX IF NOT EXISTS idx_game_match_moves_lookup ON game_match_moves(match_id, move_number)",
-                "CREATE INDEX IF NOT EXISTS idx_game_matches_completed_at ON game_matches(completed_at DESC)",
-                "CREATE INDEX IF NOT EXISTS idx_game_matches_game_type ON game_matches(game_type, status)",
             ]
             for statement in statements:
                 cur.execute(statement)
-            conn.commit()
-        finally:
-            conn.close()
-        return
-
-    conn = _db()
-    try:
-        cur = conn.cursor()
-        statements = [
-            """
-            CREATE TABLE IF NOT EXISTS game_challenges (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              game_type TEXT NOT NULL,
-              challenger_user_id INTEGER NOT NULL,
-              challenged_user_id INTEGER NOT NULL,
-              status TEXT NOT NULL,
-              created_at INTEGER NOT NULL,
-              updated_at INTEGER NOT NULL,
-              expires_at INTEGER NOT NULL,
-              responded_at INTEGER,
-              accepted_at INTEGER,
-              cancelled_at INTEGER,
-              declined_at INTEGER,
-              completed_match_id INTEGER,
-              FOREIGN KEY(challenger_user_id) REFERENCES users(id),
-              FOREIGN KEY(challenged_user_id) REFERENCES users(id)
-            )
-            """,
-            """
-            CREATE TABLE IF NOT EXISTS game_matches (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              challenge_id INTEGER,
-              game_type TEXT NOT NULL,
-              player_one_user_id INTEGER NOT NULL,
-              player_two_user_id INTEGER NOT NULL,
-              current_turn_user_id INTEGER,
-              status TEXT NOT NULL,
-              winner_user_id INTEGER,
-              loser_user_id INTEGER,
-              winner_xp_awarded INTEGER NOT NULL DEFAULT 0,
-              loser_xp_awarded INTEGER NOT NULL DEFAULT 0,
-              match_state_json TEXT NOT NULL,
-              created_at INTEGER NOT NULL,
-              updated_at INTEGER NOT NULL,
-              completed_at INTEGER,
-              reward_announced_at INTEGER,
-              FOREIGN KEY(challenge_id) REFERENCES game_challenges(id),
-              FOREIGN KEY(player_one_user_id) REFERENCES users(id),
-              FOREIGN KEY(player_two_user_id) REFERENCES users(id)
-            )
-            """,
-            """
-            CREATE TABLE IF NOT EXISTS game_match_moves (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              match_id INTEGER NOT NULL,
-              move_number INTEGER NOT NULL,
-              actor_user_id INTEGER NOT NULL,
-              move_type TEXT NOT NULL,
-              move_payload_json TEXT NOT NULL,
-              created_at INTEGER NOT NULL,
-              FOREIGN KEY(match_id) REFERENCES game_matches(id),
-              FOREIGN KEY(actor_user_id) REFERENCES users(id)
-            )
-            """,
-            """
-            CREATE TABLE IF NOT EXISTS user_game_stats (
-              user_id INTEGER PRIMARY KEY,
-              total_matches INTEGER NOT NULL DEFAULT 0,
-              total_wins INTEGER NOT NULL DEFAULT 0,
-              total_losses INTEGER NOT NULL DEFAULT 0,
-              dominoes_wins INTEGER NOT NULL DEFAULT 0,
-              dominoes_losses INTEGER NOT NULL DEFAULT 0,
-              billiards_wins INTEGER NOT NULL DEFAULT 0,
-              billiards_losses INTEGER NOT NULL DEFAULT 0,
-              game_xp_earned INTEGER NOT NULL DEFAULT 0,
-              updated_at INTEGER NOT NULL DEFAULT 0,
-              FOREIGN KEY(user_id) REFERENCES users(id)
-            )
-            """,
+            for table, column, ddl in [
+                ("game_challenges", "accepted_at", "accepted_at BIGINT"),
+                ("game_challenges", "declined_at", "declined_at BIGINT"),
+                ("game_challenges", "canceled_at", "canceled_at BIGINT"),
+                ("game_challenges", "cancelled_at", "cancelled_at BIGINT"),
+                ("game_challenges", "completed_match_id", "completed_match_id BIGINT"),
+                ("game_matches", "source_challenge_id", "source_challenge_id BIGINT"),
+                ("game_matches", "challenge_id", "challenge_id BIGINT"),
+                ("game_matches", "challenger_user_id", "challenger_user_id BIGINT"),
+                ("game_matches", "challenged_user_id", "challenged_user_id BIGINT"),
+                ("game_matches", "result_summary", "result_summary TEXT"),
+                ("game_matches", "reward_announced_at", "reward_announced_at BIGINT"),
+            ]:
+                _ensure_postgres_column(cur, table, column, ddl)
+        else:
+            statements = [
+                """
+                CREATE TABLE IF NOT EXISTS game_challenges (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  challenger_user_id INTEGER NOT NULL,
+                  challenged_user_id INTEGER NOT NULL,
+                  game_type TEXT NOT NULL,
+                  status TEXT NOT NULL,
+                  created_at INTEGER NOT NULL,
+                  updated_at INTEGER NOT NULL,
+                  expires_at INTEGER NOT NULL,
+                  accepted_at INTEGER,
+                  declined_at INTEGER,
+                  canceled_at INTEGER,
+                  cancelled_at INTEGER,
+                  responded_at INTEGER,
+                  completed_match_id INTEGER,
+                  FOREIGN KEY(challenger_user_id) REFERENCES users(id),
+                  FOREIGN KEY(challenged_user_id) REFERENCES users(id)
+                )
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS game_matches (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  source_challenge_id INTEGER,
+                  challenge_id INTEGER,
+                  game_type TEXT NOT NULL,
+                  challenger_user_id INTEGER,
+                  challenged_user_id INTEGER,
+                  player_one_user_id INTEGER NOT NULL,
+                  player_two_user_id INTEGER NOT NULL,
+                  current_turn_user_id INTEGER,
+                  status TEXT NOT NULL,
+                  winner_user_id INTEGER,
+                  loser_user_id INTEGER,
+                  winner_xp_awarded INTEGER NOT NULL DEFAULT 0,
+                  loser_xp_awarded INTEGER NOT NULL DEFAULT 0,
+                  match_state_json TEXT NOT NULL,
+                  result_summary TEXT,
+                  created_at INTEGER NOT NULL,
+                  updated_at INTEGER NOT NULL,
+                  completed_at INTEGER,
+                  reward_announced_at INTEGER,
+                  FOREIGN KEY(source_challenge_id) REFERENCES game_challenges(id),
+                  FOREIGN KEY(challenge_id) REFERENCES game_challenges(id),
+                  FOREIGN KEY(player_one_user_id) REFERENCES users(id),
+                  FOREIGN KEY(player_two_user_id) REFERENCES users(id)
+                )
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS game_match_moves (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  match_id INTEGER NOT NULL,
+                  move_number INTEGER NOT NULL,
+                  actor_user_id INTEGER NOT NULL,
+                  move_type TEXT NOT NULL,
+                  move_payload_json TEXT NOT NULL,
+                  created_at INTEGER NOT NULL,
+                  FOREIGN KEY(match_id) REFERENCES game_matches(id),
+                  FOREIGN KEY(actor_user_id) REFERENCES users(id)
+                )
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS user_game_stats (
+                  user_id INTEGER PRIMARY KEY,
+                  total_matches INTEGER NOT NULL DEFAULT 0,
+                  total_wins INTEGER NOT NULL DEFAULT 0,
+                  total_losses INTEGER NOT NULL DEFAULT 0,
+                  dominoes_wins INTEGER NOT NULL DEFAULT 0,
+                  dominoes_losses INTEGER NOT NULL DEFAULT 0,
+                  billiards_wins INTEGER NOT NULL DEFAULT 0,
+                  billiards_losses INTEGER NOT NULL DEFAULT 0,
+                  game_xp_earned INTEGER NOT NULL DEFAULT 0,
+                  updated_at INTEGER NOT NULL DEFAULT 0,
+                  FOREIGN KEY(user_id) REFERENCES users(id)
+                )
+                """,
+            ]
+            for statement in statements:
+                cur.execute(statement)
+            for table, column, ddl in [
+                ("game_challenges", "accepted_at", "accepted_at INTEGER"),
+                ("game_challenges", "declined_at", "declined_at INTEGER"),
+                ("game_challenges", "canceled_at", "canceled_at INTEGER"),
+                ("game_challenges", "cancelled_at", "cancelled_at INTEGER"),
+                ("game_challenges", "completed_match_id", "completed_match_id INTEGER"),
+                ("game_matches", "source_challenge_id", "source_challenge_id INTEGER"),
+                ("game_matches", "challenge_id", "challenge_id INTEGER"),
+                ("game_matches", "challenger_user_id", "challenger_user_id INTEGER"),
+                ("game_matches", "challenged_user_id", "challenged_user_id INTEGER"),
+                ("game_matches", "result_summary", "result_summary TEXT"),
+                ("game_matches", "reward_announced_at", "reward_announced_at INTEGER"),
+            ]:
+                _ensure_sqlite_column(cur, table, column, ddl)
+        for statement in [
             "CREATE INDEX IF NOT EXISTS idx_game_challenges_incoming ON game_challenges(challenged_user_id, status, created_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_game_challenges_outgoing ON game_challenges(challenger_user_id, status, created_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_game_challenges_pending_pairs ON game_challenges(game_type, challenger_user_id, challenged_user_id, status)",
             "CREATE INDEX IF NOT EXISTS idx_game_matches_p1_status ON game_matches(player_one_user_id, status, updated_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_game_matches_p2_status ON game_matches(player_two_user_id, status, updated_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_game_matches_pair_status ON game_matches(challenger_user_id, challenged_user_id, status)",
             "CREATE INDEX IF NOT EXISTS idx_game_match_moves_lookup ON game_match_moves(match_id, move_number)",
             "CREATE INDEX IF NOT EXISTS idx_game_matches_completed_at ON game_matches(completed_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_game_matches_game_type ON game_matches(game_type, status)",
-        ]
-        for statement in statements:
+        ]:
             cur.execute(statement)
         conn.commit()
     finally:
@@ -316,11 +399,12 @@ def _challenge_row_to_payload(row: dict[str, Any]) -> dict[str, Any]:
     viewer_is_challenger = viewer_user_id is not None and int(viewer_user_id) == challenger_user_id
     other_user_id = challenged_user_id if viewer_is_challenger else challenger_user_id
     other_user_display_name = row["challenged_display_name"] if viewer_is_challenger else row["challenger_display_name"]
+    canceled_at = row.get("canceled_at") if row.get("canceled_at") is not None else row.get("cancelled_at")
     return {
         "id": int(row["id"]),
         "game_type": row["game_type"],
         "game_key": row["game_type"],
-        "status": row["status"],
+        "status": _normalize_challenge_status(row.get("status")),
         "challenger_user_id": challenger_user_id,
         "challenger_display_name": row["challenger_display_name"],
         "challenged_user_id": challenged_user_id,
@@ -330,102 +414,12 @@ def _challenge_row_to_payload(row: dict[str, Any]) -> dict[str, Any]:
         "opponent_user_id": other_user_id,
         "opponent_display_name": other_user_display_name,
         "created_at": _iso(row.get("created_at")),
-        "updated_at": _iso(row.get("updated_at")),
         "expires_at": _iso(row.get("expires_at")),
-        "responded_at": _iso(row.get("responded_at")),
         "accepted_at": _iso(row.get("accepted_at")),
-        "cancelled_at": _iso(row.get("cancelled_at")),
         "declined_at": _iso(row.get("declined_at")),
+        "canceled_at": _iso(canceled_at),
         "completed_match_id": int(row["completed_match_id"]) if row.get("completed_match_id") is not None else None,
     }
-
-
-def create_challenge(challenger_user_id: int, target_user_id: int, game_type: str) -> dict[str, Any]:
-    normalized_game_type = str(game_type or "").strip().lower()
-    if normalized_game_type not in ALLOWED_GAME_TYPES:
-        raise HTTPException(status_code=400, detail="Unsupported game type")
-    if int(challenger_user_id) == int(target_user_id):
-        raise HTTPException(status_code=400, detail="You cannot challenge yourself")
-
-    with _db_lock:
-        conn = _db()
-        try:
-            cur = conn.cursor()
-            expire_stale_challenges(cur)
-            challenger = _validate_target_user(int(challenger_user_id), cur=cur)
-            target = _validate_target_user(int(target_user_id), cur=cur)
-            low_id, high_id = sorted((int(challenger_user_id), int(target_user_id)))
-            duplicate = _query_one_cur(
-                cur,
-                """
-                SELECT id FROM game_challenges
-                WHERE status='pending' AND game_type=?
-                  AND ((challenger_user_id=? AND challenged_user_id=?) OR (challenger_user_id=? AND challenged_user_id=?))
-                LIMIT 1
-                """,
-                (normalized_game_type, low_id, high_id, high_id, low_id),
-            )
-            if duplicate:
-                raise HTTPException(status_code=409, detail="A pending challenge already exists for these players")
-            active_match = _query_one_cur(
-                cur,
-                """
-                SELECT id FROM game_matches
-                WHERE status='active'
-                  AND ((player_one_user_id=? AND player_two_user_id=?) OR (player_one_user_id=? AND player_two_user_id=?))
-                LIMIT 1
-                """,
-                (low_id, high_id, high_id, low_id),
-            )
-            if active_match:
-                raise HTTPException(status_code=409, detail="These players already have an active match")
-            now = _now_ts()
-            challenge_id = _insert_and_get_id(
-                cur,
-                """
-                INSERT INTO game_challenges(
-                  game_type, challenger_user_id, challenged_user_id, status,
-                  created_at, updated_at, expires_at
-                ) VALUES(?,?,?,?,?,?,?)
-                """,
-                (
-                    normalized_game_type,
-                    int(challenger_user_id),
-                    int(target_user_id),
-                    "pending",
-                    now,
-                    now,
-                    now + CHALLENGE_EXPIRATION_SECONDS,
-                ),
-            )
-            conn.commit()
-            return {
-                "id": challenge_id,
-                "game_type": normalized_game_type,
-                "game_key": normalized_game_type,
-                "status": "pending",
-                "challenger_user_id": int(challenger_user_id),
-                "challenger_display_name": _display_name_for_user(challenger),
-                "challenged_user_id": int(target_user_id),
-                "challenged_display_name": _display_name_for_user(target),
-                "other_user_id": int(target_user_id),
-                "other_user_display_name": _display_name_for_user(target),
-                "opponent_user_id": int(target_user_id),
-                "opponent_display_name": _display_name_for_user(target),
-                "created_at": _iso(now),
-                "updated_at": _iso(now),
-                "expires_at": _iso(now + CHALLENGE_EXPIRATION_SECONDS),
-                "responded_at": None,
-                "accepted_at": None,
-                "cancelled_at": None,
-                "declined_at": None,
-                "completed_match_id": None,
-            }
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
 
 
 def _serialize_match_summary(row: dict[str, Any]) -> dict[str, Any]:
@@ -433,7 +427,9 @@ def _serialize_match_summary(row: dict[str, Any]) -> dict[str, Any]:
         "id": int(row["id"]),
         "game_type": row["game_type"],
         "game_key": row["game_type"],
-        "status": row["status"],
+        "status": _normalize_match_status(row["status"]),
+        "challenger_user_id": int(row.get("challenger_user_id") or row.get("player_one_user_id")),
+        "challenged_user_id": int(row.get("challenged_user_id") or row.get("player_two_user_id")),
         "current_turn_user_id": int(row["current_turn_user_id"]) if row.get("current_turn_user_id") is not None else None,
         "player_one_user_id": int(row["player_one_user_id"]),
         "player_two_user_id": int(row["player_two_user_id"]),
@@ -447,14 +443,7 @@ def _serialize_match_summary(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _upsert_user_game_stats(
-    cur,
-    *,
-    user_id: int,
-    is_win: bool,
-    game_type: str,
-    xp_earned: int,
-) -> None:
+def _upsert_user_game_stats(cur, *, user_id: int, is_win: bool, game_type: str, xp_earned: int) -> None:
     now = _now_ts()
     normalized_game_type = str(game_type or "").strip().lower()
     dominoes_win = 1 if is_win and normalized_game_type == "dominoes" else 0
@@ -492,6 +481,22 @@ def _upsert_user_game_stats(
             max(0, int(xp_earned or 0)),
             now,
         ),
+    )
+
+
+def _pair_active_match(cur, user_a: int, user_b: int) -> Optional[dict[str, Any]]:
+    low_id, high_id = sorted((int(user_a), int(user_b)))
+    return _query_one_cur(
+        cur,
+        """
+        SELECT *
+        FROM game_matches
+        WHERE status='active'
+          AND ((player_one_user_id=? AND player_two_user_id=?) OR (player_one_user_id=? AND player_two_user_id=?))
+        ORDER BY updated_at DESC, id DESC
+        LIMIT 1
+        """,
+        (low_id, high_id, high_id, low_id),
     )
 
 
@@ -533,60 +538,57 @@ def list_challengeable_users(user_id: int, *, q: str = "", limit: int = 25, stal
     )
     clean_user_ids = [int(row["id"]) for row in rows]
     badges = get_best_current_badges_for_users(clean_user_ids)
-    progressions = {uid: get_progression_for_user(uid) for uid in clean_user_ids}
+    progressions = get_progression_for_users(clean_user_ids)
     items: list[dict[str, Any]] = []
-    for row in rows:
-        item = dict(row)
-        uid = int(item["id"])
+    for raw_row in rows:
+        row = dict(raw_row)
+        uid = int(row["id"])
         progression = progressions.get(uid, {})
-        presence_updated_at = item.get("presence_updated_at")
-        display_name = _display_name_for_user(item)
-        avatar_thumb = None
-        if item.get("avatar_url"):
-            avatar_thumb = avatar_thumb_url(uid, item.get("avatar_version") or avatar_version_for_data_url(str(item.get("avatar_url") or "")))
+        presence_updated_at = row.get("presence_updated_at")
+        display_name = _display_name_for_user(row)
+        thumb_url, avatar_version = _avatar_thumb_for_user_row(row, persist_version=True)
         items.append(
             {
                 "user_id": uid,
                 "display_name": display_name,
-                "avatar_thumb_url": avatar_thumb,
-                "avatar_url": avatar_thumb,
-                "avatar_version": item.get("avatar_version") or avatar_version_for_data_url(str(item.get("avatar_url") or "")),
+                "avatar_thumb_url": thumb_url,
+                "avatar_url": row.get("avatar_url"),
+                "avatar_version": avatar_version,
                 "level": int(progression.get("level") or 1),
                 "rank_icon_key": str(progression.get("rank_icon_key") or "band_001"),
                 "leaderboard_badge_code": (badges.get(uid) or {}).get("leaderboard_badge_code"),
                 "online": bool(presence_updated_at is not None and int(presence_updated_at) >= cutoff),
-                "presence_updated_at": int(presence_updated_at) if presence_updated_at is not None else None,
             }
         )
     return items
 
 
+def _challenge_query_base(where_sql: str, params: tuple[Any, ...]) -> list[dict[str, Any]]:
+    rows = _db_query_all(
+        f"""
+        SELECT c.*, cu.email AS challenger_email, cu.display_name AS challenger_display_name_raw,
+               tu.email AS challenged_email, tu.display_name AS challenged_display_name_raw
+        FROM game_challenges c
+        JOIN users cu ON cu.id = c.challenger_user_id
+        JOIN users tu ON tu.id = c.challenged_user_id
+        WHERE {where_sql}
+        ORDER BY c.created_at DESC, c.id DESC
+        """,
+        params,
+    )
+    items: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        item["challenger_display_name"] = _clean_display_name(item.get("challenger_display_name_raw") or "", item.get("challenger_email") or "Driver")
+        item["challenged_display_name"] = _clean_display_name(item.get("challenged_display_name_raw") or "", item.get("challenged_email") or "Driver")
+        items.append(item)
+    return items
+
+
 def list_challenges_for_user(user_id: int) -> dict[str, Any]:
     expire_stale_challenges()
-    incoming_rows = _db_query_all(
-        """
-        SELECT c.*, cu.email AS challenger_email, cu.display_name AS challenger_display_name_raw,
-               tu.email AS challenged_email, tu.display_name AS challenged_display_name_raw
-        FROM game_challenges c
-        JOIN users cu ON cu.id = c.challenger_user_id
-        JOIN users tu ON tu.id = c.challenged_user_id
-        WHERE c.challenged_user_id=? AND c.status='pending'
-        ORDER BY c.created_at DESC, c.id DESC
-        """,
-        (int(user_id),),
-    )
-    outgoing_rows = _db_query_all(
-        """
-        SELECT c.*, cu.email AS challenger_email, cu.display_name AS challenger_display_name_raw,
-               tu.email AS challenged_email, tu.display_name AS challenged_display_name_raw
-        FROM game_challenges c
-        JOIN users cu ON cu.id = c.challenger_user_id
-        JOIN users tu ON tu.id = c.challenged_user_id
-        WHERE c.challenger_user_id=? AND c.status='pending'
-        ORDER BY c.created_at DESC, c.id DESC
-        """,
-        (int(user_id),),
-    )
+    incoming_rows = _challenge_query_base("c.challenged_user_id=? AND c.status='pending'", (int(user_id),))
+    outgoing_rows = _challenge_query_base("c.challenger_user_id=? AND c.status='pending'", (int(user_id),))
     active_match_row = _db_query_one(
         """
         SELECT * FROM game_matches
@@ -597,10 +599,8 @@ def list_challenges_for_user(user_id: int) -> dict[str, Any]:
         (int(user_id), int(user_id)),
     )
 
-    def _with_names(row: Any) -> dict[str, Any]:
+    def _with_names(row: dict[str, Any]) -> dict[str, Any]:
         item = dict(row)
-        item["challenger_display_name"] = _clean_display_name(item.get("challenger_display_name_raw") or "", item.get("challenger_email") or "Driver")
-        item["challenged_display_name"] = _clean_display_name(item.get("challenged_display_name_raw") or "", item.get("challenged_email") or "Driver")
         item["viewer_user_id"] = int(user_id)
         return _challenge_row_to_payload(item)
 
@@ -621,199 +621,278 @@ def list_outgoing_challenges_for_user(user_id: int) -> list[dict[str, Any]]:
     return list_challenges_for_user(int(user_id)).get("outgoing", [])
 
 
-def _seed_for_match(match_id: int) -> int:
-    return 7000 + int(match_id) * 17
+def create_challenge(challenger_user_id: int, target_user_id: int, game_type: str) -> dict[str, Any]:
+    normalized_game_type = str(game_type or "").strip().lower()
+    if normalized_game_type not in ALLOWED_GAME_TYPES:
+        raise HTTPException(status_code=400, detail="Unsupported game type")
+    if int(challenger_user_id) == int(target_user_id):
+        raise HTTPException(status_code=400, detail="You cannot challenge yourself")
+
+    with _db_lock:
+        conn = _db()
+        try:
+            cur = conn.cursor()
+            expire_stale_challenges(cur)
+            challenger = _validate_target_user(int(challenger_user_id), cur=cur)
+            target = _validate_target_user(int(target_user_id), cur=cur)
+            low_id, high_id = sorted((int(challenger_user_id), int(target_user_id)))
+            duplicate = _query_one_cur(
+                cur,
+                """
+                SELECT id FROM game_challenges
+                WHERE status='pending' AND game_type=?
+                  AND ((challenger_user_id=? AND challenged_user_id=?) OR (challenger_user_id=? AND challenged_user_id=?))
+                LIMIT 1
+                """,
+                (normalized_game_type, low_id, high_id, high_id, low_id),
+            )
+            if duplicate:
+                raise HTTPException(status_code=409, detail="A pending challenge already exists for these players")
+            active_match = _pair_active_match(cur, int(challenger_user_id), int(target_user_id))
+            if active_match:
+                raise HTTPException(status_code=409, detail="These players already have an active match")
+            now = _now_ts()
+            challenge_id = _insert_and_get_id(
+                cur,
+                """
+                INSERT INTO game_challenges(
+                  challenger_user_id, challenged_user_id, game_type, status,
+                  created_at, updated_at, expires_at
+                ) VALUES(?,?,?,?,?,?,?)
+                """,
+                (
+                    int(challenger_user_id),
+                    int(target_user_id),
+                    normalized_game_type,
+                    "pending",
+                    now,
+                    now,
+                    now + CHALLENGE_EXPIRATION_SECONDS,
+                ),
+            )
+            conn.commit()
+            return {
+                "id": challenge_id,
+                "game_type": normalized_game_type,
+                "game_key": normalized_game_type,
+                "status": "pending",
+                "challenger_user_id": int(challenger_user_id),
+                "challenger_display_name": _display_name_for_user(challenger),
+                "challenged_user_id": int(target_user_id),
+                "challenged_display_name": _display_name_for_user(target),
+                "other_user_id": int(target_user_id),
+                "other_user_display_name": _display_name_for_user(target),
+                "opponent_user_id": int(target_user_id),
+                "opponent_display_name": _display_name_for_user(target),
+                "created_at": _iso(now),
+                "expires_at": _iso(now + CHALLENGE_EXPIRATION_SECONDS),
+                "accepted_at": None,
+                "declined_at": None,
+                "canceled_at": None,
+                "completed_match_id": None,
+            }
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
 
-def _normalize_tile(tile: Iterable[int]) -> tuple[int, int]:
-    values = list(tile)
-    if len(values) != 2:
-        raise HTTPException(status_code=400, detail="Domino tile must contain two pips")
-    a = int(values[0])
-    b = int(values[1])
-    if not (0 <= a <= 6 and 0 <= b <= 6):
-        raise HTTPException(status_code=400, detail="Domino tile pips must be between 0 and 6")
-    return tuple(sorted((a, b)))
-
-
-def _dominoes_state(player_one_user_id: int, player_two_user_id: int, match_id: int) -> dict[str, Any]:
-    deck = DOMINO_SET.copy()
-    random.Random(_seed_for_match(match_id)).shuffle(deck)
-    player_one_hand = [list(tile) for tile in deck[:7]]
-    player_two_hand = [list(tile) for tile in deck[7:14]]
-    stock = [list(tile) for tile in deck[14:]]
-    first_turn = min(int(player_one_user_id), int(player_two_user_id))
-    return {
-        "game_type": "dominoes",
-        "rules": "Double-six draw dominoes. Draw when blocked, pass only when no legal move and the boneyard is empty. Lower hand pip total wins blocked rounds.",
-        "board": [],
-        "left_end": None,
-        "right_end": None,
-        "hands": {
-            str(int(player_one_user_id)): player_one_hand,
-            str(int(player_two_user_id)): player_two_hand,
-        },
-        "stock": stock,
-        "passes_in_row": 0,
-        "last_action": None,
-        "turn_user_id": first_turn,
-        "result_summary": None,
-    }
-
-
-def _tile_in_hand(hand: list[list[int]], tile: tuple[int, int]) -> bool:
-    return list(tile) in hand
-
-
-def _domino_legal_play_sides(state: dict[str, Any], tile: tuple[int, int]) -> set[str]:
-    board = state.get("board") or []
-    if not board:
-        return {"left", "right"}
-    left_end = int(state["left_end"])
-    right_end = int(state["right_end"])
-    sides: set[str] = set()
-    a, b = tile
-    if a == left_end or b == left_end:
-        sides.add("left")
-    if a == right_end or b == right_end:
-        sides.add("right")
-    return sides
-
-
-def _orient_tile_for_side(tile: tuple[int, int], side: str, state: dict[str, Any]) -> list[int]:
-    a, b = tile
-    if not state.get("board"):
-        return [a, b]
-    if side == "left":
-        left_end = int(state["left_end"])
-        return [b, a] if a == left_end else [a, b]
-    right_end = int(state["right_end"])
-    return [a, b] if a == right_end else [b, a]
-
-
-def _domino_hand_total(hand: list[list[int]]) -> int:
-    return sum(int(tile[0]) + int(tile[1]) for tile in hand)
-
-
-def _dominoes_player_has_legal_play(state: dict[str, Any], user_id: int) -> bool:
-    hand = state.get("hands", {}).get(str(int(user_id)), [])
-    return any(_domino_legal_play_sides(state, tuple(tile)) for tile in hand)
-
-
-def _dominoes_finalize_blocked(match_row: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
-    player_one = int(match_row["player_one_user_id"])
-    player_two = int(match_row["player_two_user_id"])
-    hand_one = state["hands"].get(str(player_one), [])
-    hand_two = state["hands"].get(str(player_two), [])
-    total_one = _domino_hand_total(hand_one)
-    total_two = _domino_hand_total(hand_two)
-    if total_one < total_two:
-        winner, loser = player_one, player_two
-    elif total_two < total_one:
-        winner, loser = player_two, player_one
-    else:
-        winner, loser = min(player_one, player_two), max(player_one, player_two)
-    state["result_summary"] = {
-        "reason": "blocked",
-        "player_one_pips": total_one,
-        "player_two_pips": total_two,
-    }
-    return {"winner_user_id": winner, "loser_user_id": loser, "state": state}
-
-
-def _apply_dominoes_move(match_row: dict[str, Any], state: dict[str, Any], actor_user_id: int, move: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
-    move_type = str(move.get("move_type") or "").strip().lower()
-    actor_key = str(int(actor_user_id))
-    hand = list(state.get("hands", {}).get(actor_key, []))
-    if move_type == "play_tile":
-        tile = _normalize_tile(move.get("tile") or [])
-        side = str(move.get("side") or "").strip().lower()
-        if side not in {"left", "right"}:
-            raise HTTPException(status_code=400, detail="Dominoes play_tile requires side=left or side=right")
-        if not _tile_in_hand(hand, tile):
-            raise HTTPException(status_code=409, detail="Tile is not in your hand")
-        legal_sides = _domino_legal_play_sides(state, tile)
-        if side not in legal_sides:
-            raise HTTPException(status_code=409, detail="That tile cannot be played on the requested side")
-        oriented = _orient_tile_for_side(tile, side, state)
-        hand.remove(list(tile))
-        board = list(state.get("board") or [])
-        if not board:
-            board = [oriented]
-        elif side == "left":
-            board.insert(0, oriented)
-        else:
-            board.append(oriented)
-        state["board"] = board
-        state["left_end"] = int(board[0][0])
-        state["right_end"] = int(board[-1][1])
-        state["hands"][actor_key] = hand
-        state["passes_in_row"] = 0
-        state["last_action"] = {"type": "play_tile", "tile": oriented, "side": side, "actor_user_id": int(actor_user_id)}
-        if not hand:
-            state["result_summary"] = {"reason": "emptied_hand"}
-            other = int(match_row["player_one_user_id"]) if int(match_row["player_two_user_id"]) == int(actor_user_id) else int(match_row["player_two_user_id"])
-            return state, {"completed": True, "winner_user_id": int(actor_user_id), "loser_user_id": other}
-        next_turn = int(match_row["player_one_user_id"]) if int(match_row["player_two_user_id"]) == int(actor_user_id) else int(match_row["player_two_user_id"])
-        state["turn_user_id"] = next_turn
-        return state, {"completed": False}
-
-    if move_type == "draw_tile":
-        if _dominoes_player_has_legal_play(state, actor_user_id):
-            raise HTTPException(status_code=409, detail="You already have a legal dominoes play")
-        stock = list(state.get("stock") or [])
-        if not stock:
-            raise HTTPException(status_code=409, detail="Boneyard is empty")
-        drawn_tile = stock.pop(0)
-        hand.append(drawn_tile)
-        state["stock"] = stock
-        state["hands"][actor_key] = hand
-        state["last_action"] = {"type": "draw_tile", "tile": drawn_tile, "actor_user_id": int(actor_user_id)}
-        return state, {"completed": False}
-
-    if move_type == "pass":
-        if state.get("stock"):
-            raise HTTPException(status_code=409, detail="You cannot pass while the boneyard still has tiles")
-        if _dominoes_player_has_legal_play(state, actor_user_id):
-            raise HTTPException(status_code=409, detail="You still have a legal dominoes play")
-        state["passes_in_row"] = int(state.get("passes_in_row") or 0) + 1
-        state["last_action"] = {"type": "pass", "actor_user_id": int(actor_user_id)}
-        next_turn = int(match_row["player_one_user_id"]) if int(match_row["player_two_user_id"]) == int(actor_user_id) else int(match_row["player_two_user_id"])
-        state["turn_user_id"] = next_turn
-        if int(state["passes_in_row"]) >= 2:
-            blocked = _dominoes_finalize_blocked(match_row, state)
-            return blocked["state"], {"completed": True, "winner_user_id": blocked["winner_user_id"], "loser_user_id": blocked["loser_user_id"]}
-        return state, {"completed": False}
-
-    raise HTTPException(status_code=400, detail="Unsupported dominoes move")
-
-
-def _billiards_state(player_one_user_id: int, player_two_user_id: int) -> dict[str, Any]:
+def _default_billiards_state(player_one_user_id: int, player_two_user_id: int) -> dict[str, Any]:
     first_turn = min(int(player_one_user_id), int(player_two_user_id))
     return {
         "game_type": "billiards",
-        "rules": "Quick Battle rules: each player must pocket 3 target balls, then pocket the final black ball. Scoring shots keep the turn; misses hand the turn over.",
+        "rules": "Server-authoritative 8-ball challenge flow. The table opens until a group is claimed, pocketed balls stay down, and the 8-ball wins only after clearing your group without fouling.",
         "turn_user_id": first_turn,
-        "players": {
-            str(int(player_one_user_id)): {"targets_remaining": BILLIARDS_TARGETS_TO_CLEAR, "targets_cleared": 0, "black_unlocked": False},
-            str(int(player_two_user_id)): {"targets_remaining": BILLIARDS_TARGETS_TO_CLEAR, "targets_cleared": 0, "black_unlocked": False},
+        "turn_count": 1,
+        "table_open": True,
+        "assignments": {str(int(player_one_user_id)): None, str(int(player_two_user_id)): None},
+        "remaining_balls": {
+            "solids": BILLIARDS_GROUPS["solids"][:],
+            "stripes": BILLIARDS_GROUPS["stripes"][:],
+            "eight": [FINAL_EIGHT_BALL],
         },
-        "table": {
-            "width": 100,
-            "height": 50,
-            "cue_ball": {"x": 18, "y": 25},
-            "final_ball": {"x": 82, "y": 25, "pocketed": False},
+        "pocketed_balls": [],
+        "foul_flags": [],
+        "players": {
+            str(int(player_one_user_id)): {"group": None, "targets_remaining": 7, "targets_cleared": 0, "black_unlocked": False},
+            str(int(player_two_user_id)): {"group": None, "targets_remaining": 7, "targets_cleared": 0, "black_unlocked": False},
         },
         "last_shot": None,
+        "winner_user_id": None,
         "result_summary": None,
     }
 
 
-def _billiards_switch_turn(match_row: dict[str, Any], actor_user_id: int) -> int:
+def _normalize_billiards_state(match_row: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
+    if state.get("remaining_balls"):
+        normalized = copy.deepcopy(state)
+    else:
+        normalized = _default_billiards_state(int(match_row["player_one_user_id"]), int(match_row["player_two_user_id"]))
+        normalized["turn_user_id"] = int(state.get("turn_user_id") or normalized["turn_user_id"])
+        normalized["last_shot"] = copy.deepcopy(state.get("last_shot"))
+        normalized["result_summary"] = copy.deepcopy(state.get("result_summary"))
+        legacy_players = state.get("players") or {}
+        for user_id in [int(match_row["player_one_user_id"]), int(match_row["player_two_user_id"])]:
+            legacy = legacy_players.get(str(user_id)) or {}
+            normalized["players"][str(user_id)]["targets_remaining"] = int(legacy.get("targets_remaining") or 7)
+            normalized["players"][str(user_id)]["targets_cleared"] = int(legacy.get("targets_cleared") or 0)
+            normalized["players"][str(user_id)]["black_unlocked"] = bool(legacy.get("black_unlocked"))
+    normalized.setdefault("turn_count", 1)
+    normalized.setdefault("table_open", not any(normalized.get("assignments", {}).values()))
+    normalized.setdefault("pocketed_balls", [])
+    normalized.setdefault("foul_flags", [])
+    normalized.setdefault("last_shot", None)
+    normalized.setdefault("result_summary", None)
+    normalized.setdefault("players", {})
+    for user_id in [int(match_row["player_one_user_id"]), int(match_row["player_two_user_id"])]:
+        normalized["players"].setdefault(str(user_id), {"group": None, "targets_remaining": 7, "targets_cleared": 0, "black_unlocked": False})
+    return normalized
+
+
+def _other_player_id(match_row: dict[str, Any], actor_user_id: int) -> int:
     return int(match_row["player_one_user_id"]) if int(match_row["player_two_user_id"]) == int(actor_user_id) else int(match_row["player_two_user_id"])
 
 
-def _apply_billiards_move(match_row: dict[str, Any], state: dict[str, Any], actor_user_id: int, move: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+def _group_for_ball(ball: int) -> Optional[str]:
+    if ball in BILLIARDS_GROUPS["solids"]:
+        return "solids"
+    if ball in BILLIARDS_GROUPS["stripes"]:
+        return "stripes"
+    return None
+
+
+def _sync_billiards_player_state(state: dict[str, Any], match_row: dict[str, Any]) -> None:
+    assignments = state.get("assignments") or {}
+    remaining = state.get("remaining_balls") or {}
+    for user_id in [int(match_row["player_one_user_id"]), int(match_row["player_two_user_id"])]:
+        player = state["players"].setdefault(str(user_id), {})
+        group = assignments.get(str(user_id))
+        player["group"] = group
+        if group in {"solids", "stripes"}:
+            targets_remaining = len(remaining.get(group) or [])
+            player["targets_remaining"] = targets_remaining
+            player["targets_cleared"] = 7 - targets_remaining
+            player["black_unlocked"] = targets_remaining == 0
+        else:
+            player.setdefault("targets_remaining", 7)
+            player.setdefault("targets_cleared", 0)
+            player["black_unlocked"] = False
+
+
+def _validate_billiards_transition(previous_state: dict[str, Any], next_state: dict[str, Any], *, actor_user_id: int) -> None:
+    previous_pocketed = set(int(ball) for ball in previous_state.get("pocketed_balls") or [])
+    next_pocketed = set(int(ball) for ball in next_state.get("pocketed_balls") or [])
+    if not previous_pocketed.issubset(next_pocketed):
+        raise HTTPException(status_code=409, detail="Pocketed balls cannot return to the table")
+    assignments = next_state.get("assignments") or {}
+    actor_group = assignments.get(str(int(actor_user_id)))
+    if actor_group not in {None, "solids", "stripes"}:
+        raise HTTPException(status_code=400, detail="Invalid billiards group assignment")
+
+
+def _apply_billiards_result_state(match_row: dict[str, Any], state: dict[str, Any], actor_user_id: int, move: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    shot_input = copy.deepcopy(move.get("shot_input") or {})
+    result_state = copy.deepcopy(move.get("result_state") or {})
+    if not isinstance(result_state, dict):
+        raise HTTPException(status_code=400, detail="Billiards result_state must be an object")
+    next_state = _normalize_billiards_state(match_row, state)
+    actor_key = str(int(actor_user_id))
+    opponent_user_id = _other_player_id(match_row, actor_user_id)
+    opponent_key = str(opponent_user_id)
+
+    raw_pocketed = result_state.get("pocketed_balls", [])
+    if not isinstance(raw_pocketed, list):
+        raise HTTPException(status_code=400, detail="Billiards result_state.pocketed_balls must be an array")
+    pocketed_balls = [int(ball) for ball in raw_pocketed]
+    if len(set(pocketed_balls)) != len(pocketed_balls):
+        raise HTTPException(status_code=400, detail="Duplicate pocketed balls are not allowed")
+    invalid = [ball for ball in pocketed_balls if ball < 1 or ball > 15]
+    if invalid:
+        raise HTTPException(status_code=400, detail="Pocketed balls must be between 1 and 15")
+    already_pocketed = set(int(ball) for ball in next_state.get("pocketed_balls") or [])
+    if already_pocketed.intersection(pocketed_balls):
+        raise HTTPException(status_code=409, detail="Pocketed balls cannot be pocketed again")
+
+    foul = bool(result_state.get("foul") or result_state.get("scratch") or result_state.get("cue_ball_pocketed"))
+    next_state["turn_count"] = int(next_state.get("turn_count") or 0) + 1
+    next_state["foul_flags"] = list(next_state.get("foul_flags") or [])
+    if foul:
+        next_state["foul_flags"].append({"turn": next_state["turn_count"], "actor_user_id": int(actor_user_id), "code": "foul"})
+
+    remaining = copy.deepcopy(next_state.get("remaining_balls") or {})
+    for ball in pocketed_balls:
+        group = _group_for_ball(ball)
+        if group:
+            remaining[group] = [value for value in list(remaining.get(group) or []) if int(value) != ball]
+        elif ball == FINAL_EIGHT_BALL:
+            remaining["eight"] = []
+    next_state["remaining_balls"] = remaining
+    next_state["pocketed_balls"] = sorted(already_pocketed.union(pocketed_balls))
+
+    assignments = dict(next_state.get("assignments") or {actor_key: None, opponent_key: None})
+    actor_group = assignments.get(actor_key)
+    opponent_group = assignments.get(opponent_key)
+    non_eight_groups = {_group_for_ball(ball) for ball in pocketed_balls if ball != FINAL_EIGHT_BALL}
+    non_eight_groups.discard(None)
+    if actor_group is None and opponent_group is None and not foul and len(non_eight_groups) == 1:
+        actor_group = next(iter(non_eight_groups))
+        opponent_group = "stripes" if actor_group == "solids" else "solids"
+        assignments[actor_key] = actor_group
+        assignments[opponent_key] = opponent_group
+        next_state["table_open"] = False
+    else:
+        next_state["table_open"] = not any(assignments.values())
+    next_state["assignments"] = assignments
+    _sync_billiards_player_state(next_state, match_row)
+    actor_group = assignments.get(actor_key)
+
+    actor_scored = False
+    if not foul:
+        if actor_group in {"solids", "stripes"}:
+            actor_scored = any(_group_for_ball(ball) == actor_group for ball in pocketed_balls)
+        else:
+            actor_scored = any(ball != FINAL_EIGHT_BALL for ball in pocketed_balls)
+
+    outcome = {"completed": False}
+    if FINAL_EIGHT_BALL in pocketed_balls:
+        black_unlocked = bool(next_state["players"][actor_key].get("black_unlocked"))
+        legal_eight_ball = (not foul) and actor_group in {"solids", "stripes"} and black_unlocked
+        winner_user_id = int(actor_user_id) if legal_eight_ball else int(opponent_user_id)
+        loser_user_id = int(opponent_user_id) if legal_eight_ball else int(actor_user_id)
+        next_state["winner_user_id"] = winner_user_id
+        next_state["result_summary"] = {
+            "reason": "eight_ball_pocketed" if legal_eight_ball else "illegal_eight_ball",
+            "actor_user_id": int(actor_user_id),
+            "foul": foul,
+            "pocketed_balls": pocketed_balls,
+        }
+        outcome = {"completed": True, "winner_user_id": winner_user_id, "loser_user_id": loser_user_id}
+    else:
+        next_turn_user_id = int(actor_user_id) if actor_scored and not foul else int(opponent_user_id)
+        next_state["turn_user_id"] = next_turn_user_id
+        next_state["last_shot"] = {
+            "actor_user_id": int(actor_user_id),
+            "shot_input": shot_input,
+            "reported_result": result_state,
+            "pocketed_balls": pocketed_balls,
+            "foul": foul,
+            "turn_retained": next_turn_user_id == int(actor_user_id),
+        }
+        reported_next_turn = result_state.get("next_turn_user_id")
+        if reported_next_turn is None:
+            reported_next_turn = result_state.get("current_turn_user_id")
+        if reported_next_turn is not None and int(reported_next_turn) != next_turn_user_id:
+            raise HTTPException(status_code=409, detail="Reported next turn does not match authoritative match state")
+    if result_state.get("winner_user_id") is not None:
+        expected_winner = int(outcome["winner_user_id"]) if outcome.get("completed") else None
+        if expected_winner is None or int(result_state.get("winner_user_id")) != expected_winner:
+            raise HTTPException(status_code=409, detail="Reported winner does not match authoritative match state")
+    _validate_billiards_transition(_normalize_billiards_state(match_row, state), next_state, actor_user_id=int(actor_user_id))
+    return next_state, outcome
+
+
+def _apply_billiards_legacy_move(match_row: dict[str, Any], state: dict[str, Any], actor_user_id: int, move: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
     move_type = str(move.get("move_type") or "").strip().lower()
     if move_type != "shot":
         raise HTTPException(status_code=400, detail="Billiards matches accept move_type=shot")
@@ -826,25 +905,27 @@ def _apply_billiards_move(match_row: dict[str, Any], state: dict[str, Any], acto
         raise HTTPException(status_code=400, detail="Billiards shot requires finite angle and power")
     power = max(0.0, min(1.0, power))
 
-    actor_state = state["players"][str(int(actor_user_id))]
+    legacy_state = copy.deepcopy(state)
+    legacy_state.setdefault("players", {})
+    actor_state = legacy_state["players"].setdefault(str(int(actor_user_id)), {"targets_remaining": 3, "targets_cleared": 0, "black_unlocked": False})
     shot_quality = (abs(math.sin(angle)) * 0.45) + (abs(math.cos(angle * 0.5)) * 0.25) + (power * 0.55)
     control_bonus = max(0.0, 0.25 - abs(power - 0.72))
     total_score = shot_quality + control_bonus
     pocketed_targets = 0
     pocketed_final = False
 
-    if int(actor_state["targets_remaining"]) > 0:
+    if int(actor_state.get("targets_remaining") or 0) > 0:
         if total_score >= 0.86:
             pocketed_targets = 1
-            actor_state["targets_remaining"] = max(0, int(actor_state["targets_remaining"]) - 1)
-            actor_state["targets_cleared"] = int(actor_state["targets_cleared"]) + 1
-            actor_state["black_unlocked"] = int(actor_state["targets_remaining"]) == 0
+            actor_state["targets_remaining"] = max(0, int(actor_state.get("targets_remaining") or 0) - 1)
+            actor_state["targets_cleared"] = int(actor_state.get("targets_cleared") or 0) + 1
+            actor_state["black_unlocked"] = int(actor_state.get("targets_remaining") or 0) == 0
     else:
         if total_score >= 0.93:
             pocketed_final = True
-            state["table"]["final_ball"]["pocketed"] = True
+            legacy_state.setdefault("table", {}).setdefault("final_ball", {})["pocketed"] = True
 
-    state["last_shot"] = {
+    legacy_state["last_shot"] = {
         "actor_user_id": int(actor_user_id),
         "angle": angle,
         "power": power,
@@ -852,37 +933,59 @@ def _apply_billiards_move(match_row: dict[str, Any], state: dict[str, Any], acto
         "pocketed_final": pocketed_final,
         "score_metric": round(total_score, 4),
     }
-
     if pocketed_final:
-        state["result_summary"] = {"reason": "final_ball_pocketed", "score_metric": round(total_score, 4)}
-        loser = _billiards_switch_turn(match_row, actor_user_id)
-        return state, {"completed": True, "winner_user_id": int(actor_user_id), "loser_user_id": loser}
+        legacy_state["result_summary"] = {"reason": "final_ball_pocketed", "score_metric": round(total_score, 4)}
+        loser = _other_player_id(match_row, actor_user_id)
+        return legacy_state, {"completed": True, "winner_user_id": int(actor_user_id), "loser_user_id": loser}
+    legacy_state["turn_user_id"] = int(actor_user_id) if pocketed_targets > 0 else _other_player_id(match_row, actor_user_id)
+    return legacy_state, {"completed": False}
 
-    if pocketed_targets > 0:
-        state["turn_user_id"] = int(actor_user_id)
-    else:
-        state["turn_user_id"] = _billiards_switch_turn(match_row, actor_user_id)
-    return state, {"completed": False}
+
+def _apply_billiards_move(match_row: dict[str, Any], state: dict[str, Any], actor_user_id: int, move: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    if move.get("result_state") is not None or move.get("shot_input") is not None:
+        return _apply_billiards_result_state(match_row, state, actor_user_id, move)
+    return _apply_billiards_legacy_move(match_row, state, actor_user_id, move)
 
 
 def _create_initial_match_state(game_type: str, player_one_user_id: int, player_two_user_id: int, match_id: int) -> dict[str, Any]:
     if game_type == "dominoes":
-        return _dominoes_state(player_one_user_id, player_two_user_id, match_id)
+        return create_dominoes_state(player_one_user_id, player_two_user_id, match_id)
     if game_type == "billiards":
-        return _billiards_state(player_one_user_id, player_two_user_id)
+        return _default_billiards_state(player_one_user_id, player_two_user_id)
     raise HTTPException(status_code=400, detail="Unsupported game type")
 
 
-def _finalize_match(cur, match_row: dict[str, Any], state: dict[str, Any], winner_user_id: int, loser_user_id: int, *, status: str) -> tuple[dict[str, Any], dict[int, dict[str, Any]]]:
+def _build_public_notification_payload(match_row: dict[str, Any]) -> dict[str, Any]:
+    winner_id = int(match_row["winner_user_id"])
+    loser_id = int(match_row["loser_user_id"])
+    winner = _user_row(winner_id) or {"email": "winner@example.com"}
+    loser = _user_row(loser_id) or {"email": "loser@example.com"}
+    winner_progression = get_progression_for_user(winner_id)
+    return {
+        "type": "battle_result",
+        "match_id": int(match_row["id"]),
+        "game_type": match_row["game_type"],
+        "winner_user_id": winner_id,
+        "winner_display_name": _display_name_for_user(winner),
+        "loser_user_id": loser_id,
+        "loser_display_name": _display_name_for_user(loser),
+        "winner_xp_awarded": int(match_row.get("winner_xp_awarded") or 0),
+        "winner_new_level": int(winner_progression.get("level") or 1),
+        "completed_at": _iso(match_row.get("completed_at")),
+    }
+
+
+def _finalize_match(cur, match_row: dict[str, Any], state: dict[str, Any], winner_user_id: int, loser_user_id: int, *, status: str) -> tuple[dict[str, Any], dict[int, dict[str, Any]], dict[str, Any]]:
     completed_at = _now_ts()
     winner_before = get_progression_for_user(int(winner_user_id))
     loser_before = get_progression_for_user(int(loser_user_id))
+    result_summary = copy.deepcopy(state.get("result_summary") or {})
     _exec_cur(
         cur,
         """
         UPDATE game_matches
         SET status=?, current_turn_user_id=NULL, winner_user_id=?, loser_user_id=?,
-            winner_xp_awarded=?, loser_xp_awarded=?, match_state_json=?,
+            winner_xp_awarded=?, loser_xp_awarded=?, match_state_json=?, result_summary=?,
             updated_at=?, completed_at=?
         WHERE id=? AND status='active'
         """,
@@ -893,6 +996,7 @@ def _finalize_match(cur, match_row: dict[str, Any], state: dict[str, Any], winne
             WINNER_XP_AWARD,
             LOSER_XP_AWARD,
             _dump_json(state),
+            _dump_json(result_summary),
             completed_at,
             completed_at,
             int(match_row["id"]),
@@ -901,20 +1005,8 @@ def _finalize_match(cur, match_row: dict[str, Any], state: dict[str, Any], winne
     updated_match = _query_one_cur(cur, "SELECT * FROM game_matches WHERE id=? LIMIT 1", (int(match_row["id"]),))
     if not updated_match:
         raise HTTPException(status_code=500, detail="Failed to finalize match")
-    _upsert_user_game_stats(
-        cur,
-        user_id=int(winner_user_id),
-        is_win=True,
-        game_type=str(updated_match.get("game_type") or match_row.get("game_type") or ""),
-        xp_earned=WINNER_XP_AWARD,
-    )
-    _upsert_user_game_stats(
-        cur,
-        user_id=int(loser_user_id),
-        is_win=False,
-        game_type=str(updated_match.get("game_type") or match_row.get("game_type") or ""),
-        xp_earned=LOSER_XP_AWARD,
-    )
+    _upsert_user_game_stats(cur, user_id=int(winner_user_id), is_win=True, game_type=str(updated_match.get("game_type") or ""), xp_earned=WINNER_XP_AWARD)
+    _upsert_user_game_stats(cur, user_id=int(loser_user_id), is_win=False, game_type=str(updated_match.get("game_type") or ""), xp_earned=LOSER_XP_AWARD)
     winner_after = dict(winner_before)
     winner_after.update(get_progression_snapshot_for_total_xp(int(winner_before.get("total_xp") or 0) + WINNER_XP_AWARD))
     winner_after["xp_breakdown"] = dict(winner_before.get("xp_breakdown") or {})
@@ -927,34 +1019,18 @@ def _finalize_match(cur, match_row: dict[str, Any], state: dict[str, Any], winne
         int(winner_user_id): build_reward_contract(winner_after, WINNER_XP_AWARD),
         int(loser_user_id): build_reward_contract(loser_after, LOSER_XP_AWARD),
     }
-    return updated_match, reward_contracts
+    return updated_match, reward_contracts, _build_public_notification_payload(updated_match)
 
 
-def _maybe_publish_match_result(match_row: dict[str, Any]) -> None:
+def _maybe_publish_match_result(match_row: dict[str, Any]) -> dict[str, Any]:
+    payload = _build_public_notification_payload(match_row)
     if match_row.get("reward_announced_at") is not None:
-        return
-    winner_id = int(match_row["winner_user_id"])
-    loser_id = int(match_row["loser_user_id"])
-    winner = _user_row(winner_id)
-    loser = _user_row(loser_id)
-    winner_progression = get_progression_for_user(winner_id)
-    publish_public_battle_notification(
-        {
-            "match_id": int(match_row["id"]),
-            "game_type": match_row["game_type"],
-            "winner_user_id": winner_id,
-            "winner_display_name": _display_name_for_user(winner or {"email": "winner"}),
-            "loser_user_id": loser_id,
-            "loser_display_name": _display_name_for_user(loser or {"email": "loser"}),
-            "winner_xp_awarded": int(match_row.get("winner_xp_awarded") or 0),
-            "winner_new_level": int(winner_progression.get("level") or 1),
-            "completed_at": _iso(match_row.get("completed_at")),
-        }
-    )
+        return payload
+    publish_public_battle_notification(payload)
     publish_public_battle_chat_message(
-        author_user_id=winner_id,
-        winner_display_name=_display_name_for_user(winner or {"email": "winner"}),
-        loser_display_name=_display_name_for_user(loser or {"email": "loser"}),
+        author_user_id=int(match_row["winner_user_id"]),
+        winner_display_name=payload["winner_display_name"],
+        loser_display_name=payload["loser_display_name"],
         game_type=str(match_row.get("game_type") or ""),
         winner_xp_awarded=int(match_row.get("winner_xp_awarded") or 0),
     )
@@ -966,6 +1042,7 @@ def _maybe_publish_match_result(match_row: dict[str, Any]) -> None:
             conn.commit()
         finally:
             conn.close()
+    return payload
 
 
 def _accept_challenge(challenge_id: int, user_id: int) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -992,14 +1069,14 @@ def _accept_challenge(challenge_id: int, user_id: int) -> tuple[dict[str, Any], 
                 cur,
                 """
                 SELECT * FROM game_matches
-                WHERE challenge_id=? OR (
+                WHERE source_challenge_id=? OR challenge_id=? OR (
                   status='active' AND
                   ((player_one_user_id=? AND player_two_user_id=?) OR (player_one_user_id=? AND player_two_user_id=?))
                 )
                 ORDER BY id DESC
                 LIMIT 1
                 """,
-                (int(challenge_id), player_one, player_two, player_two, player_one),
+                (int(challenge_id), int(challenge_id), player_one, player_two, player_two, player_one),
             )
             if existing_match:
                 _exec_cur(
@@ -1017,14 +1094,17 @@ def _accept_challenge(challenge_id: int, user_id: int) -> tuple[dict[str, Any], 
                 cur,
                 """
                 INSERT INTO game_matches(
-                  challenge_id, game_type, player_one_user_id, player_two_user_id,
-                  current_turn_user_id, status, winner_user_id, loser_user_id,
-                  match_state_json, created_at, updated_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                  source_challenge_id, challenge_id, game_type, challenger_user_id, challenged_user_id,
+                  player_one_user_id, player_two_user_id, current_turn_user_id, status,
+                  winner_user_id, loser_user_id, match_state_json, result_summary, created_at, updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     int(challenge_id),
+                    int(challenge_id),
                     challenge["game_type"],
+                    int(challenge["challenger_user_id"]),
+                    int(challenge["challenged_user_id"]),
                     player_one,
                     player_two,
                     min(player_one, player_two),
@@ -1032,6 +1112,7 @@ def _accept_challenge(challenge_id: int, user_id: int) -> tuple[dict[str, Any], 
                     None,
                     None,
                     "{}",
+                    None,
                     now,
                     now,
                 ),
@@ -1084,13 +1165,14 @@ def _transition_challenge(challenge_id: int, user_id: int, *, action: str) -> di
             if action == "cancel" and int(challenge["challenger_user_id"]) != int(user_id):
                 raise HTTPException(status_code=403, detail="Only the challenger can cancel this challenge")
             now = _now_ts()
-            status = "declined" if action == "decline" else "cancelled"
-            column = "declined_at" if action == "decline" else "cancelled_at"
-            _exec_cur(
-                cur,
-                f"UPDATE game_challenges SET status=?, updated_at=?, responded_at=?, {column}=? WHERE id=?",
-                (status, now, now, now, int(challenge_id)),
-            )
+            status = "declined" if action == "decline" else "canceled"
+            column = "declined_at" if action == "decline" else "canceled_at"
+            _exec_cur(cur, f"UPDATE game_challenges SET status=?, updated_at=?, responded_at=?, {column}=? WHERE id=?", (status, now, now, now, int(challenge_id)))
+            if action == "cancel":
+                try:
+                    _exec_cur(cur, "UPDATE game_challenges SET cancelled_at=? WHERE id=?", (now, int(challenge_id)))
+                except Exception:
+                    pass
             challenge = _query_one_cur(cur, "SELECT * FROM game_challenges WHERE id=? LIMIT 1", (int(challenge_id),))
             conn.commit()
             challenger = _user_row(int(challenge["challenger_user_id"])) or {"email": "Driver"}
@@ -1150,23 +1232,28 @@ def get_match_detail(match_id: int, user_id: int) -> dict[str, Any]:
         (int(match_id),),
     )
     reward_contract = None
+    public_notification = None
     opponent_user_id = int(match_row["player_one_user_id"]) if int(match_row["player_two_user_id"]) == int(user_id) else int(match_row["player_two_user_id"])
     opponent = _user_row(opponent_user_id) or {"email": f"user{opponent_user_id}@example.com"}
     match_state = _load_json(match_row.get("match_state_json"), {})
-    if match_row["status"] in {"completed", "forfeited"}:
+    result_summary = _load_json(match_row.get("result_summary"), match_state.get("result_summary"))
+    if _normalize_match_status(match_row["status"]) in {"completed", "forfeited"}:
         if int(user_id) == int(match_row.get("winner_user_id") or 0):
             reward_contract = build_reward_contract(get_progression_for_user(int(user_id)), int(match_row.get("winner_xp_awarded") or 0))
         elif int(user_id) == int(match_row.get("loser_user_id") or 0):
             reward_contract = build_reward_contract(get_progression_for_user(int(user_id)), int(match_row.get("loser_xp_awarded") or 0))
-        _maybe_publish_match_result(match_row)
+        public_notification = _maybe_publish_match_result(match_row)
     return {
         "ok": True,
         "match": {
             "id": int(match_row["id"]),
             "challenge_id": int(match_row["challenge_id"]) if match_row.get("challenge_id") is not None else None,
+            "source_challenge_id": int(match_row["source_challenge_id"]) if match_row.get("source_challenge_id") is not None else (int(match_row["challenge_id"]) if match_row.get("challenge_id") is not None else None),
             "game_type": match_row["game_type"],
             "game_key": match_row["game_type"],
-            "status": match_row["status"],
+            "status": _normalize_match_status(match_row["status"]),
+            "challenger_user_id": int(match_row.get("challenger_user_id") or match_row.get("player_one_user_id")),
+            "challenged_user_id": int(match_row.get("challenged_user_id") or match_row.get("player_two_user_id")),
             "player_one_user_id": int(match_row["player_one_user_id"]),
             "player_two_user_id": int(match_row["player_two_user_id"]),
             "current_turn_user_id": int(match_row["current_turn_user_id"]) if match_row.get("current_turn_user_id") is not None else None,
@@ -1180,7 +1267,7 @@ def get_match_detail(match_id: int, user_id: int) -> dict[str, Any]:
             "updated_at": _iso(match_row.get("updated_at")),
             "completed_at": _iso(match_row.get("completed_at")),
             "match_state": match_state,
-            "result_summary": match_state.get("result_summary"),
+            "result_summary": result_summary,
             "moves": [
                 {
                     "move_number": int(dict(move)["move_number"]),
@@ -1193,6 +1280,7 @@ def get_match_detail(match_id: int, user_id: int) -> dict[str, Any]:
             ],
         },
         "reward_contract": reward_contract,
+        "public_notification": public_notification,
     }
 
 
@@ -1211,7 +1299,13 @@ def submit_move(match_id: int, actor_user_id: int, move: dict[str, Any]) -> dict
                 raise HTTPException(status_code=409, detail="It is not your turn")
             state = _load_json(match_row.get("match_state_json"), {})
             if match_row["game_type"] == "dominoes":
-                state, outcome = _apply_dominoes_move(match_row, state, int(actor_user_id), move)
+                state, outcome = apply_dominoes_move(
+                    state,
+                    player_one_user_id=int(match_row["player_one_user_id"]),
+                    player_two_user_id=int(match_row["player_two_user_id"]),
+                    actor_user_id=int(actor_user_id),
+                    move=move,
+                )
             elif match_row["game_type"] == "billiards":
                 state, outcome = _apply_billiards_move(match_row, state, int(actor_user_id), move)
             else:
@@ -1229,9 +1323,10 @@ def submit_move(match_id: int, actor_user_id: int, move: dict[str, Any]) -> dict
                 (int(match_id), next_move_number, int(actor_user_id), str(move.get("move_type") or ""), _dump_json(move_payload), _now_ts()),
             )
             reward_contracts: dict[int, dict[str, Any]] = {}
+            public_notification = None
             if outcome.get("completed"):
                 state["completed"] = True
-                match_row, reward_contracts = _finalize_match(
+                match_row, reward_contracts, public_notification = _finalize_match(
                     cur,
                     match_row,
                     state,
@@ -1242,8 +1337,8 @@ def submit_move(match_id: int, actor_user_id: int, move: dict[str, Any]) -> dict
             else:
                 _exec_cur(
                     cur,
-                    "UPDATE game_matches SET current_turn_user_id=?, match_state_json=?, updated_at=? WHERE id=?",
-                    (state.get("turn_user_id"), _dump_json(state), _now_ts(), int(match_id)),
+                    "UPDATE game_matches SET current_turn_user_id=?, match_state_json=?, result_summary=?, updated_at=? WHERE id=?",
+                    (state.get("turn_user_id"), _dump_json(state), _dump_json(state.get("result_summary")), _now_ts(), int(match_id)),
                 )
             conn.commit()
         except Exception:
@@ -1254,10 +1349,13 @@ def submit_move(match_id: int, actor_user_id: int, move: dict[str, Any]) -> dict
     response = get_match_detail(int(match_id), int(actor_user_id))
     if reward_contracts:
         response["reward_contract"] = reward_contracts.get(int(actor_user_id))
+    if public_notification:
+        response["public_notification"] = public_notification
     return response
 
 
 def forfeit_match(match_id: int, actor_user_id: int) -> dict[str, Any]:
+    public_notification = None
     with _db_lock:
         conn = _db()
         try:
@@ -1269,17 +1367,20 @@ def forfeit_match(match_id: int, actor_user_id: int) -> dict[str, Any]:
             if match_row["status"] != "active":
                 raise HTTPException(status_code=409, detail="Match is no longer active")
             loser = int(actor_user_id)
-            winner = int(match_row["player_one_user_id"]) if int(match_row["player_two_user_id"]) == loser else int(match_row["player_two_user_id"])
+            winner = _other_player_id(match_row, actor_user_id)
             state = _load_json(match_row.get("match_state_json"), {})
             state["result_summary"] = {"reason": "forfeit", "forfeiting_user_id": loser}
-            _finalize_match(cur, match_row, state, winner, loser, status="forfeited")
+            _updated_match, _reward_contracts, public_notification = _finalize_match(cur, match_row, state, winner, loser, status="forfeited")
             conn.commit()
         except Exception:
             conn.rollback()
             raise
         finally:
             conn.close()
-    return get_match_detail(int(match_id), int(actor_user_id))
+    response = get_match_detail(int(match_id), int(actor_user_id))
+    if public_notification:
+        response["public_notification"] = public_notification
+    return response
 
 
 def get_recent_battles_for_user(user_id: int, limit: int = MAX_RECENT_BATTLES) -> list[dict[str, Any]]:
@@ -1428,6 +1529,69 @@ def get_game_battle_stats_for_users(user_ids: list[int]) -> dict[int, dict[str, 
                 "game_xp_earned": int(item.get("game_xp_earned") or 0),
             }
     return result
+
+
+def get_profile_game_context(viewer_user_id: int, target_user_id: int) -> dict[str, Any]:
+    viewer_user_id = int(viewer_user_id)
+    target_user_id = int(target_user_id)
+    if viewer_user_id == target_user_id:
+        active_match = get_active_match_for_user(viewer_user_id)
+        relationship = {"status": "active_match" if active_match else "none", "game_type": active_match["match"]["game_type"] if active_match else None, "challenge_id": active_match["match"].get("challenge_id") if active_match else None, "match_id": active_match["match"]["id"] if active_match else None}
+        return {
+            "active_match_summary": active_match["match"] if active_match else None,
+            "challenge_state_with_viewer": "active" if active_match else "none",
+            "viewer_game_relationship": relationship,
+        }
+    active_match_row = _db_query_one(
+        """
+        SELECT * FROM game_matches
+        WHERE status='active'
+          AND ((player_one_user_id=? AND player_two_user_id=?) OR (player_one_user_id=? AND player_two_user_id=?))
+        ORDER BY updated_at DESC, id DESC
+        LIMIT 1
+        """,
+        (viewer_user_id, target_user_id, target_user_id, viewer_user_id),
+    )
+    if active_match_row:
+        active_match_summary = get_match_detail(int(active_match_row["id"]), viewer_user_id)["match"]
+        return {
+            "active_match_summary": active_match_summary,
+            "challenge_state_with_viewer": "active",
+            "viewer_game_relationship": {
+                "status": "active_match",
+                "game_type": active_match_summary["game_type"],
+                "challenge_id": active_match_summary.get("challenge_id"),
+                "match_id": active_match_summary["id"],
+            },
+        }
+    pending = _db_query_one(
+        """
+        SELECT * FROM game_challenges
+        WHERE status='pending'
+          AND ((challenger_user_id=? AND challenged_user_id=?) OR (challenger_user_id=? AND challenged_user_id=?))
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        """,
+        (viewer_user_id, target_user_id, target_user_id, viewer_user_id),
+    )
+    if not pending:
+        return {
+            "active_match_summary": None,
+            "challenge_state_with_viewer": "none",
+            "viewer_game_relationship": {"status": "none", "game_type": None, "challenge_id": None, "match_id": None},
+        }
+    incoming = int(pending["challenged_user_id"]) == viewer_user_id
+    status = "incoming_challenge" if incoming else "outgoing_challenge"
+    return {
+        "active_match_summary": None,
+        "challenge_state_with_viewer": "incoming" if incoming else "outgoing",
+        "viewer_game_relationship": {
+            "status": status,
+            "game_type": pending["game_type"],
+            "challenge_id": int(pending["id"]),
+            "match_id": None,
+        },
+    }
 
 
 def get_history_for_user(user_id: int) -> dict[str, Any]:
