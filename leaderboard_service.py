@@ -242,13 +242,26 @@ def get_game_xp_for_users(user_ids: List[int]) -> Dict[int, int]:
             f"""
             SELECT user_id, COALESCE(SUM(xp_awarded), 0) AS game_xp
             FROM (
+              SELECT gmp.user_id AS user_id, gmp.xp_awarded AS xp_awarded
+              FROM game_match_participants gmp
+              JOIN game_matches gm ON gm.id = gmp.match_id
+              WHERE gm.status IN ('completed', 'forfeited', 'expired')
+              UNION ALL
               SELECT winner_user_id AS user_id, winner_xp_awarded AS xp_awarded
               FROM game_matches
-              WHERE winner_user_id IS NOT NULL AND status IN ('completed', 'forfeited')
+              WHERE winner_user_id IS NOT NULL
+                AND status IN ('completed', 'forfeited', 'expired')
+                AND NOT EXISTS (
+                  SELECT 1 FROM game_match_participants p WHERE p.match_id = game_matches.id
+                )
               UNION ALL
               SELECT loser_user_id AS user_id, loser_xp_awarded AS xp_awarded
               FROM game_matches
-              WHERE loser_user_id IS NOT NULL AND status IN ('completed', 'forfeited')
+              WHERE loser_user_id IS NOT NULL
+                AND status IN ('completed', 'forfeited', 'expired')
+                AND NOT EXISTS (
+                  SELECT 1 FROM game_match_participants p WHERE p.match_id = game_matches.id
+                )
             ) battle_xp
             WHERE user_id IN ({placeholders})
             GROUP BY user_id
