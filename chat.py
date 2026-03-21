@@ -51,10 +51,12 @@ CHAT_VOICE_MAX_MS = 60_000
 CHAT_RETENTION_SECONDS = 24 * 60 * 60
 CHAT_RETENTION_SWEEP_SECONDS = 15 * 60
 _ALLOWED_AUDIO_MIME_TYPES = {
-    "audio/mpeg": ".mp3",
-    "audio/mp4": ".mp4",
-    "audio/ogg": ".ogg",
-    "audio/webm": ".webm",
+    "audio/mpeg": ("audio/mpeg", ".mp3"),
+    "audio/mp4": ("audio/mp4", ".m4a"),
+    "audio/m4a": ("audio/mp4", ".m4a"),
+    "audio/x-m4a": ("audio/mp4", ".m4a"),
+    "audio/ogg": ("audio/ogg", ".ogg"),
+    "audio/webm": ("audio/webm", ".webm"),
 }
 
 _LOGGER = logging.getLogger(__name__)
@@ -1324,16 +1326,26 @@ def _resolve_voice_upload(request: Request, file: UploadFile | None, audio: Uplo
     return upload
 
 
+def _normalize_audio_mime_type(raw: str | None) -> str:
+    value = (raw or "").strip().lower()
+    if not value:
+        return ""
+    return value.split(";", 1)[0].strip()
+
+
 def _read_upload_audio(upload: UploadFile) -> tuple[bytes, str, str]:
-    mime_type = (upload.content_type or "").strip().lower()
-    if mime_type not in _ALLOWED_AUDIO_MIME_TYPES:
+    raw_mime_type = upload.content_type or ""
+    normalized_mime_type = _normalize_audio_mime_type(raw_mime_type)
+    resolved = _ALLOWED_AUDIO_MIME_TYPES.get(normalized_mime_type)
+    if resolved is None:
         raise HTTPException(status_code=400, detail="Unsupported audio format")
+    canonical_mime_type, extension = resolved
     data = upload.file.read(_MAX_AUDIO_BYTES + 1)
     if not data:
         raise HTTPException(status_code=400, detail="Audio upload cannot be empty")
     if len(data) > _MAX_AUDIO_BYTES:
         raise HTTPException(status_code=400, detail="Audio upload too large")
-    return data, mime_type, _ALLOWED_AUDIO_MIME_TYPES[mime_type]
+    return data, canonical_mime_type, extension
 
 
 def _resolve_audio_path(relative_path: str) -> Path:
