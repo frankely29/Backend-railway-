@@ -64,13 +64,13 @@ ZONE_MODE_PROFILES: Dict[str, ZoneScoreProfileWeights] = {
     ),
     "brooklyn_v2": ZoneScoreProfileWeights(
         demand_now_weight=0.13,
-        demand_next_weight=0.17,
+        demand_next_weight=0.18,
         pay_weight=0.09,
-        pay_per_min_weight=0.18,
-        pay_per_mile_weight=0.07,
+        pay_per_min_weight=0.19,
+        pay_per_mile_weight=0.10,
         downstream_weight=0.20,
-        short_trip_penalty_weight=0.13,
-        pickup_friction_penalty_weight=0.06,
+        short_trip_penalty_weight=0.15,
+        pickup_friction_penalty_weight=0.07,
         shared_ride_penalty_weight=0.03,
     ),
     "staten_island_v2": ZoneScoreProfileWeights(
