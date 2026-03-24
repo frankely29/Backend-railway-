@@ -1,5 +1,14 @@
 # BACKEND CHANGELOG
 
+## Current pass: Phase 7 Queens visible cutover support (backend)
+
+### Phase 7 hotspot shadow output
+- Activated the `queens_v2` profile weights in `zone_mode_profiles.py` for Queens persistence/downstream/pay-per-mile emphasis with earnings grounding.
+- Extended `zone_earnings_engine.py` to emit Queens v2 shadow score/rating/bucket/color/confidence using the same normalized HVFHV component pipeline as citywide/Manhattan/Bronx-Wash Heights.
+- Updated `build_hotspot.py` to write Queens v2 shadow fields per frame feature while preserving legacy, citywide, Manhattan, and Bronx/Wash Heights fields.
+- Updated `scoring_shadow_manifest.json` output to list all active shadow profiles: `citywide_v2`, `manhattan_v2`, `bronx_wash_heights_v2`, and `queens_v2`.
+- No API route, presence, or polling behavior was changed.
+
 ## Current pass: Phase 6 Bronx/Wash Heights visible cutover support (backend)
 
 ### Phase 6 hotspot shadow output
