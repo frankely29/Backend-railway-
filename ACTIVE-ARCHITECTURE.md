@@ -136,5 +136,5 @@ It also anonymizes `recommendation_outcomes.user_id` and deletes avatar thumbs p
 - A shared factual backend shadow score now exists for hotspot frames, based on HVFHV metrics (volume continuity, pay quality, pickup friction, short-trip share, shared-ride share, and downstream destination value).
 - Legacy visible hotspot scoring remains unchanged and still drives map colors/ratings.
 - Shadow metrics are emitted as additional numeric feature properties plus `scoring_shadow_manifest.json` in the frame output directory.
-- Backend shadow output now includes `citywide_v2`, `manhattan_v2`, `bronx_wash_heights_v2`, `queens_v2`, `brooklyn_v2`, and `staten_island_v2`; citywide remains active outside special scopes and Manhattan/Bronx-Wash Heights/Queens/Brooklyn/Staten Island cutovers stay scope-specific in frontend/runtime phases.
+- Backend shadow output includes `citywide_v2`, `manhattan_v2`, `bronx_wash_heights_v2`, `queens_v2`, `brooklyn_v2`, and `staten_island_v2`; Staten Island visible mode now prefers the Team Joseo Staten Island score when available, while citywide/Manhattan/Bronx-Wash Heights/Queens/Brooklyn cutovers remain active in their existing scopes.
 - No presence, real-time refresh, or polling behavior changed in this phase.
