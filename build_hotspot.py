@@ -522,11 +522,13 @@ def build_hotspots_frames(
     (out_dir / "scoring_shadow_manifest.json").write_text(
         json.dumps(
             {
-                "engine_version": "team-joseo-score-v2-shadow",
+                "engine_version": "team-joseo-score-v2-final-live",
                 "engine_release": "team-joseo-score-v2-final-live",
                 "source": "HVFHV",
                 "bin_minutes": int(bin_minutes),
                 "active_shadow_profile": "citywide_v2",
+                "default_citywide_profile": "citywide_v2",
+                "all_profiles_live": True,
                 "active_shadow_profiles": ["citywide_v2", "manhattan_v2", "bronx_wash_heights_v2", "queens_v2", "brooklyn_v2", "staten_island_v2"],
                 "visible_profiles_live": ["citywide_v2", "manhattan_v2", "bronx_wash_heights_v2", "queens_v2", "brooklyn_v2", "staten_island_v2"],
                 "base_color_truth": "tlc_hvfhv_earnings_opportunity",
