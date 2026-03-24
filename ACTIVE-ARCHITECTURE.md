@@ -132,9 +132,8 @@ It also anonymizes `recommendation_outcomes.user_id` and deletes avatar thumbs p
 - Postgres mode requires `psycopg2`; if it is missing, the runtime now fails with a clear Postgres-only error when the DB helpers are used.
 - Postgres connections are pooled through a shared threaded pool.
 
-## Hotspot shadow scoring (Phase 2)
-- A shared factual backend shadow score now exists for hotspot frames, based on HVFHV metrics (volume continuity, pay quality, pickup friction, short-trip share, shared-ride share, and downstream destination value).
-- Legacy visible hotspot scoring remains unchanged and still drives map colors/ratings.
-- Shadow metrics are emitted as additional numeric feature properties plus `scoring_shadow_manifest.json` in the frame output directory.
-- Backend shadow output includes `citywide_v2`, `manhattan_v2`, `bronx_wash_heights_v2`, `queens_v2`, `brooklyn_v2`, and `staten_island_v2`; Staten Island visible mode now prefers the Team Joseo Staten Island score when available, while citywide/Manhattan/Bronx-Wash Heights/Queens/Brooklyn cutovers remain active in their existing scopes.
-- No presence, real-time refresh, or polling behavior changed in this phase.
+## Team Joseo score rollout (Phase 12 final-live)
+- Team Joseo score rollout is now final-live across all visible cutovers: `citywide_v2`, `manhattan_v2`, `bronx_wash_heights_v2`, `queens_v2`, `brooklyn_v2`, and `staten_island_v2`.
+- Backend frame generation still emits all shadow/output profile fields plus `scoring_shadow_manifest.json`, now finalized with explicit production-live manifest semantics.
+- User-facing wording no longer needs to expose legacy/shadow terminology, while debug/audit tooling continues to preserve technical source truth.
+- No score formulas, mode source-selection precedence, presence timing, polling behavior, or real-time presence logic were changed in this phase.
