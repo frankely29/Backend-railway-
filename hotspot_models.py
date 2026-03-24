@@ -72,3 +72,8 @@ class ZoneEarningsShadowResult:
     earnings_shadow_rating_manhattan_v2: Optional[int]
     earnings_shadow_bucket_manhattan_v2: Optional[str]
     earnings_shadow_color_manhattan_v2: Optional[str]
+    earnings_shadow_score_bronx_wash_heights_v2: Optional[float]
+    earnings_shadow_confidence_bronx_wash_heights_v2: Optional[float]
+    earnings_shadow_rating_bronx_wash_heights_v2: Optional[int]
+    earnings_shadow_bucket_bronx_wash_heights_v2: Optional[str]
+    earnings_shadow_color_bronx_wash_heights_v2: Optional[str]
