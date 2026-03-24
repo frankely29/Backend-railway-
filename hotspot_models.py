@@ -82,3 +82,8 @@ class ZoneEarningsShadowResult:
     earnings_shadow_rating_queens_v2: Optional[int]
     earnings_shadow_bucket_queens_v2: Optional[str]
     earnings_shadow_color_queens_v2: Optional[str]
+    earnings_shadow_score_brooklyn_v2: Optional[float]
+    earnings_shadow_confidence_brooklyn_v2: Optional[float]
+    earnings_shadow_rating_brooklyn_v2: Optional[int]
+    earnings_shadow_bucket_brooklyn_v2: Optional[str]
+    earnings_shadow_color_brooklyn_v2: Optional[str]
