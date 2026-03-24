@@ -2,6 +2,13 @@
 
 ## Current pass: clean Phase 1 + safe Phase 2
 
+### Phase 2 hotspot shadow earnings engine
+- Added `zone_mode_profiles.py` with lightweight score profile scaffolding (`citywide_v2` active for this phase; borough profiles pre-created for future phases).
+- Added `zone_earnings_engine.py` with a shared HVFHV factual SQL engine that computes backend shadow metrics and a citywide shadow rating/bucket/color output.
+- Updated `build_hotspot.py` to keep legacy visible scoring intact while attaching new shadow metrics to frame feature properties.
+- Added frame output manifest `scoring_shadow_manifest.json` to document emitted shadow fields/profile/version.
+- No API routes, frontend runtime files, or presence real-time behavior were changed.
+
 ### Database/runtime spine
 - Made `psycopg2` optional for SQLite-only imports and startup.
 - Added a clear Postgres-only runtime error when Postgres mode is requested without `psycopg2`.

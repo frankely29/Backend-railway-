@@ -6,6 +6,8 @@ from datetime import datetime, timedelta
 import json
 import duckdb
 
+from zone_earnings_engine import build_zone_earnings_shadow_sql
+from zone_mode_profiles import ZONE_MODE_PROFILES
 
 def ensure_zones_geojson(data_dir: Path, force: bool = False) -> Path:
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -109,6 +111,8 @@ def build_hotspots_frames(
 
     parquet_list = [str(p) for p in parquet_files]
     parquet_sql = ", ".join("'" + p.replace("'", "''") + "'" for p in parquet_list)
+    schema_rows = con.execute(f"DESCRIBE SELECT * FROM read_parquet([{parquet_sql}])").fetchall()
+    available_columns = {str(row[0]) for row in schema_rows}
 
     # ----------------------------
     # SQL build
@@ -257,6 +261,70 @@ def build_hotspots_frames(
     ORDER BY dow_m, bin_start_min, PULocationID;
     """
 
+    shadow_sql = build_zone_earnings_shadow_sql(
+        parquet_list,
+        bin_minutes=int(bin_minutes),
+        min_trips_per_window=int(min_trips_per_window),
+        profile=ZONE_MODE_PROFILES["citywide_v2"],
+        available_columns=available_columns,
+    )
+
+    shadow_rows = con.execute(shadow_sql).fetchall()
+    shadow_by_key: Dict[Tuple[int, int, int], Dict[str, Any]] = {}
+    for row in shadow_rows:
+        (
+            pu_id,
+            s_dow_m,
+            s_bin_start_min,
+            pickups_now,
+            pickups_next,
+            median_driver_pay,
+            median_pay_per_min,
+            median_pay_per_mile,
+            median_request_to_pickup_min,
+            short_trip_share,
+            shared_ride_share,
+            downstream_next_value_raw,
+            demand_now_n,
+            demand_next_n,
+            pay_n,
+            pay_per_min_n,
+            pay_per_mile_n,
+            pickup_friction_penalty_n,
+            short_trip_penalty_n,
+            shared_ride_penalty_n,
+            downstream_value_n,
+            earnings_shadow_score_citywide_v2,
+            earnings_shadow_confidence_citywide_v2,
+            earnings_shadow_rating_citywide_v2,
+            earnings_shadow_bucket_citywide_v2,
+            earnings_shadow_color_citywide_v2,
+        ) = row
+        shadow_by_key[(int(pu_id), int(s_dow_m), int(s_bin_start_min))] = {
+            "next_pickups_shadow": None if pickups_next is None else int(pickups_next),
+            "median_driver_pay_shadow": None if median_driver_pay is None else float(median_driver_pay),
+            "median_pay_per_min_shadow": None if median_pay_per_min is None else float(median_pay_per_min),
+            "median_pay_per_mile_shadow": None if median_pay_per_mile is None else float(median_pay_per_mile),
+            "median_request_to_pickup_min_shadow": None if median_request_to_pickup_min is None else float(median_request_to_pickup_min),
+            "short_trip_share_shadow": None if short_trip_share is None else float(short_trip_share),
+            "shared_ride_share_shadow": None if shared_ride_share is None else float(shared_ride_share),
+            "downstream_value_shadow": None if downstream_next_value_raw is None else float(downstream_next_value_raw),
+            "demand_now_n_shadow": None if demand_now_n is None else float(demand_now_n),
+            "demand_next_n_shadow": None if demand_next_n is None else float(demand_next_n),
+            "pay_n_shadow": None if pay_n is None else float(pay_n),
+            "pay_per_min_n_shadow": None if pay_per_min_n is None else float(pay_per_min_n),
+            "pay_per_mile_n_shadow": None if pay_per_mile_n is None else float(pay_per_mile_n),
+            "pickup_friction_penalty_n_shadow": None if pickup_friction_penalty_n is None else float(pickup_friction_penalty_n),
+            "short_trip_penalty_n_shadow": None if short_trip_penalty_n is None else float(short_trip_penalty_n),
+            "shared_ride_penalty_n_shadow": None if shared_ride_penalty_n is None else float(shared_ride_penalty_n),
+            "downstream_value_n_shadow": None if downstream_value_n is None else float(downstream_value_n),
+            "earnings_shadow_score_citywide_v2": None if earnings_shadow_score_citywide_v2 is None else float(earnings_shadow_score_citywide_v2),
+            "earnings_shadow_confidence_citywide_v2": None if earnings_shadow_confidence_citywide_v2 is None else float(earnings_shadow_confidence_citywide_v2),
+            "earnings_shadow_rating_citywide_v2": None if earnings_shadow_rating_citywide_v2 is None else int(earnings_shadow_rating_citywide_v2),
+            "earnings_shadow_bucket_citywide_v2": earnings_shadow_bucket_citywide_v2,
+            "earnings_shadow_color_citywide_v2": earnings_shadow_color_citywide_v2,
+        }
+
     cur = con.execute(sql)
 
     # timeline labels (Mon-based week anchor)
@@ -316,6 +384,7 @@ def build_hotspots_frames(
 
             r = int(rating)
             bucket, fill = bucket_and_color_from_rating(r)
+            shadow_props = shadow_by_key.get((zid_i, int(dow_m), int(bin_start_min)), {})
 
             current_features.append({
                 "type": "Feature",
@@ -335,7 +404,29 @@ def build_hotspots_frames(
                         "weight": 0,
                         "fillColor": fill,
                         "fillOpacity": 0.82
-                    }
+                    },
+                    "next_pickups_shadow": shadow_props.get("next_pickups_shadow"),
+                    "median_driver_pay_shadow": shadow_props.get("median_driver_pay_shadow"),
+                    "median_pay_per_min_shadow": shadow_props.get("median_pay_per_min_shadow"),
+                    "median_pay_per_mile_shadow": shadow_props.get("median_pay_per_mile_shadow"),
+                    "median_request_to_pickup_min_shadow": shadow_props.get("median_request_to_pickup_min_shadow"),
+                    "short_trip_share_shadow": shadow_props.get("short_trip_share_shadow"),
+                    "shared_ride_share_shadow": shadow_props.get("shared_ride_share_shadow"),
+                    "downstream_value_shadow": shadow_props.get("downstream_value_shadow"),
+                    "demand_now_n_shadow": shadow_props.get("demand_now_n_shadow"),
+                    "demand_next_n_shadow": shadow_props.get("demand_next_n_shadow"),
+                    "pay_n_shadow": shadow_props.get("pay_n_shadow"),
+                    "pay_per_min_n_shadow": shadow_props.get("pay_per_min_n_shadow"),
+                    "pay_per_mile_n_shadow": shadow_props.get("pay_per_mile_n_shadow"),
+                    "pickup_friction_penalty_n_shadow": shadow_props.get("pickup_friction_penalty_n_shadow"),
+                    "short_trip_penalty_n_shadow": shadow_props.get("short_trip_penalty_n_shadow"),
+                    "shared_ride_penalty_n_shadow": shadow_props.get("shared_ride_penalty_n_shadow"),
+                    "downstream_value_n_shadow": shadow_props.get("downstream_value_n_shadow"),
+                    "earnings_shadow_score_citywide_v2": shadow_props.get("earnings_shadow_score_citywide_v2"),
+                    "earnings_shadow_confidence_citywide_v2": shadow_props.get("earnings_shadow_confidence_citywide_v2"),
+                    "earnings_shadow_rating_citywide_v2": shadow_props.get("earnings_shadow_rating_citywide_v2"),
+                    "earnings_shadow_bucket_citywide_v2": shadow_props.get("earnings_shadow_bucket_citywide_v2"),
+                    "earnings_shadow_color_citywide_v2": shadow_props.get("earnings_shadow_color_citywide_v2"),
                 }
             })
 
@@ -347,6 +438,42 @@ def build_hotspots_frames(
     (out_dir / "timeline.json").write_text(
         json.dumps({"timeline": timeline, "count": len(timeline)}, separators=(",", ":")),
         encoding="utf-8"
+    )
+    (out_dir / "scoring_shadow_manifest.json").write_text(
+        json.dumps(
+            {
+                "engine_version": "team-joseo-score-v2-shadow",
+                "source": "HVFHV",
+                "bin_minutes": int(bin_minutes),
+                "active_shadow_profile": "citywide_v2",
+                "shadow_fields": [
+                    "next_pickups_shadow",
+                    "median_driver_pay_shadow",
+                    "median_pay_per_min_shadow",
+                    "median_pay_per_mile_shadow",
+                    "median_request_to_pickup_min_shadow",
+                    "short_trip_share_shadow",
+                    "shared_ride_share_shadow",
+                    "downstream_value_shadow",
+                    "demand_now_n_shadow",
+                    "demand_next_n_shadow",
+                    "pay_n_shadow",
+                    "pay_per_min_n_shadow",
+                    "pay_per_mile_n_shadow",
+                    "pickup_friction_penalty_n_shadow",
+                    "short_trip_penalty_n_shadow",
+                    "shared_ride_penalty_n_shadow",
+                    "downstream_value_n_shadow",
+                    "earnings_shadow_score_citywide_v2",
+                    "earnings_shadow_confidence_citywide_v2",
+                    "earnings_shadow_rating_citywide_v2",
+                    "earnings_shadow_bucket_citywide_v2",
+                    "earnings_shadow_color_citywide_v2",
+                ],
+            },
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
     )
 
     return {"ok": True, "count": len(timeline), "frames_dir": str(out_dir), "rows": total_rows}
