@@ -33,6 +33,7 @@ def build_zone_earnings_shadow_sql(
     manhattan_profile: Optional[ZoneScoreProfileWeights] = None,
     bronx_wash_heights_profile: Optional[ZoneScoreProfileWeights] = None,
     queens_profile: Optional[ZoneScoreProfileWeights] = None,
+    brooklyn_profile: Optional[ZoneScoreProfileWeights] = None,
     available_columns: Optional[Set[str]] = None,
 ) -> str:
     parquet_sql = ", ".join("'" + p.replace("'", "''") + "'" for p in parquet_files)
@@ -58,6 +59,7 @@ def build_zone_earnings_shadow_sql(
     mw = manhattan_profile or profile
     bw = bronx_wash_heights_profile or profile
     qw = queens_profile or profile
+    bkw = brooklyn_profile or profile
 
     return f"""
     WITH base AS (
@@ -320,6 +322,19 @@ def build_zone_earnings_shadow_sql(
           {qw.pickup_friction_penalty_weight:.8f} * pickup_friction_penalty_n +
           {qw.shared_ride_penalty_weight:.8f} * shared_ride_penalty_n
         ) AS negative_score_queens_v2,
+        (
+          {bkw.demand_now_weight:.8f} * demand_now_n +
+          {bkw.demand_next_weight:.8f} * demand_next_n +
+          {bkw.pay_weight:.8f} * pay_n +
+          {bkw.pay_per_min_weight:.8f} * pay_per_min_n +
+          {bkw.pay_per_mile_weight:.8f} * pay_per_mile_n +
+          {bkw.downstream_weight:.8f} * downstream_value_n
+        ) AS positive_score_brooklyn_v2,
+        (
+          {bkw.short_trip_penalty_weight:.8f} * short_trip_penalty_n +
+          {bkw.pickup_friction_penalty_weight:.8f} * pickup_friction_penalty_n +
+          {bkw.shared_ride_penalty_weight:.8f} * shared_ride_penalty_n
+        ) AS negative_score_brooklyn_v2,
         LEAST(1.0, pickups_now / 40.0) * (0.70 + 0.30 * downstream_coverage) AS earnings_shadow_confidence_citywide_v2
       FROM normalized
     ),
@@ -330,13 +345,16 @@ def build_zone_earnings_shadow_sql(
         {clip01('positive_score_manhattan_v2 - negative_score_manhattan_v2')} AS shadow_score_raw_manhattan_v2,
         {clip01('positive_score_bronx_wash_heights_v2 - negative_score_bronx_wash_heights_v2')} AS shadow_score_raw_bronx_wash_heights_v2,
         {clip01('positive_score_queens_v2 - negative_score_queens_v2')} AS shadow_score_raw_queens_v2,
+        {clip01('positive_score_brooklyn_v2 - negative_score_brooklyn_v2')} AS shadow_score_raw_brooklyn_v2,
         {clip01(f"{clip01('positive_score - negative_score')} * earnings_shadow_confidence_citywide_v2")} AS earnings_shadow_score_citywide_v2,
         earnings_shadow_confidence_citywide_v2 AS earnings_shadow_confidence_manhattan_v2,
         {clip01(f"{clip01('positive_score_manhattan_v2 - negative_score_manhattan_v2')} * earnings_shadow_confidence_citywide_v2")} AS earnings_shadow_score_manhattan_v2,
         earnings_shadow_confidence_citywide_v2 AS earnings_shadow_confidence_bronx_wash_heights_v2,
         {clip01(f"{clip01('positive_score_bronx_wash_heights_v2 - negative_score_bronx_wash_heights_v2')} * earnings_shadow_confidence_citywide_v2")} AS earnings_shadow_score_bronx_wash_heights_v2,
         earnings_shadow_confidence_citywide_v2 AS earnings_shadow_confidence_queens_v2,
-        {clip01(f"{clip01('positive_score_queens_v2 - negative_score_queens_v2')} * earnings_shadow_confidence_citywide_v2")} AS earnings_shadow_score_queens_v2
+        {clip01(f"{clip01('positive_score_queens_v2 - negative_score_queens_v2')} * earnings_shadow_confidence_citywide_v2")} AS earnings_shadow_score_queens_v2,
+        earnings_shadow_confidence_citywide_v2 AS earnings_shadow_confidence_brooklyn_v2,
+        {clip01(f"{clip01('positive_score_brooklyn_v2 - negative_score_brooklyn_v2')} * earnings_shadow_confidence_citywide_v2")} AS earnings_shadow_score_brooklyn_v2
       FROM scored
     )
     SELECT
@@ -436,7 +454,26 @@ def build_zone_earnings_shadow_sql(
         WHEN (1 + 99 * earnings_shadow_score_queens_v2) >= 45 THEN '#66ccff'
         WHEN (1 + 99 * earnings_shadow_score_queens_v2) >= 25 THEN '#ffd400'
         ELSE '#e60000'
-      END AS earnings_shadow_color_queens_v2
+      END AS earnings_shadow_color_queens_v2,
+      earnings_shadow_score_brooklyn_v2,
+      earnings_shadow_confidence_brooklyn_v2,
+      CAST(ROUND(1 + 99 * earnings_shadow_score_brooklyn_v2) AS INTEGER) AS earnings_shadow_rating_brooklyn_v2,
+      CASE
+        WHEN (1 + 99 * earnings_shadow_score_brooklyn_v2) >= 90 THEN 'green'
+        WHEN (1 + 99 * earnings_shadow_score_brooklyn_v2) >= 80 THEN 'purple'
+        WHEN (1 + 99 * earnings_shadow_score_brooklyn_v2) >= 65 THEN 'blue'
+        WHEN (1 + 99 * earnings_shadow_score_brooklyn_v2) >= 45 THEN 'sky'
+        WHEN (1 + 99 * earnings_shadow_score_brooklyn_v2) >= 25 THEN 'yellow'
+        ELSE 'red'
+      END AS earnings_shadow_bucket_brooklyn_v2,
+      CASE
+        WHEN (1 + 99 * earnings_shadow_score_brooklyn_v2) >= 90 THEN '#00b050'
+        WHEN (1 + 99 * earnings_shadow_score_brooklyn_v2) >= 80 THEN '#8000ff'
+        WHEN (1 + 99 * earnings_shadow_score_brooklyn_v2) >= 65 THEN '#0066ff'
+        WHEN (1 + 99 * earnings_shadow_score_brooklyn_v2) >= 45 THEN '#66ccff'
+        WHEN (1 + 99 * earnings_shadow_score_brooklyn_v2) >= 25 THEN '#ffd400'
+        ELSE '#e60000'
+      END AS earnings_shadow_color_brooklyn_v2
     FROM final
     ORDER BY dow_m, bin_start_min, PULocationID
     """
