@@ -1,5 +1,14 @@
 # BACKEND CHANGELOG
 
+## Current pass: Phase 9 Staten Island visible cutover support (backend)
+
+### Phase 9 hotspot shadow output
+- Activated the `staten_island_v2` profile weights in `zone_mode_profiles.py` for sparse-market stability, pay quality, and downstream-value emphasis.
+- Extended `zone_earnings_engine.py` to emit Staten Island v2 shadow score/rating/bucket/color/confidence using the same normalized HVFHV component pipeline as citywide/Manhattan/Bronx-Wash Heights/Queens/Brooklyn.
+- Updated `build_hotspot.py` to write Staten Island v2 shadow fields per frame feature while preserving legacy plus all previously active borough/citywide shadow fields.
+- Updated `scoring_shadow_manifest.json` output to list all active shadow profiles: `citywide_v2`, `manhattan_v2`, `bronx_wash_heights_v2`, `queens_v2`, `brooklyn_v2`, and `staten_island_v2`.
+- No API route, presence, or polling behavior was changed.
+
 ## Current pass: Phase 8 Brooklyn visible cutover support (backend)
 
 ### Phase 8 hotspot shadow output
