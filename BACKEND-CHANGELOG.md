@@ -1,5 +1,12 @@
 # BACKEND CHANGELOG
 
+## Current pass: Phase 12 final production hardening / cleanup (backend)
+
+### Phase 12 manifest finalization
+- Finalized `scoring_shadow_manifest.json` output in `build_hotspot.py` to mark Team Joseo rollout as final-live (`engine_release: team-joseo-score-v2-final-live`) while preserving existing emitted shadow fields.
+- Manifest now explicitly declares all visible live profiles (`citywide_v2`, `manhattan_v2`, `bronx_wash_heights_v2`, `queens_v2`, `brooklyn_v2`, `staten_island_v2`) and adds production truth metadata for base-color source, community caution source, and unchanged presence timing.
+- No score formulas, feature-value calculations, mode scope precedence, API routes, polling, or presence logic were changed.
+
 ## Current pass: Phase 9 Staten Island visible cutover support (backend)
 
 ### Phase 9 hotspot shadow output

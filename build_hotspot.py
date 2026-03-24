@@ -523,10 +523,20 @@ def build_hotspots_frames(
         json.dumps(
             {
                 "engine_version": "team-joseo-score-v2-shadow",
+                "engine_release": "team-joseo-score-v2-final-live",
                 "source": "HVFHV",
                 "bin_minutes": int(bin_minutes),
                 "active_shadow_profile": "citywide_v2",
                 "active_shadow_profiles": ["citywide_v2", "manhattan_v2", "bronx_wash_heights_v2", "queens_v2", "brooklyn_v2", "staten_island_v2"],
+                "visible_profiles_live": ["citywide_v2", "manhattan_v2", "bronx_wash_heights_v2", "queens_v2", "brooklyn_v2", "staten_island_v2"],
+                "base_color_truth": "tlc_hvfhs_earnings_opportunity",
+                "community_caution_truth": "team_joseo_presence_only",
+                "presence_logic_changed": False,
+                "notes": [
+                    "Base colors reflect Team Joseo earnings opportunity derived from HVFHV/Taxi Zone data.",
+                    "Community crowding caution is separate and based only on Team Joseo live presence.",
+                    "No real-time presence timing was changed by the score rollout.",
+                ],
                 "shadow_fields": [
                     "next_pickups_shadow",
                     "median_driver_pay_shadow",
