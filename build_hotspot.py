@@ -535,7 +535,7 @@ def build_hotspots_frames(
                 "engine_release": "team-joseo-score-v2-final-live",
                 "source": "HVFHV",
                 "bin_minutes": int(bin_minutes),
-                # Backward-compatibility field kept for legacy consumers.
+                # Backward-compatibility field kept for external legacy consumers.
                 "active_shadow_profile": "citywide_v2",
                 "default_citywide_profile": "citywide_v2",
                 "all_profiles_live": True,
