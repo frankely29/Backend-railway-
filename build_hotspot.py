@@ -519,6 +519,15 @@ def build_hotspots_frames(
         json.dumps({"timeline": timeline, "count": len(timeline)}, separators=(",", ":")),
         encoding="utf-8"
     )
+    live_shadow_profiles = [
+        "citywide_v2",
+        "manhattan_v2",
+        "bronx_wash_heights_v2",
+        "queens_v2",
+        "brooklyn_v2",
+        "staten_island_v2",
+    ]
+
     (out_dir / "scoring_shadow_manifest.json").write_text(
         json.dumps(
             {
@@ -526,11 +535,12 @@ def build_hotspots_frames(
                 "engine_release": "team-joseo-score-v2-final-live",
                 "source": "HVFHV",
                 "bin_minutes": int(bin_minutes),
+                # Backward-compatibility field kept for legacy consumers.
                 "active_shadow_profile": "citywide_v2",
                 "default_citywide_profile": "citywide_v2",
                 "all_profiles_live": True,
-                "active_shadow_profiles": ["citywide_v2", "manhattan_v2", "bronx_wash_heights_v2", "queens_v2", "brooklyn_v2", "staten_island_v2"],
-                "visible_profiles_live": ["citywide_v2", "manhattan_v2", "bronx_wash_heights_v2", "queens_v2", "brooklyn_v2", "staten_island_v2"],
+                "active_shadow_profiles": live_shadow_profiles,
+                "visible_profiles_live": live_shadow_profiles,
                 "base_color_truth": "tlc_hvfhv_earnings_opportunity",
                 "community_caution_truth": "team_joseo_presence_only",
                 "presence_logic_changed": False,
