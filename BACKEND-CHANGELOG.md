@@ -1,5 +1,14 @@
 # BACKEND CHANGELOG
 
+## Current pass: Phase 5 Manhattan visible cutover support (backend)
+
+### Phase 5 hotspot shadow output
+- Kept `citywide_v2` intact and activated Manhattan-specific weighting updates in `zone_mode_profiles.py` for `manhattan_v2`.
+- Extended `zone_earnings_engine.py` to emit Manhattan v2 shadow score/rating/bucket/color/confidence using the same normalized HVFHV components as citywide (different profile weights only).
+- Updated `build_hotspot.py` feature output to include Manhattan v2 shadow fields while retaining all legacy + citywide shadow fields.
+- Updated `scoring_shadow_manifest.json` output to list both active shadow profiles: `citywide_v2` and `manhattan_v2`.
+- No API route, presence, or polling behavior was changed.
+
 ## Current pass: clean Phase 1 + safe Phase 2
 
 ### Phase 2 hotspot shadow earnings engine

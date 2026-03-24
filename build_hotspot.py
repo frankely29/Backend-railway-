@@ -266,6 +266,7 @@ def build_hotspots_frames(
         bin_minutes=int(bin_minutes),
         min_trips_per_window=int(min_trips_per_window),
         profile=ZONE_MODE_PROFILES["citywide_v2"],
+        manhattan_profile=ZONE_MODE_PROFILES["manhattan_v2"],
         available_columns=available_columns,
     )
 
@@ -299,6 +300,11 @@ def build_hotspots_frames(
             earnings_shadow_rating_citywide_v2,
             earnings_shadow_bucket_citywide_v2,
             earnings_shadow_color_citywide_v2,
+            earnings_shadow_score_manhattan_v2,
+            earnings_shadow_confidence_manhattan_v2,
+            earnings_shadow_rating_manhattan_v2,
+            earnings_shadow_bucket_manhattan_v2,
+            earnings_shadow_color_manhattan_v2,
         ) = row
         shadow_by_key[(int(pu_id), int(s_dow_m), int(s_bin_start_min))] = {
             "next_pickups_shadow": None if pickups_next is None else int(pickups_next),
@@ -323,6 +329,11 @@ def build_hotspots_frames(
             "earnings_shadow_rating_citywide_v2": None if earnings_shadow_rating_citywide_v2 is None else int(earnings_shadow_rating_citywide_v2),
             "earnings_shadow_bucket_citywide_v2": earnings_shadow_bucket_citywide_v2,
             "earnings_shadow_color_citywide_v2": earnings_shadow_color_citywide_v2,
+            "earnings_shadow_score_manhattan_v2": None if earnings_shadow_score_manhattan_v2 is None else float(earnings_shadow_score_manhattan_v2),
+            "earnings_shadow_confidence_manhattan_v2": None if earnings_shadow_confidence_manhattan_v2 is None else float(earnings_shadow_confidence_manhattan_v2),
+            "earnings_shadow_rating_manhattan_v2": None if earnings_shadow_rating_manhattan_v2 is None else int(earnings_shadow_rating_manhattan_v2),
+            "earnings_shadow_bucket_manhattan_v2": earnings_shadow_bucket_manhattan_v2,
+            "earnings_shadow_color_manhattan_v2": earnings_shadow_color_manhattan_v2,
         }
 
     cur = con.execute(sql)
@@ -427,6 +438,11 @@ def build_hotspots_frames(
                     "earnings_shadow_rating_citywide_v2": shadow_props.get("earnings_shadow_rating_citywide_v2"),
                     "earnings_shadow_bucket_citywide_v2": shadow_props.get("earnings_shadow_bucket_citywide_v2"),
                     "earnings_shadow_color_citywide_v2": shadow_props.get("earnings_shadow_color_citywide_v2"),
+                    "earnings_shadow_score_manhattan_v2": shadow_props.get("earnings_shadow_score_manhattan_v2"),
+                    "earnings_shadow_confidence_manhattan_v2": shadow_props.get("earnings_shadow_confidence_manhattan_v2"),
+                    "earnings_shadow_rating_manhattan_v2": shadow_props.get("earnings_shadow_rating_manhattan_v2"),
+                    "earnings_shadow_bucket_manhattan_v2": shadow_props.get("earnings_shadow_bucket_manhattan_v2"),
+                    "earnings_shadow_color_manhattan_v2": shadow_props.get("earnings_shadow_color_manhattan_v2"),
                 }
             })
 
@@ -446,6 +462,7 @@ def build_hotspots_frames(
                 "source": "HVFHV",
                 "bin_minutes": int(bin_minutes),
                 "active_shadow_profile": "citywide_v2",
+                "active_shadow_profiles": ["citywide_v2", "manhattan_v2"],
                 "shadow_fields": [
                     "next_pickups_shadow",
                     "median_driver_pay_shadow",
@@ -469,6 +486,11 @@ def build_hotspots_frames(
                     "earnings_shadow_rating_citywide_v2",
                     "earnings_shadow_bucket_citywide_v2",
                     "earnings_shadow_color_citywide_v2",
+                    "earnings_shadow_score_manhattan_v2",
+                    "earnings_shadow_confidence_manhattan_v2",
+                    "earnings_shadow_rating_manhattan_v2",
+                    "earnings_shadow_bucket_manhattan_v2",
+                    "earnings_shadow_color_manhattan_v2",
                 ],
             },
             separators=(",", ":"),
