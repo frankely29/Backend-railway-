@@ -270,6 +270,7 @@ def build_hotspots_frames(
         bronx_wash_heights_profile=ZONE_MODE_PROFILES["bronx_wash_heights_v2"],
         queens_profile=ZONE_MODE_PROFILES["queens_v2"],
         brooklyn_profile=ZONE_MODE_PROFILES["brooklyn_v2"],
+        staten_island_profile=ZONE_MODE_PROFILES["staten_island_v2"],
         available_columns=available_columns,
     )
 
@@ -323,6 +324,11 @@ def build_hotspots_frames(
             earnings_shadow_rating_brooklyn_v2,
             earnings_shadow_bucket_brooklyn_v2,
             earnings_shadow_color_brooklyn_v2,
+            earnings_shadow_score_staten_island_v2,
+            earnings_shadow_confidence_staten_island_v2,
+            earnings_shadow_rating_staten_island_v2,
+            earnings_shadow_bucket_staten_island_v2,
+            earnings_shadow_color_staten_island_v2,
         ) = row
         shadow_by_key[(int(pu_id), int(s_dow_m), int(s_bin_start_min))] = {
             "next_pickups_shadow": None if pickups_next is None else int(pickups_next),
@@ -367,6 +373,11 @@ def build_hotspots_frames(
             "earnings_shadow_rating_brooklyn_v2": None if earnings_shadow_rating_brooklyn_v2 is None else int(earnings_shadow_rating_brooklyn_v2),
             "earnings_shadow_bucket_brooklyn_v2": earnings_shadow_bucket_brooklyn_v2,
             "earnings_shadow_color_brooklyn_v2": earnings_shadow_color_brooklyn_v2,
+            "earnings_shadow_score_staten_island_v2": None if earnings_shadow_score_staten_island_v2 is None else float(earnings_shadow_score_staten_island_v2),
+            "earnings_shadow_confidence_staten_island_v2": None if earnings_shadow_confidence_staten_island_v2 is None else float(earnings_shadow_confidence_staten_island_v2),
+            "earnings_shadow_rating_staten_island_v2": None if earnings_shadow_rating_staten_island_v2 is None else int(earnings_shadow_rating_staten_island_v2),
+            "earnings_shadow_bucket_staten_island_v2": earnings_shadow_bucket_staten_island_v2,
+            "earnings_shadow_color_staten_island_v2": earnings_shadow_color_staten_island_v2,
         }
 
     cur = con.execute(sql)
@@ -491,6 +502,11 @@ def build_hotspots_frames(
                     "earnings_shadow_rating_brooklyn_v2": shadow_props.get("earnings_shadow_rating_brooklyn_v2"),
                     "earnings_shadow_bucket_brooklyn_v2": shadow_props.get("earnings_shadow_bucket_brooklyn_v2"),
                     "earnings_shadow_color_brooklyn_v2": shadow_props.get("earnings_shadow_color_brooklyn_v2"),
+                    "earnings_shadow_score_staten_island_v2": shadow_props.get("earnings_shadow_score_staten_island_v2"),
+                    "earnings_shadow_confidence_staten_island_v2": shadow_props.get("earnings_shadow_confidence_staten_island_v2"),
+                    "earnings_shadow_rating_staten_island_v2": shadow_props.get("earnings_shadow_rating_staten_island_v2"),
+                    "earnings_shadow_bucket_staten_island_v2": shadow_props.get("earnings_shadow_bucket_staten_island_v2"),
+                    "earnings_shadow_color_staten_island_v2": shadow_props.get("earnings_shadow_color_staten_island_v2"),
                 }
             })
 
@@ -510,7 +526,7 @@ def build_hotspots_frames(
                 "source": "HVFHV",
                 "bin_minutes": int(bin_minutes),
                 "active_shadow_profile": "citywide_v2",
-                "active_shadow_profiles": ["citywide_v2", "manhattan_v2", "bronx_wash_heights_v2", "queens_v2", "brooklyn_v2"],
+                "active_shadow_profiles": ["citywide_v2", "manhattan_v2", "bronx_wash_heights_v2", "queens_v2", "brooklyn_v2", "staten_island_v2"],
                 "shadow_fields": [
                     "next_pickups_shadow",
                     "median_driver_pay_shadow",
@@ -554,6 +570,11 @@ def build_hotspots_frames(
                     "earnings_shadow_rating_brooklyn_v2",
                     "earnings_shadow_bucket_brooklyn_v2",
                     "earnings_shadow_color_brooklyn_v2",
+                    "earnings_shadow_score_staten_island_v2",
+                    "earnings_shadow_confidence_staten_island_v2",
+                    "earnings_shadow_rating_staten_island_v2",
+                    "earnings_shadow_bucket_staten_island_v2",
+                    "earnings_shadow_color_staten_island_v2",
                 ],
             },
             separators=(",", ":"),
