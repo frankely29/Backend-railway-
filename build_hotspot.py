@@ -529,7 +529,7 @@ def build_hotspots_frames(
                 "active_shadow_profile": "citywide_v2",
                 "active_shadow_profiles": ["citywide_v2", "manhattan_v2", "bronx_wash_heights_v2", "queens_v2", "brooklyn_v2", "staten_island_v2"],
                 "visible_profiles_live": ["citywide_v2", "manhattan_v2", "bronx_wash_heights_v2", "queens_v2", "brooklyn_v2", "staten_island_v2"],
-                "base_color_truth": "tlc_hvfhs_earnings_opportunity",
+                "base_color_truth": "tlc_hvfhv_earnings_opportunity",
                 "community_caution_truth": "team_joseo_presence_only",
                 "presence_logic_changed": False,
                 "notes": [
