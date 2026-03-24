@@ -4,6 +4,9 @@
 - `main.py` owns the FastAPI app, core auth/profile/presence/events routes, startup schema initialization, and compatibility endpoints.
 - `chat.py` is mounted under `/chat` and owns public room chat, DM routes, voice note routes, summary routes, and additive SSE routes.
 - `leaderboard_routes.py`, `pickup_recording_feature.py`, `admin_routes.py`, `admin_mutation_routes.py`, and `admin_trips_routes.py` provide the remaining product surfaces.
+- `build_hotspot.py` now runs two backend-only scoring paths during frame generation:
+  - legacy visible hotspot score (still active for `rating`/`bucket`/`style.fillColor`)
+  - shared HVFHV factual shadow engine (`zone_earnings_engine.py`) with emitted shadow fields for future phases.
 
 ## Active auth routes
 - `POST /auth/signup`
@@ -128,3 +131,9 @@ It also anonymizes `recommendation_outcomes.user_id` and deletes avatar thumbs p
 - SQLite mode works even when `psycopg2` is absent.
 - Postgres mode requires `psycopg2`; if it is missing, the runtime now fails with a clear Postgres-only error when the DB helpers are used.
 - Postgres connections are pooled through a shared threaded pool.
+
+## Hotspot shadow scoring (Phase 2)
+- A shared factual backend shadow score now exists for hotspot frames, based on HVFHV metrics (volume continuity, pay quality, pickup friction, short-trip share, shared-ride share, and downstream destination value).
+- Legacy visible hotspot scoring remains unchanged and still drives map colors/ratings.
+- Shadow metrics are emitted as additional numeric feature properties plus `scoring_shadow_manifest.json` in the frame output directory.
+- No presence, real-time refresh, or polling behavior changed in this phase.

@@ -1,0 +1,331 @@
+from __future__ import annotations
+
+from typing import Iterable, Optional, Set
+
+from zone_mode_profiles import ZoneScoreProfileWeights
+
+
+def clip01(value_sql: str) -> str:
+    return f"LEAST(GREATEST(({value_sql}), 0.0), 1.0)"
+
+
+def percentile_rank_expr(value_expr: str, partition_expr: str, alias_prefix: str) -> str:
+    return f"""
+    ROW_NUMBER() OVER (PARTITION BY {partition_expr} ORDER BY {value_expr}) AS {alias_prefix}_rn,
+    COUNT(*) OVER (PARTITION BY {partition_expr}) AS {alias_prefix}_n
+    """
+
+
+def safe_div_sql(numerator: str, denominator: str, fallback: str = "0.0") -> str:
+    return f"COALESCE(({numerator}) / NULLIF(({denominator}), 0), {fallback})"
+
+
+def minute_diff_sql(end_ts_expr: str, start_ts_expr: str) -> str:
+    return f"(EXTRACT(EPOCH FROM ({end_ts_expr} - {start_ts_expr})) / 60.0)"
+
+
+def build_zone_earnings_shadow_sql(
+    parquet_files: Iterable[str],
+    *,
+    bin_minutes: int,
+    min_trips_per_window: int,
+    profile: ZoneScoreProfileWeights,
+    available_columns: Optional[Set[str]] = None,
+) -> str:
+    parquet_sql = ", ".join("'" + p.replace("'", "''") + "'" for p in parquet_files)
+    bins_per_day = int(1440 // bin_minutes)
+    bins_per_week = 7 * bins_per_day
+
+    cols = {c.lower() for c in (available_columns or set())}
+    has_request_datetime = "request_datetime" in cols if cols else True
+    has_shared_match_flag = "shared_match_flag" in cols if cols else False
+    has_shared_request_flag = "shared_request_flag" in cols if cols else False
+
+    lag_min_expr = minute_diff_sql("pickup_datetime", "request_datetime")
+    pay_per_min_expr = safe_div_sql("driver_pay", "GREATEST(trip_time / 60.0, 1.0 / 60.0)")
+    pay_per_mile_expr = safe_div_sql("driver_pay", "GREATEST(trip_miles, 0.1)")
+    shared_expr_parts = []
+    if has_shared_match_flag:
+        shared_expr_parts.append("TRY_CAST(shared_match_flag AS INTEGER)")
+    if has_shared_request_flag:
+        shared_expr_parts.append("TRY_CAST(shared_request_flag AS INTEGER)")
+    shared_expr = "COALESCE(" + ", ".join(shared_expr_parts + ["0"]) + ")"
+
+    w = profile
+
+    return f"""
+    WITH base AS (
+      SELECT
+        CAST(PULocationID AS INTEGER) AS PULocationID,
+        CAST(DOLocationID AS INTEGER) AS DOLocationID,
+        pickup_datetime,
+        {"request_datetime," if has_request_datetime else "NULL::TIMESTAMP AS request_datetime,"}
+        TRY_CAST(driver_pay AS DOUBLE) AS driver_pay,
+        TRY_CAST(trip_time AS DOUBLE) AS trip_time,
+        TRY_CAST(trip_miles AS DOUBLE) AS trip_miles,
+        {shared_expr} AS shared_flag
+      FROM read_parquet([{parquet_sql}])
+      WHERE PULocationID IS NOT NULL
+        AND pickup_datetime IS NOT NULL
+        AND driver_pay IS NOT NULL
+    ),
+    prepared AS (
+      SELECT
+        PULocationID,
+        DOLocationID,
+        CAST(EXTRACT('dow' FROM pickup_datetime) AS INTEGER) AS dow_i,
+        CAST(EXTRACT('hour' FROM pickup_datetime) AS INTEGER) AS hour_i,
+        CAST(EXTRACT('minute' FROM pickup_datetime) AS INTEGER) AS minute_i,
+        driver_pay,
+        trip_time,
+        trip_miles,
+        shared_flag,
+        CASE
+          WHEN request_datetime IS NULL THEN NULL
+          ELSE {lag_min_expr}
+        END AS request_to_pickup_min,
+        {pay_per_min_expr} AS pay_per_min,
+        {pay_per_mile_expr} AS pay_per_mile
+      FROM base
+      WHERE PULocationID IS NOT NULL
+    ),
+    binned AS (
+      SELECT
+        PULocationID,
+        DOLocationID,
+        CASE WHEN dow_i = 0 THEN 6 ELSE dow_i - 1 END AS dow_m,
+        CAST(FLOOR((hour_i * 60 + minute_i) / {bin_minutes}) * {bin_minutes} AS INTEGER) AS bin_start_min,
+        driver_pay,
+        trip_time,
+        trip_miles,
+        pay_per_min,
+        pay_per_mile,
+        request_to_pickup_min,
+        CASE WHEN trip_miles <= 3.0 AND trip_time <= 12.0 THEN 1 ELSE 0 END AS is_short_trip,
+        CASE WHEN shared_flag = 1 THEN 1 ELSE 0 END AS is_shared
+      FROM prepared
+      WHERE PULocationID IS NOT NULL
+    ),
+    zone_bin_raw AS (
+      SELECT
+        PULocationID,
+        dow_m,
+        bin_start_min,
+        COUNT(*) AS pickups_now,
+        MEDIAN(driver_pay) AS median_driver_pay,
+        MEDIAN(pay_per_min) AS median_pay_per_min,
+        MEDIAN(pay_per_mile) AS median_pay_per_mile,
+        MEDIAN(CASE WHEN request_to_pickup_min >= 0 THEN request_to_pickup_min END) AS median_request_to_pickup_min,
+        AVG(is_short_trip * 1.0) AS short_trip_share_3mi_12min,
+        AVG(is_shared * 1.0) AS shared_ride_share
+      FROM binned
+      GROUP BY 1,2,3
+      HAVING COUNT(*) >= {min_trips_per_window}
+    ),
+    with_next AS (
+      SELECT
+        z.*,
+        LEAD(pickups_now) OVER (PARTITION BY PULocationID, dow_m ORDER BY bin_start_min) AS pickups_next_same_day
+      FROM zone_bin_raw z
+    ),
+    zone_bin AS (
+      SELECT
+        PULocationID,
+        dow_m,
+        bin_start_min,
+        pickups_now,
+        COALESCE(
+          pickups_next_same_day,
+          FIRST_VALUE(pickups_now) OVER (PARTITION BY PULocationID, dow_m ORDER BY bin_start_min),
+          pickups_now
+        ) AS pickups_next,
+        median_driver_pay,
+        median_pay_per_min,
+        median_pay_per_mile,
+        COALESCE(median_request_to_pickup_min, 0.0) AS median_request_to_pickup_min,
+        COALESCE(short_trip_share_3mi_12min, 0.0) AS short_trip_share_3mi_12min,
+        COALESCE(shared_ride_share, 0.0) AS shared_ride_share,
+        (dow_m * {bins_per_day} + CAST(bin_start_min / {bin_minutes} AS INTEGER)) AS bin_index
+      FROM with_next
+    ),
+    dest_edges AS (
+      SELECT
+        PULocationID,
+        DOLocationID,
+        dow_m,
+        bin_start_min,
+        COUNT(*) AS edge_trips
+      FROM binned
+      WHERE DOLocationID IS NOT NULL
+      GROUP BY 1,2,3,4
+    ),
+    dest_edges_norm AS (
+      SELECT
+        e.*,
+        SUM(edge_trips) OVER (PARTITION BY PULocationID, dow_m, bin_start_min) AS edge_total,
+        (dow_m * {bins_per_day} + CAST(bin_start_min / {bin_minutes} AS INTEGER)) AS src_index,
+        ((dow_m * {bins_per_day} + CAST(bin_start_min / {bin_minutes} AS INTEGER) + 1) % {bins_per_week}) AS dst_index
+      FROM dest_edges e
+    ),
+    zone_bin_by_index AS (
+      SELECT
+        PULocationID,
+        dow_m,
+        bin_start_min,
+        pickups_now,
+        median_driver_pay,
+        median_pay_per_min,
+        (dow_m * {bins_per_day} + CAST(bin_start_min / {bin_minutes} AS INTEGER)) AS idx
+      FROM zone_bin
+    ),
+    downstream_scores AS (
+      SELECT
+        d.PULocationID,
+        d.dow_m,
+        d.bin_start_min,
+        SUM(
+          {safe_div_sql('d.edge_trips', 'd.edge_total')} *
+          (
+            0.50 * LN(1 + COALESCE(z.pickups_now, 0)) +
+            0.35 * COALESCE(z.median_driver_pay, 0) +
+            0.15 * COALESCE(z.median_pay_per_min, 0)
+          )
+        ) AS downstream_next_value_raw,
+        SUM(CASE WHEN z.PULocationID IS NULL THEN 0 ELSE d.edge_trips END) * 1.0 / NULLIF(SUM(d.edge_trips), 0) AS downstream_coverage
+      FROM dest_edges_norm d
+      LEFT JOIN zone_bin_by_index z
+        ON z.PULocationID = d.DOLocationID
+       AND z.idx = d.dst_index
+      GROUP BY 1,2,3
+    ),
+    joined AS (
+      SELECT
+        z.PULocationID,
+        z.dow_m,
+        z.bin_start_min,
+        z.pickups_now,
+        z.pickups_next,
+        z.median_driver_pay,
+        z.median_pay_per_min,
+        z.median_pay_per_mile,
+        z.median_request_to_pickup_min,
+        z.short_trip_share_3mi_12min,
+        z.shared_ride_share,
+        COALESCE(d.downstream_next_value_raw, 0.0) AS downstream_next_value_raw,
+        COALESCE(d.downstream_coverage, 0.0) AS downstream_coverage
+      FROM zone_bin z
+      LEFT JOIN downstream_scores d
+        ON d.PULocationID = z.PULocationID
+       AND d.dow_m = z.dow_m
+       AND d.bin_start_min = z.bin_start_min
+    ),
+    ranked AS (
+      SELECT
+        *,
+        {percentile_rank_expr('LN(1 + pickups_now)', 'dow_m, bin_start_min', 'demand_now')},
+        {percentile_rank_expr('LN(1 + pickups_next)', 'dow_m, bin_start_min', 'demand_next')},
+        {percentile_rank_expr('median_driver_pay', 'dow_m, bin_start_min', 'pay')},
+        {percentile_rank_expr('median_pay_per_min', 'dow_m, bin_start_min', 'pay_per_min')},
+        {percentile_rank_expr('median_pay_per_mile', 'dow_m, bin_start_min', 'pay_per_mile')},
+        {percentile_rank_expr('median_request_to_pickup_min', 'dow_m, bin_start_min', 'pickup_friction_penalty')},
+        {percentile_rank_expr('short_trip_share_3mi_12min', 'dow_m, bin_start_min', 'short_trip_penalty')},
+        {percentile_rank_expr('shared_ride_share', 'dow_m, bin_start_min', 'shared_ride_penalty')},
+        {percentile_rank_expr('downstream_next_value_raw', 'dow_m, bin_start_min', 'downstream_value')}
+      FROM joined
+    ),
+    normalized AS (
+      SELECT
+        PULocationID,
+        dow_m,
+        bin_start_min,
+        pickups_now,
+        pickups_next,
+        median_driver_pay,
+        median_pay_per_min,
+        median_pay_per_mile,
+        median_request_to_pickup_min,
+        short_trip_share_3mi_12min,
+        shared_ride_share,
+        downstream_next_value_raw,
+        CASE WHEN demand_now_n <= 1 THEN 0.0 ELSE (demand_now_rn - 1) * 1.0 / (demand_now_n - 1) END AS demand_now_n,
+        CASE WHEN demand_next_n <= 1 THEN 0.0 ELSE (demand_next_rn - 1) * 1.0 / (demand_next_n - 1) END AS demand_next_n,
+        CASE WHEN pay_n <= 1 THEN 0.0 ELSE (pay_rn - 1) * 1.0 / (pay_n - 1) END AS pay_n,
+        CASE WHEN pay_per_min_n <= 1 THEN 0.0 ELSE (pay_per_min_rn - 1) * 1.0 / (pay_per_min_n - 1) END AS pay_per_min_n,
+        CASE WHEN pay_per_mile_n <= 1 THEN 0.0 ELSE (pay_per_mile_rn - 1) * 1.0 / (pay_per_mile_n - 1) END AS pay_per_mile_n,
+        CASE WHEN pickup_friction_penalty_n <= 1 THEN 0.0 ELSE (pickup_friction_penalty_rn - 1) * 1.0 / (pickup_friction_penalty_n - 1) END AS pickup_friction_penalty_n,
+        CASE WHEN short_trip_penalty_n <= 1 THEN 0.0 ELSE (short_trip_penalty_rn - 1) * 1.0 / (short_trip_penalty_n - 1) END AS short_trip_penalty_n,
+        CASE WHEN shared_ride_penalty_n <= 1 THEN 0.0 ELSE (shared_ride_penalty_rn - 1) * 1.0 / (shared_ride_penalty_n - 1) END AS shared_ride_penalty_n,
+        CASE WHEN downstream_value_n <= 1 THEN 0.0 ELSE (downstream_value_rn - 1) * 1.0 / (downstream_value_n - 1) END AS downstream_value_n,
+        downstream_coverage
+      FROM ranked
+    ),
+    scored AS (
+      SELECT
+        *,
+        (
+          {w.demand_now_weight:.8f} * demand_now_n +
+          {w.demand_next_weight:.8f} * demand_next_n +
+          {w.pay_weight:.8f} * pay_n +
+          {w.pay_per_min_weight:.8f} * pay_per_min_n +
+          {w.pay_per_mile_weight:.8f} * pay_per_mile_n +
+          {w.downstream_weight:.8f} * downstream_value_n
+        ) AS positive_score,
+        (
+          {w.short_trip_penalty_weight:.8f} * short_trip_penalty_n +
+          {w.pickup_friction_penalty_weight:.8f} * pickup_friction_penalty_n +
+          {w.shared_ride_penalty_weight:.8f} * shared_ride_penalty_n
+        ) AS negative_score,
+        LEAST(1.0, pickups_now / 40.0) * (0.70 + 0.30 * downstream_coverage) AS earnings_shadow_confidence_citywide_v2
+      FROM normalized
+    ),
+    final AS (
+      SELECT
+        *,
+        {clip01('positive_score - negative_score')} AS shadow_score_raw,
+        {clip01(f"{clip01('positive_score - negative_score')} * earnings_shadow_confidence_citywide_v2")} AS earnings_shadow_score_citywide_v2
+      FROM scored
+    )
+    SELECT
+      PULocationID,
+      dow_m,
+      bin_start_min,
+      pickups_now,
+      pickups_next,
+      median_driver_pay,
+      median_pay_per_min,
+      median_pay_per_mile,
+      median_request_to_pickup_min,
+      short_trip_share_3mi_12min,
+      shared_ride_share,
+      downstream_next_value_raw,
+      demand_now_n,
+      demand_next_n,
+      pay_n,
+      pay_per_min_n,
+      pay_per_mile_n,
+      pickup_friction_penalty_n,
+      short_trip_penalty_n,
+      shared_ride_penalty_n,
+      downstream_value_n,
+      earnings_shadow_score_citywide_v2,
+      earnings_shadow_confidence_citywide_v2,
+      CAST(ROUND(1 + 99 * earnings_shadow_score_citywide_v2) AS INTEGER) AS earnings_shadow_rating_citywide_v2,
+      CASE
+        WHEN (1 + 99 * earnings_shadow_score_citywide_v2) >= 90 THEN 'green'
+        WHEN (1 + 99 * earnings_shadow_score_citywide_v2) >= 80 THEN 'purple'
+        WHEN (1 + 99 * earnings_shadow_score_citywide_v2) >= 65 THEN 'blue'
+        WHEN (1 + 99 * earnings_shadow_score_citywide_v2) >= 45 THEN 'sky'
+        WHEN (1 + 99 * earnings_shadow_score_citywide_v2) >= 25 THEN 'yellow'
+        ELSE 'red'
+      END AS earnings_shadow_bucket_citywide_v2,
+      CASE
+        WHEN (1 + 99 * earnings_shadow_score_citywide_v2) >= 90 THEN '#00b050'
+        WHEN (1 + 99 * earnings_shadow_score_citywide_v2) >= 80 THEN '#8000ff'
+        WHEN (1 + 99 * earnings_shadow_score_citywide_v2) >= 65 THEN '#0066ff'
+        WHEN (1 + 99 * earnings_shadow_score_citywide_v2) >= 45 THEN '#66ccff'
+        WHEN (1 + 99 * earnings_shadow_score_citywide_v2) >= 25 THEN '#ffd400'
+        ELSE '#e60000'
+      END AS earnings_shadow_color_citywide_v2
+    FROM final
+    ORDER BY dow_m, bin_start_min, PULocationID
+    """
