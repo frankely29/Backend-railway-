@@ -1,5 +1,16 @@
 # BACKEND CHANGELOG
 
+## Current pass: Phase 1 density + trip-quality shadow metrics (backend)
+
+### Phase 1 shadow metric inputs
+- Added `zone_geometry_metrics.py` to compute Taxi Zone area (square miles) from Taxi Zone geometry (`taxi_zones.geojson`) without introducing heavy GIS dependencies.
+- Updated `build_hotspot.py` to register temporary DuckDB table `zone_geometry_metrics` for build-time joins and to emit new shadow fields for:
+  - zone area and area-normalized pickup density (now/next),
+  - 20+ minute trip share,
+  - same-zone dropoff share + retention penalty normalization.
+- Updated `zone_earnings_engine.py` to output the new raw + normalized density/trip-quality metrics per zone x day-of-week x 20-minute bin.
+- Visible scores/colors and active profile formulas remain unchanged (shadow data collection only in this phase).
+
 ## Current pass: Phase 12 final production hardening / cleanup (backend)
 
 ### Phase 12 manifest finalization

@@ -7,6 +7,7 @@ import json
 import duckdb
 
 from zone_earnings_engine import build_zone_earnings_shadow_sql
+from zone_geometry_metrics import build_zone_geometry_metrics_rows
 from zone_mode_profiles import ZONE_MODE_PROFILES
 
 def ensure_zones_geojson(data_dir: Path, force: bool = False) -> Path:
@@ -113,6 +114,20 @@ def build_hotspots_frames(
     parquet_sql = ", ".join("'" + p.replace("'", "''") + "'" for p in parquet_list)
     schema_rows = con.execute(f"DESCRIBE SELECT * FROM read_parquet([{parquet_sql}])").fetchall()
     available_columns = {str(row[0]) for row in schema_rows}
+
+    zone_geometry_rows = build_zone_geometry_metrics_rows(zones_geojson_path)
+    con.execute("CREATE TEMP TABLE zone_geometry_metrics (PULocationID INTEGER, zone_area_sq_miles DOUBLE)")
+    if zone_geometry_rows:
+        con.executemany(
+            "INSERT INTO zone_geometry_metrics (PULocationID, zone_area_sq_miles) VALUES (?, ?)",
+            [
+                (
+                    int(row["PULocationID"]),
+                    None if row["zone_area_sq_miles"] is None else float(row["zone_area_sq_miles"]),
+                )
+                for row in zone_geometry_rows
+            ],
+        )
 
     # ----------------------------
     # SQL build
@@ -289,6 +304,11 @@ def build_hotspots_frames(
             median_request_to_pickup_min,
             short_trip_share,
             shared_ride_share,
+            zone_area_sq_miles,
+            pickups_per_sq_mile_now,
+            pickups_per_sq_mile_next,
+            long_trip_share_20plus,
+            same_zone_dropoff_share,
             downstream_next_value_raw,
             demand_now_n,
             demand_next_n,
@@ -299,6 +319,10 @@ def build_hotspots_frames(
             short_trip_penalty_n,
             shared_ride_penalty_n,
             downstream_value_n,
+            demand_density_now_n,
+            demand_density_next_n,
+            long_trip_share_20plus_n,
+            same_zone_retention_penalty_n,
             earnings_shadow_score_citywide_v2,
             earnings_shadow_confidence_citywide_v2,
             earnings_shadow_rating_citywide_v2,
@@ -338,6 +362,11 @@ def build_hotspots_frames(
             "median_request_to_pickup_min_shadow": None if median_request_to_pickup_min is None else float(median_request_to_pickup_min),
             "short_trip_share_shadow": None if short_trip_share is None else float(short_trip_share),
             "shared_ride_share_shadow": None if shared_ride_share is None else float(shared_ride_share),
+            "zone_area_sq_miles_shadow": None if zone_area_sq_miles is None else float(zone_area_sq_miles),
+            "pickups_per_sq_mile_now_shadow": None if pickups_per_sq_mile_now is None else float(pickups_per_sq_mile_now),
+            "pickups_per_sq_mile_next_shadow": None if pickups_per_sq_mile_next is None else float(pickups_per_sq_mile_next),
+            "long_trip_share_20plus_shadow": None if long_trip_share_20plus is None else float(long_trip_share_20plus),
+            "same_zone_dropoff_share_shadow": None if same_zone_dropoff_share is None else float(same_zone_dropoff_share),
             "downstream_value_shadow": None if downstream_next_value_raw is None else float(downstream_next_value_raw),
             "demand_now_n_shadow": None if demand_now_n is None else float(demand_now_n),
             "demand_next_n_shadow": None if demand_next_n is None else float(demand_next_n),
@@ -348,6 +377,10 @@ def build_hotspots_frames(
             "short_trip_penalty_n_shadow": None if short_trip_penalty_n is None else float(short_trip_penalty_n),
             "shared_ride_penalty_n_shadow": None if shared_ride_penalty_n is None else float(shared_ride_penalty_n),
             "downstream_value_n_shadow": None if downstream_value_n is None else float(downstream_value_n),
+            "demand_density_now_n_shadow": None if demand_density_now_n is None else float(demand_density_now_n),
+            "demand_density_next_n_shadow": None if demand_density_next_n is None else float(demand_density_next_n),
+            "long_trip_share_20plus_n_shadow": None if long_trip_share_20plus_n is None else float(long_trip_share_20plus_n),
+            "same_zone_retention_penalty_n_shadow": None if same_zone_retention_penalty_n is None else float(same_zone_retention_penalty_n),
             "earnings_shadow_score_citywide_v2": None if earnings_shadow_score_citywide_v2 is None else float(earnings_shadow_score_citywide_v2),
             "earnings_shadow_confidence_citywide_v2": None if earnings_shadow_confidence_citywide_v2 is None else float(earnings_shadow_confidence_citywide_v2),
             "earnings_shadow_rating_citywide_v2": None if earnings_shadow_rating_citywide_v2 is None else int(earnings_shadow_rating_citywide_v2),
@@ -467,6 +500,11 @@ def build_hotspots_frames(
                     "median_request_to_pickup_min_shadow": shadow_props.get("median_request_to_pickup_min_shadow"),
                     "short_trip_share_shadow": shadow_props.get("short_trip_share_shadow"),
                     "shared_ride_share_shadow": shadow_props.get("shared_ride_share_shadow"),
+                    "zone_area_sq_miles_shadow": shadow_props.get("zone_area_sq_miles_shadow"),
+                    "pickups_per_sq_mile_now_shadow": shadow_props.get("pickups_per_sq_mile_now_shadow"),
+                    "pickups_per_sq_mile_next_shadow": shadow_props.get("pickups_per_sq_mile_next_shadow"),
+                    "long_trip_share_20plus_shadow": shadow_props.get("long_trip_share_20plus_shadow"),
+                    "same_zone_dropoff_share_shadow": shadow_props.get("same_zone_dropoff_share_shadow"),
                     "downstream_value_shadow": shadow_props.get("downstream_value_shadow"),
                     "demand_now_n_shadow": shadow_props.get("demand_now_n_shadow"),
                     "demand_next_n_shadow": shadow_props.get("demand_next_n_shadow"),
@@ -477,6 +515,10 @@ def build_hotspots_frames(
                     "short_trip_penalty_n_shadow": shadow_props.get("short_trip_penalty_n_shadow"),
                     "shared_ride_penalty_n_shadow": shadow_props.get("shared_ride_penalty_n_shadow"),
                     "downstream_value_n_shadow": shadow_props.get("downstream_value_n_shadow"),
+                    "demand_density_now_n_shadow": shadow_props.get("demand_density_now_n_shadow"),
+                    "demand_density_next_n_shadow": shadow_props.get("demand_density_next_n_shadow"),
+                    "long_trip_share_20plus_n_shadow": shadow_props.get("long_trip_share_20plus_n_shadow"),
+                    "same_zone_retention_penalty_n_shadow": shadow_props.get("same_zone_retention_penalty_n_shadow"),
                     "earnings_shadow_score_citywide_v2": shadow_props.get("earnings_shadow_score_citywide_v2"),
                     "earnings_shadow_confidence_citywide_v2": shadow_props.get("earnings_shadow_confidence_citywide_v2"),
                     "earnings_shadow_rating_citywide_v2": shadow_props.get("earnings_shadow_rating_citywide_v2"),
@@ -548,6 +590,7 @@ def build_hotspots_frames(
                     "Base colors reflect Team Joseo earnings opportunity derived from HVFHV/Taxi Zone data.",
                     "Community crowding caution is separate and based only on Team Joseo live presence.",
                     "No real-time presence timing was changed by the score rollout.",
+                    "Phase 1 adds zone-size density and long-trip/trap metrics in shadow form only.",
                 ],
                 "shadow_fields": [
                     "next_pickups_shadow",
@@ -557,6 +600,11 @@ def build_hotspots_frames(
                     "median_request_to_pickup_min_shadow",
                     "short_trip_share_shadow",
                     "shared_ride_share_shadow",
+                    "zone_area_sq_miles_shadow",
+                    "pickups_per_sq_mile_now_shadow",
+                    "pickups_per_sq_mile_next_shadow",
+                    "long_trip_share_20plus_shadow",
+                    "same_zone_dropoff_share_shadow",
                     "downstream_value_shadow",
                     "demand_now_n_shadow",
                     "demand_next_n_shadow",
@@ -567,6 +615,10 @@ def build_hotspots_frames(
                     "short_trip_penalty_n_shadow",
                     "shared_ride_penalty_n_shadow",
                     "downstream_value_n_shadow",
+                    "demand_density_now_n_shadow",
+                    "demand_density_next_n_shadow",
+                    "long_trip_share_20plus_n_shadow",
+                    "same_zone_retention_penalty_n_shadow",
                     "earnings_shadow_score_citywide_v2",
                     "earnings_shadow_confidence_citywide_v2",
                     "earnings_shadow_rating_citywide_v2",
