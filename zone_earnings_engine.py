@@ -88,6 +88,8 @@ def build_zone_earnings_shadow_sql(
         {shared_expr} AS shared_flag
       FROM read_parquet([{parquet_sql}])
       WHERE PULocationID IS NOT NULL
+        AND CAST(PULocationID AS INTEGER) NOT IN (1, 132, 138)
+        AND (DOLocationID IS NULL OR CAST(DOLocationID AS INTEGER) NOT IN (1, 132, 138))
         AND pickup_datetime IS NOT NULL
         AND driver_pay IS NOT NULL
     ),
@@ -592,6 +594,12 @@ def build_zone_earnings_shadow_sql(
       same_zone_retention_penalty_n,
       positive_score_citywide_v3 AS earnings_shadow_positive_citywide_v3,
       negative_score_citywide_v3 AS earnings_shadow_negative_citywide_v3,
+      shadow_score_raw_citywide_v3 AS earnings_shadow_score_raw_citywide_v3,
+      shadow_score_raw_manhattan_v3 AS earnings_shadow_score_raw_manhattan_v3,
+      shadow_score_raw_bronx_wash_heights_v3 AS earnings_shadow_score_raw_bronx_wash_heights_v3,
+      shadow_score_raw_queens_v3 AS earnings_shadow_score_raw_queens_v3,
+      shadow_score_raw_brooklyn_v3 AS earnings_shadow_score_raw_brooklyn_v3,
+      shadow_score_raw_staten_island_v3 AS earnings_shadow_score_raw_staten_island_v3,
       earnings_shadow_score_citywide_v3,
       earnings_shadow_confidence_citywide_v3,
       CAST(ROUND(1 + 99 * earnings_shadow_score_citywide_v3) AS INTEGER) AS earnings_shadow_rating_citywide_v3,
