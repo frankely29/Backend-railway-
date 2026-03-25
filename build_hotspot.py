@@ -585,6 +585,15 @@ def build_hotspots_frames(
     )
     live_shadow_profiles = [
         "citywide_v2",
+        "citywide_v3",
+        "manhattan_v2",
+        "bronx_wash_heights_v2",
+        "queens_v2",
+        "brooklyn_v2",
+        "staten_island_v2",
+    ]
+    visible_profiles_live = [
+        "citywide_v3",
         "manhattan_v2",
         "bronx_wash_heights_v2",
         "queens_v2",
@@ -601,11 +610,12 @@ def build_hotspots_frames(
                 "bin_minutes": int(bin_minutes),
                 # Backward-compatibility field kept for external legacy consumers.
                 "active_shadow_profile": "citywide_v2",
-                "default_citywide_profile": "citywide_v2",
+                "default_citywide_profile": "citywide_v3",
                 "all_profiles_live": True,
                 "active_shadow_profiles": live_shadow_profiles,
-                "visible_profiles_live": live_shadow_profiles,
+                "visible_profiles_live": visible_profiles_live,
                 "candidate_shadow_profiles": ["citywide_v3"],
+                "comparison_profiles": ["citywide_v2"],
                 "base_color_truth": "tlc_hvfhv_earnings_opportunity",
                 "community_caution_truth": "team_joseo_presence_only",
                 "presence_logic_changed": False,
@@ -615,6 +625,7 @@ def build_hotspots_frames(
                     "No real-time presence timing was changed by the score rollout.",
                     "Phase 1 adds zone-size density and long-trip/trap metrics in shadow form only.",
                     "Phase 2 adds a citywide_v3 shadow candidate that blends raw demand, demand density, long-trip share, pay quality, downstream value, and trap penalties.",
+                    "Phase 3 promotes citywide_v3 to the live visible citywide score while borough profiles remain on v2.",
                 ],
                 "shadow_fields": [
                     "next_pickups_shadow",
