@@ -642,7 +642,6 @@ def test_generated_artifact_sync() -> Dict[str, Any]:
         bin_minutes=int(os.environ.get("DEFAULT_BIN_MINUTES", "20")),
         min_trips_per_window=int(os.environ.get("DEFAULT_MIN_TRIPS_PER_WINDOW", "25")),
     )
-    expected = report.get("expected") if isinstance(report, dict) else {}
     ok = bool(report.get("fresh"))
     return _response(
         ok,
@@ -654,8 +653,8 @@ def test_generated_artifact_sync() -> Dict[str, Any]:
             "summary": report.get("summary"),
             "reason_codes": report.get("reason_codes") or [],
             "sampled_frame_integrity": report.get("sampled_frame_integrity") or {},
-            "artifact_signature": expected.get("artifact_signature"),
-            "code_dependency_hash": expected.get("code_dependency_hash"),
-            "source_data_hash": expected.get("source_data_hash"),
+            "artifact_signature": report.get("artifact_signature"),
+            "code_dependency_hash": report.get("code_dependency_hash"),
+            "source_data_hash": report.get("source_data_hash"),
         },
     )
