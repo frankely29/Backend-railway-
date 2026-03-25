@@ -99,11 +99,52 @@ def _normalized_borough_name(value: Any) -> str:
     return " ".join(str(value or "").strip().lower().split())
 
 
-def _is_airport_zone(zone_name: Any, location_id: int) -> bool:
-    if int(location_id) in AIRPORT_ZONE_IDS:
-        return True
-    name = str(zone_name or "").lower()
-    return any(token in name for token in ("airport", "jfk", "la guardia", "laguardia", "newark"))
+def _normalized_zone_text(value: Any) -> str:
+    return " ".join(str(value or "").strip().lower().split())
+
+
+def is_airport_zone(location_id: Any, zone_name: Any, borough_name: Any) -> bool:
+    try:
+        if int(location_id) in AIRPORT_ZONE_IDS:
+            return True
+    except Exception:
+        pass
+    normalized_text = " ".join(
+        part for part in (
+            _normalized_zone_text(zone_name),
+            _normalized_borough_name(borough_name),
+        ) if part
+    )
+    return any(token in normalized_text for token in ("airport", "jfk", "la guardia", "laguardia", "newark", "ewr"))
+
+
+def _is_airport_props(props: Dict[str, Any]) -> bool:
+    return is_airport_zone(
+        props.get("LocationID", 0),
+        props.get("zone_name"),
+        props.get("borough"),
+    )
+
+
+def _set_airport_excluded_profile_state(props: Dict[str, Any], profile_name: str) -> None:
+    visible_bucket, visible_color = bucket_and_color_from_rating(1)
+    props[f"earnings_shadow_visible_rank_{profile_name}"] = 0.0
+    props[f"earnings_shadow_visible_score_{profile_name}"] = 0.0
+    props[f"earnings_shadow_rating_{profile_name}"] = 1
+    props[f"earnings_shadow_bucket_{profile_name}"] = visible_bucket
+    props[f"earnings_shadow_color_{profile_name}"] = visible_color
+
+
+def _apply_airport_exclusion_state(props: Dict[str, Any]) -> None:
+    if not _is_airport_props(props):
+        return
+    props["airport_excluded"] = True
+    for profile_name in V3_PROFILE_CONFIG:
+        _set_airport_excluded_profile_state(props, profile_name)
+
+
+def _is_airport_zone(zone_name: Any, location_id: int, borough_name: Any) -> bool:
+    return is_airport_zone(location_id, zone_name, borough_name)
 
 
 def _iter_geometry_points(geometry: Any):
@@ -141,6 +182,8 @@ def _eligible_for_profile(profile_name: str, props: Dict[str, Any], geometry: An
     borough = _normalized_borough_name(props.get("borough"))
     zone_name = props.get("zone_name")
     centroid_lat = _geometry_centroid_latitude(geometry)
+    if _is_airport_zone(zone_name, location_id, borough):
+        return False
 
     if profile_name == "citywide_v3":
         return props.get("earnings_shadow_score_citywide_v3") is not None
@@ -149,7 +192,7 @@ def _eligible_for_profile(profile_name: str, props: Dict[str, Any], geometry: An
     if profile_name == "brooklyn_v3":
         return "brooklyn" in borough
     if profile_name == "queens_v3":
-        return "queens" in borough and not _is_airport_zone(zone_name, location_id)
+        return "queens" in borough
     if profile_name == "bronx_wash_heights_v3":
         return ("bronx" in borough) or (location_id in BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS)
     if profile_name == "manhattan_v3":
@@ -162,6 +205,13 @@ def _eligible_for_profile(profile_name: str, props: Dict[str, Any], geometry: An
 
 
 def _recalibrate_visible_v3_fields(features: List[Dict[str, Any]]) -> None:
+    for feature in features:
+        props = feature.get("properties") or {}
+        if _is_airport_props(props):
+            _apply_airport_exclusion_state(props)
+        else:
+            props["airport_excluded"] = False
+
     for profile_name, profile_fields in V3_PROFILE_CONFIG.items():
         score_field = profile_fields["score"]
         confidence_field = profile_fields["confidence"]
@@ -196,6 +246,10 @@ def _recalibrate_visible_v3_fields(features: List[Dict[str, Any]]) -> None:
             props[f"earnings_shadow_rating_{profile_name}"] = visible_rating
             props[f"earnings_shadow_bucket_{profile_name}"] = visible_bucket
             props[f"earnings_shadow_color_{profile_name}"] = visible_color
+    for feature in features:
+        props = feature.get("properties") or {}
+        if _is_airport_props(props):
+            _apply_airport_exclusion_state(props)
 
 
 def build_hotspots_frames(
@@ -288,6 +342,19 @@ def build_hotspots_frames(
                 for row in zone_geometry_rows
             ],
         )
+    con.execute("CREATE TEMP TABLE zone_metadata (PULocationID INTEGER, zone_name VARCHAR, borough_name VARCHAR, airport_excluded BOOLEAN)")
+    con.executemany(
+        "INSERT INTO zone_metadata (PULocationID, zone_name, borough_name, airport_excluded) VALUES (?, ?, ?, ?)",
+        [
+            (
+                int(zid),
+                str(name_by_id.get(zid, "") or ""),
+                str(borough_by_id.get(zid, "") or ""),
+                bool(is_airport_zone(zid, name_by_id.get(zid, ""), borough_by_id.get(zid, ""))),
+            )
+            for zid in sorted(name_by_id.keys())
+        ],
+    )
 
     # ----------------------------
     # SQL build
@@ -305,7 +372,12 @@ def build_hotspots_frames(
         pickup_datetime,
         TRY_CAST(driver_pay AS DOUBLE) AS driver_pay
       FROM read_parquet([{parquet_sql}])
-      WHERE PULocationID IS NOT NULL AND pickup_datetime IS NOT NULL
+      WHERE PULocationID IS NOT NULL
+        AND pickup_datetime IS NOT NULL
+        AND CAST(PULocationID AS INTEGER) NOT IN (1, 132, 138)
+        AND CAST(PULocationID AS INTEGER) IN (
+          SELECT PULocationID FROM zone_metadata WHERE airport_excluded = FALSE
+        )
     ),
     t AS (
       SELECT
@@ -552,6 +624,14 @@ def build_hotspots_frames(
             earnings_shadow_bucket_staten_island_v3,
             earnings_shadow_color_staten_island_v3,
         ) = row
+        if bool(
+            is_airport_zone(
+                pu_id,
+                name_by_id.get(int(pu_id), ""),
+                borough_by_id.get(int(pu_id), ""),
+            )
+        ):
+            continue
         shadow_by_key[(int(pu_id), int(s_dow_m), int(s_bin_start_min))] = {
             "next_pickups_shadow": None if pickups_next is None else int(pickups_next),
             "median_driver_pay_shadow": None if median_driver_pay is None else float(median_driver_pay),
@@ -712,6 +792,7 @@ def build_hotspots_frames(
                     "LocationID": zid_i,
                     "zone_name": name_by_id.get(zid_i, ""),
                     "borough": borough_by_id.get(zid_i, ""),
+                    "airport_excluded": bool(is_airport_zone(zid_i, name_by_id.get(zid_i, ""), borough_by_id.get(zid_i, ""))),
                     "rating": r,
                     "bucket": bucket,
                     "pickups": int(pickups),
