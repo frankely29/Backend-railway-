@@ -1,5 +1,12 @@
 # BACKEND CHANGELOG
 
+## Current pass: Phase 3 citywide_v3 live visible citywide profile (backend)
+
+### Phase 3 rollout-state manifest update
+- Promoted `citywide_v3` to the live visible citywide profile in backend manifest metadata.
+- Kept `citywide_v2` available for comparison/debug metadata usage.
+- Kept borough visible profiles unchanged in Phase 3 (`manhattan_v2`, `bronx_wash_heights_v2`, `queens_v2`, `brooklyn_v2`, `staten_island_v2`).
+
 ## Current pass: Phase 2 citywide_v3 shadow candidate (backend)
 
 ### Phase 2 shadow score rollout
