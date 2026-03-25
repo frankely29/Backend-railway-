@@ -69,6 +69,20 @@ def build_hotspots_frames(
     """
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Remove previously generated frame artifacts so stale files cannot survive rebuilds.
+    for generated in out_dir.glob("frame_*.json"):
+        try:
+            generated.unlink()
+        except Exception:
+            pass
+    for generated_name in ("timeline.json", "scoring_shadow_manifest.json"):
+        generated_path = out_dir / generated_name
+        try:
+            if generated_path.exists() and generated_path.is_file():
+                generated_path.unlink()
+        except Exception:
+            pass
+
     # ----------------------------
     # Load zone geometry + names
     # ----------------------------
