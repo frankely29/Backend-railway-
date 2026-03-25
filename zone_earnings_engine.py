@@ -30,6 +30,7 @@ def build_zone_earnings_shadow_sql(
     bin_minutes: int,
     min_trips_per_window: int,
     profile: ZoneScoreProfileWeights,
+    citywide_v3_profile: Optional[ZoneScoreProfileWeights] = None,
     manhattan_profile: Optional[ZoneScoreProfileWeights] = None,
     bronx_wash_heights_profile: Optional[ZoneScoreProfileWeights] = None,
     queens_profile: Optional[ZoneScoreProfileWeights] = None,
@@ -57,6 +58,7 @@ def build_zone_earnings_shadow_sql(
     shared_expr = "COALESCE(" + ", ".join(shared_expr_parts + ["0"]) + ")"
 
     w = profile
+    c3w = citywide_v3_profile or profile
     mw = manhattan_profile or profile
     bw = bronx_wash_heights_profile or profile
     qw = queens_profile or profile
@@ -159,6 +161,8 @@ def build_zone_earnings_shadow_sql(
         COALESCE(median_request_to_pickup_min, 0.0) AS median_request_to_pickup_min,
         COALESCE(short_trip_share_3mi_12min, 0.0) AS short_trip_share_3mi_12min,
         COALESCE(shared_ride_share, 0.0) AS shared_ride_share,
+        COALESCE(long_trip_share_20plus, 0.0) AS long_trip_share_20plus,
+        COALESCE(same_zone_dropoff_share, 0.0) AS same_zone_dropoff_share,
         (dow_m * {bins_per_day} + CAST(bin_start_min / {bin_minutes} AS INTEGER)) AS bin_index
       FROM with_next
     ),
@@ -400,6 +404,23 @@ def build_zone_earnings_shadow_sql(
           {sw.pickup_friction_penalty_weight:.8f} * pickup_friction_penalty_n +
           {sw.shared_ride_penalty_weight:.8f} * shared_ride_penalty_n
         ) AS negative_score_staten_island_v2,
+        (
+          {c3w.demand_now_weight:.8f} * demand_now_n +
+          {c3w.demand_next_weight:.8f} * demand_next_n +
+          {c3w.demand_density_now_weight:.8f} * COALESCE(demand_density_now_n, demand_now_n) +
+          {c3w.demand_density_next_weight:.8f} * COALESCE(demand_density_next_n, demand_next_n) +
+          {c3w.pay_weight:.8f} * pay_n +
+          {c3w.pay_per_min_weight:.8f} * pay_per_min_n +
+          {c3w.pay_per_mile_weight:.8f} * pay_per_mile_n +
+          {c3w.long_trip_share_20plus_weight:.8f} * COALESCE(long_trip_share_20plus_n, 0.0) +
+          {c3w.downstream_weight:.8f} * downstream_value_n
+        ) AS positive_score_citywide_v3,
+        (
+          {c3w.short_trip_penalty_weight:.8f} * short_trip_penalty_n +
+          {c3w.same_zone_retention_penalty_weight:.8f} * COALESCE(same_zone_retention_penalty_n, 0.0) +
+          {c3w.pickup_friction_penalty_weight:.8f} * pickup_friction_penalty_n +
+          {c3w.shared_ride_penalty_weight:.8f} * shared_ride_penalty_n
+        ) AS negative_score_citywide_v3,
         LEAST(1.0, pickups_now / 40.0) * (0.70 + 0.30 * downstream_coverage) AS earnings_shadow_confidence_citywide_v2
       FROM normalized
     ),
@@ -407,6 +428,7 @@ def build_zone_earnings_shadow_sql(
       SELECT
         *,
         {clip01('positive_score - negative_score')} AS shadow_score_raw,
+        (positive_score_citywide_v3 - negative_score_citywide_v3) AS shadow_score_raw_citywide_v3,
         {clip01('positive_score_manhattan_v2 - negative_score_manhattan_v2')} AS shadow_score_raw_manhattan_v2,
         {clip01('positive_score_bronx_wash_heights_v2 - negative_score_bronx_wash_heights_v2')} AS shadow_score_raw_bronx_wash_heights_v2,
         {clip01('positive_score_queens_v2 - negative_score_queens_v2')} AS shadow_score_raw_queens_v2,
@@ -422,7 +444,9 @@ def build_zone_earnings_shadow_sql(
         earnings_shadow_confidence_citywide_v2 AS earnings_shadow_confidence_brooklyn_v2,
         {clip01(f"{clip01('positive_score_brooklyn_v2 - negative_score_brooklyn_v2')} * earnings_shadow_confidence_citywide_v2")} AS earnings_shadow_score_brooklyn_v2,
         earnings_shadow_confidence_citywide_v2 AS earnings_shadow_confidence_staten_island_v2,
-        {clip01(f"{clip01('positive_score_staten_island_v2 - negative_score_staten_island_v2')} * earnings_shadow_confidence_citywide_v2")} AS earnings_shadow_score_staten_island_v2
+        {clip01(f"{clip01('positive_score_staten_island_v2 - negative_score_staten_island_v2')} * earnings_shadow_confidence_citywide_v2")} AS earnings_shadow_score_staten_island_v2,
+        earnings_shadow_confidence_citywide_v2 AS earnings_shadow_confidence_citywide_v3,
+        {clip01(f"{clip01('positive_score_citywide_v3 - negative_score_citywide_v3')} * earnings_shadow_confidence_citywide_v2")} AS earnings_shadow_score_citywide_v3
       FROM scored
     )
     SELECT
@@ -456,6 +480,27 @@ def build_zone_earnings_shadow_sql(
       demand_density_next_n,
       long_trip_share_20plus_n,
       same_zone_retention_penalty_n,
+      positive_score_citywide_v3 AS earnings_shadow_positive_citywide_v3,
+      negative_score_citywide_v3 AS earnings_shadow_negative_citywide_v3,
+      earnings_shadow_score_citywide_v3,
+      earnings_shadow_confidence_citywide_v3,
+      CAST(ROUND(1 + 99 * earnings_shadow_score_citywide_v3) AS INTEGER) AS earnings_shadow_rating_citywide_v3,
+      CASE
+        WHEN (1 + 99 * earnings_shadow_score_citywide_v3) >= 90 THEN 'green'
+        WHEN (1 + 99 * earnings_shadow_score_citywide_v3) >= 80 THEN 'purple'
+        WHEN (1 + 99 * earnings_shadow_score_citywide_v3) >= 65 THEN 'blue'
+        WHEN (1 + 99 * earnings_shadow_score_citywide_v3) >= 45 THEN 'sky'
+        WHEN (1 + 99 * earnings_shadow_score_citywide_v3) >= 25 THEN 'yellow'
+        ELSE 'red'
+      END AS earnings_shadow_bucket_citywide_v3,
+      CASE
+        WHEN (1 + 99 * earnings_shadow_score_citywide_v3) >= 90 THEN '#00b050'
+        WHEN (1 + 99 * earnings_shadow_score_citywide_v3) >= 80 THEN '#8000ff'
+        WHEN (1 + 99 * earnings_shadow_score_citywide_v3) >= 65 THEN '#0066ff'
+        WHEN (1 + 99 * earnings_shadow_score_citywide_v3) >= 45 THEN '#66ccff'
+        WHEN (1 + 99 * earnings_shadow_score_citywide_v3) >= 25 THEN '#ffd400'
+        ELSE '#e60000'
+      END AS earnings_shadow_color_citywide_v3,
       earnings_shadow_score_citywide_v2,
       earnings_shadow_confidence_citywide_v2,
       CAST(ROUND(1 + 99 * earnings_shadow_score_citywide_v2) AS INTEGER) AS earnings_shadow_rating_citywide_v2,

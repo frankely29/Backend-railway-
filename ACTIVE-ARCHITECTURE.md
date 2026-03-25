@@ -1,5 +1,10 @@
 # ACTIVE ARCHITECTURE
 
+## Current pass: Phase 2 citywide_v3 shadow candidate
+- Added `citywide_v3` as a new shadow-only candidate profile for backend scoring output.
+- `citywide_v3` blends raw demand, demand density, long-trip share, pay quality, downstream value, and trap penalties.
+- Visible map scores/buckets/colors remain unchanged in this phase (no live cutover).
+
 ## Current pass: Phase 1 density + trip-quality shadow metrics
 - Added backend geometry helper `zone_geometry_metrics.py` to compute Taxi Zone polygon area (square miles) from `taxi_zones.geojson` during hotspot builds.
 - `build_hotspot.py` now registers temporary DuckDB table `zone_geometry_metrics` and emits additional shadow-only frame properties:
