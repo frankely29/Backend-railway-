@@ -9,6 +9,7 @@ from typing import Any, Dict
 from admin_service import get_admin_pickup_logs, get_admin_police_reports, get_admin_summary
 from admin_trips_service import get_admin_recent_trips, get_admin_trips_summary
 from artifact_freshness import evaluate_artifact_freshness
+from artifact_storage_service import get_artifact_storage_report
 from core import DB_BACKEND, _db_query_all, _db_query_one
 
 
@@ -42,6 +43,13 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parent
 
 
+def _low_space_context(generate_error: str | None = None) -> Dict[str, Any]:
+    storage_report = get_artifact_storage_report(_data_dir(), _frames_dir())
+    error_text = str(generate_error or "")
+    low_space = bool(storage_report.get("low_space")) or "no space left on device" in error_text.lower() or "errno 28" in error_text.lower()
+    return {"low_space": low_space, "storage_report": storage_report}
+
+
 def test_backend_status() -> Dict[str, Any]:
     try:
         row = _db_query_one("SELECT 1 AS ok")
@@ -58,15 +66,18 @@ def test_backend_status() -> Dict[str, Any]:
 
 
 def test_build_sync() -> Dict[str, Any]:
+    from main import _artifact_freshness_snapshot, _backend_identity_snapshot
+
     frames_dir = _frames_dir()
     timeline_path = frames_dir / "timeline.json"
     manifest_path = frames_dir / "scoring_shadow_manifest.json"
 
-    backend_build_id = (os.environ.get("BACKEND_BUILD_ID") or "").strip()
-    backend_release = (os.environ.get("BACKEND_RELEASE") or "").strip()
+    identity = _backend_identity_snapshot(_artifact_freshness_snapshot())
+    backend_build_id = identity.get("backend_build_id")
+    backend_release = identity.get("backend_release")
     timeline_present = timeline_path.exists() and timeline_path.stat().st_size > 0 if timeline_path.exists() else False
     manifest_present = manifest_path.exists() and manifest_path.stat().st_size > 0 if manifest_path.exists() else False
-    identity_available = bool(backend_build_id or backend_release)
+    identity_available = bool(backend_build_id and backend_release)
 
     return _response(
         identity_available,
@@ -75,9 +86,24 @@ def test_build_sync() -> Dict[str, Any]:
         {
             "backend_build_id": backend_build_id,
             "backend_release": backend_release,
+            "backend_identity_source": identity.get("source"),
             "frames_dir": str(frames_dir),
             "manifest_present": manifest_present,
             "timeline_present": timeline_present,
+        },
+    )
+
+
+def test_storage_health() -> Dict[str, Any]:
+    report = get_artifact_storage_report(_data_dir(), _frames_dir())
+    ok = not bool(report.get("low_space"))
+    return _response(
+        ok,
+        "storage-health",
+        "Storage has enough headroom for artifact rebuild." if ok else "Storage is too full for artifact rebuild.",
+        {
+            "storage_report": report,
+            "cleanup_candidates": report.get("cleanup_candidates") or [],
         },
     )
 
@@ -323,6 +349,8 @@ def test_pickup_overlay_endpoint(admin_user: Any) -> Dict[str, Any]:
 
 
 def test_score_manifest() -> Dict[str, Any]:
+    from main import _get_state
+
     frames_dir = _frames_dir()
     manifest_path = frames_dir / "scoring_shadow_manifest.json"
     manifest_present = manifest_path.exists() and manifest_path.stat().st_size > 0 if manifest_path.exists() else False
@@ -344,17 +372,23 @@ def test_score_manifest() -> Dict[str, Any]:
         min_trips_per_window=int(os.environ.get("DEFAULT_MIN_TRIPS_PER_WINDOW", "25")),
     )
 
+    low_space_ctx = _low_space_context((_get_state().get("error") or ""))
     if not manifest_present or not freshness.get("fresh"):
+        likely_cause = "low_space_volume" if low_space_ctx["low_space"] else "generic_stale_artifacts"
         return _response(
             False,
             "score-manifest",
-            "Generated artifacts are stale or missing.",
+            "Generated artifacts are stale or missing due to low volume space."
+            if likely_cause == "low_space_volume"
+            else "Generated artifacts are stale or missing.",
             {
                 "manifest_path": str(manifest_path),
                 "manifest_present": manifest_present,
                 "visible_profiles_live": [],
                 "default_citywide_profile": None,
                 "mismatches": freshness.get("reason_codes") or ["manifest missing"],
+                "likely_cause": likely_cause,
+                "storage_report": low_space_ctx["storage_report"],
             },
         )
 
@@ -508,7 +542,7 @@ def test_zone_geometry_metrics() -> Dict[str, Any]:
     )
 
 def test_score_frame_integrity() -> Dict[str, Any]:
-    from main import _generate_lock_snapshot
+    from main import _generate_lock_snapshot, _get_state
 
     frames_dir = _frames_dir()
     timeline_path = frames_dir / "timeline.json"
@@ -671,6 +705,14 @@ def test_score_frame_integrity() -> Dict[str, Any]:
     )
     lock_snapshot = _generate_lock_snapshot()
     stale_lock = bool(lock_snapshot.get("lock_present")) and not bool(lock_snapshot.get("thread_alive"))
+    low_space_ctx = _low_space_context((_get_state().get("error") or ""))
+    likely_cause = None
+    if low_space_ctx["low_space"]:
+        likely_cause = "low_space_volume"
+    elif stale_field_mismatch and stale_lock:
+        likely_cause = "stale_generate_lock"
+    elif stale_field_mismatch:
+        likely_cause = "generic_stale_artifacts"
 
     ok = bool(sampled_features) and len(violations) == 0 and not stale_field_mismatch
     return _response(
@@ -679,8 +721,10 @@ def test_score_frame_integrity() -> Dict[str, Any]:
         "Sampled frame features contain valid v3 score, density, and trap fields."
         if ok
         else (
-            "Frames appear older than the deployed scoring code; rebuild may be blocked by a stale generate lock."
-            if stale_field_mismatch and stale_lock
+            "Frames appear older than the deployed scoring code; rebuild is likely blocked by low space on the mounted volume."
+            if stale_field_mismatch and likely_cause == "low_space_volume"
+            else "Frames appear older than the deployed scoring code; rebuild may be blocked by a stale generate lock."
+            if stale_field_mismatch and likely_cause == "stale_generate_lock"
             else "Frames appear older than the deployed scoring code."
             if stale_field_mismatch
             else "Sampled frame features contain invalid or missing score fields."
@@ -694,11 +738,13 @@ def test_score_frame_integrity() -> Dict[str, Any]:
             "lock_present": lock_snapshot.get("lock_present"),
             "lock_age_seconds": lock_snapshot.get("lock_age_seconds"),
             "thread_alive": lock_snapshot.get("thread_alive"),
+            "likely_cause": likely_cause,
+            "storage_report": low_space_ctx["storage_report"],
         },
     )
 
 def test_generated_artifact_sync() -> Dict[str, Any]:
-    from main import _generate_lock_snapshot
+    from main import _generate_lock_snapshot, _get_state
 
     frames_dir = _frames_dir()
     freshness = evaluate_artifact_freshness(
@@ -711,8 +757,18 @@ def test_generated_artifact_sync() -> Dict[str, Any]:
     ok = bool(freshness.get("fresh"))
     lock_snapshot = _generate_lock_snapshot()
     stale_lock = bool(lock_snapshot.get("lock_present")) and not bool(lock_snapshot.get("thread_alive"))
+    low_space_ctx = _low_space_context((_get_state().get("error") or ""))
+    likely_cause = None
+    if not ok and low_space_ctx["low_space"]:
+        likely_cause = "low_space_volume"
+    elif not ok and stale_lock:
+        likely_cause = "stale_generate_lock"
+    elif not ok:
+        likely_cause = "generic_stale_artifacts"
     summary = freshness.get("summary") or ("Generated frame artifacts match the deployed v3 code." if ok else "Generated frame artifacts are stale.")
-    if not ok and stale_lock:
+    if not ok and likely_cause == "low_space_volume":
+        summary = f"{summary} Likely cause: low space on the mounted volume is blocking rebuild."
+    elif not ok and stale_lock:
         summary = f"{summary} Likely cause: stale generate lock is present without an active worker thread."
     details = {
         "summary": freshness.get("summary"),
@@ -725,8 +781,10 @@ def test_generated_artifact_sync() -> Dict[str, Any]:
         "lock_age_seconds": lock_snapshot.get("lock_age_seconds"),
         "thread_alive": lock_snapshot.get("thread_alive"),
     }
-    if stale_lock:
-        details["likely_cause"] = "stale_generate_lock"
+    if likely_cause:
+        details["likely_cause"] = likely_cause
+    if likely_cause == "low_space_volume":
+        details["storage_report"] = low_space_ctx["storage_report"]
 
     return _response(
         ok,

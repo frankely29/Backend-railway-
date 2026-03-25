@@ -33,6 +33,7 @@ from hotspot_experiments import (
 )
 from hotspot_scoring import score_zones
 from artifact_freshness import evaluate_artifact_freshness
+from artifact_storage_service import cleanup_artifact_storage, get_artifact_storage_report
 from avatar_assets import (
     AVATAR_THUMB_MIME,
     avatar_thumb_path,
@@ -326,6 +327,32 @@ def _artifact_freshness_snapshot() -> Dict[str, Any]:
             "code_dependency_hash": None,
             "source_data_hash": None,
         }
+
+
+def _is_no_space_error(exc_or_text: Any) -> bool:
+    text = str(exc_or_text or "").lower()
+    return "no space left on device" in text or "errno 28" in text or "[errno 28]" in text
+
+
+def _backend_identity_snapshot(freshness: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    env_build_id = (os.environ.get("BACKEND_BUILD_ID") or "").strip()
+    env_release = (os.environ.get("BACKEND_RELEASE") or "").strip()
+    if env_build_id or env_release:
+        return {
+            "backend_build_id": env_build_id or None,
+            "backend_release": env_release or None,
+            "source": "env",
+        }
+    snap = freshness or _artifact_freshness_snapshot()
+    code_hash = str(snap.get("code_dependency_hash") or "").strip()
+    if code_hash:
+        short = code_hash[:12]
+        return {
+            "backend_build_id": short,
+            "backend_release": f"code-{short}",
+            "source": "code_dependency_hash_fallback",
+        }
+    return {"backend_build_id": None, "backend_release": None, "source": "missing"}
 
 
 def _has_frames() -> bool:
@@ -936,6 +963,7 @@ def _generate_worker(bin_minutes: int, min_trips_per_window: int) -> None:
         result = {
             "frames": frames_result,
             "day_tendency": day_tendency_result,
+            "storage_report": get_artifact_storage_report(DATA_DIR, FRAMES_DIR),
         }
 
         end = time.time()
@@ -948,18 +976,30 @@ def _generate_worker(bin_minutes: int, min_trips_per_window: int) -> None:
 
     except Exception as e:
         end = time.time()
+        storage_report = get_artifact_storage_report(DATA_DIR, FRAMES_DIR)
+        low_space = bool(storage_report.get("low_space")) or _is_no_space_error(e)
+        error_text = str(e)
+        if low_space:
+            error_text = (
+                "Artifact rebuild blocked by low space on mounted volume. "
+                f"Original error: {str(e)}"
+            )
         _set_state(
             state="error",
             finished_at_unix=end,
             duration_sec=round(end - start, 2),
-            error=str(e),
+            error=error_text,
             trace=traceback.format_exc(),
+            result={
+                "likely_cause": "low_space_volume" if low_space else "unknown",
+                "storage_report": storage_report,
+            },
         )
     finally:
         _clear_lock()
 
 
-def start_generate(bin_minutes: int, min_trips_per_window: int) -> Dict[str, Any]:
+def start_generate(bin_minutes: int, min_trips_per_window: int, force_clear_lock: bool = False) -> Dict[str, Any]:
     global _generate_thread
     st = _get_state()
     if st["state"] in ("started", "running") and _generate_thread_alive():
@@ -969,6 +1009,14 @@ def start_generate(bin_minutes: int, min_trips_per_window: int) -> Dict[str, Any
             "bin_minutes": st["bin_minutes"],
             "min_trips_per_window": st["min_trips_per_window"],
         }
+
+    cleanup_result = None
+    lock_cleared = False
+    if not _generate_thread_alive():
+        cleanup_result = cleanup_artifact_storage(DATA_DIR, FRAMES_DIR)
+        if force_clear_lock and _lock_is_present():
+            _clear_lock()
+            lock_cleared = True
 
     if _lock_is_present():
         if not _generate_thread_alive():
@@ -980,6 +1028,8 @@ def start_generate(bin_minutes: int, min_trips_per_window: int) -> Dict[str, Any
                 "state": "running",
                 "bin_minutes": bin_minutes,
                 "min_trips_per_window": min_trips_per_window,
+                "cleanup": cleanup_result,
+                "lock_cleared": lock_cleared,
             }
 
     _write_lock()
@@ -989,7 +1039,14 @@ def start_generate(bin_minutes: int, min_trips_per_window: int) -> Dict[str, Any
     _generate_thread = t
     t.start()
 
-    return {"ok": True, "state": "started", "bin_minutes": bin_minutes, "min_trips_per_window": min_trips_per_window}
+    return {
+        "ok": True,
+        "state": "started",
+        "bin_minutes": bin_minutes,
+        "min_trips_per_window": min_trips_per_window,
+        "cleanup": cleanup_result,
+        "lock_cleared": lock_cleared,
+    }
 
 
 # =========================================================
@@ -2314,26 +2371,28 @@ def root():
 def status():
     parquets = [p.name for p in _list_parquets()]
     zones_path = DATA_DIR / "taxi_zones.geojson"
-    backend_build_id = os.environ.get("BACKEND_BUILD_ID")
-    backend_release = os.environ.get("BACKEND_RELEASE")
     manifest_path = FRAMES_DIR / "scoring_shadow_manifest.json"
     timeline_present = TIMELINE_PATH.exists() and TIMELINE_PATH.stat().st_size > 0 if TIMELINE_PATH.exists() else False
     manifest_present = manifest_path.exists() and manifest_path.stat().st_size > 0 if manifest_path.exists() else False
+    freshness = _artifact_freshness_snapshot()
+    identity = _backend_identity_snapshot(freshness)
     return {
         "status": "ok",
         "data_dir": str(DATA_DIR),
         "parquets": parquets,
         "zones_geojson": zones_path.name if zones_path.exists() else None,
         "zones_present": zones_path.exists(),
-        "backend_build_id": backend_build_id if backend_build_id else None,
-        "backend_release": backend_release if backend_release else None,
+        "backend_build_id": identity.get("backend_build_id"),
+        "backend_release": identity.get("backend_release"),
+        "backend_identity_source": identity.get("source"),
         "frames_dir": str(FRAMES_DIR),
         "manifest_present": manifest_present,
         "timeline_present": timeline_present,
         "has_timeline": _has_frames(),
         "generate_state": _get_state(),
         "generate_lock": _generate_lock_snapshot(),
-        "artifact_freshness": _artifact_freshness_snapshot(),
+        "artifact_freshness": freshness,
+        "storage_report": get_artifact_storage_report(DATA_DIR, FRAMES_DIR),
         "community_db": os.environ.get("COMMUNITY_DB", str(DATA_DIR / "community.db")),
         "trial_days": TRIAL_DAYS,
         "trial_enforced": ENFORCE_TRIAL,

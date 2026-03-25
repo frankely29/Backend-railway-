@@ -19,6 +19,7 @@ from admin_test_service import (
     test_admin_auth,
     test_backend_status,
     test_build_sync,
+    test_storage_health,
     test_frame_current,
     test_generated_artifact_sync,
     test_me,
@@ -50,6 +51,12 @@ def admin_test_backend_status(admin: sqlite3.Row = Depends(require_admin_user)):
 def admin_test_build_sync(admin: sqlite3.Row = Depends(require_admin_user)):
     _ = admin
     return test_build_sync()
+
+
+@router.get("/storage-health", response_model=AdminDiagnosticResponse)
+def admin_test_storage_health(admin: sqlite3.Row = Depends(require_admin_user)):
+    _ = admin
+    return test_storage_health()
 
 
 @router.get("/timeline", response_model=AdminDiagnosticResponse)
@@ -99,39 +106,33 @@ def admin_test_rebuild_artifacts(admin: sqlite3.Row = Depends(require_admin_user
     _ = admin
     from main import DEFAULT_BIN_MINUTES, DEFAULT_MIN_TRIPS_PER_WINDOW, start_generate
 
+    generate_state = start_generate(DEFAULT_BIN_MINUTES, DEFAULT_MIN_TRIPS_PER_WINDOW)
     return {
         "ok": True,
         "test_name": "rebuild-artifacts",
         "checked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "summary": "Artifact regeneration requested.",
-        "details": start_generate(DEFAULT_BIN_MINUTES, DEFAULT_MIN_TRIPS_PER_WINDOW),
+        "details": {
+            "cleanup": generate_state.get("cleanup"),
+            "generate_state": generate_state,
+        },
     }
 
 
 @router.post("/force-rebuild-artifacts", response_model=AdminDiagnosticResponse)
 def admin_test_force_rebuild_artifacts(admin: sqlite3.Row = Depends(require_admin_user)):
     _ = admin
-    from main import (
-        DEFAULT_BIN_MINUTES,
-        DEFAULT_MIN_TRIPS_PER_WINDOW,
-        _clear_lock,
-        _lock_is_present,
-        start_generate,
-    )
+    from main import DEFAULT_BIN_MINUTES, DEFAULT_MIN_TRIPS_PER_WINDOW, start_generate
 
-    lock_cleared = False
-    if _lock_is_present():
-        _clear_lock()
-        lock_cleared = True
-
-    generate_state = start_generate(DEFAULT_BIN_MINUTES, DEFAULT_MIN_TRIPS_PER_WINDOW)
+    generate_state = start_generate(DEFAULT_BIN_MINUTES, DEFAULT_MIN_TRIPS_PER_WINDOW, force_clear_lock=True)
     return {
         "ok": True,
         "test_name": "force-rebuild-artifacts",
         "checked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "summary": "Force artifact regeneration requested.",
         "details": {
-            "lock_cleared": lock_cleared,
+            "lock_cleared": bool(generate_state.get("lock_cleared")),
+            "cleanup": generate_state.get("cleanup"),
             "generate_state": generate_state,
         },
     }
