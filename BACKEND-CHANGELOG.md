@@ -1,15 +1,16 @@
 # BACKEND CHANGELOG
 
-## Current pass: Phase 8 Brooklyn v3 live visible cutover (backend)
+## Current pass: Phase 9 Staten Island v3 live visible cutover (backend)
 
-### Phase 8 rollout-state manifest update
-- Promoted `brooklyn_v3` to the live visible Brooklyn profile in backend manifest metadata.
-- Kept `brooklyn_v2` available for fallback/debug comparison metadata usage.
+### Phase 9 rollout-state manifest update
+- Promoted `staten_island_v3` to the live visible Staten Island profile in backend manifest metadata.
+- Kept `staten_island_v2` available for fallback/debug comparison metadata usage.
 - Kept `citywide_v3` as the live visible citywide profile.
 - Kept `manhattan_v3` as the live visible Manhattan profile.
 - Kept `bronx_wash_heights_v3` as the live visible Bronx/Wash Heights profile.
 - Kept `queens_v3` as the live visible Queens profile.
-- Kept Staten Island visible profile unchanged in Phase 8 (`staten_island_v2`).
+- Kept `brooklyn_v3` as the live visible Brooklyn profile.
+- Visible v3 rollout is now complete across citywide and all borough modes.
 
 ## Current pass: Phase 7 Queens v3 live visible cutover (backend)
 
