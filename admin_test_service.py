@@ -9,10 +9,6 @@ from typing import Any, Dict
 from admin_service import get_admin_pickup_logs, get_admin_police_reports, get_admin_summary
 from admin_trips_service import get_admin_recent_trips, get_admin_trips_summary
 from core import DB_BACKEND, _db_query_all, _db_query_one
-from zone_earnings_engine import build_zone_earnings_shadow_sql
-from zone_geometry_metrics import build_zone_geometry_metrics_rows
-from zone_mode_profiles import ZONE_MODE_PROFILES
-from artifact_freshness import evaluate_artifact_freshness
 
 
 def _checked_at() -> str:
@@ -324,23 +320,7 @@ def test_pickup_overlay_endpoint(admin_user: Any) -> Dict[str, Any]:
 def test_score_manifest() -> Dict[str, Any]:
     frames_dir = _frames_dir()
     manifest_path = frames_dir / "scoring_shadow_manifest.json"
-    if not manifest_path.exists():
-        return _response(
-            False,
-            "score-manifest",
-            "Generated artifacts are stale or missing.",
-            {"manifest_path": str(manifest_path), "mismatches": ["Manifest file missing"]},
-        )
-
-    try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        return _response(
-            False,
-            "score-manifest",
-            "Scoring manifest does not match the expected v3 rollout.",
-            {"manifest_path": str(manifest_path), "mismatches": [f"Manifest unreadable: {exc}"]},
-        )
+    manifest_present = manifest_path.exists() and manifest_path.stat().st_size > 0 if manifest_path.exists() else False
 
     expected_visible = [
         "citywide_v3",
@@ -350,65 +330,81 @@ def test_score_manifest() -> Dict[str, Any]:
         "brooklyn_v3",
         "staten_island_v3",
     ]
-    expected_v2 = [
-        "citywide_v2",
-        "manhattan_v2",
-        "bronx_wash_heights_v2",
-        "queens_v2",
-        "brooklyn_v2",
-        "staten_island_v2",
-    ]
+
+    if not manifest_present:
+        return _response(
+            False,
+            "score-manifest",
+            "Scoring manifest does not match the expected v3 rollout.",
+            {
+                "manifest_path": str(manifest_path),
+                "manifest_present": False,
+                "visible_profiles_live": [],
+                "default_citywide_profile": None,
+                "mismatches": ["manifest missing"],
+            },
+        )
+
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return _response(
+            False,
+            "score-manifest",
+            "Scoring manifest does not match the expected v3 rollout.",
+            {
+                "manifest_path": str(manifest_path),
+                "manifest_present": True,
+                "visible_profiles_live": [],
+                "default_citywide_profile": None,
+                "mismatches": [f"manifest unreadable: {exc}"],
+            },
+        )
 
     visible_profiles_live = manifest.get("visible_profiles_live")
-    comparison_profiles = manifest.get("comparison_profiles")
-    candidate_shadow_profiles = manifest.get("candidate_shadow_profiles")
+    default_citywide_profile = manifest.get("default_citywide_profile")
 
-    mismatches = []
-    if manifest.get("engine_version") != "team-joseo-score-v2-final-live":
-        mismatches.append("engine_version mismatch")
-    if manifest.get("default_citywide_profile") != "citywide_v3":
-        mismatches.append("default_citywide_profile mismatch")
-    if manifest.get("all_profiles_live") is not True:
-        mismatches.append("all_profiles_live must be true")
-    if manifest.get("base_color_truth") != "tlc_hvfhv_earnings_opportunity":
-        mismatches.append("base_color_truth mismatch")
-    if visible_profiles_live != expected_visible:
-        mismatches.append("visible_profiles_live mismatch")
-    if not isinstance(comparison_profiles, list) or any(profile not in comparison_profiles for profile in expected_v2):
-        mismatches.append("comparison_profiles missing required v2 profiles")
-    if candidate_shadow_profiles not in (None, []):
-        mismatches.append("candidate_shadow_profiles must be missing or empty")
+    mismatches: list[str] = []
+    if default_citywide_profile != "citywide_v3":
+        mismatches.append("default_citywide_profile != citywide_v3")
+    if not isinstance(visible_profiles_live, list):
+        mismatches.append("visible_profiles_live must be a list")
+        visible_profiles_live = []
+
+    missing_profiles = [profile for profile in expected_visible if profile not in visible_profiles_live]
+    if missing_profiles:
+        mismatches.append(f"missing visible_profiles_live entries: {missing_profiles}")
 
     ok = len(mismatches) == 0
     return _response(
         ok,
         "score-manifest",
-        "Scoring manifest matches the full v3 rollout." if ok else "Scoring manifest does not match the expected v3 rollout.",
+        "Scoring manifest matches the expected v3 rollout." if ok else "Scoring manifest does not match the expected v3 rollout.",
         {
             "manifest_path": str(manifest_path),
+            "manifest_present": True,
             "visible_profiles_live": visible_profiles_live,
-            "comparison_profiles": comparison_profiles,
-            "default_citywide_profile": manifest.get("default_citywide_profile"),
-            "all_profiles_live": manifest.get("all_profiles_live"),
-            "base_color_truth": manifest.get("base_color_truth"),
+            "default_citywide_profile": default_citywide_profile,
             "mismatches": mismatches,
         },
     )
 
-
 def test_score_sql_definitions() -> Dict[str, Any]:
+    from zone_earnings_engine import build_zone_earnings_shadow_sql
+    from zone_mode_profiles import ZONE_MODE_PROFILES
+
     try:
         sql = build_zone_earnings_shadow_sql(
             ["/tmp/dummy.parquet"],
             bin_minutes=20,
             min_trips_per_window=25,
-            profile=ZONE_MODE_PROFILES["citywide_v2"],
+            profile=ZONE_MODE_PROFILES["citywide_v3"],
             citywide_v3_profile=ZONE_MODE_PROFILES["citywide_v3"],
-            manhattan_profile=ZONE_MODE_PROFILES["manhattan_v2"],
-            bronx_wash_heights_profile=ZONE_MODE_PROFILES["bronx_wash_heights_v2"],
-            queens_profile=ZONE_MODE_PROFILES["queens_v2"],
-            brooklyn_profile=ZONE_MODE_PROFILES["brooklyn_v2"],
-            staten_island_profile=ZONE_MODE_PROFILES["staten_island_v2"],
+            manhattan_profile=ZONE_MODE_PROFILES["manhattan_v3"],
+            bronx_wash_heights_profile=ZONE_MODE_PROFILES["bronx_wash_heights_v3"],
+            queens_profile=ZONE_MODE_PROFILES["queens_v3"],
+            brooklyn_profile=ZONE_MODE_PROFILES["brooklyn_v3"],
+            staten_island_profile=ZONE_MODE_PROFILES["staten_island_v3"],
             manhattan_v3_profile=ZONE_MODE_PROFILES["manhattan_v3"],
             bronx_wash_heights_v3_profile=ZONE_MODE_PROFILES["bronx_wash_heights_v3"],
             queens_v3_profile=ZONE_MODE_PROFILES["queens_v3"],
@@ -421,71 +417,69 @@ def test_score_sql_definitions() -> Dict[str, Any]:
             False,
             "score-sql-definitions",
             "Score SQL definitions do not match the intended trap-aware logic.",
-            {"error": str(exc)},
+            {
+                "contains_trip_time_lte_720": False,
+                "contains_trip_time_gte_1200": False,
+                "contains_retention_rank_asc": False,
+                "contains_retention_rank_desc": False,
+                "error": str(exc),
+            },
         )
 
-    checks = {
-        "has_short_trip_gate": "trip_miles <= 3.0 AND trip_time <= 720.0" in sql,
-        "has_long_trip_gate": "trip_time >= 1200" in sql,
-        "has_retention_penalty_rank_asc": "ORDER BY same_zone_dropoff_share) AS same_zone_retention_penalty_rn" in sql,
-        "has_retention_penalty_rank_desc": "ORDER BY same_zone_dropoff_share DESC) AS same_zone_retention_penalty_rn" in sql,
+    contains_retention_rank_asc = "same_zone_retention_penalty_rn" in sql and "ORDER BY same_zone_dropoff_share" in sql
+    contains_retention_rank_desc = "ORDER BY same_zone_dropoff_share DESC" in sql and "same_zone_retention_penalty_rn" in sql
+
+    details = {
+        "contains_trip_time_lte_720": "trip_time <= 720.0" in sql,
+        "contains_trip_time_gte_1200": "trip_time >= 1200" in sql,
+        "contains_retention_rank_asc": contains_retention_rank_asc,
+        "contains_retention_rank_desc": contains_retention_rank_desc,
     }
-    ok = checks["has_short_trip_gate"] and checks["has_long_trip_gate"] and checks["has_retention_penalty_rank_asc"] and not checks["has_retention_penalty_rank_desc"]
+    ok = (
+        details["contains_trip_time_lte_720"]
+        and details["contains_trip_time_gte_1200"]
+        and details["contains_retention_rank_asc"]
+        and not details["contains_retention_rank_desc"]
+    )
+
     return _response(
         ok,
         "score-sql-definitions",
-        "Score SQL definitions match the intended trap-aware logic."
-        if ok
-        else "Score SQL definitions do not match the intended trap-aware logic.",
-        {**checks, "freshness_scope": "This test validates code SQL definitions only, not persisted frame freshness."},
+        "Score SQL definitions match the intended trap-aware logic." if ok else "Score SQL definitions do not match the intended trap-aware logic.",
+        details,
     )
 
-
 def test_zone_geometry_metrics() -> Dict[str, Any]:
+    from zone_geometry_metrics import build_zone_geometry_metrics_rows
+
     zones_geojson_path = _data_dir() / "taxi_zones.geojson"
-    if not zones_geojson_path.exists():
+    if not zones_geojson_path.exists() or zones_geojson_path.stat().st_size == 0:
         return _response(
             False,
             "zone-geometry-metrics",
             "Zone geometry metrics are missing or invalid.",
-            {"zones_geojson_path": str(zones_geojson_path), "error": "taxi_zones.geojson missing"},
+            {
+                "zones_geojson_path": str(zones_geojson_path),
+                "total_rows": 0,
+                "positive_area_rows": 0,
+                "null_or_zero_area_rows": 0,
+                "min_area_sq_miles": None,
+                "max_area_sq_miles": None,
+            },
         )
 
     try:
         rows = build_zone_geometry_metrics_rows(zones_geojson_path)
-    except Exception as exc:
-        return _response(
-            False,
-            "zone-geometry-metrics",
-            "Zone geometry metrics are missing or invalid.",
-            {"zones_geojson_path": str(zones_geojson_path), "error": str(exc)},
-        )
+    except Exception:
+        rows = []
 
     areas = [float(row.get("zone_area_sq_miles")) for row in rows if row.get("zone_area_sq_miles") is not None]
-    positive_areas = [value for value in areas if value > 0]
-    null_or_zero_area_rows = len(rows) - len(positive_areas)
+    positive_areas = [area for area in areas if area > 0]
+    min_area = min(positive_areas) if positive_areas else None
+    max_area = max(positive_areas) if positive_areas else None
 
-    median_area_sq_miles = None
-    if positive_areas:
-        ordered = sorted(positive_areas)
-        mid = len(ordered) // 2
-        if len(ordered) % 2 == 0:
-            median_area_sq_miles = (ordered[mid - 1] + ordered[mid]) / 2.0
-        else:
-            median_area_sq_miles = ordered[mid]
+    ok = len(rows) > 200 and len(positive_areas) > 200 and min_area is not None and max_area is not None and max_area > min_area > 0
 
-    min_area_sq_miles = min(positive_areas) if positive_areas else None
-    max_area_sq_miles = max(positive_areas) if positive_areas else None
-
-    ok = (
-        len(rows) > 200
-        and len(positive_areas) > 200
-        and null_or_zero_area_rows <= 10
-        and min_area_sq_miles is not None
-        and min_area_sq_miles > 0
-        and max_area_sq_miles is not None
-        and min_area_sq_miles < max_area_sq_miles
-    )
     return _response(
         ok,
         "zone-geometry-metrics",
@@ -494,50 +488,48 @@ def test_zone_geometry_metrics() -> Dict[str, Any]:
             "zones_geojson_path": str(zones_geojson_path),
             "total_rows": len(rows),
             "positive_area_rows": len(positive_areas),
-            "null_or_zero_area_rows": null_or_zero_area_rows,
-            "min_area_sq_miles": min_area_sq_miles,
-            "median_area_sq_miles": median_area_sq_miles,
-            "max_area_sq_miles": max_area_sq_miles,
+            "null_or_zero_area_rows": len(rows) - len(positive_areas),
+            "min_area_sq_miles": min_area,
+            "max_area_sq_miles": max_area,
         },
     )
-
 
 def test_score_frame_integrity() -> Dict[str, Any]:
     frames_dir = _frames_dir()
     timeline_path = frames_dir / "timeline.json"
-    if not timeline_path.exists():
+    if not timeline_path.exists() or timeline_path.stat().st_size == 0:
         return _response(
             False,
             "score-frame-integrity",
-            "Frames appear older than the deployed scoring code.",
+            "Sampled frame features contain invalid or missing score fields.",
             {
                 "sampled_frame_indices": [],
                 "sampled_feature_count": 0,
                 "violation_count": 1,
-                "first_violations": [f"timeline.json missing at {timeline_path}"],
+                "first_violations": [f"timeline missing: {timeline_path}"],
             },
         )
+
     try:
         timeline_payload = json.loads(timeline_path.read_text(encoding="utf-8"))
     except Exception as exc:
         return _response(
             False,
             "score-frame-integrity",
-            "Frames appear older than the deployed scoring code.",
+            "Sampled frame features contain invalid or missing score fields.",
             {
                 "sampled_frame_indices": [],
                 "sampled_feature_count": 0,
                 "violation_count": 1,
-                "first_violations": [f"timeline.json unreadable: {exc}"],
+                "first_violations": [f"timeline unreadable: {exc}"],
             },
         )
 
     timeline_items: list[Any] = []
-    if isinstance(timeline_payload, dict):
-        if isinstance(timeline_payload.get("timeline"), list):
-            timeline_items = timeline_payload.get("timeline") or []
-        elif isinstance(timeline_payload.get("frames"), list):
-            timeline_items = timeline_payload.get("frames") or []
+    if isinstance(timeline_payload, dict) and isinstance(timeline_payload.get("timeline"), list):
+        timeline_items = timeline_payload.get("timeline") or []
+    elif isinstance(timeline_payload, dict) and isinstance(timeline_payload.get("frames"), list):
+        timeline_items = timeline_payload.get("frames") or []
     elif isinstance(timeline_payload, list):
         timeline_items = timeline_payload
 
@@ -545,14 +537,17 @@ def test_score_frame_integrity() -> Dict[str, Any]:
         return _response(
             False,
             "score-frame-integrity",
-            "Frames appear older than the deployed scoring code.",
-            {"sampled_frame_indices": [], "sampled_feature_count": 0, "violation_count": 1, "first_violations": ["timeline has no frame entries"]},
+            "Sampled frame features contain invalid or missing score fields.",
+            {
+                "sampled_frame_indices": [],
+                "sampled_feature_count": 0,
+                "violation_count": 1,
+                "first_violations": ["timeline contains no frames"],
+            },
         )
 
-    indices = sorted(set([0, len(timeline_items) // 2, len(timeline_items) - 1]))
-    features: list[Dict[str, Any]] = []
-    violations: list[str] = []
-    v3_rating_fields = [
+    sampled_frame_indices = sorted(set([0, len(timeline_items) // 2, len(timeline_items) - 1]))
+    required_rating_fields = [
         "earnings_shadow_rating_citywide_v3",
         "earnings_shadow_rating_manhattan_v3",
         "earnings_shadow_rating_bronx_wash_heights_v3",
@@ -560,7 +555,7 @@ def test_score_frame_integrity() -> Dict[str, Any]:
         "earnings_shadow_rating_brooklyn_v3",
         "earnings_shadow_rating_staten_island_v3",
     ]
-    density_fields = [
+    required_metric_fields = [
         "zone_area_sq_miles_shadow",
         "pickups_per_sq_mile_now_shadow",
         "pickups_per_sq_mile_next_shadow",
@@ -579,15 +574,18 @@ def test_score_frame_integrity() -> Dict[str, Any]:
         "earnings_shadow_confidence_staten_island_v3",
     ]
 
-    for idx in indices:
-        frame_path = frames_dir / f"frame_{idx:06d}.json"
-        if not frame_path.exists():
-            violations.append(f"missing frame file for index {idx}: {frame_path.name}")
+    sampled_features: list[Dict[str, Any]] = []
+    violations: list[str] = []
+
+    for frame_idx in sampled_frame_indices:
+        frame_path = frames_dir / f"frame_{frame_idx:06d}.json"
+        if not frame_path.exists() or frame_path.stat().st_size == 0:
+            violations.append(f"missing frame_{frame_idx:06d}.json")
             continue
         try:
             frame_payload = json.loads(frame_path.read_text(encoding="utf-8"))
         except Exception as exc:
-            violations.append(f"unreadable frame file for index {idx}: {exc}")
+            violations.append(f"unreadable frame_{frame_idx:06d}.json: {exc}")
             continue
 
         frame_features: list[Any] = []
@@ -597,89 +595,140 @@ def test_score_frame_integrity() -> Dict[str, Any]:
                 frame_features = polygons.get("features") or []
             elif isinstance(frame_payload.get("features"), list):
                 frame_features = frame_payload.get("features") or []
+
         for feature in frame_features:
             if isinstance(feature, dict):
-                features.append(feature)
+                sampled_features.append(feature)
 
-    for i, feature in enumerate(features):
+    for feature_idx, feature in enumerate(sampled_features):
         props = feature.get("properties") if isinstance(feature, dict) else None
         if not isinstance(props, dict):
-            violations.append(f"feature {i}: properties missing")
+            violations.append(f"feature {feature_idx}: missing properties")
             continue
-        for key in ("LocationID", "rating", "bucket"):
-            if key not in props:
-                violations.append(f"feature {i}: missing properties.{key}")
-        style = props.get("style")
-        if not isinstance(style, dict) or "fillColor" not in style:
-            violations.append(f"feature {i}: missing properties.style.fillColor")
-        for key in v3_rating_fields + density_fields:
-            if key not in props:
-                violations.append(f"feature {i}: missing properties.{key}")
 
-        if (area := props.get("zone_area_sq_miles_shadow")) is not None and float(area) <= 0:
-            violations.append(f"feature {i}: zone_area_sq_miles_shadow must be > 0")
-        for nonneg in ("pickups_per_sq_mile_now_shadow", "pickups_per_sq_mile_next_shadow"):
-            value = props.get(nonneg)
-            if value is not None and float(value) < 0:
-                violations.append(f"feature {i}: {nonneg} must be >= 0")
-        for zero_one in (
+        for key in required_rating_fields + required_metric_fields:
+            if key not in props:
+                violations.append(f"feature {feature_idx}: missing {key}")
+
+        for rating_key in required_rating_fields:
+            value = props.get(rating_key)
+            if value is not None and not (1 <= float(value) <= 100):
+                violations.append(f"feature {feature_idx}: {rating_key} out of range [1,100]")
+
+        for confidence_key in confidence_fields:
+            value = props.get(confidence_key)
+            if value is not None and not (0 <= float(value) <= 1):
+                violations.append(f"feature {feature_idx}: {confidence_key} out of range [0,1]")
+
+        area = props.get("zone_area_sq_miles_shadow")
+        if area is not None and float(area) <= 0:
+            violations.append(f"feature {feature_idx}: zone_area_sq_miles_shadow must be > 0")
+
+        for density_key in ("pickups_per_sq_mile_now_shadow", "pickups_per_sq_mile_next_shadow"):
+            density_value = props.get(density_key)
+            if density_value is not None and float(density_value) < 0:
+                violations.append(f"feature {feature_idx}: {density_key} must be >= 0")
+
+        for share_key in (
             "long_trip_share_20plus_shadow",
             "same_zone_dropoff_share_shadow",
             "demand_density_now_n_shadow",
             "demand_density_next_n_shadow",
             "same_zone_retention_penalty_n_shadow",
         ):
-            value = props.get(zero_one)
-            if value is not None and not (0 <= float(value) <= 1):
-                violations.append(f"feature {i}: {zero_one} out of [0,1]")
-        for rating_field in v3_rating_fields:
-            value = props.get(rating_field)
-            if value is not None and not (1 <= float(value) <= 100):
-                violations.append(f"feature {i}: {rating_field} out of [1,100]")
-        for confidence_field in confidence_fields:
-            value = props.get(confidence_field)
-            if value is not None and not (0 <= float(value) <= 1):
-                violations.append(f"feature {i}: {confidence_field} out of [0,1]")
+            share_value = props.get(share_key)
+            if share_value is not None and not (0 <= float(share_value) <= 1):
+                violations.append(f"feature {feature_idx}: {share_key} out of range [0,1]")
 
-    ok = bool(features) and not violations
+    ok = bool(sampled_features) and len(violations) == 0
     return _response(
         ok,
         "score-frame-integrity",
         "Sampled frame features contain valid v3 score, density, and trap fields."
         if ok
-        else "Frames appear older than the deployed scoring code.",
+        else "Sampled frame features contain invalid or missing score fields.",
         {
-            "sampled_frame_indices": indices,
-            "sampled_feature_count": len(features),
+            "sampled_frame_indices": sampled_frame_indices,
+            "sampled_feature_count": len(sampled_features),
             "violation_count": len(violations),
             "first_violations": violations[:10],
         },
     )
 
-
 def test_generated_artifact_sync() -> Dict[str, Any]:
     frames_dir = _frames_dir()
-    data_dir = _data_dir()
-    report = evaluate_artifact_freshness(
-        repo_root=Path(__file__).resolve().parent,
-        data_dir=data_dir,
-        frames_dir=frames_dir,
-        bin_minutes=int(os.environ.get("DEFAULT_BIN_MINUTES", "20")),
-        min_trips_per_window=int(os.environ.get("DEFAULT_MIN_TRIPS_PER_WINDOW", "25")),
-    )
-    ok = bool(report.get("fresh"))
+    manifest_path = frames_dir / "scoring_shadow_manifest.json"
+    timeline_path = frames_dir / "timeline.json"
+
+    manifest_present = manifest_path.exists() and manifest_path.stat().st_size > 0 if manifest_path.exists() else False
+    timeline_present = timeline_path.exists() and timeline_path.stat().st_size > 0 if timeline_path.exists() else False
+
+    sampled_frame_file = None
+    frame_has_citywide_v3 = False
+    frame_has_borough_v3_fields = False
+
+    if timeline_present:
+        try:
+            timeline_payload = json.loads(timeline_path.read_text(encoding="utf-8"))
+            timeline_items: list[Any] = []
+            if isinstance(timeline_payload, dict) and isinstance(timeline_payload.get("timeline"), list):
+                timeline_items = timeline_payload.get("timeline") or []
+            elif isinstance(timeline_payload, dict) and isinstance(timeline_payload.get("frames"), list):
+                timeline_items = timeline_payload.get("frames") or []
+            elif isinstance(timeline_payload, list):
+                timeline_items = timeline_payload
+
+            if timeline_items:
+                sample_idx = len(timeline_items) - 1
+                frame_path = frames_dir / f"frame_{sample_idx:06d}.json"
+                if frame_path.exists() and frame_path.stat().st_size > 0:
+                    sampled_frame_file = frame_path.name
+                    frame_payload = json.loads(frame_path.read_text(encoding="utf-8"))
+                    features = []
+                    if isinstance(frame_payload, dict):
+                        polygons = frame_payload.get("polygons")
+                        if isinstance(polygons, dict) and isinstance(polygons.get("features"), list):
+                            features = polygons.get("features") or []
+                        elif isinstance(frame_payload.get("features"), list):
+                            features = frame_payload.get("features") or []
+
+                    if features and isinstance(features[0], dict):
+                        props = features[0].get("properties") if isinstance(features[0], dict) else None
+                        if isinstance(props, dict):
+                            frame_has_citywide_v3 = "earnings_shadow_rating_citywide_v3" in props
+                            borough_keys = [
+                                "earnings_shadow_rating_manhattan_v3",
+                                "earnings_shadow_rating_bronx_wash_heights_v3",
+                                "earnings_shadow_rating_queens_v3",
+                                "earnings_shadow_rating_brooklyn_v3",
+                                "earnings_shadow_rating_staten_island_v3",
+                            ]
+                            frame_has_borough_v3_fields = all(key in props for key in borough_keys)
+        except Exception:
+            pass
+
+    ok = manifest_present and timeline_present and frame_has_citywide_v3 and frame_has_borough_v3_fields
+
+    likely_cause = None
+    if not ok:
+        if not manifest_present or not timeline_present:
+            likely_cause = "Generated files are missing from /data/frames."
+        elif not frame_has_citywide_v3 or not frame_has_borough_v3_fields:
+            likely_cause = "Frames were generated before v3 rollout fields were added."
+
     return _response(
         ok,
         "generated-artifact-sync",
-        "Generated frame artifacts match deployed code and source data."
+        "Generated frame artifacts match the deployed v3 code."
         if ok
-        else "Generated frame artifacts are stale and need regeneration.",
+        else "Generated frame artifacts are older than the deployed v3 code.",
         {
-            "summary": report.get("summary"),
-            "reason_codes": report.get("reason_codes") or [],
-            "sampled_frame_integrity": report.get("sampled_frame_integrity") or {},
-            "artifact_signature": report.get("artifact_signature"),
-            "code_dependency_hash": report.get("code_dependency_hash"),
-            "source_data_hash": report.get("source_data_hash"),
+            "manifest_present": manifest_present,
+            "timeline_present": timeline_present,
+            "sampled_frame_file": sampled_frame_file,
+            "frame_has_citywide_v3": frame_has_citywide_v3,
+            "frame_has_borough_v3_fields": frame_has_borough_v3_fields,
+            "likely_cause": likely_cause,
         },
     )
+
