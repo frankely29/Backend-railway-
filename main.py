@@ -308,14 +308,13 @@ def _artifact_freshness_snapshot() -> Dict[str, Any]:
             bin_minutes=DEFAULT_BIN_MINUTES,
             min_trips_per_window=DEFAULT_MIN_TRIPS_PER_WINDOW,
         )
-        expected = report.get("expected") if isinstance(report, dict) else {}
         return {
             "fresh": bool(report.get("fresh")),
             "summary": report.get("summary") or "Artifact freshness evaluated",
             "reason_codes": report.get("reason_codes") or [],
-            "artifact_signature": expected.get("artifact_signature"),
-            "code_dependency_hash": expected.get("code_dependency_hash"),
-            "source_data_hash": expected.get("source_data_hash"),
+            "artifact_signature": report.get("artifact_signature"),
+            "code_dependency_hash": report.get("code_dependency_hash"),
+            "source_data_hash": report.get("source_data_hash"),
         }
     except Exception:
         return {

@@ -280,12 +280,12 @@ def evaluate_artifact_freshness(
                 reason_codes.append("frame_files_missing")
                 break
 
-    sampled = sample_frame_integrity(frames_dir)
-    if not sampled.get("frame_has_v3_fields"):
+    sampled_frame_integrity = sample_frame_integrity(frames_dir)
+    if not sampled_frame_integrity.get("frame_has_v3_fields"):
         reason_codes.append("sampled_frames_missing_v3_fields")
-    if not sampled.get("frame_has_density_fields"):
+    if not sampled_frame_integrity.get("frame_has_density_fields"):
         reason_codes.append("sampled_frames_missing_density_fields")
-    if not sampled.get("frame_has_trap_fields"):
+    if not sampled_frame_integrity.get("frame_has_trap_fields"):
         reason_codes.append("sampled_frames_missing_trap_fields")
 
     if current_manifest is None:
@@ -302,19 +302,23 @@ def evaluate_artifact_freshness(
         if current_manifest.get("default_citywide_profile") != expected.get("expected_default_citywide_profile"):
             reason_codes.append("default_citywide_profile_mismatch")
 
-    fresh = len(reason_codes) == 0
+    deduped_reason_codes = list(dict.fromkeys(reason_codes))
+    fresh = len(deduped_reason_codes) == 0
     summary = (
         "Artifacts are fresh and aligned with code, source data, and expected rollout profiles."
         if fresh
-        else f"Artifacts are stale ({', '.join(reason_codes)})."
+        else f"Artifacts are stale ({', '.join(deduped_reason_codes)})."
     )
 
-    deduped_reason_codes = list(dict.fromkeys(reason_codes))
     return {
         "fresh": fresh,
         "reason_codes": deduped_reason_codes,
+        "sampled_frame_integrity": sampled_frame_integrity,
+        "artifact_signature": expected.get("artifact_signature"),
+        "source_data_hash": expected.get("source_data_hash"),
+        "code_dependency_hash": expected.get("code_dependency_hash"),
+        "artifact_schema_version": expected.get("artifact_schema_version"),
         "expected": expected,
         "current_manifest": current_manifest,
-        "sampled_frame_integrity": sampled,
         "summary": summary,
     }
