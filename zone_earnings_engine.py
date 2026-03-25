@@ -112,7 +112,9 @@ def build_zone_earnings_shadow_sql(
         pay_per_mile,
         request_to_pickup_min,
         CASE WHEN trip_miles <= 3.0 AND trip_time <= 12.0 THEN 1 ELSE 0 END AS is_short_trip,
-        CASE WHEN shared_flag = 1 THEN 1 ELSE 0 END AS is_shared
+        CASE WHEN shared_flag = 1 THEN 1 ELSE 0 END AS is_shared,
+        CASE WHEN trip_time >= 1200 THEN 1 ELSE 0 END AS is_long_trip_20plus,
+        CASE WHEN DOLocationID = PULocationID THEN 1 ELSE 0 END AS is_same_zone_dropoff
       FROM prepared
       WHERE PULocationID IS NOT NULL
     ),
@@ -127,7 +129,9 @@ def build_zone_earnings_shadow_sql(
         MEDIAN(pay_per_mile) AS median_pay_per_mile,
         MEDIAN(CASE WHEN request_to_pickup_min >= 0 THEN request_to_pickup_min END) AS median_request_to_pickup_min,
         AVG(is_short_trip * 1.0) AS short_trip_share_3mi_12min,
-        AVG(is_shared * 1.0) AS shared_ride_share
+        AVG(is_shared * 1.0) AS shared_ride_share,
+        AVG(is_long_trip_20plus * 1.0) AS long_trip_share_20plus,
+        AVG(is_same_zone_dropoff * 1.0) AS same_zone_dropoff_share
       FROM binned
       GROUP BY 1,2,3
       HAVING COUNT(*) >= {min_trips_per_window}
@@ -221,13 +225,26 @@ def build_zone_earnings_shadow_sql(
         z.median_request_to_pickup_min,
         z.short_trip_share_3mi_12min,
         z.shared_ride_share,
+        z.long_trip_share_20plus,
+        z.same_zone_dropoff_share,
         COALESCE(d.downstream_next_value_raw, 0.0) AS downstream_next_value_raw,
-        COALESCE(d.downstream_coverage, 0.0) AS downstream_coverage
+        COALESCE(d.downstream_coverage, 0.0) AS downstream_coverage,
+        g.zone_area_sq_miles,
+        CASE
+          WHEN g.zone_area_sq_miles > 0 THEN z.pickups_now * 1.0 / g.zone_area_sq_miles
+          ELSE NULL
+        END AS pickups_per_sq_mile_now,
+        CASE
+          WHEN g.zone_area_sq_miles > 0 THEN z.pickups_next * 1.0 / g.zone_area_sq_miles
+          ELSE NULL
+        END AS pickups_per_sq_mile_next
       FROM zone_bin z
       LEFT JOIN downstream_scores d
         ON d.PULocationID = z.PULocationID
        AND d.dow_m = z.dow_m
        AND d.bin_start_min = z.bin_start_min
+      LEFT JOIN zone_geometry_metrics g
+        ON g.PULocationID = z.PULocationID
     ),
     ranked AS (
       SELECT
@@ -240,7 +257,15 @@ def build_zone_earnings_shadow_sql(
         {percentile_rank_expr('median_request_to_pickup_min', 'dow_m, bin_start_min', 'pickup_friction_penalty')},
         {percentile_rank_expr('short_trip_share_3mi_12min', 'dow_m, bin_start_min', 'short_trip_penalty')},
         {percentile_rank_expr('shared_ride_share', 'dow_m, bin_start_min', 'shared_ride_penalty')},
-        {percentile_rank_expr('downstream_next_value_raw', 'dow_m, bin_start_min', 'downstream_value')}
+        {percentile_rank_expr('downstream_next_value_raw', 'dow_m, bin_start_min', 'downstream_value')},
+        ROW_NUMBER() OVER (PARTITION BY dow_m, bin_start_min ORDER BY pickups_per_sq_mile_now) AS demand_density_now_rn,
+        COUNT(pickups_per_sq_mile_now) OVER (PARTITION BY dow_m, bin_start_min) AS demand_density_now_n,
+        ROW_NUMBER() OVER (PARTITION BY dow_m, bin_start_min ORDER BY pickups_per_sq_mile_next) AS demand_density_next_rn,
+        COUNT(pickups_per_sq_mile_next) OVER (PARTITION BY dow_m, bin_start_min) AS demand_density_next_n,
+        ROW_NUMBER() OVER (PARTITION BY dow_m, bin_start_min ORDER BY long_trip_share_20plus) AS long_trip_share_20plus_rn,
+        COUNT(long_trip_share_20plus) OVER (PARTITION BY dow_m, bin_start_min) AS long_trip_share_20plus_n,
+        ROW_NUMBER() OVER (PARTITION BY dow_m, bin_start_min ORDER BY same_zone_dropoff_share DESC) AS same_zone_retention_penalty_rn,
+        COUNT(same_zone_dropoff_share) OVER (PARTITION BY dow_m, bin_start_min) AS same_zone_retention_penalty_n
       FROM joined
     ),
     normalized AS (
@@ -256,6 +281,11 @@ def build_zone_earnings_shadow_sql(
         median_request_to_pickup_min,
         short_trip_share_3mi_12min,
         shared_ride_share,
+        long_trip_share_20plus,
+        same_zone_dropoff_share,
+        zone_area_sq_miles,
+        pickups_per_sq_mile_now,
+        pickups_per_sq_mile_next,
         downstream_next_value_raw,
         CASE WHEN demand_now_n <= 1 THEN 0.0 ELSE (demand_now_rn - 1) * 1.0 / (demand_now_n - 1) END AS demand_now_n,
         CASE WHEN demand_next_n <= 1 THEN 0.0 ELSE (demand_next_rn - 1) * 1.0 / (demand_next_n - 1) END AS demand_next_n,
@@ -266,6 +296,26 @@ def build_zone_earnings_shadow_sql(
         CASE WHEN short_trip_penalty_n <= 1 THEN 0.0 ELSE (short_trip_penalty_rn - 1) * 1.0 / (short_trip_penalty_n - 1) END AS short_trip_penalty_n,
         CASE WHEN shared_ride_penalty_n <= 1 THEN 0.0 ELSE (shared_ride_penalty_rn - 1) * 1.0 / (shared_ride_penalty_n - 1) END AS shared_ride_penalty_n,
         CASE WHEN downstream_value_n <= 1 THEN 0.0 ELSE (downstream_value_rn - 1) * 1.0 / (downstream_value_n - 1) END AS downstream_value_n,
+        CASE
+          WHEN pickups_per_sq_mile_now IS NULL THEN NULL
+          WHEN demand_density_now_n <= 1 THEN 0.0
+          ELSE (demand_density_now_rn - 1) * 1.0 / (demand_density_now_n - 1)
+        END AS demand_density_now_n,
+        CASE
+          WHEN pickups_per_sq_mile_next IS NULL THEN NULL
+          WHEN demand_density_next_n <= 1 THEN 0.0
+          ELSE (demand_density_next_rn - 1) * 1.0 / (demand_density_next_n - 1)
+        END AS demand_density_next_n,
+        CASE
+          WHEN long_trip_share_20plus IS NULL THEN NULL
+          WHEN long_trip_share_20plus_n <= 1 THEN 0.0
+          ELSE (long_trip_share_20plus_rn - 1) * 1.0 / (long_trip_share_20plus_n - 1)
+        END AS long_trip_share_20plus_n,
+        CASE
+          WHEN same_zone_dropoff_share IS NULL THEN NULL
+          WHEN same_zone_retention_penalty_n <= 1 THEN 0.0
+          ELSE (same_zone_retention_penalty_rn - 1) * 1.0 / (same_zone_retention_penalty_n - 1)
+        END AS same_zone_retention_penalty_n,
         downstream_coverage
       FROM ranked
     ),
@@ -387,6 +437,11 @@ def build_zone_earnings_shadow_sql(
       median_request_to_pickup_min,
       short_trip_share_3mi_12min,
       shared_ride_share,
+      zone_area_sq_miles,
+      pickups_per_sq_mile_now,
+      pickups_per_sq_mile_next,
+      long_trip_share_20plus,
+      same_zone_dropoff_share,
       downstream_next_value_raw,
       demand_now_n,
       demand_next_n,
@@ -397,6 +452,10 @@ def build_zone_earnings_shadow_sql(
       short_trip_penalty_n,
       shared_ride_penalty_n,
       downstream_value_n,
+      demand_density_now_n,
+      demand_density_next_n,
+      long_trip_share_20plus_n,
+      same_zone_retention_penalty_n,
       earnings_shadow_score_citywide_v2,
       earnings_shadow_confidence_citywide_v2,
       CAST(ROUND(1 + 99 * earnings_shadow_score_citywide_v2) AS INTEGER) AS earnings_shadow_rating_citywide_v2,

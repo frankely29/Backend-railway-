@@ -1,5 +1,14 @@
 # ACTIVE ARCHITECTURE
 
+## Current pass: Phase 1 density + trip-quality shadow metrics
+- Added backend geometry helper `zone_geometry_metrics.py` to compute Taxi Zone polygon area (square miles) from `taxi_zones.geojson` during hotspot builds.
+- `build_hotspot.py` now registers temporary DuckDB table `zone_geometry_metrics` and emits additional shadow-only frame properties:
+  - zone-size density raw/normalized fields
+  - 20+ minute trip-share raw/normalized fields
+  - same-zone retention raw/normalized penalty fields
+- `zone_earnings_engine.py` now joins zone geometry area and outputs these added metrics per pickup zone x dow x 20-minute bin in shadow form.
+- Visible map scores/buckets/colors remain unchanged in this phase.
+
 ## App shape
 - `main.py` owns the FastAPI app, core auth/profile/presence/events routes, startup schema initialization, and compatibility endpoints.
 - `chat.py` is mounted under `/chat` and owns public room chat, DM routes, voice note routes, summary routes, and additive SSE routes.
