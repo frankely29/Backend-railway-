@@ -19,6 +19,9 @@ from admin_test_service import (
     test_backend_status,
     test_frame_current,
     test_me,
+    test_score_frame_integrity,
+    test_score_manifest,
+    test_score_sql_definitions,
     test_pickup_reports,
     test_pickup_overlay_endpoint,
     test_presence_endpoint,
@@ -28,6 +31,7 @@ from admin_test_service import (
     test_timeline,
     test_trips_recent,
     test_trips_summary,
+    test_zone_geometry_metrics,
 )
 
 router = APIRouter(prefix="/admin/tests", tags=["admin-tests"])
@@ -49,6 +53,30 @@ def admin_test_timeline(admin: sqlite3.Row = Depends(require_admin_user)):
 def admin_test_frame_current(admin: sqlite3.Row = Depends(require_admin_user)):
     _ = admin
     return test_frame_current()
+
+
+@router.get("/score-manifest", response_model=AdminDiagnosticResponse)
+def admin_test_score_manifest(admin: sqlite3.Row = Depends(require_admin_user)):
+    _ = admin
+    return test_score_manifest()
+
+
+@router.get("/score-sql-definitions", response_model=AdminDiagnosticResponse)
+def admin_test_score_sql_definitions(admin: sqlite3.Row = Depends(require_admin_user)):
+    _ = admin
+    return test_score_sql_definitions()
+
+
+@router.get("/zone-geometry-metrics", response_model=AdminDiagnosticResponse)
+def admin_test_zone_geometry_metrics(admin: sqlite3.Row = Depends(require_admin_user)):
+    _ = admin
+    return test_zone_geometry_metrics()
+
+
+@router.get("/score-frame-integrity", response_model=AdminDiagnosticResponse)
+def admin_test_score_frame_integrity(admin: sqlite3.Row = Depends(require_admin_user)):
+    _ = admin
+    return test_score_frame_integrity()
 
 
 @router.get("/admin-auth", response_model=AdminDiagnosticResponse)
