@@ -88,8 +88,15 @@ def build_zone_earnings_shadow_sql(
         {shared_expr} AS shared_flag
       FROM read_parquet([{parquet_sql}])
       WHERE PULocationID IS NOT NULL
-        AND CAST(PULocationID AS INTEGER) NOT IN (1, 132, 138)
-        AND (DOLocationID IS NULL OR CAST(DOLocationID AS INTEGER) NOT IN (1, 132, 138))
+        AND CAST(PULocationID AS INTEGER) IN (
+          SELECT PULocationID FROM zone_metadata WHERE airport_excluded = FALSE
+        )
+        AND (
+          DOLocationID IS NULL
+          OR CAST(DOLocationID AS INTEGER) IN (
+            SELECT PULocationID FROM zone_metadata WHERE airport_excluded = FALSE
+          )
+        )
         AND pickup_datetime IS NOT NULL
         AND driver_pay IS NOT NULL
     ),
@@ -187,6 +194,9 @@ def build_zone_earnings_shadow_sql(
         COUNT(*) AS edge_trips
       FROM binned
       WHERE DOLocationID IS NOT NULL
+        AND DOLocationID IN (
+          SELECT PULocationID FROM zone_metadata WHERE airport_excluded = FALSE
+        )
       GROUP BY 1,2,3,4
     ),
     dest_edges_norm AS (
@@ -335,6 +345,24 @@ def build_zone_earnings_shadow_sql(
         downstream_coverage
       FROM ranked
     ),
+    normalized_support AS (
+      SELECT
+        *,
+        GREATEST(demand_now_n, demand_next_n) AS demand_support_n,
+        LEAST(
+          GREATEST((0.20 + 0.80 * GREATEST(demand_now_n, demand_next_n)), 0.0),
+          1.0
+        ) AS density_support_n,
+        COALESCE(demand_density_now_n, demand_now_n) * LEAST(
+          GREATEST((0.20 + 0.80 * GREATEST(demand_now_n, demand_next_n)), 0.0),
+          1.0
+        ) AS effective_demand_density_now_n,
+        COALESCE(demand_density_next_n, demand_next_n) * LEAST(
+          GREATEST((0.20 + 0.80 * GREATEST(demand_now_n, demand_next_n)), 0.0),
+          1.0
+        ) AS effective_demand_density_next_n
+      FROM normalized
+    ),
     scored AS (
       SELECT
         *,
@@ -419,8 +447,8 @@ def build_zone_earnings_shadow_sql(
         (
           {c3w.demand_now_weight:.8f} * demand_now_n +
           {c3w.demand_next_weight:.8f} * demand_next_n +
-          {c3w.demand_density_now_weight:.8f} * COALESCE(demand_density_now_n, demand_now_n) +
-          {c3w.demand_density_next_weight:.8f} * COALESCE(demand_density_next_n, demand_next_n) +
+          {c3w.demand_density_now_weight:.8f} * effective_demand_density_now_n +
+          {c3w.demand_density_next_weight:.8f} * effective_demand_density_next_n +
           {c3w.pay_weight:.8f} * pay_n +
           {c3w.pay_per_min_weight:.8f} * pay_per_min_n +
           {c3w.pay_per_mile_weight:.8f} * pay_per_mile_n +
@@ -436,8 +464,8 @@ def build_zone_earnings_shadow_sql(
         (
           {mw3.demand_now_weight:.8f} * demand_now_n +
           {mw3.demand_next_weight:.8f} * demand_next_n +
-          {mw3.demand_density_now_weight:.8f} * COALESCE(demand_density_now_n, demand_now_n) +
-          {mw3.demand_density_next_weight:.8f} * COALESCE(demand_density_next_n, demand_next_n) +
+          {mw3.demand_density_now_weight:.8f} * effective_demand_density_now_n +
+          {mw3.demand_density_next_weight:.8f} * effective_demand_density_next_n +
           {mw3.pay_weight:.8f} * pay_n +
           {mw3.pay_per_min_weight:.8f} * pay_per_min_n +
           {mw3.pay_per_mile_weight:.8f} * pay_per_mile_n +
@@ -453,8 +481,8 @@ def build_zone_earnings_shadow_sql(
         (
           {bw3.demand_now_weight:.8f} * demand_now_n +
           {bw3.demand_next_weight:.8f} * demand_next_n +
-          {bw3.demand_density_now_weight:.8f} * COALESCE(demand_density_now_n, demand_now_n) +
-          {bw3.demand_density_next_weight:.8f} * COALESCE(demand_density_next_n, demand_next_n) +
+          {bw3.demand_density_now_weight:.8f} * effective_demand_density_now_n +
+          {bw3.demand_density_next_weight:.8f} * effective_demand_density_next_n +
           {bw3.pay_weight:.8f} * pay_n +
           {bw3.pay_per_min_weight:.8f} * pay_per_min_n +
           {bw3.pay_per_mile_weight:.8f} * pay_per_mile_n +
@@ -470,8 +498,8 @@ def build_zone_earnings_shadow_sql(
         (
           {qw3.demand_now_weight:.8f} * demand_now_n +
           {qw3.demand_next_weight:.8f} * demand_next_n +
-          {qw3.demand_density_now_weight:.8f} * COALESCE(demand_density_now_n, demand_now_n) +
-          {qw3.demand_density_next_weight:.8f} * COALESCE(demand_density_next_n, demand_next_n) +
+          {qw3.demand_density_now_weight:.8f} * effective_demand_density_now_n +
+          {qw3.demand_density_next_weight:.8f} * effective_demand_density_next_n +
           {qw3.pay_weight:.8f} * pay_n +
           {qw3.pay_per_min_weight:.8f} * pay_per_min_n +
           {qw3.pay_per_mile_weight:.8f} * pay_per_mile_n +
@@ -487,8 +515,8 @@ def build_zone_earnings_shadow_sql(
         (
           {bkw3.demand_now_weight:.8f} * demand_now_n +
           {bkw3.demand_next_weight:.8f} * demand_next_n +
-          {bkw3.demand_density_now_weight:.8f} * COALESCE(demand_density_now_n, demand_now_n) +
-          {bkw3.demand_density_next_weight:.8f} * COALESCE(demand_density_next_n, demand_next_n) +
+          {bkw3.demand_density_now_weight:.8f} * effective_demand_density_now_n +
+          {bkw3.demand_density_next_weight:.8f} * effective_demand_density_next_n +
           {bkw3.pay_weight:.8f} * pay_n +
           {bkw3.pay_per_min_weight:.8f} * pay_per_min_n +
           {bkw3.pay_per_mile_weight:.8f} * pay_per_mile_n +
@@ -504,8 +532,8 @@ def build_zone_earnings_shadow_sql(
         (
           {sw3.demand_now_weight:.8f} * demand_now_n +
           {sw3.demand_next_weight:.8f} * demand_next_n +
-          {sw3.demand_density_now_weight:.8f} * COALESCE(demand_density_now_n, demand_now_n) +
-          {sw3.demand_density_next_weight:.8f} * COALESCE(demand_density_next_n, demand_next_n) +
+          {sw3.demand_density_now_weight:.8f} * effective_demand_density_now_n +
+          {sw3.demand_density_next_weight:.8f} * effective_demand_density_next_n +
           {sw3.pay_weight:.8f} * pay_n +
           {sw3.pay_per_min_weight:.8f} * pay_per_min_n +
           {sw3.pay_per_mile_weight:.8f} * pay_per_mile_n +
@@ -519,7 +547,7 @@ def build_zone_earnings_shadow_sql(
           {sw3.shared_ride_penalty_weight:.8f} * shared_ride_penalty_n
         ) AS negative_score_staten_island_v3,
         LEAST(1.0, pickups_now / 40.0) * (0.70 + 0.30 * downstream_coverage) AS earnings_shadow_confidence_citywide_v2
-      FROM normalized
+      FROM normalized_support
     ),
     final AS (
       SELECT
@@ -590,6 +618,10 @@ def build_zone_earnings_shadow_sql(
       downstream_value_n,
       demand_density_now_n,
       demand_density_next_n,
+      demand_support_n AS demand_support_n_shadow,
+      density_support_n AS density_support_n_shadow,
+      effective_demand_density_now_n AS effective_demand_density_now_n_shadow,
+      effective_demand_density_next_n AS effective_demand_density_next_n_shadow,
       long_trip_share_20plus_n,
       same_zone_retention_penalty_n,
       positive_score_citywide_v3 AS earnings_shadow_positive_citywide_v3,

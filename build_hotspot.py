@@ -212,7 +212,52 @@ def _recalibrate_visible_v3_fields(features: List[Dict[str, Any]]) -> None:
         else:
             props["airport_excluded"] = False
 
+    citywide_rank_field = V3_PROFILE_CONFIG["citywide_v3"]["score"]
+    citywide_conf_field = V3_PROFILE_CONFIG["citywide_v3"]["confidence"]
+    for feature in features:
+        props = feature.get("properties") or {}
+        if not _is_airport_props(props):
+            props["earnings_shadow_visible_rank_citywide_v3"] = None
+            props["earnings_shadow_visible_score_citywide_v3"] = None
+
+    citywide_rated = [
+        feature for feature in features
+        if _eligible_for_profile("citywide_v3", feature.get("properties") or {}, feature.get("geometry"))
+        and (feature.get("properties") or {}).get("earnings_shadow_score_citywide_v3") is not None
+    ]
+    citywide_anchor_by_location: Dict[int, float] = {}
+    ranked_citywide = sorted(
+        citywide_rated,
+        key=lambda f: (
+            float((f.get("properties") or {}).get(citywide_rank_field) or 0.0),
+            float((f.get("properties") or {}).get(citywide_conf_field) or 0.0),
+            int((f.get("properties") or {}).get("LocationID") or 0),
+        ),
+    )
+    n_city = len(ranked_citywide)
+    for idx, feature in enumerate(ranked_citywide):
+        props = feature.get("properties") or {}
+        location_id = int(props.get("LocationID") or 0)
+        citywide_local_rank = 0.0 if n_city <= 1 else (idx / (n_city - 1))
+        citywide_raw_score = _clamp01(float(props.get("earnings_shadow_score_citywide_v3") or 0.0))
+        citywide_conf = _clamp01(float(props.get("earnings_shadow_confidence_citywide_v3") or 0.0))
+        citywide_anchor_norm = _clamp01(
+            0.66 * citywide_local_rank +
+            0.24 * citywide_raw_score +
+            0.10 * citywide_conf
+        )
+        visible_rating = int(round(1 + 99 * citywide_anchor_norm))
+        visible_bucket, visible_color = bucket_and_color_from_rating(visible_rating)
+        props["earnings_shadow_visible_rank_citywide_v3"] = float(citywide_local_rank)
+        props["earnings_shadow_visible_score_citywide_v3"] = float(citywide_anchor_norm)
+        props["earnings_shadow_rating_citywide_v3"] = visible_rating
+        props["earnings_shadow_bucket_citywide_v3"] = visible_bucket
+        props["earnings_shadow_color_citywide_v3"] = visible_color
+        citywide_anchor_by_location[location_id] = float(citywide_anchor_norm)
+
     for profile_name, profile_fields in V3_PROFILE_CONFIG.items():
+        if profile_name == "citywide_v3":
+            continue
         score_field = profile_fields["score"]
         confidence_field = profile_fields["confidence"]
         for feature in features:
@@ -220,14 +265,12 @@ def _recalibrate_visible_v3_fields(features: List[Dict[str, Any]]) -> None:
             if not _is_airport_props(props):
                 props[f"earnings_shadow_visible_rank_{profile_name}"] = None
                 props[f"earnings_shadow_visible_score_{profile_name}"] = None
+
         rated_features = [
             feature for feature in features
             if _eligible_for_profile(profile_name, feature.get("properties") or {}, feature.get("geometry"))
             and (feature.get("properties") or {}).get(score_field) is not None
         ]
-        if not rated_features:
-            continue
-
         ranked = sorted(
             rated_features,
             key=lambda f: (
@@ -239,14 +282,21 @@ def _recalibrate_visible_v3_fields(features: List[Dict[str, Any]]) -> None:
         n = len(ranked)
         for idx, feature in enumerate(ranked):
             props = feature.get("properties") or {}
-            raw_score = _clamp01(float(props.get(score_field) or 0.0))
-            confidence = _clamp01(float(props.get(confidence_field) or 0.0))
-            local_percent_rank = raw_score if n <= 1 else (idx / (n - 1))
-            visible_norm = _clamp01(0.64 * local_percent_rank + 0.24 * raw_score + 0.12 * confidence)
+            location_id = int(props.get("LocationID") or 0)
+            citywide_anchor_norm = _clamp01(citywide_anchor_by_location.get(location_id, 0.0))
+            profile_local_rank = 0.0 if n <= 1 else (idx / (n - 1))
+            profile_raw_score = _clamp01(float(props.get(score_field) or 0.0))
+            profile_conf = _clamp01(float(props.get(confidence_field) or 0.0))
+            visible_norm = _clamp01(
+                0.60 * citywide_anchor_norm +
+                0.25 * profile_local_rank +
+                0.10 * profile_raw_score +
+                0.05 * profile_conf
+            )
             visible_rating = int(round(1 + 99 * visible_norm))
             visible_bucket, visible_color = bucket_and_color_from_rating(visible_rating)
 
-            props[f"earnings_shadow_visible_rank_{profile_name}"] = float(local_percent_rank)
+            props[f"earnings_shadow_visible_rank_{profile_name}"] = float(profile_local_rank)
             props[f"earnings_shadow_visible_score_{profile_name}"] = float(visible_norm)
             props[f"earnings_shadow_rating_{profile_name}"] = visible_rating
             props[f"earnings_shadow_bucket_{profile_name}"] = visible_bucket
@@ -564,6 +614,10 @@ def build_hotspots_frames(
             downstream_value_n,
             demand_density_now_n,
             demand_density_next_n,
+            demand_support_n_shadow,
+            density_support_n_shadow,
+            effective_demand_density_now_n_shadow,
+            effective_demand_density_next_n_shadow,
             long_trip_share_20plus_n,
             same_zone_retention_penalty_n,
             earnings_shadow_positive_citywide_v3,
@@ -668,6 +722,10 @@ def build_hotspots_frames(
             "downstream_value_n_shadow": None if downstream_value_n is None else float(downstream_value_n),
             "demand_density_now_n_shadow": None if demand_density_now_n is None else float(demand_density_now_n),
             "demand_density_next_n_shadow": None if demand_density_next_n is None else float(demand_density_next_n),
+            "demand_support_n_shadow": None if demand_support_n_shadow is None else float(demand_support_n_shadow),
+            "density_support_n_shadow": None if density_support_n_shadow is None else float(density_support_n_shadow),
+            "effective_demand_density_now_n_shadow": None if effective_demand_density_now_n_shadow is None else float(effective_demand_density_now_n_shadow),
+            "effective_demand_density_next_n_shadow": None if effective_demand_density_next_n_shadow is None else float(effective_demand_density_next_n_shadow),
             "long_trip_share_20plus_n_shadow": None if long_trip_share_20plus_n is None else float(long_trip_share_20plus_n),
             "same_zone_retention_penalty_n_shadow": None if same_zone_retention_penalty_n is None else float(same_zone_retention_penalty_n),
             "earnings_shadow_positive_citywide_v3": None if earnings_shadow_positive_citywide_v3 is None else float(earnings_shadow_positive_citywide_v3),
@@ -846,6 +904,10 @@ def build_hotspots_frames(
                     "downstream_value_n_shadow": shadow_props.get("downstream_value_n_shadow"),
                     "demand_density_now_n_shadow": shadow_props.get("demand_density_now_n_shadow"),
                     "demand_density_next_n_shadow": shadow_props.get("demand_density_next_n_shadow"),
+                    "demand_support_n_shadow": shadow_props.get("demand_support_n_shadow"),
+                    "density_support_n_shadow": shadow_props.get("density_support_n_shadow"),
+                    "effective_demand_density_now_n_shadow": shadow_props.get("effective_demand_density_now_n_shadow"),
+                    "effective_demand_density_next_n_shadow": shadow_props.get("effective_demand_density_next_n_shadow"),
                     "long_trip_share_20plus_n_shadow": shadow_props.get("long_trip_share_20plus_n_shadow"),
                     "same_zone_retention_penalty_n_shadow": shadow_props.get("same_zone_retention_penalty_n_shadow"),
                     "earnings_shadow_positive_citywide_v3": shadow_props.get("earnings_shadow_positive_citywide_v3"),
@@ -1021,6 +1083,10 @@ def build_hotspots_frames(
                     "downstream_value_n_shadow",
                     "demand_density_now_n_shadow",
                     "demand_density_next_n_shadow",
+                    "demand_support_n_shadow",
+                    "density_support_n_shadow",
+                    "effective_demand_density_now_n_shadow",
+                    "effective_demand_density_next_n_shadow",
                     "long_trip_share_20plus_n_shadow",
                     "same_zone_retention_penalty_n_shadow",
                     "earnings_shadow_positive_citywide_v3",
