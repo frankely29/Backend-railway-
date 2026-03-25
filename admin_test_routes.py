@@ -108,6 +108,35 @@ def admin_test_rebuild_artifacts(admin: sqlite3.Row = Depends(require_admin_user
     }
 
 
+@router.post("/force-rebuild-artifacts", response_model=AdminDiagnosticResponse)
+def admin_test_force_rebuild_artifacts(admin: sqlite3.Row = Depends(require_admin_user)):
+    _ = admin
+    from main import (
+        DEFAULT_BIN_MINUTES,
+        DEFAULT_MIN_TRIPS_PER_WINDOW,
+        _clear_lock,
+        _lock_is_present,
+        start_generate,
+    )
+
+    lock_cleared = False
+    if _lock_is_present():
+        _clear_lock()
+        lock_cleared = True
+
+    generate_state = start_generate(DEFAULT_BIN_MINUTES, DEFAULT_MIN_TRIPS_PER_WINDOW)
+    return {
+        "ok": True,
+        "test_name": "force-rebuild-artifacts",
+        "checked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "summary": "Force artifact regeneration requested.",
+        "details": {
+            "lock_cleared": lock_cleared,
+            "generate_state": generate_state,
+        },
+    }
+
+
 @router.get("/admin-auth", response_model=AdminDiagnosticResponse)
 def admin_test_admin_auth(admin: sqlite3.Row = Depends(require_admin_user)):
     return test_admin_auth(admin)

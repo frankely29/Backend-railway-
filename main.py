@@ -152,6 +152,7 @@ _to_4326 = Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
 # In-memory job state (hotspot generate)
 # =========================================================
 _state_lock = threading.Lock()
+_generate_thread: Optional[threading.Thread] = None
 _generate_state: Dict[str, Any] = {
     "state": "idle",  # idle | started | running | done | error
     "bin_minutes": None,
@@ -834,6 +835,54 @@ def _lock_is_present() -> bool:
     return LOCK_PATH.exists()
 
 
+def _read_lock_timestamp() -> int | None:
+    try:
+        raw = LOCK_PATH.read_text(encoding="utf-8").strip()
+    except Exception:
+        return None
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except Exception:
+        return None
+
+
+def _lock_age_seconds() -> int | None:
+    ts = _read_lock_timestamp()
+    if ts is None:
+        return None
+    try:
+        return max(0, int(time.time()) - int(ts))
+    except Exception:
+        return None
+
+
+def _clear_stale_lock(max_age_sec: int = 7200) -> bool:
+    if not _lock_is_present():
+        return False
+    age_seconds = _lock_age_seconds()
+    should_clear = age_seconds is None or age_seconds > int(max_age_sec)
+    if not should_clear:
+        return False
+    _clear_lock()
+    return True
+
+
+def _generate_thread_alive() -> bool:
+    return bool(_generate_thread and _generate_thread.is_alive())
+
+
+def _generate_lock_snapshot() -> Dict[str, Any]:
+    state = _get_state().get("state")
+    return {
+        "lock_present": _lock_is_present(),
+        "lock_age_seconds": _lock_age_seconds(),
+        "thread_alive": _generate_thread_alive(),
+        "state": state,
+    }
+
+
 def _set_state(**kwargs):
     with _state_lock:
         _generate_state.update(kwargs)
@@ -911,8 +960,9 @@ def _generate_worker(bin_minutes: int, min_trips_per_window: int) -> None:
 
 
 def start_generate(bin_minutes: int, min_trips_per_window: int) -> Dict[str, Any]:
+    global _generate_thread
     st = _get_state()
-    if st["state"] in ("started", "running"):
+    if st["state"] in ("started", "running") and _generate_thread_alive():
         return {
             "ok": True,
             "state": st["state"],
@@ -921,18 +971,22 @@ def start_generate(bin_minutes: int, min_trips_per_window: int) -> Dict[str, Any
         }
 
     if _lock_is_present():
-        _set_state(state="running", bin_minutes=bin_minutes, min_trips_per_window=min_trips_per_window)
-        return {
-            "ok": True,
-            "state": "running",
-            "bin_minutes": bin_minutes,
-            "min_trips_per_window": min_trips_per_window,
-        }
+        if not _generate_thread_alive():
+            _clear_stale_lock()
+        if _lock_is_present():
+            _set_state(state="running", bin_minutes=bin_minutes, min_trips_per_window=min_trips_per_window)
+            return {
+                "ok": True,
+                "state": "running",
+                "bin_minutes": bin_minutes,
+                "min_trips_per_window": min_trips_per_window,
+            }
 
     _write_lock()
     _set_state(state="started", bin_minutes=bin_minutes, min_trips_per_window=min_trips_per_window)
 
     t = threading.Thread(target=_generate_worker, args=(bin_minutes, min_trips_per_window), daemon=True)
+    _generate_thread = t
     t.start()
 
     return {"ok": True, "state": "started", "bin_minutes": bin_minutes, "min_trips_per_window": min_trips_per_window}
@@ -2278,6 +2332,7 @@ def status():
         "timeline_present": timeline_present,
         "has_timeline": _has_frames(),
         "generate_state": _get_state(),
+        "generate_lock": _generate_lock_snapshot(),
         "artifact_freshness": _artifact_freshness_snapshot(),
         "community_db": os.environ.get("COMMUNITY_DB", str(DATA_DIR / "community.db")),
         "trial_days": TRIAL_DAYS,
