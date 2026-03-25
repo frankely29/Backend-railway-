@@ -2261,13 +2261,22 @@ def root():
 def status():
     parquets = [p.name for p in _list_parquets()]
     zones_path = DATA_DIR / "taxi_zones.geojson"
+    backend_build_id = os.environ.get("BACKEND_BUILD_ID")
+    backend_release = os.environ.get("BACKEND_RELEASE")
+    manifest_path = FRAMES_DIR / "scoring_shadow_manifest.json"
+    timeline_present = TIMELINE_PATH.exists() and TIMELINE_PATH.stat().st_size > 0 if TIMELINE_PATH.exists() else False
+    manifest_present = manifest_path.exists() and manifest_path.stat().st_size > 0 if manifest_path.exists() else False
     return {
         "status": "ok",
         "data_dir": str(DATA_DIR),
         "parquets": parquets,
         "zones_geojson": zones_path.name if zones_path.exists() else None,
         "zones_present": zones_path.exists(),
+        "backend_build_id": backend_build_id if backend_build_id else None,
+        "backend_release": backend_release if backend_release else None,
         "frames_dir": str(FRAMES_DIR),
+        "manifest_present": manifest_present,
+        "timeline_present": timeline_present,
         "has_timeline": _has_frames(),
         "generate_state": _get_state(),
         "artifact_freshness": _artifact_freshness_snapshot(),
