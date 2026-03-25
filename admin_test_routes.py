@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 
 from fastapi import APIRouter, Depends, Response, status
 
@@ -91,6 +92,20 @@ def admin_test_score_frame_integrity(admin: sqlite3.Row = Depends(require_admin_
 def admin_test_generated_artifact_sync(admin: sqlite3.Row = Depends(require_admin_user)):
     _ = admin
     return test_generated_artifact_sync()
+
+
+@router.post("/rebuild-artifacts", response_model=AdminDiagnosticResponse)
+def admin_test_rebuild_artifacts(admin: sqlite3.Row = Depends(require_admin_user)):
+    _ = admin
+    from main import DEFAULT_BIN_MINUTES, DEFAULT_MIN_TRIPS_PER_WINDOW, start_generate
+
+    return {
+        "ok": True,
+        "test_name": "rebuild-artifacts",
+        "checked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "summary": "Artifact regeneration requested.",
+        "details": start_generate(DEFAULT_BIN_MINUTES, DEFAULT_MIN_TRIPS_PER_WINDOW),
+    }
 
 
 @router.get("/admin-auth", response_model=AdminDiagnosticResponse)

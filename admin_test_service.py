@@ -8,6 +8,7 @@ from typing import Any, Dict
 
 from admin_service import get_admin_pickup_logs, get_admin_police_reports, get_admin_summary
 from admin_trips_service import get_admin_recent_trips, get_admin_trips_summary
+from artifact_freshness import evaluate_artifact_freshness
 from core import DB_BACKEND, _db_query_all, _db_query_one
 
 
@@ -35,6 +36,10 @@ def _frames_dir() -> Path:
 
 def _data_dir() -> Path:
     return Path(os.environ.get("DATA_DIR", "/data"))
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parent
 
 
 def test_backend_status() -> Dict[str, Any]:
@@ -331,17 +336,25 @@ def test_score_manifest() -> Dict[str, Any]:
         "staten_island_v3",
     ]
 
-    if not manifest_present:
+    freshness = evaluate_artifact_freshness(
+        repo_root=_repo_root(),
+        data_dir=_data_dir(),
+        frames_dir=frames_dir,
+        bin_minutes=int(os.environ.get("DEFAULT_BIN_MINUTES", "20")),
+        min_trips_per_window=int(os.environ.get("DEFAULT_MIN_TRIPS_PER_WINDOW", "25")),
+    )
+
+    if not manifest_present or not freshness.get("fresh"):
         return _response(
             False,
             "score-manifest",
-            "Scoring manifest does not match the expected v3 rollout.",
+            "Generated artifacts are stale or missing.",
             {
                 "manifest_path": str(manifest_path),
-                "manifest_present": False,
+                "manifest_present": manifest_present,
                 "visible_profiles_live": [],
                 "default_citywide_profile": None,
-                "mismatches": ["manifest missing"],
+                "mismatches": freshness.get("reason_codes") or ["manifest missing"],
             },
         )
 
@@ -640,95 +653,62 @@ def test_score_frame_integrity() -> Dict[str, Any]:
             if share_value is not None and not (0 <= float(share_value) <= 1):
                 violations.append(f"feature {feature_idx}: {share_key} out of range [0,1]")
 
-    ok = bool(sampled_features) and len(violations) == 0
+    freshness = evaluate_artifact_freshness(
+        repo_root=_repo_root(),
+        data_dir=_data_dir(),
+        frames_dir=frames_dir,
+        bin_minutes=int(os.environ.get("DEFAULT_BIN_MINUTES", "20")),
+        min_trips_per_window=int(os.environ.get("DEFAULT_MIN_TRIPS_PER_WINDOW", "25")),
+    )
+    sampled_integrity = freshness.get("sampled_frame_integrity") or {}
+    stale_field_mismatch = (
+        not sampled_integrity.get("frame_has_citywide_v3")
+        or not sampled_integrity.get("frame_has_borough_v3_fields")
+        or not sampled_integrity.get("frame_has_density_fields")
+        or not sampled_integrity.get("frame_has_trap_fields")
+    )
+
+    ok = bool(sampled_features) and len(violations) == 0 and not stale_field_mismatch
     return _response(
         ok,
         "score-frame-integrity",
         "Sampled frame features contain valid v3 score, density, and trap fields."
         if ok
-        else "Sampled frame features contain invalid or missing score fields.",
+        else (
+            "Frames appear older than the deployed scoring code."
+            if stale_field_mismatch
+            else "Sampled frame features contain invalid or missing score fields."
+        ),
         {
             "sampled_frame_indices": sampled_frame_indices,
             "sampled_feature_count": len(sampled_features),
             "violation_count": len(violations),
             "first_violations": violations[:10],
+            "sampled_frame_integrity": sampled_integrity,
         },
     )
 
 def test_generated_artifact_sync() -> Dict[str, Any]:
     frames_dir = _frames_dir()
-    manifest_path = frames_dir / "scoring_shadow_manifest.json"
-    timeline_path = frames_dir / "timeline.json"
-
-    manifest_present = manifest_path.exists() and manifest_path.stat().st_size > 0 if manifest_path.exists() else False
-    timeline_present = timeline_path.exists() and timeline_path.stat().st_size > 0 if timeline_path.exists() else False
-
-    sampled_frame_file = None
-    frame_has_citywide_v3 = False
-    frame_has_borough_v3_fields = False
-
-    if timeline_present:
-        try:
-            timeline_payload = json.loads(timeline_path.read_text(encoding="utf-8"))
-            timeline_items: list[Any] = []
-            if isinstance(timeline_payload, dict) and isinstance(timeline_payload.get("timeline"), list):
-                timeline_items = timeline_payload.get("timeline") or []
-            elif isinstance(timeline_payload, dict) and isinstance(timeline_payload.get("frames"), list):
-                timeline_items = timeline_payload.get("frames") or []
-            elif isinstance(timeline_payload, list):
-                timeline_items = timeline_payload
-
-            if timeline_items:
-                sample_idx = len(timeline_items) - 1
-                frame_path = frames_dir / f"frame_{sample_idx:06d}.json"
-                if frame_path.exists() and frame_path.stat().st_size > 0:
-                    sampled_frame_file = frame_path.name
-                    frame_payload = json.loads(frame_path.read_text(encoding="utf-8"))
-                    features = []
-                    if isinstance(frame_payload, dict):
-                        polygons = frame_payload.get("polygons")
-                        if isinstance(polygons, dict) and isinstance(polygons.get("features"), list):
-                            features = polygons.get("features") or []
-                        elif isinstance(frame_payload.get("features"), list):
-                            features = frame_payload.get("features") or []
-
-                    if features and isinstance(features[0], dict):
-                        props = features[0].get("properties") if isinstance(features[0], dict) else None
-                        if isinstance(props, dict):
-                            frame_has_citywide_v3 = "earnings_shadow_rating_citywide_v3" in props
-                            borough_keys = [
-                                "earnings_shadow_rating_manhattan_v3",
-                                "earnings_shadow_rating_bronx_wash_heights_v3",
-                                "earnings_shadow_rating_queens_v3",
-                                "earnings_shadow_rating_brooklyn_v3",
-                                "earnings_shadow_rating_staten_island_v3",
-                            ]
-                            frame_has_borough_v3_fields = all(key in props for key in borough_keys)
-        except Exception:
-            pass
-
-    ok = manifest_present and timeline_present and frame_has_citywide_v3 and frame_has_borough_v3_fields
-
-    likely_cause = None
-    if not ok:
-        if not manifest_present or not timeline_present:
-            likely_cause = "Generated files are missing from /data/frames."
-        elif not frame_has_citywide_v3 or not frame_has_borough_v3_fields:
-            likely_cause = "Frames were generated before v3 rollout fields were added."
+    freshness = evaluate_artifact_freshness(
+        repo_root=_repo_root(),
+        data_dir=_data_dir(),
+        frames_dir=frames_dir,
+        bin_minutes=int(os.environ.get("DEFAULT_BIN_MINUTES", "20")),
+        min_trips_per_window=int(os.environ.get("DEFAULT_MIN_TRIPS_PER_WINDOW", "25")),
+    )
+    ok = bool(freshness.get("fresh"))
 
     return _response(
         ok,
         "generated-artifact-sync",
-        "Generated frame artifacts match the deployed v3 code."
-        if ok
-        else "Generated frame artifacts are older than the deployed v3 code.",
+        freshness.get("summary") or ("Generated frame artifacts match the deployed v3 code." if ok else "Generated frame artifacts are stale."),
         {
-            "manifest_present": manifest_present,
-            "timeline_present": timeline_present,
-            "sampled_frame_file": sampled_frame_file,
-            "frame_has_citywide_v3": frame_has_citywide_v3,
-            "frame_has_borough_v3_fields": frame_has_borough_v3_fields,
-            "likely_cause": likely_cause,
+            "summary": freshness.get("summary"),
+            "reason_codes": freshness.get("reason_codes") or [],
+            "sampled_frame_integrity": freshness.get("sampled_frame_integrity") or {},
+            "artifact_signature": freshness.get("artifact_signature"),
+            "code_dependency_hash": freshness.get("code_dependency_hash"),
+            "source_data_hash": freshness.get("source_data_hash"),
         },
     )
-
