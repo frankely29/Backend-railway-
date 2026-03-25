@@ -177,6 +177,7 @@ def _recalibrate_visible_v3_fields(features: List[Dict[str, Any]]) -> None:
             rated_features,
             key=lambda f: (
                 float((f.get("properties") or {}).get(score_field) or 0.0),
+                float((f.get("properties") or {}).get(confidence_field) or 0.0),
                 int((f.get("properties") or {}).get("LocationID") or 0),
             ),
         )
@@ -186,7 +187,7 @@ def _recalibrate_visible_v3_fields(features: List[Dict[str, Any]]) -> None:
             raw_score = _clamp01(float(props.get(score_field) or 0.0))
             confidence = _clamp01(float(props.get(confidence_field) or 0.0))
             local_percent_rank = raw_score if n <= 1 else (idx / (n - 1))
-            visible_norm = _clamp01(0.72 * local_percent_rank + 0.18 * raw_score + 0.10 * confidence)
+            visible_norm = _clamp01(0.64 * local_percent_rank + 0.24 * raw_score + 0.12 * confidence)
             visible_rating = int(round(1 + 99 * visible_norm))
             visible_bucket, visible_color = bucket_and_color_from_rating(visible_rating)
 
