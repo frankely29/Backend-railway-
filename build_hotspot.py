@@ -9,6 +9,7 @@ import duckdb
 from zone_earnings_engine import build_zone_earnings_shadow_sql
 from zone_geometry_metrics import build_zone_geometry_metrics_rows
 from zone_mode_profiles import ZONE_MODE_PROFILES
+from artifact_freshness import build_expected_artifact_signature
 
 def ensure_zones_geojson(data_dir: Path, force: bool = False) -> Path:
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -686,9 +687,15 @@ def build_hotspots_frames(
         "staten_island_v3",
     ]
 
-    (out_dir / "scoring_shadow_manifest.json").write_text(
-        json.dumps(
-            {
+    expected_freshness = build_expected_artifact_signature(
+        repo_root=Path(__file__).resolve().parent,
+        data_dir=zones_geojson_path.parent,
+        frames_dir=out_dir,
+        bin_minutes=int(bin_minutes),
+        min_trips_per_window=int(min_trips_per_window),
+    )
+
+    manifest_payload = {
                 "engine_version": "team-joseo-score-v2-final-live",
                 "engine_release": "team-joseo-score-v2-final-live",
                 "source": "HVFHV",
@@ -815,9 +822,17 @@ def build_hotspots_frames(
                     "earnings_shadow_bucket_staten_island_v3",
                     "earnings_shadow_color_staten_island_v3",
                 ],
-            },
-            separators=(",", ":"),
-        ),
+                "artifact_schema_version": expected_freshness.get("artifact_schema_version"),
+                "code_dependency_hash": expected_freshness.get("code_dependency_hash"),
+                "source_data_hash": expected_freshness.get("source_data_hash"),
+                "artifact_signature": expected_freshness.get("artifact_signature"),
+                "dependency_files": expected_freshness.get("code_dependencies", {}).get("dependency_files", []),
+                "parquet_inventory": expected_freshness.get("source_inventory", {}).get("parquet_files", []),
+                "zones_geojson_signature": expected_freshness.get("source_inventory", {}).get("zones_geojson"),
+            }
+
+    (out_dir / "scoring_shadow_manifest.json").write_text(
+        json.dumps(manifest_payload, separators=(",", ":")),
         encoding="utf-8",
     )
 
