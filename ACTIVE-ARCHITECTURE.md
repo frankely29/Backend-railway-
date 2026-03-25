@@ -1,5 +1,13 @@
 # ACTIVE ARCHITECTURE
 
+## Current pass: Phase 7 Queens v3 live visible cutover (backend only)
+- `queens_v3` is now the live visible Queens profile.
+- `queens_v2` remains available for fallback/debug comparison.
+- `citywide_v3` remains the live visible citywide score.
+- `manhattan_v3` remains the live visible Manhattan profile.
+- `bronx_wash_heights_v3` remains the live visible Bronx/Wash Heights profile.
+- Brooklyn / Staten Island visible profiles remain unchanged in Phase 7 (`brooklyn_v2`, `staten_island_v2`).
+
 ## Current pass: Phase 6 Bronx/Wash Heights v3 live visible cutover (backend only)
 - `bronx_wash_heights_v3` is now the live visible Bronx/Wash Heights profile.
 - `bronx_wash_heights_v2` remains available for fallback/debug comparison.

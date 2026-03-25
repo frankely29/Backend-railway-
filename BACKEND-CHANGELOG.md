@@ -1,5 +1,15 @@
 # BACKEND CHANGELOG
 
+## Current pass: Phase 7 Queens v3 live visible cutover (backend)
+
+### Phase 7 rollout-state manifest update
+- Promoted `queens_v3` to the live visible Queens profile in backend manifest metadata.
+- Kept `queens_v2` available for fallback/debug comparison metadata usage.
+- Kept `citywide_v3` as the live visible citywide profile.
+- Kept `manhattan_v3` as the live visible Manhattan profile.
+- Kept `bronx_wash_heights_v3` as the live visible Bronx/Wash Heights profile.
+- Kept Brooklyn / Staten Island visible profiles unchanged in Phase 7 (`brooklyn_v2`, `staten_island_v2`).
+
 ## Current pass: Phase 6 Bronx/Wash Heights v3 live visible cutover (backend)
 
 ### Phase 6 rollout-state manifest update
