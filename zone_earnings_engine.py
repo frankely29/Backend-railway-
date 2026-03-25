@@ -123,7 +123,7 @@ def build_zone_earnings_shadow_sql(
         pay_per_min,
         pay_per_mile,
         request_to_pickup_min,
-        CASE WHEN trip_miles <= 3.0 AND trip_time <= 12.0 THEN 1 ELSE 0 END AS is_short_trip,
+        CASE WHEN trip_miles <= 3.0 AND trip_time <= 720.0 THEN 1 ELSE 0 END AS is_short_trip,
         CASE WHEN shared_flag = 1 THEN 1 ELSE 0 END AS is_shared,
         CASE WHEN trip_time >= 1200 THEN 1 ELSE 0 END AS is_long_trip_20plus,
         CASE WHEN DOLocationID = PULocationID THEN 1 ELSE 0 END AS is_same_zone_dropoff
@@ -278,7 +278,7 @@ def build_zone_earnings_shadow_sql(
         COUNT(pickups_per_sq_mile_next) OVER (PARTITION BY dow_m, bin_start_min) AS demand_density_next_n,
         ROW_NUMBER() OVER (PARTITION BY dow_m, bin_start_min ORDER BY long_trip_share_20plus) AS long_trip_share_20plus_rn,
         COUNT(long_trip_share_20plus) OVER (PARTITION BY dow_m, bin_start_min) AS long_trip_share_20plus_n,
-        ROW_NUMBER() OVER (PARTITION BY dow_m, bin_start_min ORDER BY same_zone_dropoff_share DESC) AS same_zone_retention_penalty_rn,
+        ROW_NUMBER() OVER (PARTITION BY dow_m, bin_start_min ORDER BY same_zone_dropoff_share) AS same_zone_retention_penalty_rn,
         COUNT(same_zone_dropoff_share) OVER (PARTITION BY dow_m, bin_start_min) AS same_zone_retention_penalty_n
       FROM joined
     ),
