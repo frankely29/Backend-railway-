@@ -18,6 +18,7 @@ from admin_test_service import (
     test_admin_auth,
     test_backend_status,
     test_frame_current,
+    test_generated_artifact_sync,
     test_me,
     test_score_frame_integrity,
     test_score_manifest,
@@ -77,6 +78,12 @@ def admin_test_zone_geometry_metrics(admin: sqlite3.Row = Depends(require_admin_
 def admin_test_score_frame_integrity(admin: sqlite3.Row = Depends(require_admin_user)):
     _ = admin
     return test_score_frame_integrity()
+
+
+@router.get("/generated-artifact-sync", response_model=AdminDiagnosticResponse)
+def admin_test_generated_artifact_sync(admin: sqlite3.Row = Depends(require_admin_user)):
+    _ = admin
+    return test_generated_artifact_sync()
 
 
 @router.get("/admin-auth", response_model=AdminDiagnosticResponse)

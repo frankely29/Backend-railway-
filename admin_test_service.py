@@ -12,6 +12,7 @@ from core import DB_BACKEND, _db_query_all, _db_query_one
 from zone_earnings_engine import build_zone_earnings_shadow_sql
 from zone_geometry_metrics import build_zone_geometry_metrics_rows
 from zone_mode_profiles import ZONE_MODE_PROFILES
+from artifact_freshness import evaluate_artifact_freshness
 
 
 def _checked_at() -> str:
@@ -302,7 +303,7 @@ def test_score_manifest() -> Dict[str, Any]:
         return _response(
             False,
             "score-manifest",
-            "Scoring manifest does not match the expected v3 rollout.",
+            "Generated artifacts are stale or missing.",
             {"manifest_path": str(manifest_path), "mismatches": ["Manifest file missing"]},
         )
 
@@ -411,7 +412,7 @@ def test_score_sql_definitions() -> Dict[str, Any]:
         "Score SQL definitions match the intended trap-aware logic."
         if ok
         else "Score SQL definitions do not match the intended trap-aware logic.",
-        checks,
+        {**checks, "freshness_scope": "This test validates code SQL definitions only, not persisted frame freshness."},
     )
 
 
@@ -483,7 +484,7 @@ def test_score_frame_integrity() -> Dict[str, Any]:
         return _response(
             False,
             "score-frame-integrity",
-            "Sampled frame features contain invalid or missing score fields.",
+            "Frames appear older than the deployed scoring code.",
             {
                 "sampled_frame_indices": [],
                 "sampled_feature_count": 0,
@@ -497,7 +498,7 @@ def test_score_frame_integrity() -> Dict[str, Any]:
         return _response(
             False,
             "score-frame-integrity",
-            "Sampled frame features contain invalid or missing score fields.",
+            "Frames appear older than the deployed scoring code.",
             {
                 "sampled_frame_indices": [],
                 "sampled_feature_count": 0,
@@ -519,7 +520,7 @@ def test_score_frame_integrity() -> Dict[str, Any]:
         return _response(
             False,
             "score-frame-integrity",
-            "Sampled frame features contain invalid or missing score fields.",
+            "Frames appear older than the deployed scoring code.",
             {"sampled_frame_indices": [], "sampled_feature_count": 0, "violation_count": 1, "first_violations": ["timeline has no frame entries"]},
         )
 
@@ -621,11 +622,40 @@ def test_score_frame_integrity() -> Dict[str, Any]:
         "score-frame-integrity",
         "Sampled frame features contain valid v3 score, density, and trap fields."
         if ok
-        else "Sampled frame features contain invalid or missing score fields.",
+        else "Frames appear older than the deployed scoring code.",
         {
             "sampled_frame_indices": indices,
             "sampled_feature_count": len(features),
             "violation_count": len(violations),
             "first_violations": violations[:10],
+        },
+    )
+
+
+def test_generated_artifact_sync() -> Dict[str, Any]:
+    frames_dir = _frames_dir()
+    data_dir = _data_dir()
+    report = evaluate_artifact_freshness(
+        repo_root=Path(__file__).resolve().parent,
+        data_dir=data_dir,
+        frames_dir=frames_dir,
+        bin_minutes=int(os.environ.get("DEFAULT_BIN_MINUTES", "20")),
+        min_trips_per_window=int(os.environ.get("DEFAULT_MIN_TRIPS_PER_WINDOW", "25")),
+    )
+    expected = report.get("expected") if isinstance(report, dict) else {}
+    ok = bool(report.get("fresh"))
+    return _response(
+        ok,
+        "generated-artifact-sync",
+        "Generated frame artifacts match deployed code and source data."
+        if ok
+        else "Generated frame artifacts are stale and need regeneration.",
+        {
+            "summary": report.get("summary"),
+            "reason_codes": report.get("reason_codes") or [],
+            "sampled_frame_integrity": report.get("sampled_frame_integrity") or {},
+            "artifact_signature": expected.get("artifact_signature"),
+            "code_dependency_hash": expected.get("code_dependency_hash"),
+            "source_data_hash": expected.get("source_data_hash"),
         },
     )

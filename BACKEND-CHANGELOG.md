@@ -159,3 +159,10 @@
   - Postgres pool wrapper path
   - live capabilities route
   - live-token SSE auth contract
+
+
+## Current pass: Artifact freshness self-healing + auto-regeneration (backend)
+### Freshness + startup regeneration
+- Added backend artifact freshness signatures that combine code dependency hashes, source parquet inventory signatures, zones geometry signature, manifest alignment, and sampled frame field integrity checks.
+- Startup now evaluates freshness and automatically triggers generation when artifacts are stale.
+- Normal operation no longer requires manual deletion of old frame artifacts before rebuilds; stale outputs are overwritten by regeneration.

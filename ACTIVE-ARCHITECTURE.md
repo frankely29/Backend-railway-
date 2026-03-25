@@ -181,3 +181,9 @@ It also anonymizes `recommendation_outcomes.user_id` and deletes avatar thumbs p
 - Backend frame generation still emits all shadow/output profile fields plus `scoring_shadow_manifest.json`, now finalized with explicit production-live manifest semantics.
 - User-facing wording no longer needs to expose legacy/shadow terminology, while debug/audit tooling continues to preserve technical source truth.
 - No score formulas, mode source-selection precedence, presence timing, polling behavior, or real-time presence logic were changed in this phase.
+
+
+## Current pass: Artifact freshness self-healing (backend only)
+- Backend now computes artifact freshness from code dependencies + source parquet inventory + `taxi_zones.geojson` + manifest metadata + sampled generated frames.
+- Startup now auto-regenerates stale frame artifacts when source/code/manifest/frame integrity drift is detected.
+- Manual deletion of frame artifacts is no longer required in normal operation; regeneration overwrites stale outputs.

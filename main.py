@@ -32,6 +32,7 @@ from hotspot_experiments import (
     prune_experiment_tables,
 )
 from hotspot_scoring import score_zones
+from artifact_freshness import evaluate_artifact_freshness
 from avatar_assets import (
     AVATAR_THUMB_MIME,
     avatar_thumb_path,
@@ -295,6 +296,36 @@ def _list_parquets() -> List[Path]:
     if not DATA_DIR.exists():
         return []
     return sorted([p for p in DATA_DIR.glob("*.parquet") if p.is_file()])
+
+
+def _artifact_freshness_snapshot() -> Dict[str, Any]:
+    repo_root = Path(__file__).resolve().parent
+    try:
+        report = evaluate_artifact_freshness(
+            repo_root=repo_root,
+            data_dir=DATA_DIR,
+            frames_dir=FRAMES_DIR,
+            bin_minutes=DEFAULT_BIN_MINUTES,
+            min_trips_per_window=DEFAULT_MIN_TRIPS_PER_WINDOW,
+        )
+        expected = report.get("expected") if isinstance(report, dict) else {}
+        return {
+            "fresh": bool(report.get("fresh")),
+            "summary": report.get("summary") or "Artifact freshness evaluated",
+            "reason_codes": report.get("reason_codes") or [],
+            "artifact_signature": expected.get("artifact_signature"),
+            "code_dependency_hash": expected.get("code_dependency_hash"),
+            "source_data_hash": expected.get("source_data_hash"),
+        }
+    except Exception:
+        return {
+            "fresh": False,
+            "summary": "Freshness evaluation failed",
+            "reason_codes": ["freshness_check_failed"],
+            "artifact_signature": None,
+            "code_dependency_hash": None,
+            "source_data_hash": None,
+        }
 
 
 def _has_frames() -> bool:
@@ -2132,41 +2163,30 @@ def startup():
     except Exception:
         traceback.print_exc()
 
-    # Auto-fill generate state if frames/day tendency already exist
+    # Auto-fill generate state and self-heal stale artifacts/day tendency.
     try:
         frames_ready = _has_frames()
         day_tendency_ready = _day_tendency_model_is_current()
         zones_ok = (DATA_DIR / "taxi_zones.geojson").exists()
         parquets_ok = len(_list_parquets()) > 0
 
-        if frames_ready and day_tendency_ready:
-            try:
-                tl = _read_json(TIMELINE_PATH)
-                _set_state(
-                    state="done",
-                    bin_minutes=DEFAULT_BIN_MINUTES,
-                    min_trips_per_window=DEFAULT_MIN_TRIPS_PER_WINDOW,
-                    result={
-                        "ok": True,
-                        "count": tl.get("count"),
-                        "day_tendency": {"ok": True, "built_at_startup": False},
-                    },
-                )
-            except Exception:
-                _set_state(
-                    state="done",
-                    bin_minutes=DEFAULT_BIN_MINUTES,
-                    min_trips_per_window=DEFAULT_MIN_TRIPS_PER_WINDOW,
-                    result={
-                        "ok": True,
-                        "day_tendency": {"ok": True, "built_at_startup": False},
-                    },
-                )
+        if not zones_ok or not parquets_ok:
+            _set_state(state="idle")
             return
 
-        if frames_ready and not day_tendency_ready:
-            print("[warn] day tendency model missing or stale; rebuilding at startup")
-            if parquets_ok:
+        freshness = evaluate_artifact_freshness(
+            repo_root=Path(__file__).resolve().parent,
+            data_dir=DATA_DIR,
+            frames_dir=FRAMES_DIR,
+            bin_minutes=DEFAULT_BIN_MINUTES,
+            min_trips_per_window=DEFAULT_MIN_TRIPS_PER_WINDOW,
+        )
+        reason_codes = freshness.get("reason_codes") or []
+
+        if frames_ready and freshness.get("fresh"):
+            print(f"[artifact-freshness] fresh reason_codes={reason_codes}")
+            if not day_tendency_ready:
+                print("[warn] day tendency model missing or stale; rebuilding at startup")
                 try:
                     _build_day_tendency_only(DEFAULT_BIN_MINUTES)
                 except Exception:
@@ -2181,7 +2201,7 @@ def startup():
                     result={
                         "ok": True,
                         "count": tl.get("count"),
-                        "day_tendency": {"ok": _has_day_tendency_model(), "built_at_startup": True},
+                        "day_tendency": {"ok": _has_day_tendency_model(), "built_at_startup": not day_tendency_ready},
                     },
                 )
             except Exception:
@@ -2191,15 +2211,13 @@ def startup():
                     min_trips_per_window=DEFAULT_MIN_TRIPS_PER_WINDOW,
                     result={
                         "ok": True,
-                        "day_tendency": {"ok": _has_day_tendency_model(), "built_at_startup": True},
+                        "day_tendency": {"ok": _has_day_tendency_model(), "built_at_startup": not day_tendency_ready},
                     },
                 )
             return
 
-        if zones_ok and parquets_ok:
-            start_generate(DEFAULT_BIN_MINUTES, DEFAULT_MIN_TRIPS_PER_WINDOW)
-        else:
-            _set_state(state="idle")
+        print(f"[artifact-freshness] stale -> regenerating reason_codes={reason_codes}")
+        start_generate(DEFAULT_BIN_MINUTES, DEFAULT_MIN_TRIPS_PER_WINDOW)
     except Exception:
         _set_state(state="idle")
 
@@ -2252,6 +2270,7 @@ def status():
         "frames_dir": str(FRAMES_DIR),
         "has_timeline": _has_frames(),
         "generate_state": _get_state(),
+        "artifact_freshness": _artifact_freshness_snapshot(),
         "community_db": os.environ.get("COMMUNITY_DB", str(DATA_DIR / "community.db")),
         "trial_days": TRIAL_DAYS,
         "trial_enforced": ENFORCE_TRIAL,
