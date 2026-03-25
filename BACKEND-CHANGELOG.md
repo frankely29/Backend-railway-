@@ -1,5 +1,12 @@
 # BACKEND CHANGELOG
 
+## Current pass: Phase 4 borough_v3 shadow candidates (backend)
+
+### Phase 4 shadow candidate rollout
+- Added borough_v3 shadow candidates for Manhattan, Bronx/Wash Heights, Queens, Brooklyn, and Staten Island in backend scoring/profile plumbing.
+- Visible borough scores remain unchanged in Phase 4 (borough v2 profiles stay live for visible outputs).
+- `citywide_v3` remains the live visible citywide score.
+
 ## Current pass: Phase 3 citywide_v3 live visible citywide profile (backend)
 
 ### Phase 3 rollout-state manifest update

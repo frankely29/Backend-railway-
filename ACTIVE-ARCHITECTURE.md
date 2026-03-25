@@ -1,5 +1,10 @@
 # ACTIVE ARCHITECTURE
 
+## Current pass: Phase 4 borough_v3 shadow candidates (backend only)
+- Added borough-specific `*_v3` shadow candidates for Manhattan, Bronx/Wash Heights, Queens, Brooklyn, and Staten Island.
+- Visible borough profiles remain unchanged in Phase 4 (`manhattan_v2`, `bronx_wash_heights_v2`, `queens_v2`, `brooklyn_v2`, `staten_island_v2`).
+- `citywide_v3` remains the live visible citywide score.
+
 ## Current pass: Phase 3 citywide_v3 citywide visible cutover
 - `citywide_v3` is now the live visible citywide profile in backend rollout metadata.
 - `citywide_v2` remains retained and available for comparison/debug in manifest metadata.
