@@ -680,7 +680,7 @@ def build_hotspots_frames(
     visible_profiles_live = [
         "citywide_v3",
         "manhattan_v3",
-        "bronx_wash_heights_v2",
+        "bronx_wash_heights_v3",
         "queens_v2",
         "brooklyn_v2",
         "staten_island_v2",
@@ -726,6 +726,7 @@ def build_hotspots_frames(
                     "Phase 3 promotes citywide_v3 to the live visible citywide score while borough profiles remain on v2.",
                     "Phase 4 adds borough_v3 shadow candidates that blend density, long-trip quality, pay quality, downstream value, and local trap penalties without changing visible borough scores yet.",
                     "Phase 5 promotes manhattan_v3 to the live visible Manhattan score while other borough visible profiles remain unchanged.",
+                    "Phase 6 promotes bronx_wash_heights_v3 to the live visible Bronx/Wash Heights score while Queens, Brooklyn, and Staten Island remain on v2 visible profiles.",
                 ],
                 "shadow_fields": [
                     "next_pickups_shadow",
