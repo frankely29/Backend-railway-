@@ -1,5 +1,12 @@
 # BACKEND CHANGELOG
 
+## Current pass: Phase 2 citywide_v3 shadow candidate (backend)
+
+### Phase 2 shadow score rollout
+- Added `citywide_v3` shadow score support across the backend hotspot shadow pipeline.
+- `citywide_v3` blends raw demand, demand density, long-trip share, pay quality, downstream value, and trap penalties.
+- Visible scores/colors remain unchanged in Phase 2 (shadow-only additive output, no live cutover).
+
 ## Current pass: Phase 1 density + trip-quality shadow metrics (backend)
 
 ### Phase 1 shadow metric inputs

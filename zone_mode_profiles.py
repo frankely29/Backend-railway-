@@ -6,15 +6,19 @@ from typing import Dict
 
 @dataclass(frozen=True)
 class ZoneScoreProfileWeights:
-    demand_now_weight: float
-    demand_next_weight: float
-    pay_weight: float
-    pay_per_min_weight: float
-    pay_per_mile_weight: float
-    downstream_weight: float
-    short_trip_penalty_weight: float
-    pickup_friction_penalty_weight: float
-    shared_ride_penalty_weight: float
+    demand_now_weight: float = 0.0
+    demand_next_weight: float = 0.0
+    demand_density_now_weight: float = 0.0
+    demand_density_next_weight: float = 0.0
+    pay_weight: float = 0.0
+    pay_per_min_weight: float = 0.0
+    pay_per_mile_weight: float = 0.0
+    long_trip_share_20plus_weight: float = 0.0
+    downstream_weight: float = 0.0
+    short_trip_penalty_weight: float = 0.0
+    same_zone_retention_penalty_weight: float = 0.0
+    pickup_friction_penalty_weight: float = 0.0
+    shared_ride_penalty_weight: float = 0.0
 
 
 ZONE_MODE_PROFILES: Dict[str, ZoneScoreProfileWeights] = {
@@ -28,6 +32,21 @@ ZONE_MODE_PROFILES: Dict[str, ZoneScoreProfileWeights] = {
         short_trip_penalty_weight=0.04,
         pickup_friction_penalty_weight=0.03,
         shared_ride_penalty_weight=0.01,
+    ),
+    "citywide_v3": ZoneScoreProfileWeights(
+        demand_now_weight=0.12,
+        demand_next_weight=0.12,
+        demand_density_now_weight=0.14,
+        demand_density_next_weight=0.10,
+        pay_weight=0.08,
+        pay_per_min_weight=0.14,
+        pay_per_mile_weight=0.05,
+        long_trip_share_20plus_weight=0.14,
+        downstream_weight=0.11,
+        short_trip_penalty_weight=0.10,
+        same_zone_retention_penalty_weight=0.12,
+        pickup_friction_penalty_weight=0.05,
+        shared_ride_penalty_weight=0.03,
     ),
     "manhattan_v2": ZoneScoreProfileWeights(
         demand_now_weight=0.14,
