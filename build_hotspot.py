@@ -682,7 +682,7 @@ def build_hotspots_frames(
         "manhattan_v3",
         "bronx_wash_heights_v3",
         "queens_v3",
-        "brooklyn_v2",
+        "brooklyn_v3",
         "staten_island_v2",
     ]
 
@@ -700,10 +700,6 @@ def build_hotspots_frames(
                 "active_shadow_profiles": live_shadow_profiles,
                 "visible_profiles_live": visible_profiles_live,
                 "candidate_shadow_profiles": [
-                    "manhattan_v3",
-                    "bronx_wash_heights_v3",
-                    "queens_v3",
-                    "brooklyn_v3",
                     "staten_island_v3",
                 ],
                 "comparison_profiles": [
@@ -728,6 +724,7 @@ def build_hotspots_frames(
                     "Phase 5 promotes manhattan_v3 to the live visible Manhattan score while other borough visible profiles remain unchanged.",
                     "Phase 6 promotes bronx_wash_heights_v3 to the live visible Bronx/Wash Heights score while Queens, Brooklyn, and Staten Island remain on v2 visible profiles.",
                     "Phase 7 promotes queens_v3 to the live visible Queens score while Brooklyn and Staten Island remain on v2 visible profiles.",
+                    "Phase 8 promotes brooklyn_v3 to the live visible Brooklyn score while Staten Island remains on the v2 visible profile.",
                 ],
                 "shadow_fields": [
                     "next_pickups_shadow",
