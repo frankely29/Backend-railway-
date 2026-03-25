@@ -4,7 +4,10 @@ from pathlib import Path
 from typing import List, Dict, Any, Tuple
 from datetime import datetime, timedelta
 import json
+import os
 import shutil
+import tempfile
+import zipfile
 import duckdb
 
 from zone_earnings_engine import build_zone_earnings_shadow_sql
@@ -17,6 +20,17 @@ def ensure_zones_geojson(data_dir: Path, force: bool = False) -> Path:
     geojson_path = data_dir / "taxi_zones.geojson"
     if geojson_path.exists() and geojson_path.stat().st_size > 0 and not force:
         return geojson_path
+    zip_path = data_dir / "taxi_zones.zip"
+    if zip_path.exists() and zip_path.is_file():
+        try:
+            with zipfile.ZipFile(zip_path, "r") as archive:
+                if "taxi_zones.geojson" in archive.namelist():
+                    with archive.open("taxi_zones.geojson", "r") as src, geojson_path.open("wb") as dst:
+                        shutil.copyfileobj(src, dst)
+                    if geojson_path.exists() and geojson_path.stat().st_size > 0:
+                        return geojson_path
+        except Exception:
+            pass
     raise RuntimeError("Missing /data/taxi_zones.geojson. Upload it via POST /upload_zones_geojson.")
 
 
@@ -69,10 +83,14 @@ def build_hotspots_frames(
         so airports cannot compress baseline scores either.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
-    stage_dir = out_dir.parent / f"{out_dir.name}.__building__"
-    if stage_dir.exists():
-        shutil.rmtree(stage_dir, ignore_errors=True)
+    temp_root = Path(os.environ.get("ARTIFACT_BUILD_TMP_DIR", "/tmp/tlc_artifact_build"))
+    temp_root.mkdir(parents=True, exist_ok=True)
+    temp_run_dir_ctx = tempfile.TemporaryDirectory(prefix="build_", dir=str(temp_root))
+    temp_run_dir = Path(temp_run_dir_ctx.name)
+    stage_dir = temp_run_dir / "frames.__building__"
+    duckdb_tmp_dir = temp_run_dir / "duckdb_tmp"
     stage_dir.mkdir(parents=True, exist_ok=True)
+    duckdb_tmp_dir.mkdir(parents=True, exist_ok=True)
 
     # ----------------------------
     # Load zone geometry + names
@@ -109,12 +127,9 @@ def build_hotspots_frames(
     # ----------------------------
     # DuckDB (spill to volume)
     # ----------------------------
-    tmp_dir = out_dir.parent / "duckdb_tmp"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-
     con = duckdb.connect(database=":memory:")
     con.execute("PRAGMA enable_progress_bar=false")
-    con.execute(f"PRAGMA temp_directory='{tmp_dir.as_posix()}'")
+    con.execute(f"PRAGMA temp_directory='{duckdb_tmp_dir.as_posix()}'")
 
     parquet_list = [str(p) for p in parquet_files]
     parquet_sql = ", ".join("'" + p.replace("'", "''") + "'" for p in parquet_list)
@@ -840,6 +855,12 @@ def build_hotspots_frames(
         json.dumps(manifest_payload, separators=(",", ":")),
         encoding="utf-8",
     )
+    staged_timeline = stage_dir / "timeline.json"
+    staged_manifest = stage_dir / "scoring_shadow_manifest.json"
+    staged_frames = sorted(stage_dir.glob("frame_*.json"))
+    if not staged_timeline.exists() or not staged_manifest.exists() or not staged_frames:
+        raise RuntimeError("Staged artifact build did not produce required files.")
+
     for generated in out_dir.glob("frame_*.json"):
         try:
             generated.unlink()
@@ -855,6 +876,10 @@ def build_hotspots_frames(
     for built_file in stage_dir.iterdir():
         if built_file.is_file():
             shutil.move(str(built_file), str(out_dir / built_file.name))
-    shutil.rmtree(stage_dir, ignore_errors=True)
+    try:
+        con.close()
+    except Exception:
+        pass
+    temp_run_dir_ctx.cleanup()
 
     return {"ok": True, "count": len(timeline), "frames_dir": str(out_dir), "rows": total_rows}
