@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import List, Dict, Any, Tuple
 from datetime import datetime, timedelta
 import json
+import shutil
 import duckdb
 
 from zone_earnings_engine import build_zone_earnings_shadow_sql
@@ -68,20 +69,10 @@ def build_hotspots_frames(
         so airports cannot compress baseline scores either.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
-
-    # Remove previously generated frame artifacts so stale files cannot survive rebuilds.
-    for generated in out_dir.glob("frame_*.json"):
-        try:
-            generated.unlink()
-        except Exception:
-            pass
-    for generated_name in ("timeline.json", "scoring_shadow_manifest.json"):
-        generated_path = out_dir / generated_name
-        try:
-            if generated_path.exists() and generated_path.is_file():
-                generated_path.unlink()
-        except Exception:
-            pass
+    stage_dir = out_dir.parent / f"{out_dir.name}.__building__"
+    if stage_dir.exists():
+        shutil.rmtree(stage_dir, ignore_errors=True)
+    stage_dir.mkdir(parents=True, exist_ok=True)
 
     # ----------------------------
     # Load zone geometry + names
@@ -515,7 +506,7 @@ def build_hotspots_frames(
             return
 
         timeline.append(current_time_iso)
-        frame_path = out_dir / f"frame_{frame_count:06d}.json"
+        frame_path = stage_dir / f"frame_{frame_count:06d}.json"
         payload = {
             "time": current_time_iso,
             "polygons": {"type": "FeatureCollection", "features": current_features},
@@ -674,7 +665,7 @@ def build_hotspots_frames(
 
     flush_frame()
 
-    (out_dir / "timeline.json").write_text(
+    (stage_dir / "timeline.json").write_text(
         json.dumps({"timeline": timeline, "count": len(timeline)}, separators=(",", ":")),
         encoding="utf-8"
     )
@@ -704,7 +695,7 @@ def build_hotspots_frames(
     expected_freshness = build_expected_artifact_signature(
         repo_root=Path(__file__).resolve().parent,
         data_dir=zones_geojson_path.parent,
-        frames_dir=out_dir,
+        frames_dir=stage_dir,
         bin_minutes=int(bin_minutes),
         min_trips_per_window=int(min_trips_per_window),
     )
@@ -845,9 +836,25 @@ def build_hotspots_frames(
                 "zones_geojson_signature": expected_freshness.get("source_inventory", {}).get("zones_geojson"),
             }
 
-    (out_dir / "scoring_shadow_manifest.json").write_text(
+    (stage_dir / "scoring_shadow_manifest.json").write_text(
         json.dumps(manifest_payload, separators=(",", ":")),
         encoding="utf-8",
     )
+    for generated in out_dir.glob("frame_*.json"):
+        try:
+            generated.unlink()
+        except Exception:
+            pass
+    for generated_name in ("timeline.json", "scoring_shadow_manifest.json"):
+        generated_path = out_dir / generated_name
+        try:
+            if generated_path.exists() and generated_path.is_file():
+                generated_path.unlink()
+        except Exception:
+            pass
+    for built_file in stage_dir.iterdir():
+        if built_file.is_file():
+            shutil.move(str(built_file), str(out_dir / built_file.name))
+    shutil.rmtree(stage_dir, ignore_errors=True)
 
     return {"ok": True, "count": len(timeline), "frames_dir": str(out_dir), "rows": total_rows}

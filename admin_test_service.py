@@ -508,6 +508,8 @@ def test_zone_geometry_metrics() -> Dict[str, Any]:
     )
 
 def test_score_frame_integrity() -> Dict[str, Any]:
+    from main import _generate_lock_snapshot
+
     frames_dir = _frames_dir()
     timeline_path = frames_dir / "timeline.json"
     if not timeline_path.exists() or timeline_path.stat().st_size == 0:
@@ -667,6 +669,8 @@ def test_score_frame_integrity() -> Dict[str, Any]:
         or not sampled_integrity.get("frame_has_density_fields")
         or not sampled_integrity.get("frame_has_trap_fields")
     )
+    lock_snapshot = _generate_lock_snapshot()
+    stale_lock = bool(lock_snapshot.get("lock_present")) and not bool(lock_snapshot.get("thread_alive"))
 
     ok = bool(sampled_features) and len(violations) == 0 and not stale_field_mismatch
     return _response(
@@ -675,7 +679,9 @@ def test_score_frame_integrity() -> Dict[str, Any]:
         "Sampled frame features contain valid v3 score, density, and trap fields."
         if ok
         else (
-            "Frames appear older than the deployed scoring code."
+            "Frames appear older than the deployed scoring code; rebuild may be blocked by a stale generate lock."
+            if stale_field_mismatch and stale_lock
+            else "Frames appear older than the deployed scoring code."
             if stale_field_mismatch
             else "Sampled frame features contain invalid or missing score fields."
         ),
@@ -685,10 +691,15 @@ def test_score_frame_integrity() -> Dict[str, Any]:
             "violation_count": len(violations),
             "first_violations": violations[:10],
             "sampled_frame_integrity": sampled_integrity,
+            "lock_present": lock_snapshot.get("lock_present"),
+            "lock_age_seconds": lock_snapshot.get("lock_age_seconds"),
+            "thread_alive": lock_snapshot.get("thread_alive"),
         },
     )
 
 def test_generated_artifact_sync() -> Dict[str, Any]:
+    from main import _generate_lock_snapshot
+
     frames_dir = _frames_dir()
     freshness = evaluate_artifact_freshness(
         repo_root=_repo_root(),
@@ -698,17 +709,28 @@ def test_generated_artifact_sync() -> Dict[str, Any]:
         min_trips_per_window=int(os.environ.get("DEFAULT_MIN_TRIPS_PER_WINDOW", "25")),
     )
     ok = bool(freshness.get("fresh"))
+    lock_snapshot = _generate_lock_snapshot()
+    stale_lock = bool(lock_snapshot.get("lock_present")) and not bool(lock_snapshot.get("thread_alive"))
+    summary = freshness.get("summary") or ("Generated frame artifacts match the deployed v3 code." if ok else "Generated frame artifacts are stale.")
+    if not ok and stale_lock:
+        summary = f"{summary} Likely cause: stale generate lock is present without an active worker thread."
+    details = {
+        "summary": freshness.get("summary"),
+        "reason_codes": freshness.get("reason_codes") or [],
+        "sampled_frame_integrity": freshness.get("sampled_frame_integrity") or {},
+        "artifact_signature": freshness.get("artifact_signature"),
+        "code_dependency_hash": freshness.get("code_dependency_hash"),
+        "source_data_hash": freshness.get("source_data_hash"),
+        "lock_present": lock_snapshot.get("lock_present"),
+        "lock_age_seconds": lock_snapshot.get("lock_age_seconds"),
+        "thread_alive": lock_snapshot.get("thread_alive"),
+    }
+    if stale_lock:
+        details["likely_cause"] = "stale_generate_lock"
 
     return _response(
         ok,
         "generated-artifact-sync",
-        freshness.get("summary") or ("Generated frame artifacts match the deployed v3 code." if ok else "Generated frame artifacts are stale."),
-        {
-            "summary": freshness.get("summary"),
-            "reason_codes": freshness.get("reason_codes") or [],
-            "sampled_frame_integrity": freshness.get("sampled_frame_integrity") or {},
-            "artifact_signature": freshness.get("artifact_signature"),
-            "code_dependency_hash": freshness.get("code_dependency_hash"),
-            "source_data_hash": freshness.get("source_data_hash"),
-        },
+        summary,
+        details,
     )
