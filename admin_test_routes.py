@@ -17,6 +17,7 @@ from admin_test_models import AdminDiagnosticResponse
 from admin_test_service import (
     test_admin_auth,
     test_backend_status,
+    test_build_sync,
     test_frame_current,
     test_generated_artifact_sync,
     test_me,
@@ -42,6 +43,12 @@ router = APIRouter(prefix="/admin/tests", tags=["admin-tests"])
 def admin_test_backend_status(admin: sqlite3.Row = Depends(require_admin_user)):
     _ = admin
     return test_backend_status()
+
+
+@router.get("/build-sync", response_model=AdminDiagnosticResponse)
+def admin_test_build_sync(admin: sqlite3.Row = Depends(require_admin_user)):
+    _ = admin
+    return test_build_sync()
 
 
 @router.get("/timeline", response_model=AdminDiagnosticResponse)

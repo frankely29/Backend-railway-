@@ -56,6 +56,31 @@ def test_backend_status() -> Dict[str, Any]:
     )
 
 
+def test_build_sync() -> Dict[str, Any]:
+    frames_dir = _frames_dir()
+    timeline_path = frames_dir / "timeline.json"
+    manifest_path = frames_dir / "scoring_shadow_manifest.json"
+
+    backend_build_id = (os.environ.get("BACKEND_BUILD_ID") or "").strip()
+    backend_release = (os.environ.get("BACKEND_RELEASE") or "").strip()
+    timeline_present = timeline_path.exists() and timeline_path.stat().st_size > 0 if timeline_path.exists() else False
+    manifest_present = manifest_path.exists() and manifest_path.stat().st_size > 0 if manifest_path.exists() else False
+    identity_available = bool(backend_build_id or backend_release)
+
+    return _response(
+        identity_available,
+        "build-sync",
+        "Backend build identity available" if identity_available else "Backend build identity missing",
+        {
+            "backend_build_id": backend_build_id,
+            "backend_release": backend_release,
+            "frames_dir": str(frames_dir),
+            "manifest_present": manifest_present,
+            "timeline_present": timeline_present,
+        },
+    )
+
+
 def test_timeline() -> Dict[str, Any]:
     frames_dir = _frames_dir()
     timeline_path = frames_dir / "timeline.json"
