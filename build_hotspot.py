@@ -59,6 +59,144 @@ def bucket_and_color_from_rating(rating: int) -> tuple[str, str]:
     return "red", "#e60000"
 
 
+BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS = {
+    41, 42, 74, 75, 116, 127, 128, 151, 152, 166, 243, 244
+}
+AIRPORT_ZONE_IDS = {1, 132, 138}
+V3_PROFILE_CONFIG = {
+    "citywide_v3": {
+        "score": "earnings_shadow_score_citywide_v3",
+        "confidence": "earnings_shadow_confidence_citywide_v3",
+    },
+    "manhattan_v3": {
+        "score": "earnings_shadow_score_manhattan_v3",
+        "confidence": "earnings_shadow_confidence_manhattan_v3",
+    },
+    "bronx_wash_heights_v3": {
+        "score": "earnings_shadow_score_bronx_wash_heights_v3",
+        "confidence": "earnings_shadow_confidence_bronx_wash_heights_v3",
+    },
+    "queens_v3": {
+        "score": "earnings_shadow_score_queens_v3",
+        "confidence": "earnings_shadow_confidence_queens_v3",
+    },
+    "brooklyn_v3": {
+        "score": "earnings_shadow_score_brooklyn_v3",
+        "confidence": "earnings_shadow_confidence_brooklyn_v3",
+    },
+    "staten_island_v3": {
+        "score": "earnings_shadow_score_staten_island_v3",
+        "confidence": "earnings_shadow_confidence_staten_island_v3",
+    },
+}
+
+
+def _clamp01(value: float) -> float:
+    return max(0.0, min(1.0, float(value)))
+
+
+def _normalized_borough_name(value: Any) -> str:
+    return " ".join(str(value or "").strip().lower().split())
+
+
+def _is_airport_zone(zone_name: Any, location_id: int) -> bool:
+    if int(location_id) in AIRPORT_ZONE_IDS:
+        return True
+    name = str(zone_name or "").lower()
+    return any(token in name for token in ("airport", "jfk", "la guardia", "laguardia", "newark"))
+
+
+def _iter_geometry_points(geometry: Any):
+    if not isinstance(geometry, dict):
+        return
+    coords = geometry.get("coordinates")
+    gtype = str(geometry.get("type") or "")
+    if not coords:
+        return
+    if gtype == "Point":
+        if len(coords) >= 2:
+            yield float(coords[0]), float(coords[1])
+        return
+
+    def _walk(node: Any):
+        if isinstance(node, (list, tuple)):
+            if len(node) >= 2 and isinstance(node[0], (int, float)) and isinstance(node[1], (int, float)):
+                yield float(node[0]), float(node[1])
+            else:
+                for child in node:
+                    yield from _walk(child)
+
+    yield from _walk(coords)
+
+
+def _geometry_centroid_latitude(geometry: Any) -> float | None:
+    points = list(_iter_geometry_points(geometry))
+    if not points:
+        return None
+    return sum(lat for _, lat in points) / len(points)
+
+
+def _eligible_for_profile(profile_name: str, props: Dict[str, Any], geometry: Any) -> bool:
+    location_id = int(props.get("LocationID", 0))
+    borough = _normalized_borough_name(props.get("borough"))
+    zone_name = props.get("zone_name")
+    centroid_lat = _geometry_centroid_latitude(geometry)
+
+    if profile_name == "citywide_v3":
+        return props.get("earnings_shadow_score_citywide_v3") is not None
+    if profile_name == "staten_island_v3":
+        return "staten" in borough
+    if profile_name == "brooklyn_v3":
+        return "brooklyn" in borough
+    if profile_name == "queens_v3":
+        return "queens" in borough and not _is_airport_zone(zone_name, location_id)
+    if profile_name == "bronx_wash_heights_v3":
+        return ("bronx" in borough) or (location_id in BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS)
+    if profile_name == "manhattan_v3":
+        if "manhattan" not in borough:
+            return False
+        if location_id in BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS:
+            return False
+        return centroid_lat is not None and centroid_lat <= 40.795
+    return False
+
+
+def _recalibrate_visible_v3_fields(features: List[Dict[str, Any]]) -> None:
+    for profile_name, profile_fields in V3_PROFILE_CONFIG.items():
+        score_field = profile_fields["score"]
+        confidence_field = profile_fields["confidence"]
+        rated_features = [
+            feature for feature in features
+            if _eligible_for_profile(profile_name, feature.get("properties") or {}, feature.get("geometry"))
+            and (feature.get("properties") or {}).get(score_field) is not None
+        ]
+        if not rated_features:
+            continue
+
+        ranked = sorted(
+            rated_features,
+            key=lambda f: (
+                float((f.get("properties") or {}).get(score_field) or 0.0),
+                int((f.get("properties") or {}).get("LocationID") or 0),
+            ),
+        )
+        n = len(ranked)
+        for idx, feature in enumerate(ranked):
+            props = feature.get("properties") or {}
+            raw_score = _clamp01(float(props.get(score_field) or 0.0))
+            confidence = _clamp01(float(props.get(confidence_field) or 0.0))
+            local_percent_rank = raw_score if n <= 1 else (idx / (n - 1))
+            visible_norm = _clamp01(0.72 * local_percent_rank + 0.18 * raw_score + 0.10 * confidence)
+            visible_rating = int(round(1 + 99 * visible_norm))
+            visible_bucket, visible_color = bucket_and_color_from_rating(visible_rating)
+
+            props[f"earnings_shadow_visible_rank_{profile_name}"] = float(local_percent_rank)
+            props[f"earnings_shadow_visible_score_{profile_name}"] = float(visible_norm)
+            props[f"earnings_shadow_rating_{profile_name}"] = visible_rating
+            props[f"earnings_shadow_bucket_{profile_name}"] = visible_bucket
+            props[f"earnings_shadow_color_{profile_name}"] = visible_color
+
+
 def build_hotspots_frames(
     parquet_files: List[Path],
     zones_geojson_path: Path,
@@ -520,6 +658,7 @@ def build_hotspots_frames(
         if current_time_iso is None:
             return
 
+        _recalibrate_visible_v3_fields(current_features)
         timeline.append(current_time_iso)
         frame_path = stage_dir / f"frame_{frame_count:06d}.json"
         payload = {

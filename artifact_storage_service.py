@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+import os
 import shutil
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
@@ -52,11 +54,37 @@ def _sum_sizes(paths: Iterable[Path]) -> int:
     return sum(_safe_size(p) for p in paths)
 
 
+def _is_build_tmp_on_data_volume(data_dir: Path, build_tmp_dir: Path) -> bool:
+    try:
+        data_resolved = data_dir.resolve()
+        build_resolved = build_tmp_dir.resolve()
+        if build_resolved == data_resolved or data_resolved in build_resolved.parents:
+            return True
+    except Exception:
+        pass
+
+    try:
+        return int(os.stat(build_tmp_dir).st_dev) == int(os.stat(data_dir).st_dev)
+    except Exception:
+        return False
+
+
 def get_artifact_storage_report(data_dir: Path, frames_dir: Path) -> Dict[str, Any]:
     usage = shutil.disk_usage(str(data_dir))
     parquet_files = sorted(data_dir.glob("*.parquet"))
     legacy_files = _legacy_candidates(data_dir) if frames_dir.resolve() != data_dir.resolve() else []
-    recommended_free_bytes = max(256 * _MB, _safe_size(frames_dir) + 256 * _MB)
+    frames_dir_bytes = _safe_size(frames_dir)
+    build_tmp_dir = Path(os.environ.get("ARTIFACT_BUILD_TMP_DIR", "/tmp/tlc_artifact_build"))
+    build_tmp_on_data_volume = _is_build_tmp_on_data_volume(data_dir, build_tmp_dir)
+    if build_tmp_on_data_volume:
+        headroom_model = "stage_on_volume"
+        recommended_free_bytes = max(256 * _MB, frames_dir_bytes + 256 * _MB)
+    else:
+        headroom_model = "publish_only"
+        recommended_free_bytes = max(
+            256 * _MB,
+            min(512 * _MB, int(math.ceil(frames_dir_bytes * 0.10))),
+        )
     free_bytes = int(usage.free)
     can_stage_rebuild = free_bytes >= recommended_free_bytes
 
@@ -64,12 +92,15 @@ def get_artifact_storage_report(data_dir: Path, frames_dir: Path) -> Dict[str, A
     return {
         "data_dir": str(data_dir),
         "frames_dir": str(frames_dir),
+        "build_tmp_dir": str(build_tmp_dir),
+        "build_tmp_on_data_volume": build_tmp_on_data_volume,
+        "headroom_model": headroom_model,
         "disk_total_bytes": int(usage.total),
         "disk_used_bytes": int(usage.used),
         "disk_free_bytes": free_bytes,
         "disk_percent_used": round((usage.used / usage.total) * 100.0, 2) if usage.total else 0.0,
         "parquet_bytes": _sum_sizes(parquet_files),
-        "frames_dir_bytes": _safe_size(frames_dir),
+        "frames_dir_bytes": frames_dir_bytes,
         "day_tendency_bytes": _safe_size(data_dir / "day_tendency"),
         "community_db_bytes": _safe_size(data_dir / "community_v2.db"),
         "zones_geojson_bytes": _safe_size(data_dir / "taxi_zones.geojson"),
