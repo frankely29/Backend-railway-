@@ -65,27 +65,27 @@ BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS = {
 AIRPORT_ZONE_IDS = {1, 132, 138}
 V3_PROFILE_CONFIG = {
     "citywide_v3": {
-        "score": "earnings_shadow_score_citywide_v3",
+        "score": "earnings_shadow_score_raw_citywide_v3",
         "confidence": "earnings_shadow_confidence_citywide_v3",
     },
     "manhattan_v3": {
-        "score": "earnings_shadow_score_manhattan_v3",
+        "score": "earnings_shadow_score_raw_manhattan_v3",
         "confidence": "earnings_shadow_confidence_manhattan_v3",
     },
     "bronx_wash_heights_v3": {
-        "score": "earnings_shadow_score_bronx_wash_heights_v3",
+        "score": "earnings_shadow_score_raw_bronx_wash_heights_v3",
         "confidence": "earnings_shadow_confidence_bronx_wash_heights_v3",
     },
     "queens_v3": {
-        "score": "earnings_shadow_score_queens_v3",
+        "score": "earnings_shadow_score_raw_queens_v3",
         "confidence": "earnings_shadow_confidence_queens_v3",
     },
     "brooklyn_v3": {
-        "score": "earnings_shadow_score_brooklyn_v3",
+        "score": "earnings_shadow_score_raw_brooklyn_v3",
         "confidence": "earnings_shadow_confidence_brooklyn_v3",
     },
     "staten_island_v3": {
-        "score": "earnings_shadow_score_staten_island_v3",
+        "score": "earnings_shadow_score_raw_staten_island_v3",
         "confidence": "earnings_shadow_confidence_staten_island_v3",
     },
 }
@@ -215,6 +215,11 @@ def _recalibrate_visible_v3_fields(features: List[Dict[str, Any]]) -> None:
     for profile_name, profile_fields in V3_PROFILE_CONFIG.items():
         score_field = profile_fields["score"]
         confidence_field = profile_fields["confidence"]
+        for feature in features:
+            props = feature.get("properties") or {}
+            if not _is_airport_props(props):
+                props[f"earnings_shadow_visible_rank_{profile_name}"] = None
+                props[f"earnings_shadow_visible_score_{profile_name}"] = None
         rated_features = [
             feature for feature in features
             if _eligible_for_profile(profile_name, feature.get("properties") or {}, feature.get("geometry"))
@@ -563,6 +568,12 @@ def build_hotspots_frames(
             same_zone_retention_penalty_n,
             earnings_shadow_positive_citywide_v3,
             earnings_shadow_negative_citywide_v3,
+            earnings_shadow_score_raw_citywide_v3,
+            earnings_shadow_score_raw_manhattan_v3,
+            earnings_shadow_score_raw_bronx_wash_heights_v3,
+            earnings_shadow_score_raw_queens_v3,
+            earnings_shadow_score_raw_brooklyn_v3,
+            earnings_shadow_score_raw_staten_island_v3,
             earnings_shadow_score_citywide_v3,
             earnings_shadow_confidence_citywide_v3,
             earnings_shadow_rating_citywide_v3,
@@ -661,6 +672,12 @@ def build_hotspots_frames(
             "same_zone_retention_penalty_n_shadow": None if same_zone_retention_penalty_n is None else float(same_zone_retention_penalty_n),
             "earnings_shadow_positive_citywide_v3": None if earnings_shadow_positive_citywide_v3 is None else float(earnings_shadow_positive_citywide_v3),
             "earnings_shadow_negative_citywide_v3": None if earnings_shadow_negative_citywide_v3 is None else float(earnings_shadow_negative_citywide_v3),
+            "earnings_shadow_score_raw_citywide_v3": None if earnings_shadow_score_raw_citywide_v3 is None else float(earnings_shadow_score_raw_citywide_v3),
+            "earnings_shadow_score_raw_manhattan_v3": None if earnings_shadow_score_raw_manhattan_v3 is None else float(earnings_shadow_score_raw_manhattan_v3),
+            "earnings_shadow_score_raw_bronx_wash_heights_v3": None if earnings_shadow_score_raw_bronx_wash_heights_v3 is None else float(earnings_shadow_score_raw_bronx_wash_heights_v3),
+            "earnings_shadow_score_raw_queens_v3": None if earnings_shadow_score_raw_queens_v3 is None else float(earnings_shadow_score_raw_queens_v3),
+            "earnings_shadow_score_raw_brooklyn_v3": None if earnings_shadow_score_raw_brooklyn_v3 is None else float(earnings_shadow_score_raw_brooklyn_v3),
+            "earnings_shadow_score_raw_staten_island_v3": None if earnings_shadow_score_raw_staten_island_v3 is None else float(earnings_shadow_score_raw_staten_island_v3),
             "earnings_shadow_score_citywide_v3": None if earnings_shadow_score_citywide_v3 is None else float(earnings_shadow_score_citywide_v3),
             "earnings_shadow_confidence_citywide_v3": None if earnings_shadow_confidence_citywide_v3 is None else float(earnings_shadow_confidence_citywide_v3),
             "earnings_shadow_rating_citywide_v3": None if earnings_shadow_rating_citywide_v3 is None else int(earnings_shadow_rating_citywide_v3),
@@ -833,6 +850,12 @@ def build_hotspots_frames(
                     "same_zone_retention_penalty_n_shadow": shadow_props.get("same_zone_retention_penalty_n_shadow"),
                     "earnings_shadow_positive_citywide_v3": shadow_props.get("earnings_shadow_positive_citywide_v3"),
                     "earnings_shadow_negative_citywide_v3": shadow_props.get("earnings_shadow_negative_citywide_v3"),
+                    "earnings_shadow_score_raw_citywide_v3": shadow_props.get("earnings_shadow_score_raw_citywide_v3"),
+                    "earnings_shadow_score_raw_manhattan_v3": shadow_props.get("earnings_shadow_score_raw_manhattan_v3"),
+                    "earnings_shadow_score_raw_bronx_wash_heights_v3": shadow_props.get("earnings_shadow_score_raw_bronx_wash_heights_v3"),
+                    "earnings_shadow_score_raw_queens_v3": shadow_props.get("earnings_shadow_score_raw_queens_v3"),
+                    "earnings_shadow_score_raw_brooklyn_v3": shadow_props.get("earnings_shadow_score_raw_brooklyn_v3"),
+                    "earnings_shadow_score_raw_staten_island_v3": shadow_props.get("earnings_shadow_score_raw_staten_island_v3"),
                     "earnings_shadow_score_citywide_v3": shadow_props.get("earnings_shadow_score_citywide_v3"),
                     "earnings_shadow_confidence_citywide_v3": shadow_props.get("earnings_shadow_confidence_citywide_v3"),
                     "earnings_shadow_rating_citywide_v3": shadow_props.get("earnings_shadow_rating_citywide_v3"),
