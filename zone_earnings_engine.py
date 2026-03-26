@@ -444,7 +444,14 @@ def build_zone_earnings_shadow_sql(
             1.0
           )
           ELSE 0.0
-        END AS manhattan_core_saturation_proxy_n
+        END AS manhattan_core_saturation_proxy_n,
+        CASE
+          WHEN POSITION('manhattan' IN LOWER(COALESCE(borough_name, ''))) > 0
+            AND COALESCE(centroid_latitude, 999.0) <= 40.795
+            AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
+          THEN 0.90
+          ELSE 1.00
+        END AS citywide_manhattan_saturation_discount_factor_n
       FROM normalized
     ),
     normalized_support_enriched AS (
@@ -718,7 +725,8 @@ def build_zone_earnings_shadow_sql(
         {clip01('0.80 * earnings_shadow_confidence_citywide_v2 + 0.20 * COALESCE(balanced_trip_share_n, 0.0)')} AS earnings_shadow_confidence_staten_island_v3,
         {clip01(f"{clip01('positive_score_staten_island_v3 - negative_score_staten_island_v3')} * {clip01('0.80 * earnings_shadow_confidence_citywide_v2 + 0.20 * COALESCE(balanced_trip_share_n, 0.0)')}")} AS earnings_shadow_score_staten_island_v3,
         {clip01('0.85 * earnings_shadow_confidence_citywide_v2 + 0.15 * demand_support_n')} AS earnings_shadow_confidence_citywide_v3,
-        {clip01(f"{clip01('positive_score_citywide_v3 - negative_score_citywide_v3')} * {clip01('0.85 * earnings_shadow_confidence_citywide_v2 + 0.15 * demand_support_n')}")} AS earnings_shadow_score_citywide_v3
+        {clip01('shadow_score_raw_citywide_v3 * citywide_manhattan_saturation_discount_factor_n')} AS earnings_shadow_score_citywide_v3_anchor_shadow,
+        {clip01(f"{clip01('positive_score_citywide_v3 - negative_score_citywide_v3')} * {clip01('0.85 * earnings_shadow_confidence_citywide_v2 + 0.15 * demand_support_n')} * citywide_manhattan_saturation_discount_factor_n")} AS earnings_shadow_score_citywide_v3
       FROM scored
     )
     SELECT
@@ -766,9 +774,12 @@ def build_zone_earnings_shadow_sql(
       manhattan_core_saturation_penalty_n AS manhattan_core_saturation_penalty_n_shadow,
       market_saturation_pressure_n AS market_saturation_pressure_n_shadow,
       market_saturation_penalty_n AS market_saturation_penalty_n_shadow,
+      citywide_manhattan_saturation_discount_factor_n AS citywide_manhattan_saturation_discount_factor_shadow,
       positive_score_citywide_v3 AS earnings_shadow_positive_citywide_v3,
       negative_score_citywide_v3 AS earnings_shadow_negative_citywide_v3,
       shadow_score_raw_citywide_v3 AS earnings_shadow_score_raw_citywide_v3,
+      shadow_score_raw_citywide_v3 AS earnings_shadow_score_raw_citywide_v3_pre_manhattan_discount_shadow,
+      {clip01('shadow_score_raw_citywide_v3 * citywide_manhattan_saturation_discount_factor_n')} AS earnings_shadow_score_citywide_v3_anchor_shadow,
       shadow_score_raw_manhattan_v3 AS earnings_shadow_score_raw_manhattan_v3,
       shadow_score_raw_bronx_wash_heights_v3 AS earnings_shadow_score_raw_bronx_wash_heights_v3,
       shadow_score_raw_queens_v3 AS earnings_shadow_score_raw_queens_v3,
