@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 from pathlib import Path
@@ -605,6 +606,8 @@ def test_score_frame_integrity() -> Dict[str, Any]:
         "earnings_shadow_rating_staten_island_v3",
     ]
     required_metric_fields = [
+        "pickups_now_shadow",
+        "next_pickups_shadow",
         "zone_area_sq_miles_shadow",
         "pickups_per_sq_mile_now_shadow",
         "pickups_per_sq_mile_next_shadow",
@@ -689,6 +692,40 @@ def test_score_frame_integrity() -> Dict[str, Any]:
             if share_value is not None and not (0 <= float(share_value) <= 1):
                 violations.append(f"feature {feature_idx}: {share_key} out of range [0,1]")
 
+        if bool(props.get("airport_excluded")):
+            continue
+
+        def _finite_float(key: str) -> float | None:
+            raw = props.get(key)
+            try:
+                number = float(raw)
+            except Exception:
+                violations.append(f"feature {feature_idx}: {key} is not a finite number")
+                return None
+            if not math.isfinite(number):
+                violations.append(f"feature {feature_idx}: {key} is not a finite number")
+                return None
+            return number
+
+        pickups_now = _finite_float("pickups_now_shadow")
+        pickups_next = _finite_float("next_pickups_shadow")
+        zone_area = _finite_float("zone_area_sq_miles_shadow")
+        density_now = _finite_float("pickups_per_sq_mile_now_shadow")
+        density_next = _finite_float("pickups_per_sq_mile_next_shadow")
+
+        if zone_area is not None and density_now is not None and pickups_now is not None:
+            expected_now = zone_area * density_now
+            if abs(pickups_now - expected_now) > 2.0:
+                violations.append(
+                    f"feature {feature_idx}: pickups_now_shadow mismatch (got={pickups_now:.6f}, expected={expected_now:.6f})"
+                )
+        if zone_area is not None and density_next is not None and pickups_next is not None:
+            expected_next = zone_area * density_next
+            if abs(pickups_next - expected_next) > 2.0:
+                violations.append(
+                    f"feature {feature_idx}: next_pickups_shadow mismatch (got={pickups_next:.6f}, expected={expected_next:.6f})"
+                )
+
     freshness = evaluate_artifact_freshness(
         repo_root=_repo_root(),
         data_dir=_data_dir(),
@@ -702,6 +739,7 @@ def test_score_frame_integrity() -> Dict[str, Any]:
         or not sampled_integrity.get("frame_has_borough_v3_fields")
         or not sampled_integrity.get("frame_has_density_fields")
         or not sampled_integrity.get("frame_has_trap_fields")
+        or not sampled_integrity.get("frame_has_popup_metric_fields")
     )
     lock_snapshot = _generate_lock_snapshot()
     stale_lock = bool(lock_snapshot.get("lock_present")) and not bool(lock_snapshot.get("thread_alive"))
