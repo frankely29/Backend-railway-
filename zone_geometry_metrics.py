@@ -49,6 +49,35 @@ def _polygon_area_sq_miles(coords: Any) -> Optional[float]:
     return area if area > 0 else None
 
 
+def _iter_geometry_points(geometry: Dict[str, Any]):
+    gtype = geometry.get("type")
+    coords = geometry.get("coordinates")
+    if not isinstance(coords, list):
+        return
+
+    if gtype == "Point":
+        if len(coords) >= 2:
+            yield float(coords[0]), float(coords[1])
+        return
+
+    def _walk(node: Any):
+        if isinstance(node, (list, tuple)):
+            if len(node) >= 2 and isinstance(node[0], (int, float)) and isinstance(node[1], (int, float)):
+                yield float(node[0]), float(node[1])
+            else:
+                for child in node:
+                    yield from _walk(child)
+
+    yield from _walk(coords)
+
+
+def _geometry_centroid_latitude(geometry: Dict[str, Any]) -> Optional[float]:
+    points = list(_iter_geometry_points(geometry))
+    if not points:
+        return None
+    return sum(lat for _, lat in points) / len(points)
+
+
 def _geometry_area_sq_miles(geometry: Dict[str, Any]) -> Optional[float]:
     gtype = geometry.get("type")
     coords = geometry.get("coordinates")
@@ -101,13 +130,40 @@ def compute_zone_area_sq_miles_from_geojson(zones_geojson_path: str | Path) -> D
 
 
 def build_zone_geometry_metrics_rows(zones_geojson_path: str | Path) -> List[Dict[str, Optional[float]]]:
-    zone_area = compute_zone_area_sq_miles_from_geojson(zones_geojson_path)
+    path = Path(zones_geojson_path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
     rows: List[Dict[str, Optional[float]]] = []
-    for zone_id in sorted(zone_area):
+
+    for feature in payload.get("features", []):
+        props = feature.get("properties") or {}
+        raw_id = props.get("LocationID")
+        if raw_id is None:
+            continue
+        try:
+            zone_id = int(raw_id)
+        except Exception:
+            continue
+
+        geometry = feature.get("geometry")
+        area = None
+        centroid_latitude = None
+        if isinstance(geometry, dict):
+            try:
+                area = _geometry_area_sq_miles(geometry)
+            except Exception:
+                area = None
+            try:
+                centroid_latitude = _geometry_centroid_latitude(geometry)
+            except Exception:
+                centroid_latitude = None
+
         rows.append(
             {
                 "PULocationID": int(zone_id),
-                "zone_area_sq_miles": None if zone_area[zone_id] is None else float(zone_area[zone_id]),
+                "zone_area_sq_miles": None if area is None else float(area),
+                "centroid_latitude": None if centroid_latitude is None else float(centroid_latitude),
             }
         )
+
+    rows.sort(key=lambda row: int(row["PULocationID"]))
     return rows
