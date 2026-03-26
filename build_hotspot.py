@@ -320,16 +320,16 @@ def _recalibrate_visible_v3_fields(features: List[Dict[str, Any]]) -> None:
             profile_conf = _clamp01(float(props.get(confidence_field) or 0.0))
             if profile_name == "manhattan_v3":
                 base_visible_norm = _clamp01(
-                    0.58 * citywide_anchor_norm +
-                    0.24 * profile_local_rank +
-                    0.12 * profile_raw_score +
+                    0.40 * citywide_anchor_norm +
+                    0.36 * profile_local_rank +
+                    0.18 * profile_raw_score +
                     0.06 * profile_conf
                 )
             elif profile_name == "staten_island_v3":
                 base_visible_norm = _clamp01(
-                    0.46 * citywide_anchor_norm +
-                    0.30 * profile_local_rank +
-                    0.16 * profile_raw_score +
+                    0.20 * citywide_anchor_norm +
+                    0.52 * profile_local_rank +
+                    0.20 * profile_raw_score +
                     0.08 * profile_conf
                 )
             else:
