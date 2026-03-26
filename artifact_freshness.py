@@ -209,6 +209,7 @@ def sample_frame_integrity(frames_dir: Path) -> dict:
             "frame_has_borough_v3_fields": False,
             "frame_has_density_fields": False,
             "frame_has_trap_fields": False,
+            "frame_has_popup_metric_fields": False,
         }
 
     sample_indices = sorted(set([0, len(timeline_items) // 2, len(timeline_items) - 1]))
@@ -247,6 +248,13 @@ def sample_frame_integrity(frames_dir: Path) -> dict:
         "same_zone_dropoff_share_shadow",
         "same_zone_retention_penalty_n_shadow",
     ]
+    popup_metric_required = [
+        "pickups_now_shadow",
+        "next_pickups_shadow",
+        "zone_area_sq_miles_shadow",
+        "pickups_per_sq_mile_now_shadow",
+        "pickups_per_sq_mile_next_shadow",
+    ]
 
     def _all_features_have(required_fields: list[str]) -> bool:
         if not sampled_features:
@@ -267,6 +275,7 @@ def sample_frame_integrity(frames_dir: Path) -> dict:
         "frame_has_borough_v3_fields": _all_features_have(borough_required),
         "frame_has_density_fields": _all_features_have(density_required),
         "frame_has_trap_fields": _all_features_have(trap_required),
+        "frame_has_popup_metric_fields": _all_features_have(popup_metric_required),
     }
 
 
@@ -304,6 +313,8 @@ def evaluate_artifact_freshness(
         reason_codes.append("sampled_frames_missing_density_fields")
     if not sampled.get("frame_has_trap_fields"):
         reason_codes.append("sampled_frames_missing_trap_fields")
+    if not sampled.get("frame_has_popup_metric_fields"):
+        reason_codes.append("sampled_frames_missing_popup_metric_fields")
 
     if current_manifest is None:
         reason_codes.append("manifest_missing")

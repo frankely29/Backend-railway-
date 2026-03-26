@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import List, Dict, Any, Tuple
 from datetime import datetime, timedelta
 import json
+import math
 import os
 import shutil
 import tempfile
@@ -358,10 +359,90 @@ def _recalibrate_visible_v3_fields(features: List[Dict[str, Any]]) -> None:
             props[f"earnings_shadow_rating_{profile_name}"] = visible_rating
             props[f"earnings_shadow_bucket_{profile_name}"] = visible_bucket
             props[f"earnings_shadow_color_{profile_name}"] = visible_color
+
+
+def _validate_popup_metric_consistency(features: List[Dict[str, Any]], frame_time: str) -> None:
+    popup_metric_fields = [
+        "pickups_now_shadow",
+        "next_pickups_shadow",
+        "zone_area_sq_miles_shadow",
+        "pickups_per_sq_mile_now_shadow",
+        "pickups_per_sq_mile_next_shadow",
+    ]
+    tolerance = 2.0
+    failures: list[str] = []
+
+    def _as_finite_number(value: Any) -> float | None:
+        try:
+            number = float(value)
+        except Exception:
+            return None
+        if not math.isfinite(number):
+            return None
+        return number
+
     for feature in features:
-        props = feature.get("properties") or {}
-        if _is_airport_props(props):
-            _apply_airport_exclusion_state(props)
+        props = feature.get("properties") if isinstance(feature, dict) else None
+        if not isinstance(props, dict) or _is_airport_props(props):
+            continue
+
+        location_id = props.get("LocationID")
+        zone_name = props.get("zone_name")
+        parsed_values: Dict[str, float] = {}
+        for field_name in popup_metric_fields:
+            number = _as_finite_number(props.get(field_name))
+            if number is None:
+                failures.append(
+                    f"LocationID={location_id} zone_name={zone_name!r} frame_time={frame_time} invalid {field_name}"
+                )
+                continue
+            parsed_values[field_name] = number
+
+        pickups_now = parsed_values.get("pickups_now_shadow")
+        pickups_next = parsed_values.get("next_pickups_shadow")
+        zone_area = parsed_values.get("zone_area_sq_miles_shadow")
+        density_now = parsed_values.get("pickups_per_sq_mile_now_shadow")
+        density_next = parsed_values.get("pickups_per_sq_mile_next_shadow")
+
+        if pickups_now is not None and pickups_now < 0:
+            failures.append(
+                f"LocationID={location_id} zone_name={zone_name!r} frame_time={frame_time} pickups_now_shadow must be >= 0"
+            )
+        if pickups_next is not None and pickups_next < 0:
+            failures.append(
+                f"LocationID={location_id} zone_name={zone_name!r} frame_time={frame_time} next_pickups_shadow must be >= 0"
+            )
+        if zone_area is not None and zone_area <= 0:
+            failures.append(
+                f"LocationID={location_id} zone_name={zone_name!r} frame_time={frame_time} zone_area_sq_miles_shadow must be > 0"
+            )
+        if density_now is not None and density_now < 0:
+            failures.append(
+                f"LocationID={location_id} zone_name={zone_name!r} frame_time={frame_time} pickups_per_sq_mile_now_shadow must be >= 0"
+            )
+        if density_next is not None and density_next < 0:
+            failures.append(
+                f"LocationID={location_id} zone_name={zone_name!r} frame_time={frame_time} pickups_per_sq_mile_next_shadow must be >= 0"
+            )
+
+        if zone_area is not None and pickups_now is not None and density_now is not None:
+            expected_now = zone_area * density_now
+            if abs(pickups_now - expected_now) > tolerance:
+                failures.append(
+                    f"LocationID={location_id} zone_name={zone_name!r} frame_time={frame_time} "
+                    f"pickups_now_shadow mismatch: got={pickups_now:.6f} expected={expected_now:.6f}"
+                )
+        if zone_area is not None and pickups_next is not None and density_next is not None:
+            expected_next = zone_area * density_next
+            if abs(pickups_next - expected_next) > tolerance:
+                failures.append(
+                    f"LocationID={location_id} zone_name={zone_name!r} frame_time={frame_time} "
+                    f"next_pickups_shadow mismatch: got={pickups_next:.6f} expected={expected_next:.6f}"
+                )
+
+    if failures:
+        sample = "; ".join(failures[:8])
+        raise RuntimeError(f"Popup metric consistency validation failed ({len(failures)}): {sample}")
 
 
 def build_hotspots_frames(
@@ -1007,6 +1088,7 @@ def build_hotspots_frames(
             return
 
         _recalibrate_visible_v3_fields(current_features)
+        _validate_popup_metric_consistency(current_features, current_time_iso)
         timeline.append(current_time_iso)
         frame_path = stage_dir / f"frame_{frame_count:06d}.json"
         payload = {
