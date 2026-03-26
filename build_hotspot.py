@@ -289,12 +289,27 @@ def _recalibrate_visible_v3_fields(features: List[Dict[str, Any]]) -> None:
             profile_local_rank = 0.0 if n <= 1 else (idx / (n - 1))
             profile_raw_score = _clamp01(float(props.get(score_field) or 0.0))
             profile_conf = _clamp01(float(props.get(confidence_field) or 0.0))
-            visible_norm = _clamp01(
-                0.60 * citywide_anchor_norm +
-                0.25 * profile_local_rank +
-                0.10 * profile_raw_score +
-                0.05 * profile_conf
-            )
+            if profile_name == "manhattan_v3":
+                visible_norm = _clamp01(
+                    0.58 * citywide_anchor_norm +
+                    0.24 * profile_local_rank +
+                    0.12 * profile_raw_score +
+                    0.06 * profile_conf
+                )
+            elif profile_name == "staten_island_v3":
+                visible_norm = _clamp01(
+                    0.46 * citywide_anchor_norm +
+                    0.30 * profile_local_rank +
+                    0.16 * profile_raw_score +
+                    0.08 * profile_conf
+                )
+            else:
+                visible_norm = _clamp01(
+                    0.50 * citywide_anchor_norm +
+                    0.28 * profile_local_rank +
+                    0.15 * profile_raw_score +
+                    0.07 * profile_conf
+                )
             visible_rating = int(round(1 + 99 * visible_norm))
             visible_bucket, visible_color = bucket_and_color_from_rating(visible_rating)
 
@@ -630,6 +645,7 @@ def build_hotspots_frames(
             same_zone_retention_penalty_n,
             churn_pressure_n_shadow,
             manhattan_core_saturation_proxy_n_shadow,
+            manhattan_core_saturation_penalty_n_shadow,
             market_saturation_pressure_n_shadow,
             market_saturation_penalty_n_shadow,
             earnings_shadow_positive_citywide_v3,
@@ -752,6 +768,7 @@ def build_hotspots_frames(
             "same_zone_retention_penalty_n_shadow": None if same_zone_retention_penalty_n is None else float(same_zone_retention_penalty_n),
             "churn_pressure_n_shadow": None if churn_pressure_n_shadow is None else float(churn_pressure_n_shadow),
             "manhattan_core_saturation_proxy_n_shadow": None if manhattan_core_saturation_proxy_n_shadow is None else float(manhattan_core_saturation_proxy_n_shadow),
+            "manhattan_core_saturation_penalty_n_shadow": None if manhattan_core_saturation_penalty_n_shadow is None else float(manhattan_core_saturation_penalty_n_shadow),
             "market_saturation_pressure_n_shadow": None if market_saturation_pressure_n_shadow is None else float(market_saturation_pressure_n_shadow),
             "market_saturation_penalty_n_shadow": None if market_saturation_penalty_n_shadow is None else float(market_saturation_penalty_n_shadow),
             "earnings_shadow_positive_citywide_v3": None if earnings_shadow_positive_citywide_v3 is None else float(earnings_shadow_positive_citywide_v3),
@@ -948,6 +965,7 @@ def build_hotspots_frames(
                     "same_zone_retention_penalty_n_shadow": shadow_props.get("same_zone_retention_penalty_n_shadow"),
                     "churn_pressure_n_shadow": shadow_props.get("churn_pressure_n_shadow"),
                     "manhattan_core_saturation_proxy_n_shadow": shadow_props.get("manhattan_core_saturation_proxy_n_shadow"),
+                    "manhattan_core_saturation_penalty_n_shadow": shadow_props.get("manhattan_core_saturation_penalty_n_shadow"),
                     "market_saturation_pressure_n_shadow": shadow_props.get("market_saturation_pressure_n_shadow"),
                     "market_saturation_penalty_n_shadow": shadow_props.get("market_saturation_penalty_n_shadow"),
                     "earnings_shadow_positive_citywide_v3": shadow_props.get("earnings_shadow_positive_citywide_v3"),
@@ -1142,6 +1160,7 @@ def build_hotspots_frames(
                     "same_zone_retention_penalty_n_shadow",
                     "churn_pressure_n_shadow",
                     "manhattan_core_saturation_proxy_n_shadow",
+                    "manhattan_core_saturation_penalty_n_shadow",
                     "market_saturation_pressure_n_shadow",
                     "market_saturation_penalty_n_shadow",
                     "earnings_shadow_positive_citywide_v3",
