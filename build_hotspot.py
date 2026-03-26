@@ -139,6 +139,7 @@ def _apply_airport_exclusion_state(props: Dict[str, Any]) -> None:
     if not _is_airport_props(props):
         return
     props["airport_excluded"] = True
+    props["earnings_shadow_citywide_anchor_norm_v3"] = 0.0
     for profile_name in V3_PROFILE_CONFIG:
         _set_airport_excluded_profile_state(props, profile_name)
 
@@ -250,6 +251,7 @@ def _recalibrate_visible_v3_fields(features: List[Dict[str, Any]]) -> None:
         visible_bucket, visible_color = bucket_and_color_from_rating(visible_rating)
         props["earnings_shadow_visible_rank_citywide_v3"] = float(citywide_local_rank)
         props["earnings_shadow_visible_score_citywide_v3"] = float(citywide_anchor_norm)
+        props["earnings_shadow_citywide_anchor_norm_v3"] = float(citywide_anchor_norm)
         props["earnings_shadow_rating_citywide_v3"] = visible_rating
         props["earnings_shadow_bucket_citywide_v3"] = visible_bucket
         props["earnings_shadow_color_citywide_v3"] = visible_color
@@ -385,14 +387,15 @@ def build_hotspots_frames(
     available_columns = {str(row[0]) for row in schema_rows}
 
     zone_geometry_rows = build_zone_geometry_metrics_rows(zones_geojson_path)
-    con.execute("CREATE TEMP TABLE zone_geometry_metrics (PULocationID INTEGER, zone_area_sq_miles DOUBLE)")
+    con.execute("CREATE TEMP TABLE zone_geometry_metrics (PULocationID INTEGER, zone_area_sq_miles DOUBLE, centroid_latitude DOUBLE)")
     if zone_geometry_rows:
         con.executemany(
-            "INSERT INTO zone_geometry_metrics (PULocationID, zone_area_sq_miles) VALUES (?, ?)",
+            "INSERT INTO zone_geometry_metrics (PULocationID, zone_area_sq_miles, centroid_latitude) VALUES (?, ?, ?)",
             [
                 (
                     int(row["PULocationID"]),
                     None if row["zone_area_sq_miles"] is None else float(row["zone_area_sq_miles"]),
+                    None if row.get("centroid_latitude") is None else float(row["centroid_latitude"]),
                 )
                 for row in zone_geometry_rows
             ],
@@ -601,6 +604,7 @@ def build_hotspots_frames(
             pickups_per_sq_mile_now,
             pickups_per_sq_mile_next,
             long_trip_share_20plus,
+            balanced_trip_share,
             same_zone_dropoff_share,
             downstream_next_value_raw,
             demand_now_n,
@@ -618,8 +622,14 @@ def build_hotspots_frames(
             density_support_n_shadow,
             effective_demand_density_now_n_shadow,
             effective_demand_density_next_n_shadow,
+            busy_now_base_n_shadow,
+            busy_next_base_n_shadow,
             long_trip_share_20plus_n,
+            balanced_trip_quality_n_shadow,
+            balanced_trip_share_shadow,
             same_zone_retention_penalty_n,
+            churn_pressure_n_shadow,
+            manhattan_core_saturation_proxy_n_shadow,
             earnings_shadow_positive_citywide_v3,
             earnings_shadow_negative_citywide_v3,
             earnings_shadow_score_raw_citywide_v3,
@@ -630,6 +640,12 @@ def build_hotspots_frames(
             earnings_shadow_score_raw_staten_island_v3,
             earnings_shadow_score_citywide_v3,
             earnings_shadow_confidence_citywide_v3,
+            citywide_v3_confidence_profile_shadow,
+            manhattan_v3_confidence_profile_shadow,
+            bronx_wash_heights_v3_confidence_profile_shadow,
+            queens_v3_confidence_profile_shadow,
+            brooklyn_v3_confidence_profile_shadow,
+            staten_island_v3_confidence_profile_shadow,
             earnings_shadow_rating_citywide_v3,
             earnings_shadow_bucket_citywide_v3,
             earnings_shadow_color_citywide_v3,
@@ -709,6 +725,7 @@ def build_hotspots_frames(
             "pickups_per_sq_mile_now_shadow": None if pickups_per_sq_mile_now is None else float(pickups_per_sq_mile_now),
             "pickups_per_sq_mile_next_shadow": None if pickups_per_sq_mile_next is None else float(pickups_per_sq_mile_next),
             "long_trip_share_20plus_shadow": None if long_trip_share_20plus is None else float(long_trip_share_20plus),
+            "balanced_trip_share_shadow": None if balanced_trip_share is None else float(balanced_trip_share),
             "same_zone_dropoff_share_shadow": None if same_zone_dropoff_share is None else float(same_zone_dropoff_share),
             "downstream_value_shadow": None if downstream_next_value_raw is None else float(downstream_next_value_raw),
             "demand_now_n_shadow": None if demand_now_n is None else float(demand_now_n),
@@ -726,8 +743,13 @@ def build_hotspots_frames(
             "density_support_n_shadow": None if density_support_n_shadow is None else float(density_support_n_shadow),
             "effective_demand_density_now_n_shadow": None if effective_demand_density_now_n_shadow is None else float(effective_demand_density_now_n_shadow),
             "effective_demand_density_next_n_shadow": None if effective_demand_density_next_n_shadow is None else float(effective_demand_density_next_n_shadow),
+            "busy_now_base_n_shadow": None if busy_now_base_n_shadow is None else float(busy_now_base_n_shadow),
+            "busy_next_base_n_shadow": None if busy_next_base_n_shadow is None else float(busy_next_base_n_shadow),
             "long_trip_share_20plus_n_shadow": None if long_trip_share_20plus_n is None else float(long_trip_share_20plus_n),
+            "balanced_trip_quality_n_shadow": None if balanced_trip_quality_n_shadow is None else float(balanced_trip_quality_n_shadow),
             "same_zone_retention_penalty_n_shadow": None if same_zone_retention_penalty_n is None else float(same_zone_retention_penalty_n),
+            "churn_pressure_n_shadow": None if churn_pressure_n_shadow is None else float(churn_pressure_n_shadow),
+            "manhattan_core_saturation_proxy_n_shadow": None if manhattan_core_saturation_proxy_n_shadow is None else float(manhattan_core_saturation_proxy_n_shadow),
             "earnings_shadow_positive_citywide_v3": None if earnings_shadow_positive_citywide_v3 is None else float(earnings_shadow_positive_citywide_v3),
             "earnings_shadow_negative_citywide_v3": None if earnings_shadow_negative_citywide_v3 is None else float(earnings_shadow_negative_citywide_v3),
             "earnings_shadow_score_raw_citywide_v3": None if earnings_shadow_score_raw_citywide_v3 is None else float(earnings_shadow_score_raw_citywide_v3),
@@ -796,6 +818,12 @@ def build_hotspots_frames(
             "earnings_shadow_rating_staten_island_v3": None if earnings_shadow_rating_staten_island_v3 is None else int(earnings_shadow_rating_staten_island_v3),
             "earnings_shadow_bucket_staten_island_v3": earnings_shadow_bucket_staten_island_v3,
             "earnings_shadow_color_staten_island_v3": earnings_shadow_color_staten_island_v3,
+            "citywide_v3_confidence_profile_shadow": None if citywide_v3_confidence_profile_shadow is None else float(citywide_v3_confidence_profile_shadow),
+            "manhattan_v3_confidence_profile_shadow": None if manhattan_v3_confidence_profile_shadow is None else float(manhattan_v3_confidence_profile_shadow),
+            "bronx_wash_heights_v3_confidence_profile_shadow": None if bronx_wash_heights_v3_confidence_profile_shadow is None else float(bronx_wash_heights_v3_confidence_profile_shadow),
+            "queens_v3_confidence_profile_shadow": None if queens_v3_confidence_profile_shadow is None else float(queens_v3_confidence_profile_shadow),
+            "brooklyn_v3_confidence_profile_shadow": None if brooklyn_v3_confidence_profile_shadow is None else float(brooklyn_v3_confidence_profile_shadow),
+            "staten_island_v3_confidence_profile_shadow": None if staten_island_v3_confidence_profile_shadow is None else float(staten_island_v3_confidence_profile_shadow),
         }
 
     cur = con.execute(sql)
@@ -891,6 +919,7 @@ def build_hotspots_frames(
                     "pickups_per_sq_mile_now_shadow": shadow_props.get("pickups_per_sq_mile_now_shadow"),
                     "pickups_per_sq_mile_next_shadow": shadow_props.get("pickups_per_sq_mile_next_shadow"),
                     "long_trip_share_20plus_shadow": shadow_props.get("long_trip_share_20plus_shadow"),
+                    "balanced_trip_share_shadow": shadow_props.get("balanced_trip_share_shadow"),
                     "same_zone_dropoff_share_shadow": shadow_props.get("same_zone_dropoff_share_shadow"),
                     "downstream_value_shadow": shadow_props.get("downstream_value_shadow"),
                     "demand_now_n_shadow": shadow_props.get("demand_now_n_shadow"),
@@ -908,8 +937,13 @@ def build_hotspots_frames(
                     "density_support_n_shadow": shadow_props.get("density_support_n_shadow"),
                     "effective_demand_density_now_n_shadow": shadow_props.get("effective_demand_density_now_n_shadow"),
                     "effective_demand_density_next_n_shadow": shadow_props.get("effective_demand_density_next_n_shadow"),
+                    "busy_now_base_n_shadow": shadow_props.get("busy_now_base_n_shadow"),
+                    "busy_next_base_n_shadow": shadow_props.get("busy_next_base_n_shadow"),
                     "long_trip_share_20plus_n_shadow": shadow_props.get("long_trip_share_20plus_n_shadow"),
+                    "balanced_trip_quality_n_shadow": shadow_props.get("balanced_trip_quality_n_shadow"),
                     "same_zone_retention_penalty_n_shadow": shadow_props.get("same_zone_retention_penalty_n_shadow"),
+                    "churn_pressure_n_shadow": shadow_props.get("churn_pressure_n_shadow"),
+                    "manhattan_core_saturation_proxy_n_shadow": shadow_props.get("manhattan_core_saturation_proxy_n_shadow"),
                     "earnings_shadow_positive_citywide_v3": shadow_props.get("earnings_shadow_positive_citywide_v3"),
                     "earnings_shadow_negative_citywide_v3": shadow_props.get("earnings_shadow_negative_citywide_v3"),
                     "earnings_shadow_score_raw_citywide_v3": shadow_props.get("earnings_shadow_score_raw_citywide_v3"),
@@ -920,6 +954,7 @@ def build_hotspots_frames(
                     "earnings_shadow_score_raw_staten_island_v3": shadow_props.get("earnings_shadow_score_raw_staten_island_v3"),
                     "earnings_shadow_score_citywide_v3": shadow_props.get("earnings_shadow_score_citywide_v3"),
                     "earnings_shadow_confidence_citywide_v3": shadow_props.get("earnings_shadow_confidence_citywide_v3"),
+                    "earnings_shadow_citywide_anchor_norm_v3": shadow_props.get("earnings_shadow_citywide_anchor_norm_v3"),
                     "earnings_shadow_rating_citywide_v3": shadow_props.get("earnings_shadow_rating_citywide_v3"),
                     "earnings_shadow_bucket_citywide_v3": shadow_props.get("earnings_shadow_bucket_citywide_v3"),
                     "earnings_shadow_color_citywide_v3": shadow_props.get("earnings_shadow_color_citywide_v3"),
@@ -975,6 +1010,12 @@ def build_hotspots_frames(
                     "earnings_shadow_color_brooklyn_v3": shadow_props.get("earnings_shadow_color_brooklyn_v3"),
                     "earnings_shadow_score_staten_island_v3": shadow_props.get("earnings_shadow_score_staten_island_v3"),
                     "earnings_shadow_confidence_staten_island_v3": shadow_props.get("earnings_shadow_confidence_staten_island_v3"),
+                    "citywide_v3_confidence_profile_shadow": shadow_props.get("citywide_v3_confidence_profile_shadow"),
+                    "manhattan_v3_confidence_profile_shadow": shadow_props.get("manhattan_v3_confidence_profile_shadow"),
+                    "bronx_wash_heights_v3_confidence_profile_shadow": shadow_props.get("bronx_wash_heights_v3_confidence_profile_shadow"),
+                    "queens_v3_confidence_profile_shadow": shadow_props.get("queens_v3_confidence_profile_shadow"),
+                    "brooklyn_v3_confidence_profile_shadow": shadow_props.get("brooklyn_v3_confidence_profile_shadow"),
+                    "staten_island_v3_confidence_profile_shadow": shadow_props.get("staten_island_v3_confidence_profile_shadow"),
                     "earnings_shadow_rating_staten_island_v3": shadow_props.get("earnings_shadow_rating_staten_island_v3"),
                     "earnings_shadow_bucket_staten_island_v3": shadow_props.get("earnings_shadow_bucket_staten_island_v3"),
                     "earnings_shadow_color_staten_island_v3": shadow_props.get("earnings_shadow_color_staten_island_v3"),
@@ -1070,6 +1111,7 @@ def build_hotspots_frames(
                     "pickups_per_sq_mile_now_shadow",
                     "pickups_per_sq_mile_next_shadow",
                     "long_trip_share_20plus_shadow",
+                    "balanced_trip_share_shadow",
                     "same_zone_dropoff_share_shadow",
                     "downstream_value_shadow",
                     "demand_now_n_shadow",
@@ -1087,12 +1129,24 @@ def build_hotspots_frames(
                     "density_support_n_shadow",
                     "effective_demand_density_now_n_shadow",
                     "effective_demand_density_next_n_shadow",
+                    "busy_now_base_n_shadow",
+                    "busy_next_base_n_shadow",
                     "long_trip_share_20plus_n_shadow",
+                    "balanced_trip_quality_n_shadow",
                     "same_zone_retention_penalty_n_shadow",
+                    "churn_pressure_n_shadow",
+                    "manhattan_core_saturation_proxy_n_shadow",
                     "earnings_shadow_positive_citywide_v3",
                     "earnings_shadow_negative_citywide_v3",
                     "earnings_shadow_score_citywide_v3",
                     "earnings_shadow_confidence_citywide_v3",
+                    "earnings_shadow_citywide_anchor_norm_v3",
+                    "citywide_v3_confidence_profile_shadow",
+                    "manhattan_v3_confidence_profile_shadow",
+                    "bronx_wash_heights_v3_confidence_profile_shadow",
+                    "queens_v3_confidence_profile_shadow",
+                    "brooklyn_v3_confidence_profile_shadow",
+                    "staten_island_v3_confidence_profile_shadow",
                     "earnings_shadow_rating_citywide_v3",
                     "earnings_shadow_bucket_citywide_v3",
                     "earnings_shadow_color_citywide_v3",
