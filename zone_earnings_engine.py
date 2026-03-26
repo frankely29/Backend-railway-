@@ -597,7 +597,7 @@ def build_zone_earnings_shadow_sql(
           {c3w.pickup_friction_penalty_weight:.8f} * pickup_friction_penalty_n +
           {c3w.shared_ride_penalty_weight:.8f} * shared_ride_penalty_n +
           {c3w.market_saturation_penalty_weight:.8f} * market_saturation_penalty_n +
-          0.08 * manhattan_core_saturation_penalty_n
+          0.072 * manhattan_core_saturation_penalty_n
         ) AS negative_score_citywide_v3,
         (
           {mw3_busy_now_weight:.8f} * busy_now_base_n +
@@ -615,7 +615,7 @@ def build_zone_earnings_shadow_sql(
           {mw3.pickup_friction_penalty_weight:.8f} * pickup_friction_penalty_n +
           {mw3.shared_ride_penalty_weight:.8f} * shared_ride_penalty_n +
           {mw3.market_saturation_penalty_weight:.8f} * market_saturation_penalty_n +
-          0.16 * manhattan_core_saturation_penalty_n
+          0.144 * manhattan_core_saturation_penalty_n
         ) AS negative_score_manhattan_v3,
         (
           {bw3_busy_now_weight:.8f} * busy_now_base_n +
