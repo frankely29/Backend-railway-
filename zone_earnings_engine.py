@@ -837,228 +837,228 @@ def build_zone_earnings_shadow_sql(
       earnings_shadow_confidence_staten_island_v3 AS staten_island_v3_confidence_profile_shadow,
       CAST(ROUND(1 + 99 * earnings_shadow_score_citywide_v3) AS INTEGER) AS earnings_shadow_rating_citywide_v3,
       CASE
-        WHEN (1 + 99 * earnings_shadow_score_citywide_v3) >= 90 THEN 'green'
-        WHEN (1 + 99 * earnings_shadow_score_citywide_v3) >= 80 THEN 'purple'
-        WHEN (1 + 99 * earnings_shadow_score_citywide_v3) >= 65 THEN 'blue'
-        WHEN (1 + 99 * earnings_shadow_score_citywide_v3) >= 45 THEN 'sky'
-        WHEN (1 + 99 * earnings_shadow_score_citywide_v3) >= 25 THEN 'yellow'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_citywide_v3) AS INTEGER) >= 85 THEN 'green'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_citywide_v3) AS INTEGER) >= 70 THEN 'purple'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_citywide_v3) AS INTEGER) >= 50 THEN 'blue'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_citywide_v3) AS INTEGER) >= 40 THEN 'sky'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_citywide_v3) AS INTEGER) >= 30 THEN 'yellow'
         ELSE 'red'
       END AS earnings_shadow_bucket_citywide_v3,
       CASE
-        WHEN (1 + 99 * earnings_shadow_score_citywide_v3) >= 90 THEN '#00b050'
-        WHEN (1 + 99 * earnings_shadow_score_citywide_v3) >= 80 THEN '#8000ff'
-        WHEN (1 + 99 * earnings_shadow_score_citywide_v3) >= 65 THEN '#0066ff'
-        WHEN (1 + 99 * earnings_shadow_score_citywide_v3) >= 45 THEN '#66ccff'
-        WHEN (1 + 99 * earnings_shadow_score_citywide_v3) >= 25 THEN '#ffd400'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_citywide_v3) AS INTEGER) >= 85 THEN '#00b050'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_citywide_v3) AS INTEGER) >= 70 THEN '#8000ff'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_citywide_v3) AS INTEGER) >= 50 THEN '#0066ff'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_citywide_v3) AS INTEGER) >= 40 THEN '#66ccff'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_citywide_v3) AS INTEGER) >= 30 THEN '#ffd400'
         ELSE '#e60000'
       END AS earnings_shadow_color_citywide_v3,
       earnings_shadow_score_citywide_v2,
       earnings_shadow_confidence_citywide_v2,
       CAST(ROUND(1 + 99 * earnings_shadow_score_citywide_v2) AS INTEGER) AS earnings_shadow_rating_citywide_v2,
       CASE
-        WHEN (1 + 99 * earnings_shadow_score_citywide_v2) >= 90 THEN 'green'
-        WHEN (1 + 99 * earnings_shadow_score_citywide_v2) >= 80 THEN 'purple'
-        WHEN (1 + 99 * earnings_shadow_score_citywide_v2) >= 65 THEN 'blue'
-        WHEN (1 + 99 * earnings_shadow_score_citywide_v2) >= 45 THEN 'sky'
-        WHEN (1 + 99 * earnings_shadow_score_citywide_v2) >= 25 THEN 'yellow'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_citywide_v2) AS INTEGER) >= 85 THEN 'green'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_citywide_v2) AS INTEGER) >= 70 THEN 'purple'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_citywide_v2) AS INTEGER) >= 50 THEN 'blue'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_citywide_v2) AS INTEGER) >= 40 THEN 'sky'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_citywide_v2) AS INTEGER) >= 30 THEN 'yellow'
         ELSE 'red'
       END AS earnings_shadow_bucket_citywide_v2,
       CASE
-        WHEN (1 + 99 * earnings_shadow_score_citywide_v2) >= 90 THEN '#00b050'
-        WHEN (1 + 99 * earnings_shadow_score_citywide_v2) >= 80 THEN '#8000ff'
-        WHEN (1 + 99 * earnings_shadow_score_citywide_v2) >= 65 THEN '#0066ff'
-        WHEN (1 + 99 * earnings_shadow_score_citywide_v2) >= 45 THEN '#66ccff'
-        WHEN (1 + 99 * earnings_shadow_score_citywide_v2) >= 25 THEN '#ffd400'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_citywide_v2) AS INTEGER) >= 85 THEN '#00b050'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_citywide_v2) AS INTEGER) >= 70 THEN '#8000ff'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_citywide_v2) AS INTEGER) >= 50 THEN '#0066ff'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_citywide_v2) AS INTEGER) >= 40 THEN '#66ccff'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_citywide_v2) AS INTEGER) >= 30 THEN '#ffd400'
         ELSE '#e60000'
       END AS earnings_shadow_color_citywide_v2,
       earnings_shadow_score_manhattan_v2,
       earnings_shadow_confidence_manhattan_v2,
       CAST(ROUND(1 + 99 * earnings_shadow_score_manhattan_v2) AS INTEGER) AS earnings_shadow_rating_manhattan_v2,
       CASE
-        WHEN (1 + 99 * earnings_shadow_score_manhattan_v2) >= 90 THEN 'green'
-        WHEN (1 + 99 * earnings_shadow_score_manhattan_v2) >= 80 THEN 'purple'
-        WHEN (1 + 99 * earnings_shadow_score_manhattan_v2) >= 65 THEN 'blue'
-        WHEN (1 + 99 * earnings_shadow_score_manhattan_v2) >= 45 THEN 'sky'
-        WHEN (1 + 99 * earnings_shadow_score_manhattan_v2) >= 25 THEN 'yellow'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_manhattan_v2) AS INTEGER) >= 85 THEN 'green'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_manhattan_v2) AS INTEGER) >= 70 THEN 'purple'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_manhattan_v2) AS INTEGER) >= 50 THEN 'blue'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_manhattan_v2) AS INTEGER) >= 40 THEN 'sky'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_manhattan_v2) AS INTEGER) >= 30 THEN 'yellow'
         ELSE 'red'
       END AS earnings_shadow_bucket_manhattan_v2,
       CASE
-        WHEN (1 + 99 * earnings_shadow_score_manhattan_v2) >= 90 THEN '#00b050'
-        WHEN (1 + 99 * earnings_shadow_score_manhattan_v2) >= 80 THEN '#8000ff'
-        WHEN (1 + 99 * earnings_shadow_score_manhattan_v2) >= 65 THEN '#0066ff'
-        WHEN (1 + 99 * earnings_shadow_score_manhattan_v2) >= 45 THEN '#66ccff'
-        WHEN (1 + 99 * earnings_shadow_score_manhattan_v2) >= 25 THEN '#ffd400'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_manhattan_v2) AS INTEGER) >= 85 THEN '#00b050'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_manhattan_v2) AS INTEGER) >= 70 THEN '#8000ff'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_manhattan_v2) AS INTEGER) >= 50 THEN '#0066ff'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_manhattan_v2) AS INTEGER) >= 40 THEN '#66ccff'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_manhattan_v2) AS INTEGER) >= 30 THEN '#ffd400'
         ELSE '#e60000'
       END AS earnings_shadow_color_manhattan_v2,
       earnings_shadow_score_bronx_wash_heights_v2,
       earnings_shadow_confidence_bronx_wash_heights_v2,
       CAST(ROUND(1 + 99 * earnings_shadow_score_bronx_wash_heights_v2) AS INTEGER) AS earnings_shadow_rating_bronx_wash_heights_v2,
       CASE
-        WHEN (1 + 99 * earnings_shadow_score_bronx_wash_heights_v2) >= 90 THEN 'green'
-        WHEN (1 + 99 * earnings_shadow_score_bronx_wash_heights_v2) >= 80 THEN 'purple'
-        WHEN (1 + 99 * earnings_shadow_score_bronx_wash_heights_v2) >= 65 THEN 'blue'
-        WHEN (1 + 99 * earnings_shadow_score_bronx_wash_heights_v2) >= 45 THEN 'sky'
-        WHEN (1 + 99 * earnings_shadow_score_bronx_wash_heights_v2) >= 25 THEN 'yellow'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_bronx_wash_heights_v2) AS INTEGER) >= 85 THEN 'green'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_bronx_wash_heights_v2) AS INTEGER) >= 70 THEN 'purple'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_bronx_wash_heights_v2) AS INTEGER) >= 50 THEN 'blue'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_bronx_wash_heights_v2) AS INTEGER) >= 40 THEN 'sky'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_bronx_wash_heights_v2) AS INTEGER) >= 30 THEN 'yellow'
         ELSE 'red'
       END AS earnings_shadow_bucket_bronx_wash_heights_v2,
       CASE
-        WHEN (1 + 99 * earnings_shadow_score_bronx_wash_heights_v2) >= 90 THEN '#00b050'
-        WHEN (1 + 99 * earnings_shadow_score_bronx_wash_heights_v2) >= 80 THEN '#8000ff'
-        WHEN (1 + 99 * earnings_shadow_score_bronx_wash_heights_v2) >= 65 THEN '#0066ff'
-        WHEN (1 + 99 * earnings_shadow_score_bronx_wash_heights_v2) >= 45 THEN '#66ccff'
-        WHEN (1 + 99 * earnings_shadow_score_bronx_wash_heights_v2) >= 25 THEN '#ffd400'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_bronx_wash_heights_v2) AS INTEGER) >= 85 THEN '#00b050'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_bronx_wash_heights_v2) AS INTEGER) >= 70 THEN '#8000ff'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_bronx_wash_heights_v2) AS INTEGER) >= 50 THEN '#0066ff'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_bronx_wash_heights_v2) AS INTEGER) >= 40 THEN '#66ccff'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_bronx_wash_heights_v2) AS INTEGER) >= 30 THEN '#ffd400'
         ELSE '#e60000'
       END AS earnings_shadow_color_bronx_wash_heights_v2,
       earnings_shadow_score_queens_v2,
       earnings_shadow_confidence_queens_v2,
       CAST(ROUND(1 + 99 * earnings_shadow_score_queens_v2) AS INTEGER) AS earnings_shadow_rating_queens_v2,
       CASE
-        WHEN (1 + 99 * earnings_shadow_score_queens_v2) >= 90 THEN 'green'
-        WHEN (1 + 99 * earnings_shadow_score_queens_v2) >= 80 THEN 'purple'
-        WHEN (1 + 99 * earnings_shadow_score_queens_v2) >= 65 THEN 'blue'
-        WHEN (1 + 99 * earnings_shadow_score_queens_v2) >= 45 THEN 'sky'
-        WHEN (1 + 99 * earnings_shadow_score_queens_v2) >= 25 THEN 'yellow'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_queens_v2) AS INTEGER) >= 85 THEN 'green'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_queens_v2) AS INTEGER) >= 70 THEN 'purple'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_queens_v2) AS INTEGER) >= 50 THEN 'blue'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_queens_v2) AS INTEGER) >= 40 THEN 'sky'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_queens_v2) AS INTEGER) >= 30 THEN 'yellow'
         ELSE 'red'
       END AS earnings_shadow_bucket_queens_v2,
       CASE
-        WHEN (1 + 99 * earnings_shadow_score_queens_v2) >= 90 THEN '#00b050'
-        WHEN (1 + 99 * earnings_shadow_score_queens_v2) >= 80 THEN '#8000ff'
-        WHEN (1 + 99 * earnings_shadow_score_queens_v2) >= 65 THEN '#0066ff'
-        WHEN (1 + 99 * earnings_shadow_score_queens_v2) >= 45 THEN '#66ccff'
-        WHEN (1 + 99 * earnings_shadow_score_queens_v2) >= 25 THEN '#ffd400'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_queens_v2) AS INTEGER) >= 85 THEN '#00b050'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_queens_v2) AS INTEGER) >= 70 THEN '#8000ff'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_queens_v2) AS INTEGER) >= 50 THEN '#0066ff'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_queens_v2) AS INTEGER) >= 40 THEN '#66ccff'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_queens_v2) AS INTEGER) >= 30 THEN '#ffd400'
         ELSE '#e60000'
       END AS earnings_shadow_color_queens_v2,
       earnings_shadow_score_brooklyn_v2,
       earnings_shadow_confidence_brooklyn_v2,
       CAST(ROUND(1 + 99 * earnings_shadow_score_brooklyn_v2) AS INTEGER) AS earnings_shadow_rating_brooklyn_v2,
       CASE
-        WHEN (1 + 99 * earnings_shadow_score_brooklyn_v2) >= 90 THEN 'green'
-        WHEN (1 + 99 * earnings_shadow_score_brooklyn_v2) >= 80 THEN 'purple'
-        WHEN (1 + 99 * earnings_shadow_score_brooklyn_v2) >= 65 THEN 'blue'
-        WHEN (1 + 99 * earnings_shadow_score_brooklyn_v2) >= 45 THEN 'sky'
-        WHEN (1 + 99 * earnings_shadow_score_brooklyn_v2) >= 25 THEN 'yellow'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_brooklyn_v2) AS INTEGER) >= 85 THEN 'green'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_brooklyn_v2) AS INTEGER) >= 70 THEN 'purple'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_brooklyn_v2) AS INTEGER) >= 50 THEN 'blue'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_brooklyn_v2) AS INTEGER) >= 40 THEN 'sky'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_brooklyn_v2) AS INTEGER) >= 30 THEN 'yellow'
         ELSE 'red'
       END AS earnings_shadow_bucket_brooklyn_v2,
       CASE
-        WHEN (1 + 99 * earnings_shadow_score_brooklyn_v2) >= 90 THEN '#00b050'
-        WHEN (1 + 99 * earnings_shadow_score_brooklyn_v2) >= 80 THEN '#8000ff'
-        WHEN (1 + 99 * earnings_shadow_score_brooklyn_v2) >= 65 THEN '#0066ff'
-        WHEN (1 + 99 * earnings_shadow_score_brooklyn_v2) >= 45 THEN '#66ccff'
-        WHEN (1 + 99 * earnings_shadow_score_brooklyn_v2) >= 25 THEN '#ffd400'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_brooklyn_v2) AS INTEGER) >= 85 THEN '#00b050'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_brooklyn_v2) AS INTEGER) >= 70 THEN '#8000ff'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_brooklyn_v2) AS INTEGER) >= 50 THEN '#0066ff'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_brooklyn_v2) AS INTEGER) >= 40 THEN '#66ccff'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_brooklyn_v2) AS INTEGER) >= 30 THEN '#ffd400'
         ELSE '#e60000'
       END AS earnings_shadow_color_brooklyn_v2,
       earnings_shadow_score_staten_island_v2,
       earnings_shadow_confidence_staten_island_v2,
       CAST(ROUND(1 + 99 * earnings_shadow_score_staten_island_v2) AS INTEGER) AS earnings_shadow_rating_staten_island_v2,
       CASE
-        WHEN (1 + 99 * earnings_shadow_score_staten_island_v2) >= 90 THEN 'green'
-        WHEN (1 + 99 * earnings_shadow_score_staten_island_v2) >= 80 THEN 'purple'
-        WHEN (1 + 99 * earnings_shadow_score_staten_island_v2) >= 65 THEN 'blue'
-        WHEN (1 + 99 * earnings_shadow_score_staten_island_v2) >= 45 THEN 'sky'
-        WHEN (1 + 99 * earnings_shadow_score_staten_island_v2) >= 25 THEN 'yellow'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_staten_island_v2) AS INTEGER) >= 85 THEN 'green'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_staten_island_v2) AS INTEGER) >= 70 THEN 'purple'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_staten_island_v2) AS INTEGER) >= 50 THEN 'blue'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_staten_island_v2) AS INTEGER) >= 40 THEN 'sky'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_staten_island_v2) AS INTEGER) >= 30 THEN 'yellow'
         ELSE 'red'
       END AS earnings_shadow_bucket_staten_island_v2,
       CASE
-        WHEN (1 + 99 * earnings_shadow_score_staten_island_v2) >= 90 THEN '#00b050'
-        WHEN (1 + 99 * earnings_shadow_score_staten_island_v2) >= 80 THEN '#8000ff'
-        WHEN (1 + 99 * earnings_shadow_score_staten_island_v2) >= 65 THEN '#0066ff'
-        WHEN (1 + 99 * earnings_shadow_score_staten_island_v2) >= 45 THEN '#66ccff'
-        WHEN (1 + 99 * earnings_shadow_score_staten_island_v2) >= 25 THEN '#ffd400'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_staten_island_v2) AS INTEGER) >= 85 THEN '#00b050'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_staten_island_v2) AS INTEGER) >= 70 THEN '#8000ff'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_staten_island_v2) AS INTEGER) >= 50 THEN '#0066ff'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_staten_island_v2) AS INTEGER) >= 40 THEN '#66ccff'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_staten_island_v2) AS INTEGER) >= 30 THEN '#ffd400'
         ELSE '#e60000'
       END AS earnings_shadow_color_staten_island_v2,
       earnings_shadow_score_manhattan_v3,
       earnings_shadow_confidence_manhattan_v3,
       CAST(ROUND(1 + 99 * earnings_shadow_score_manhattan_v3) AS INTEGER) AS earnings_shadow_rating_manhattan_v3,
       CASE
-        WHEN (1 + 99 * earnings_shadow_score_manhattan_v3) >= 90 THEN 'green'
-        WHEN (1 + 99 * earnings_shadow_score_manhattan_v3) >= 80 THEN 'purple'
-        WHEN (1 + 99 * earnings_shadow_score_manhattan_v3) >= 65 THEN 'blue'
-        WHEN (1 + 99 * earnings_shadow_score_manhattan_v3) >= 45 THEN 'sky'
-        WHEN (1 + 99 * earnings_shadow_score_manhattan_v3) >= 25 THEN 'yellow'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_manhattan_v3) AS INTEGER) >= 85 THEN 'green'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_manhattan_v3) AS INTEGER) >= 70 THEN 'purple'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_manhattan_v3) AS INTEGER) >= 50 THEN 'blue'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_manhattan_v3) AS INTEGER) >= 40 THEN 'sky'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_manhattan_v3) AS INTEGER) >= 30 THEN 'yellow'
         ELSE 'red'
       END AS earnings_shadow_bucket_manhattan_v3,
       CASE
-        WHEN (1 + 99 * earnings_shadow_score_manhattan_v3) >= 90 THEN '#00b050'
-        WHEN (1 + 99 * earnings_shadow_score_manhattan_v3) >= 80 THEN '#8000ff'
-        WHEN (1 + 99 * earnings_shadow_score_manhattan_v3) >= 65 THEN '#0066ff'
-        WHEN (1 + 99 * earnings_shadow_score_manhattan_v3) >= 45 THEN '#66ccff'
-        WHEN (1 + 99 * earnings_shadow_score_manhattan_v3) >= 25 THEN '#ffd400'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_manhattan_v3) AS INTEGER) >= 85 THEN '#00b050'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_manhattan_v3) AS INTEGER) >= 70 THEN '#8000ff'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_manhattan_v3) AS INTEGER) >= 50 THEN '#0066ff'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_manhattan_v3) AS INTEGER) >= 40 THEN '#66ccff'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_manhattan_v3) AS INTEGER) >= 30 THEN '#ffd400'
         ELSE '#e60000'
       END AS earnings_shadow_color_manhattan_v3,
       earnings_shadow_score_bronx_wash_heights_v3,
       earnings_shadow_confidence_bronx_wash_heights_v3,
       CAST(ROUND(1 + 99 * earnings_shadow_score_bronx_wash_heights_v3) AS INTEGER) AS earnings_shadow_rating_bronx_wash_heights_v3,
       CASE
-        WHEN (1 + 99 * earnings_shadow_score_bronx_wash_heights_v3) >= 90 THEN 'green'
-        WHEN (1 + 99 * earnings_shadow_score_bronx_wash_heights_v3) >= 80 THEN 'purple'
-        WHEN (1 + 99 * earnings_shadow_score_bronx_wash_heights_v3) >= 65 THEN 'blue'
-        WHEN (1 + 99 * earnings_shadow_score_bronx_wash_heights_v3) >= 45 THEN 'sky'
-        WHEN (1 + 99 * earnings_shadow_score_bronx_wash_heights_v3) >= 25 THEN 'yellow'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_bronx_wash_heights_v3) AS INTEGER) >= 85 THEN 'green'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_bronx_wash_heights_v3) AS INTEGER) >= 70 THEN 'purple'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_bronx_wash_heights_v3) AS INTEGER) >= 50 THEN 'blue'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_bronx_wash_heights_v3) AS INTEGER) >= 40 THEN 'sky'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_bronx_wash_heights_v3) AS INTEGER) >= 30 THEN 'yellow'
         ELSE 'red'
       END AS earnings_shadow_bucket_bronx_wash_heights_v3,
       CASE
-        WHEN (1 + 99 * earnings_shadow_score_bronx_wash_heights_v3) >= 90 THEN '#00b050'
-        WHEN (1 + 99 * earnings_shadow_score_bronx_wash_heights_v3) >= 80 THEN '#8000ff'
-        WHEN (1 + 99 * earnings_shadow_score_bronx_wash_heights_v3) >= 65 THEN '#0066ff'
-        WHEN (1 + 99 * earnings_shadow_score_bronx_wash_heights_v3) >= 45 THEN '#66ccff'
-        WHEN (1 + 99 * earnings_shadow_score_bronx_wash_heights_v3) >= 25 THEN '#ffd400'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_bronx_wash_heights_v3) AS INTEGER) >= 85 THEN '#00b050'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_bronx_wash_heights_v3) AS INTEGER) >= 70 THEN '#8000ff'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_bronx_wash_heights_v3) AS INTEGER) >= 50 THEN '#0066ff'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_bronx_wash_heights_v3) AS INTEGER) >= 40 THEN '#66ccff'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_bronx_wash_heights_v3) AS INTEGER) >= 30 THEN '#ffd400'
         ELSE '#e60000'
       END AS earnings_shadow_color_bronx_wash_heights_v3,
       earnings_shadow_score_queens_v3,
       earnings_shadow_confidence_queens_v3,
       CAST(ROUND(1 + 99 * earnings_shadow_score_queens_v3) AS INTEGER) AS earnings_shadow_rating_queens_v3,
       CASE
-        WHEN (1 + 99 * earnings_shadow_score_queens_v3) >= 90 THEN 'green'
-        WHEN (1 + 99 * earnings_shadow_score_queens_v3) >= 80 THEN 'purple'
-        WHEN (1 + 99 * earnings_shadow_score_queens_v3) >= 65 THEN 'blue'
-        WHEN (1 + 99 * earnings_shadow_score_queens_v3) >= 45 THEN 'sky'
-        WHEN (1 + 99 * earnings_shadow_score_queens_v3) >= 25 THEN 'yellow'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_queens_v3) AS INTEGER) >= 85 THEN 'green'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_queens_v3) AS INTEGER) >= 70 THEN 'purple'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_queens_v3) AS INTEGER) >= 50 THEN 'blue'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_queens_v3) AS INTEGER) >= 40 THEN 'sky'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_queens_v3) AS INTEGER) >= 30 THEN 'yellow'
         ELSE 'red'
       END AS earnings_shadow_bucket_queens_v3,
       CASE
-        WHEN (1 + 99 * earnings_shadow_score_queens_v3) >= 90 THEN '#00b050'
-        WHEN (1 + 99 * earnings_shadow_score_queens_v3) >= 80 THEN '#8000ff'
-        WHEN (1 + 99 * earnings_shadow_score_queens_v3) >= 65 THEN '#0066ff'
-        WHEN (1 + 99 * earnings_shadow_score_queens_v3) >= 45 THEN '#66ccff'
-        WHEN (1 + 99 * earnings_shadow_score_queens_v3) >= 25 THEN '#ffd400'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_queens_v3) AS INTEGER) >= 85 THEN '#00b050'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_queens_v3) AS INTEGER) >= 70 THEN '#8000ff'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_queens_v3) AS INTEGER) >= 50 THEN '#0066ff'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_queens_v3) AS INTEGER) >= 40 THEN '#66ccff'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_queens_v3) AS INTEGER) >= 30 THEN '#ffd400'
         ELSE '#e60000'
       END AS earnings_shadow_color_queens_v3,
       earnings_shadow_score_brooklyn_v3,
       earnings_shadow_confidence_brooklyn_v3,
       CAST(ROUND(1 + 99 * earnings_shadow_score_brooklyn_v3) AS INTEGER) AS earnings_shadow_rating_brooklyn_v3,
       CASE
-        WHEN (1 + 99 * earnings_shadow_score_brooklyn_v3) >= 90 THEN 'green'
-        WHEN (1 + 99 * earnings_shadow_score_brooklyn_v3) >= 80 THEN 'purple'
-        WHEN (1 + 99 * earnings_shadow_score_brooklyn_v3) >= 65 THEN 'blue'
-        WHEN (1 + 99 * earnings_shadow_score_brooklyn_v3) >= 45 THEN 'sky'
-        WHEN (1 + 99 * earnings_shadow_score_brooklyn_v3) >= 25 THEN 'yellow'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_brooklyn_v3) AS INTEGER) >= 85 THEN 'green'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_brooklyn_v3) AS INTEGER) >= 70 THEN 'purple'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_brooklyn_v3) AS INTEGER) >= 50 THEN 'blue'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_brooklyn_v3) AS INTEGER) >= 40 THEN 'sky'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_brooklyn_v3) AS INTEGER) >= 30 THEN 'yellow'
         ELSE 'red'
       END AS earnings_shadow_bucket_brooklyn_v3,
       CASE
-        WHEN (1 + 99 * earnings_shadow_score_brooklyn_v3) >= 90 THEN '#00b050'
-        WHEN (1 + 99 * earnings_shadow_score_brooklyn_v3) >= 80 THEN '#8000ff'
-        WHEN (1 + 99 * earnings_shadow_score_brooklyn_v3) >= 65 THEN '#0066ff'
-        WHEN (1 + 99 * earnings_shadow_score_brooklyn_v3) >= 45 THEN '#66ccff'
-        WHEN (1 + 99 * earnings_shadow_score_brooklyn_v3) >= 25 THEN '#ffd400'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_brooklyn_v3) AS INTEGER) >= 85 THEN '#00b050'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_brooklyn_v3) AS INTEGER) >= 70 THEN '#8000ff'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_brooklyn_v3) AS INTEGER) >= 50 THEN '#0066ff'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_brooklyn_v3) AS INTEGER) >= 40 THEN '#66ccff'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_brooklyn_v3) AS INTEGER) >= 30 THEN '#ffd400'
         ELSE '#e60000'
       END AS earnings_shadow_color_brooklyn_v3,
       earnings_shadow_score_staten_island_v3,
       earnings_shadow_confidence_staten_island_v3,
       CAST(ROUND(1 + 99 * earnings_shadow_score_staten_island_v3) AS INTEGER) AS earnings_shadow_rating_staten_island_v3,
       CASE
-        WHEN (1 + 99 * earnings_shadow_score_staten_island_v3) >= 90 THEN 'green'
-        WHEN (1 + 99 * earnings_shadow_score_staten_island_v3) >= 80 THEN 'purple'
-        WHEN (1 + 99 * earnings_shadow_score_staten_island_v3) >= 65 THEN 'blue'
-        WHEN (1 + 99 * earnings_shadow_score_staten_island_v3) >= 45 THEN 'sky'
-        WHEN (1 + 99 * earnings_shadow_score_staten_island_v3) >= 25 THEN 'yellow'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_staten_island_v3) AS INTEGER) >= 85 THEN 'green'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_staten_island_v3) AS INTEGER) >= 70 THEN 'purple'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_staten_island_v3) AS INTEGER) >= 50 THEN 'blue'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_staten_island_v3) AS INTEGER) >= 40 THEN 'sky'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_staten_island_v3) AS INTEGER) >= 30 THEN 'yellow'
         ELSE 'red'
       END AS earnings_shadow_bucket_staten_island_v3,
       CASE
-        WHEN (1 + 99 * earnings_shadow_score_staten_island_v3) >= 90 THEN '#00b050'
-        WHEN (1 + 99 * earnings_shadow_score_staten_island_v3) >= 80 THEN '#8000ff'
-        WHEN (1 + 99 * earnings_shadow_score_staten_island_v3) >= 65 THEN '#0066ff'
-        WHEN (1 + 99 * earnings_shadow_score_staten_island_v3) >= 45 THEN '#66ccff'
-        WHEN (1 + 99 * earnings_shadow_score_staten_island_v3) >= 25 THEN '#ffd400'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_staten_island_v3) AS INTEGER) >= 85 THEN '#00b050'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_staten_island_v3) AS INTEGER) >= 70 THEN '#8000ff'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_staten_island_v3) AS INTEGER) >= 50 THEN '#0066ff'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_staten_island_v3) AS INTEGER) >= 40 THEN '#66ccff'
+        WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_staten_island_v3) AS INTEGER) >= 30 THEN '#ffd400'
         ELSE '#e60000'
       END AS earnings_shadow_color_staten_island_v3
     FROM final
