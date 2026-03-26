@@ -47,16 +47,20 @@ def bucket_and_color_from_rating(rating: int) -> tuple[str, str]:
     """
     r = int(rating)
 
-    if r >= 85:
+    if r >= 87:
         return "green", "#00b050"
-    if r >= 70:
+    if r >= 73:
         return "purple", "#8000ff"
-    if r >= 50:
+    if r >= 60:
+        return "indigo", "#4b3cff"
+    if r >= 48:
         return "blue", "#0066ff"
     if r >= 40:
         return "sky", "#66ccff"
-    if r >= 30:
+    if r >= 33:
         return "yellow", "#ffd400"
+    if r >= 25:
+        return "orange", "#ff8c00"
     return "red", "#e60000"
 
 
