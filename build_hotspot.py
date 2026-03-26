@@ -129,6 +129,7 @@ def _is_airport_props(props: Dict[str, Any]) -> bool:
 def _set_airport_excluded_profile_state(props: Dict[str, Any], profile_name: str) -> None:
     visible_bucket, visible_color = bucket_and_color_from_rating(1)
     props[f"earnings_shadow_visible_rank_{profile_name}"] = 0.0
+    props[f"earnings_shadow_visible_base_score_{profile_name}"] = 0.0
     props[f"earnings_shadow_visible_score_{profile_name}"] = 0.0
     props[f"earnings_shadow_rating_{profile_name}"] = 1
     props[f"earnings_shadow_bucket_{profile_name}"] = visible_bucket
@@ -139,6 +140,7 @@ def _apply_airport_exclusion_state(props: Dict[str, Any]) -> None:
     if not _is_airport_props(props):
         return
     props["airport_excluded"] = True
+    props["citywide_visual_anchor_discount_factor_shadow"] = 1.0
     props["earnings_shadow_citywide_anchor_norm_v3"] = 0.0
     for profile_name in V3_PROFILE_CONFIG:
         _set_airport_excluded_profile_state(props, profile_name)
@@ -176,6 +178,22 @@ def _geometry_centroid_latitude(geometry: Any) -> float | None:
     if not points:
         return None
     return sum(lat for _, lat in points) / len(points)
+
+
+def _is_core_manhattan_for_citywide_discount(props: Dict[str, Any], geometry: Any) -> bool:
+    borough = _normalized_borough_name(props.get("borough"))
+    if "manhattan" not in borough:
+        return False
+    location_id = int(props.get("LocationID") or 0)
+    if location_id in BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS:
+        return False
+    centroid_lat = _geometry_centroid_latitude(geometry)
+    return centroid_lat is not None and centroid_lat <= 40.795
+
+
+def _relaxed_display_curve(x: float) -> float:
+    x = _clamp01(x)
+    return _clamp01(0.62 * x + 0.38 * (x ** 0.5))
 
 
 def _eligible_for_profile(profile_name: str, props: Dict[str, Any], geometry: Any) -> bool:
@@ -219,7 +237,9 @@ def _recalibrate_visible_v3_fields(features: List[Dict[str, Any]]) -> None:
         props = feature.get("properties") or {}
         if not _is_airport_props(props):
             props["earnings_shadow_visible_rank_citywide_v3"] = None
+            props["earnings_shadow_visible_base_score_citywide_v3"] = None
             props["earnings_shadow_visible_score_citywide_v3"] = None
+            props["citywide_visual_anchor_discount_factor_shadow"] = 1.0
 
     citywide_rated = [
         feature for feature in features
@@ -230,7 +250,10 @@ def _recalibrate_visible_v3_fields(features: List[Dict[str, Any]]) -> None:
     ranked_citywide = sorted(
         citywide_rated,
         key=lambda f: (
-            float((f.get("properties") or {}).get(citywide_rank_field) or 0.0),
+            (
+                _clamp01(float((f.get("properties") or {}).get(citywide_rank_field) or 0.0))
+                * (0.90 if _is_core_manhattan_for_citywide_discount((f.get("properties") or {}), f.get("geometry")) else 1.0)
+            ),
             float((f.get("properties") or {}).get(citywide_conf_field) or 0.0),
             int((f.get("properties") or {}).get("LocationID") or 0),
         ),
@@ -240,22 +263,27 @@ def _recalibrate_visible_v3_fields(features: List[Dict[str, Any]]) -> None:
         props = feature.get("properties") or {}
         location_id = int(props.get("LocationID") or 0)
         citywide_local_rank = 0.0 if n_city <= 1 else (idx / (n_city - 1))
-        citywide_raw_score = _clamp01(float(props.get("earnings_shadow_score_citywide_v3") or 0.0))
+        citywide_anchor_discount_factor = 0.90 if _is_core_manhattan_for_citywide_discount(props, feature.get("geometry")) else 1.0
+        citywide_raw_score = _clamp01(float(props.get(citywide_rank_field) or 0.0))
+        citywide_raw_score_for_display = _clamp01(citywide_raw_score * citywide_anchor_discount_factor)
         citywide_conf = _clamp01(float(props.get("earnings_shadow_confidence_citywide_v3") or 0.0))
-        citywide_anchor_norm = _clamp01(
+        citywide_base_norm = _clamp01(
             0.66 * citywide_local_rank +
-            0.24 * citywide_raw_score +
+            0.24 * citywide_raw_score_for_display +
             0.10 * citywide_conf
         )
-        visible_rating = int(round(1 + 99 * citywide_anchor_norm))
+        citywide_display_norm = _relaxed_display_curve(citywide_base_norm)
+        visible_rating = int(round(1 + 99 * citywide_display_norm))
         visible_bucket, visible_color = bucket_and_color_from_rating(visible_rating)
         props["earnings_shadow_visible_rank_citywide_v3"] = float(citywide_local_rank)
-        props["earnings_shadow_visible_score_citywide_v3"] = float(citywide_anchor_norm)
-        props["earnings_shadow_citywide_anchor_norm_v3"] = float(citywide_anchor_norm)
+        props["earnings_shadow_visible_base_score_citywide_v3"] = float(citywide_base_norm)
+        props["earnings_shadow_visible_score_citywide_v3"] = float(citywide_display_norm)
+        props["citywide_visual_anchor_discount_factor_shadow"] = float(citywide_anchor_discount_factor)
+        props["earnings_shadow_citywide_anchor_norm_v3"] = float(citywide_display_norm)
         props["earnings_shadow_rating_citywide_v3"] = visible_rating
         props["earnings_shadow_bucket_citywide_v3"] = visible_bucket
         props["earnings_shadow_color_citywide_v3"] = visible_color
-        citywide_anchor_by_location[location_id] = float(citywide_anchor_norm)
+        citywide_anchor_by_location[location_id] = float(citywide_display_norm)
 
     for profile_name, profile_fields in V3_PROFILE_CONFIG.items():
         if profile_name == "citywide_v3":
@@ -266,6 +294,7 @@ def _recalibrate_visible_v3_fields(features: List[Dict[str, Any]]) -> None:
             props = feature.get("properties") or {}
             if not _is_airport_props(props):
                 props[f"earnings_shadow_visible_rank_{profile_name}"] = None
+                props[f"earnings_shadow_visible_base_score_{profile_name}"] = None
                 props[f"earnings_shadow_visible_score_{profile_name}"] = None
 
         rated_features = [
@@ -290,30 +319,32 @@ def _recalibrate_visible_v3_fields(features: List[Dict[str, Any]]) -> None:
             profile_raw_score = _clamp01(float(props.get(score_field) or 0.0))
             profile_conf = _clamp01(float(props.get(confidence_field) or 0.0))
             if profile_name == "manhattan_v3":
-                visible_norm = _clamp01(
+                base_visible_norm = _clamp01(
                     0.58 * citywide_anchor_norm +
                     0.24 * profile_local_rank +
                     0.12 * profile_raw_score +
                     0.06 * profile_conf
                 )
             elif profile_name == "staten_island_v3":
-                visible_norm = _clamp01(
+                base_visible_norm = _clamp01(
                     0.46 * citywide_anchor_norm +
                     0.30 * profile_local_rank +
                     0.16 * profile_raw_score +
                     0.08 * profile_conf
                 )
             else:
-                visible_norm = _clamp01(
+                base_visible_norm = _clamp01(
                     0.50 * citywide_anchor_norm +
                     0.28 * profile_local_rank +
                     0.15 * profile_raw_score +
                     0.07 * profile_conf
                 )
+            visible_norm = _relaxed_display_curve(base_visible_norm)
             visible_rating = int(round(1 + 99 * visible_norm))
             visible_bucket, visible_color = bucket_and_color_from_rating(visible_rating)
 
             props[f"earnings_shadow_visible_rank_{profile_name}"] = float(profile_local_rank)
+            props[f"earnings_shadow_visible_base_score_{profile_name}"] = float(base_visible_norm)
             props[f"earnings_shadow_visible_score_{profile_name}"] = float(visible_norm)
             props[f"earnings_shadow_rating_{profile_name}"] = visible_rating
             props[f"earnings_shadow_bucket_{profile_name}"] = visible_bucket
@@ -1173,6 +1204,7 @@ def build_hotspots_frames(
                     "market_saturation_pressure_n_shadow",
                     "market_saturation_penalty_n_shadow",
                     "citywide_manhattan_saturation_discount_factor_shadow",
+                    "citywide_visual_anchor_discount_factor_shadow",
                     "earnings_shadow_positive_citywide_v3",
                     "earnings_shadow_negative_citywide_v3",
                     "earnings_shadow_score_raw_citywide_v3_pre_manhattan_discount_shadow",
@@ -1180,6 +1212,12 @@ def build_hotspots_frames(
                     "earnings_shadow_score_citywide_v3",
                     "earnings_shadow_confidence_citywide_v3",
                     "earnings_shadow_citywide_anchor_norm_v3",
+                    "earnings_shadow_visible_base_score_citywide_v3",
+                    "earnings_shadow_visible_base_score_manhattan_v3",
+                    "earnings_shadow_visible_base_score_bronx_wash_heights_v3",
+                    "earnings_shadow_visible_base_score_queens_v3",
+                    "earnings_shadow_visible_base_score_brooklyn_v3",
+                    "earnings_shadow_visible_base_score_staten_island_v3",
                     "citywide_v3_confidence_profile_shadow",
                     "manhattan_v3_confidence_profile_shadow",
                     "bronx_wash_heights_v3_confidence_profile_shadow",
