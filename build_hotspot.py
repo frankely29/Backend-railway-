@@ -823,6 +823,7 @@ def build_hotspots_frames(
         ):
             continue
         shadow_by_key[(int(pu_id), int(s_dow_m), int(s_bin_start_min))] = {
+            "pickups_now_shadow": None if pickups_now is None else int(pickups_now),
             "next_pickups_shadow": None if pickups_next is None else int(pickups_next),
             "median_driver_pay_shadow": None if median_driver_pay is None else float(median_driver_pay),
             "median_pay_per_min_shadow": None if median_pay_per_min is None else float(median_pay_per_min),
@@ -1072,6 +1073,7 @@ def build_hotspots_frames(
                         "fillOpacity": 0.82
                     },
                     "next_pickups_shadow": shadow_props.get("next_pickups_shadow"),
+                    "pickups_now_shadow": shadow_props.get("pickups_now_shadow"),
                     "median_driver_pay_shadow": shadow_props.get("median_driver_pay_shadow"),
                     "median_pay_per_min_shadow": shadow_props.get("median_pay_per_min_shadow"),
                     "median_pay_per_mile_shadow": shadow_props.get("median_pay_per_mile_shadow"),
@@ -1320,6 +1322,7 @@ def build_hotspots_frames(
                     "Phase 9 promotes staten_island_v3 to the live visible Staten Island score and completes the visible v3 rollout across citywide and all borough modes.",
                 ],
                 "shadow_fields": [
+                    "pickups_now_shadow",
                     "next_pickups_shadow",
                     "median_driver_pay_shadow",
                     "median_pay_per_min_shadow",
