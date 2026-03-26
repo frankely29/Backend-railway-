@@ -52,7 +52,7 @@ ZONE_MODE_PROFILES: Dict[str, ZoneScoreProfileWeights] = {
         same_zone_retention_penalty_weight=0.09,
         pickup_friction_penalty_weight=0.045,
         shared_ride_penalty_weight=0.027,
-        market_saturation_penalty_weight=0.162,
+        market_saturation_penalty_weight=0.0,
     ),
     "manhattan_v2": ZoneScoreProfileWeights(
         demand_now_weight=0.14,
@@ -80,7 +80,7 @@ ZONE_MODE_PROFILES: Dict[str, ZoneScoreProfileWeights] = {
         same_zone_retention_penalty_weight=0.09,
         pickup_friction_penalty_weight=0.032,
         shared_ride_penalty_weight=0.012,
-        market_saturation_penalty_weight=0.18,
+        market_saturation_penalty_weight=0.0,
     ),
     "bronx_wash_heights_v2": ZoneScoreProfileWeights(
         demand_now_weight=0.18,
@@ -108,7 +108,7 @@ ZONE_MODE_PROFILES: Dict[str, ZoneScoreProfileWeights] = {
         same_zone_retention_penalty_weight=0.054,
         pickup_friction_penalty_weight=0.036,
         shared_ride_penalty_weight=0.018,
-        market_saturation_penalty_weight=0.036,
+        market_saturation_penalty_weight=0.0,
     ),
     "queens_v2": ZoneScoreProfileWeights(
         demand_now_weight=0.15,
@@ -136,7 +136,7 @@ ZONE_MODE_PROFILES: Dict[str, ZoneScoreProfileWeights] = {
         same_zone_retention_penalty_weight=0.081,
         pickup_friction_penalty_weight=0.027,
         shared_ride_penalty_weight=0.018,
-        market_saturation_penalty_weight=0.054,
+        market_saturation_penalty_weight=0.0,
     ),
     "brooklyn_v2": ZoneScoreProfileWeights(
         demand_now_weight=0.13,
@@ -164,7 +164,7 @@ ZONE_MODE_PROFILES: Dict[str, ZoneScoreProfileWeights] = {
         same_zone_retention_penalty_weight=0.099,
         pickup_friction_penalty_weight=0.036,
         shared_ride_penalty_weight=0.018,
-        market_saturation_penalty_weight=0.063,
+        market_saturation_penalty_weight=0.0,
     ),
     "staten_island_v2": ZoneScoreProfileWeights(
         demand_now_weight=0.11,
@@ -192,6 +192,6 @@ ZONE_MODE_PROFILES: Dict[str, ZoneScoreProfileWeights] = {
         same_zone_retention_penalty_weight=0.020,
         pickup_friction_penalty_weight=0.015,
         shared_ride_penalty_weight=0.005,
-        market_saturation_penalty_weight=0.005,
+        market_saturation_penalty_weight=0.0,
     ),
 }
