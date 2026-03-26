@@ -24,7 +24,7 @@ def log_zone_bins(db_exec, *, bin_time: int, rows: Iterable[ZoneScoreResult]) ->
                 int(bin_time), int(r.zone_id), float(r.final_score), float(r.confidence),
                 float(r.historical_component), float(r.live_component), float(r.same_timeslot_component),
                 float(r.density_penalty), float(r.weighted_trip_count), int(r.unique_driver_count),
-                1 if r.recommended else 0,
+                bool(r.recommended),
             ),
         )
 
@@ -41,7 +41,7 @@ def log_micro_bins(db_exec, *, bin_time: int, rows: Iterable[MicroHotspotScoreRe
             """,
             (
                 int(bin_time), int(r.zone_id), str(r.cluster_id), float(r.final_score), float(r.confidence),
-                float(r.weighted_trip_count), int(r.unique_driver_count), float(r.crowding_penalty), 1 if r.recommended else 0,
+                float(r.weighted_trip_count), int(r.unique_driver_count), float(r.crowding_penalty), bool(r.recommended),
             ),
         )
 
@@ -71,7 +71,7 @@ def log_recommendation_outcome(
             cluster_id,
             float(score),
             float(confidence),
-            None if converted_to_trip is None else (1 if converted_to_trip else 0),
+            None if converted_to_trip is None else bool(converted_to_trip),
             minutes_to_trip,
         ),
     )
