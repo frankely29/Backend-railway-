@@ -339,13 +339,13 @@ def _recalibrate_visible_v3_fields(features: List[Dict[str, Any]]) -> None:
                     0.15 * profile_raw_score +
                     0.07 * profile_conf
                 )
-            visible_norm = _relaxed_display_curve(base_visible_norm)
-            visible_rating = int(round(1 + 99 * visible_norm))
+            visible_display_norm = _relaxed_display_curve(base_visible_norm)
+            visible_rating = int(round(1 + 99 * visible_display_norm))
             visible_bucket, visible_color = bucket_and_color_from_rating(visible_rating)
 
             props[f"earnings_shadow_visible_rank_{profile_name}"] = float(profile_local_rank)
             props[f"earnings_shadow_visible_base_score_{profile_name}"] = float(base_visible_norm)
-            props[f"earnings_shadow_visible_score_{profile_name}"] = float(visible_norm)
+            props[f"earnings_shadow_visible_score_{profile_name}"] = float(visible_display_norm)
             props[f"earnings_shadow_rating_{profile_name}"] = visible_rating
             props[f"earnings_shadow_bucket_{profile_name}"] = visible_bucket
             props[f"earnings_shadow_color_{profile_name}"] = visible_color
