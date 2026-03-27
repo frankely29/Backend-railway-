@@ -626,6 +626,20 @@ def test_score_frame_integrity() -> Dict[str, Any]:
         "earnings_shadow_confidence_brooklyn_v3",
         "earnings_shadow_confidence_staten_island_v3",
     ]
+    shadow_rating_families = [
+        "earnings_shadow_rating_citywide_v2",
+        "earnings_shadow_rating_citywide_v3",
+        "earnings_shadow_rating_manhattan_v2",
+        "earnings_shadow_rating_manhattan_v3",
+        "earnings_shadow_rating_bronx_wash_heights_v2",
+        "earnings_shadow_rating_bronx_wash_heights_v3",
+        "earnings_shadow_rating_queens_v2",
+        "earnings_shadow_rating_queens_v3",
+        "earnings_shadow_rating_brooklyn_v2",
+        "earnings_shadow_rating_brooklyn_v3",
+        "earnings_shadow_rating_staten_island_v2",
+        "earnings_shadow_rating_staten_island_v3",
+    ]
 
     sampled_features: list[Dict[str, Any]] = []
     violations: list[str] = []
@@ -713,6 +727,25 @@ def test_score_frame_integrity() -> Dict[str, Any]:
                     f"feature {feature_idx}: zone_id={location_id} zone_name={zone_name!r} family=legacy_visible invalid rating"
                 )
 
+        for family in shadow_rating_families:
+            family_rating = props.get(family)
+            if family_rating is None:
+                continue
+            emitted_bucket = props.get(f"{family}_bucket")
+            emitted_color = props.get(f"{family}_color")
+            try:
+                expected_bucket, expected_color = bucket_and_color_from_rating(int(family_rating))
+                if emitted_bucket != expected_bucket or emitted_color != expected_color:
+                    violations.append(
+                        f"feature {feature_idx}: zone_id={location_id} zone_name={zone_name!r} family={family} "
+                        f"rating={int(family_rating)} emitted_bucket={emitted_bucket!r} expected_bucket={expected_bucket!r} "
+                        f"emitted_color={emitted_color!r} expected_color={expected_color!r}"
+                    )
+            except Exception:
+                violations.append(
+                    f"feature {feature_idx}: zone_id={location_id} zone_name={zone_name!r} family={family} invalid rating"
+                )
+
         if bool(props.get("airport_excluded")):
             continue
 
@@ -761,6 +794,7 @@ def test_score_frame_integrity() -> Dict[str, Any]:
         or not sampled_integrity.get("frame_has_density_fields")
         or not sampled_integrity.get("frame_has_trap_fields")
         or not sampled_integrity.get("frame_has_popup_metric_fields")
+        or not sampled_integrity.get("frame_has_rating_bucket_color_consistency")
     )
     lock_snapshot = _generate_lock_snapshot()
     stale_lock = bool(lock_snapshot.get("lock_present")) and not bool(lock_snapshot.get("thread_alive"))
