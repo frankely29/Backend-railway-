@@ -81,11 +81,13 @@ class ProgressionXpBreakdown(BaseModel):
     miles_xp: int
     hours_xp: int
     report_xp: int
+    game_xp: int
 
 
 class ProgressionPayload(BaseModel):
     level: int
     rank_name: str
+    title: str
     rank_icon_key: str
     total_xp: int
     current_level_xp: int

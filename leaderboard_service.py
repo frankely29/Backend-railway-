@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import sqlite3
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
@@ -15,12 +16,13 @@ PROGRESSION_XP_PER_MILE = 8
 PROGRESSION_XP_PER_HOUR = 30
 PROGRESSION_XP_PER_REPORTED_PICKUP = 20
 PROGRESSION_MAX_PICKUP_REPORTS_PER_DAY_FOR_XP = 25
+MAX_LEVEL = 1000
 
 
 def _build_level_xp_thresholds() -> List[int]:
     thresholds = [0]
     total_xp = 0
-    for level_index in range(2, 101):
+    for level_index in range(2, MAX_LEVEL + 1):
         step_xp = round(120 + ((level_index - 1) * 26) + (((level_index - 1) ** 1.28) * 7))
         total_xp += int(step_xp)
         thresholds.append(total_xp)
@@ -30,23 +32,13 @@ def _build_level_xp_thresholds() -> List[int]:
 LEVEL_XP_THRESHOLDS = _build_level_xp_thresholds()
 
 RANK_LADDER = [
-    (1, 4, "Recruit", "recruit"),
-    (5, 8, "Private", "private"),
-    (9, 12, "Corporal", "corporal"),
-    (13, 16, "Sergeant", "sergeant"),
-    (17, 20, "Staff Sergeant", "staff_sergeant"),
-    (21, 24, "Sergeant First Class", "sergeant_first_class"),
-    (25, 28, "Master Sergeant", "master_sergeant"),
-    (29, 32, "Lieutenant", "lieutenant"),
-    (33, 36, "Captain", "captain"),
-    (37, 40, "Major", "major"),
-    (41, 44, "Colonel", "colonel"),
-    (45, 52, "Brigadier", "brigadier"),
-    (53, 60, "Major General", "major_general"),
-    (61, 70, "Lieutenant General", "lieutenant_general"),
-    (71, 82, "General", "general"),
-    (83, 92, "Commander", "commander"),
-    (93, 100, "Road Legend", "road_legend"),
+    (
+        ((band_index - 1) * 10) + 1,
+        band_index * 10,
+        f"Band {band_index:03d}",
+        f"band_{band_index:03d}",
+    )
+    for band_index in range(1, 101)
 ]
 
 
@@ -132,29 +124,29 @@ def _display_name(row: Dict) -> str:
 
 
 def _rank_for_level(level: int) -> Dict[str, str]:
-    clamped = max(1, min(100, int(level)))
+    clamped = max(1, min(MAX_LEVEL, int(level)))
     for start, end, rank_name, rank_icon_key in RANK_LADDER:
         if start <= clamped <= end:
             return {"rank_name": rank_name, "rank_icon_key": rank_icon_key}
-    return {"rank_name": "Recruit", "rank_icon_key": "recruit"}
+    return {"rank_name": "Band 001", "rank_icon_key": "band_001"}
 
 
 def get_level_from_lifetime_xp(total_xp: int) -> int:
     xp = max(0, int(total_xp or 0))
     if xp >= LEVEL_XP_THRESHOLDS[-1]:
-        return 100
+        return MAX_LEVEL
     level = 1
     for idx, threshold in enumerate(LEVEL_XP_THRESHOLDS):
         if xp >= threshold:
             level = idx + 1
         else:
             break
-    return min(100, max(1, level))
+    return min(MAX_LEVEL, max(1, level))
 
 
 def get_next_level_xp(level: int) -> Optional[int]:
-    clamped = max(1, min(100, int(level)))
-    if clamped >= 100:
+    clamped = max(1, min(MAX_LEVEL, int(level)))
+    if clamped >= MAX_LEVEL:
         return None
     return int(LEVEL_XP_THRESHOLDS[clamped])
 
@@ -175,7 +167,7 @@ def get_level_progress_from_lifetime_xp(total_xp: int) -> Dict[str, Any]:
         "current_level_xp": current_level_xp,
         "next_level_xp": next_level_xp,
         "xp_to_next_level": xp_to_next_level,
-        "max_level_reached": level == 100,
+        "max_level_reached": level == MAX_LEVEL,
     }
 
 
@@ -186,6 +178,7 @@ def _build_progression_from_daily_stats_rows(rows: List[Dict[str, Any]]) -> Dict
     miles_xp = 0
     hours_xp = 0
     report_xp = 0
+    game_xp = 0
 
     for raw_row in rows:
         row = dict(raw_row)
@@ -203,6 +196,7 @@ def _build_progression_from_daily_stats_rows(rows: List[Dict[str, Any]]) -> Dict
         report_xp += pickup_count_for_xp * PROGRESSION_XP_PER_REPORTED_PICKUP
 
     total_xp = int(miles_xp + hours_xp + report_xp)
+    total_xp += game_xp
     progression = get_level_progress_from_lifetime_xp(total_xp)
     progression["lifetime_miles"] = round(lifetime_miles, 4)
     progression["lifetime_hours"] = round(lifetime_hours, 4)
@@ -211,6 +205,7 @@ def _build_progression_from_daily_stats_rows(rows: List[Dict[str, Any]]) -> Dict
         "miles_xp": int(miles_xp),
         "hours_xp": int(hours_xp),
         "report_xp": int(report_xp),
+        "game_xp": int(game_xp),
     }
     return progression
 
@@ -260,7 +255,31 @@ def get_progression_for_users(user_ids: List[int]) -> Dict[int, Dict[str, Any]]:
     rows_by_user: Dict[int, List[Dict[str, Any]]] = {uid: [] for uid in clean_user_ids}
     for row in rows:
         rows_by_user.setdefault(int(row["user_id"]), []).append(dict(row))
-    return {uid: _build_progression_from_daily_stats_rows(rows_by_user.get(uid, [])) for uid in clean_user_ids}
+    progression_by_user = {uid: _build_progression_from_daily_stats_rows(rows_by_user.get(uid, [])) for uid in clean_user_ids}
+    try:
+        game_rows = _db_query_all(
+            f"""
+            SELECT user_id, COALESCE(SUM(xp_awarded), 0) AS xp_total
+            FROM game_xp_awards
+            WHERE user_id IN ({placeholders})
+            GROUP BY user_id
+            """,
+            tuple(clean_user_ids),
+        )
+    except sqlite3.OperationalError:
+        game_rows = []
+    game_xp_by_user = {int(row["user_id"]): int(row["xp_total"] or 0) for row in game_rows}
+    for uid in clean_user_ids:
+        progression = progression_by_user.get(uid)
+        if not progression:
+            continue
+        game_xp = int(game_xp_by_user.get(uid, 0))
+        progression["xp_breakdown"]["game_xp"] = game_xp
+        progression["total_xp"] = int(progression["total_xp"]) + game_xp
+        merged = get_level_progress_from_lifetime_xp(int(progression["total_xp"]))
+        for key in ("level", "rank_name", "rank_icon_key", "title", "current_level_xp", "next_level_xp", "xp_to_next_level", "max_level_reached"):
+            progression[key] = merged[key]
+    return progression_by_user
 
 
 def _enrich_rows_with_progression(rows: List[Dict]) -> None:

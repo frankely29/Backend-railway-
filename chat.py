@@ -685,6 +685,42 @@ def _publish_public_message_event(message: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def publish_public_battle_notification(payload: dict[str, Any]) -> dict[str, Any]:
+    room = "global"
+    event_payload = dict(payload)
+    event_payload["type"] = "battle_result"
+    event_payload["scope"] = "public_room"
+    event_payload["room"] = room
+    envelope = _live_event_broker.publish(_public_channel(room), "battle_result", event_payload)
+    event_payload["event_id"] = envelope["id"]
+    return event_payload
+
+
+def publish_public_battle_chat_message(
+    *,
+    author_user_id: int,
+    winner_display_name: str,
+    loser_display_name: str,
+    game_type: str,
+    winner_xp_awarded: int,
+) -> dict[str, Any]:
+    author = _db_query_one("SELECT * FROM users WHERE id=? LIMIT 1", (int(author_user_id),))
+    if not author:
+        raise HTTPException(status_code=404, detail="Author not found")
+    summary = f"{winner_display_name} beat {loser_display_name} in {str(game_type).title()} (+{int(winner_xp_awarded)} XP)"
+    row = _insert_public_message(
+        "global",
+        author,
+        summary,
+        message_type="system",
+    )
+    _db_exec("UPDATE chat_messages SET display_name=? WHERE id=?", ("Battle Results", int(row["id"])))
+    out = _serialize_public_message(dict(row))
+    out["display_name"] = "Battle Results"
+    _publish_public_message_event(out)
+    return out
+
+
 def _build_dm_summary_event(
     *,
     viewer_user_id: int,
