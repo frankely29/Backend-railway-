@@ -105,12 +105,6 @@ def build_zone_earnings_shadow_sql(
         AND CAST(PULocationID AS INTEGER) IN (
           SELECT PULocationID FROM zone_metadata WHERE airport_excluded = FALSE
         )
-        AND (
-          DOLocationID IS NULL
-          OR CAST(DOLocationID AS INTEGER) IN (
-            SELECT PULocationID FROM zone_metadata WHERE airport_excluded = FALSE
-          )
-        )
         AND pickup_datetime IS NOT NULL
         AND driver_pay IS NOT NULL
     ),
