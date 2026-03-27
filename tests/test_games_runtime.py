@@ -98,31 +98,39 @@ def _set_match_state(main_module, match_id: int, state: dict, *, current_turn_us
 
 
 def _replace_game_tables_with_old_match_schema(main_module) -> None:
+    games_service = importlib.import_module("games_service")
+    games_service._GAMES_SCHEMA_READY = False
+
+    main_module._db_exec("DROP TABLE IF EXISTS game_challenges")
     main_module._db_exec("DROP TABLE IF EXISTS game_match_participants")
     main_module._db_exec("DROP TABLE IF EXISTS game_match_moves")
+    main_module._db_exec("DROP TABLE IF EXISTS game_xp_awards")
     main_module._db_exec("DROP TABLE IF EXISTS game_matches")
+    main_module._db_exec(
+        """
+        CREATE TABLE game_challenges (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          game_type TEXT NOT NULL,
+          challenger_user_id INTEGER NOT NULL,
+          challenged_user_id INTEGER NOT NULL,
+          status TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL
+        )
+        """
+    )
     main_module._db_exec(
         """
         CREATE TABLE game_matches (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
-          challenge_id INTEGER,
           game_type TEXT NOT NULL,
-          challenger_user_id INTEGER,
-          challenged_user_id INTEGER,
           player_one_user_id INTEGER NOT NULL,
           player_two_user_id INTEGER NOT NULL,
           current_turn_user_id INTEGER,
           status TEXT NOT NULL,
-          winner_user_id INTEGER,
-          loser_user_id INTEGER,
-          winner_xp_awarded INTEGER NOT NULL DEFAULT 0,
-          loser_xp_awarded INTEGER NOT NULL DEFAULT 0,
           match_state_json TEXT NOT NULL,
-          result_summary TEXT,
           created_at INTEGER NOT NULL,
-          updated_at INTEGER NOT NULL,
-          accepted_at INTEGER,
-          completed_at INTEGER
+          updated_at INTEGER NOT NULL
         )
         """
     )
@@ -137,6 +145,17 @@ def _replace_game_tables_with_old_match_schema(main_module) -> None:
           result TEXT NOT NULL DEFAULT 'pending',
           xp_awarded INTEGER NOT NULL DEFAULT 0,
           joined_at INTEGER NOT NULL
+            )
+            """
+        )
+    main_module._db_exec(
+        """
+        CREATE TABLE game_xp_awards (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          match_id INTEGER NOT NULL,
+          user_id INTEGER NOT NULL,
+          xp_awarded INTEGER NOT NULL,
+          created_at INTEGER NOT NULL
         )
         """
     )
@@ -310,7 +329,7 @@ def test_games_contract_supports_frontend_alias_fields(app_env):
     assert active_match_response.json()["match"]["id"] == match["id"]
 
 
-def test_ensure_games_schema_upgrades_old_match_table_with_expires_at(app_env):
+def test_ensure_games_schema_upgrades_legacy_games_tables_and_backfills_timestamps(app_env):
     main, _client = app_env
     games_service = importlib.import_module("games_service")
 
@@ -318,29 +337,38 @@ def test_ensure_games_schema_upgrades_old_match_table_with_expires_at(app_env):
     main._db_exec(
         """
         INSERT INTO game_matches(
-            id, challenge_id, game_type, challenger_user_id, challenged_user_id,
-            player_one_user_id, player_two_user_id, current_turn_user_id, status,
-            winner_user_id, loser_user_id, winner_xp_awarded, loser_xp_awarded,
-            match_state_json, result_summary, created_at, updated_at, accepted_at, completed_at
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            id, game_type, player_one_user_id, player_two_user_id, current_turn_user_id, status,
+            match_state_json, created_at, updated_at
+        ) VALUES(?,?,?,?,?,?,?,?,?)
         """,
         (
-            1, None, "dominoes", 11, 22,
-            11, 22, 11, "active",
-            None, None, 0, 0,
-            json.dumps({"turn_user_id": 11}, separators=(",", ":")), None, 1_700_000_000, 1_700_000_000, 1_700_000_000, None,
+            1, "dominoes", 11, 22, 11, "active",
+            json.dumps({"turn_user_id": 11}, separators=(",", ":")), 1_700_000_000, 1_700_000_000,
         ),
     )
 
     games_service.ensure_games_schema()
 
-    columns = {
+    match_columns = {
         row["name"] if isinstance(row, dict) else row[1]
         for row in main._db_query_all("PRAGMA table_info(game_matches)")
     }
-    assert "expires_at" in columns
-    row = main._db_query_one("SELECT id, expires_at FROM game_matches WHERE id=1 LIMIT 1")
+    assert "challenge_id" in match_columns
+    assert "accepted_at" in match_columns
+    assert "expires_at" in match_columns
+    assert "winner_xp_awarded" in match_columns
+    assert "loser_xp_awarded" in match_columns
+
+    challenge_columns = {
+        row["name"] if isinstance(row, dict) else row[1]
+        for row in main._db_query_all("PRAGMA table_info(game_challenges)")
+    }
+    assert "responded_at" in challenge_columns
+    assert "accepted_match_id" in challenge_columns
+
+    row = main._db_query_one("SELECT id, accepted_at, expires_at FROM game_matches WHERE id=1 LIMIT 1")
     assert row["id"] == 1
+    assert int(row["accepted_at"]) == 1_700_000_000
     assert int(row["expires_at"]) == 1_700_086_400
 
 
@@ -353,15 +381,13 @@ def test_active_match_route_fails_soft_and_returns_200_on_old_match_schema(app_e
     main._db_exec(
         """
         INSERT INTO game_matches(
-            game_type, challenger_user_id, challenged_user_id, player_one_user_id, player_two_user_id,
-            current_turn_user_id, status, winner_xp_awarded, loser_xp_awarded, match_state_json,
-            created_at, updated_at, accepted_at
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+            game_type, player_one_user_id, player_two_user_id, current_turn_user_id, status,
+            match_state_json, created_at, updated_at
+        ) VALUES(?,?,?,?,?,?,?,?)
         """,
         (
-            "dominoes", int(alice["id"]), int(bob["id"]), int(alice["id"]), int(bob["id"]),
-            int(alice["id"]), "active", 0, 0, json.dumps({"turn_user_id": int(alice["id"])}, separators=(",", ":")),
-            1_700_000_000, 1_700_000_000, 1_700_000_000,
+            "dominoes", int(alice["id"]), int(bob["id"]), int(alice["id"]), "active",
+            json.dumps({"turn_user_id": int(alice["id"])}, separators=(",", ":")), 1_700_000_000, 1_700_000_000,
         ),
     )
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -14,6 +15,8 @@ MATCH_TTL_SECONDS = 24 * 3600
 WINNER_XP = 60
 LOSER_XP = 0
 _ALLOWED_GAME_TYPES = {"dominoes", "billiards"}
+_GAMES_SCHEMA_LOCK = threading.Lock()
+_GAMES_SCHEMA_READY = False
 
 
 def _safe_iso(unix_ts: Optional[int]) -> Optional[str]:
@@ -126,7 +129,50 @@ def _match_row_to_payload(row: Dict[str, Any], viewer_user_id: int, user_map: Di
     }
 
 
+def _table_columns_sqlite(table_name: str) -> set[str]:
+    rows = _db_query_all(f"PRAGMA table_info({table_name})")
+    return {str(r["name"] if isinstance(r, dict) else r[1]) for r in rows}
+
+
+def _postgres_columns_by_table(table_names: List[str]) -> Dict[str, set[str]]:
+    if not table_names:
+        return {}
+    placeholders = ",".join(["?" for _ in table_names])
+    rows = _db_query_all(
+        f"""
+        SELECT table_name, column_name
+        FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name IN ({placeholders})
+        """,
+        tuple(table_names),
+    )
+    out: Dict[str, set[str]] = {name: set() for name in table_names}
+    for row in rows:
+        raw = dict(row)
+        out.setdefault(str(raw["table_name"]), set()).add(str(raw["column_name"]))
+    return out
+
+
+def _ensure_column_if_missing(table_name: str, existing_columns: set[str], column_name: str, ddl: str) -> None:
+    if column_name in existing_columns:
+        return
+    _db_exec(f"ALTER TABLE {table_name} ADD COLUMN {ddl}")
+    existing_columns.add(column_name)
+
+
 def ensure_games_schema() -> None:
+    global _GAMES_SCHEMA_READY
+    if _GAMES_SCHEMA_READY:
+        return
+    with _GAMES_SCHEMA_LOCK:
+        if _GAMES_SCHEMA_READY:
+            return
+        _ensure_games_schema_impl()
+        _GAMES_SCHEMA_READY = True
+
+
+def _ensure_games_schema_impl() -> None:
     if DB_BACKEND == "postgres":
         _db_exec(
             """
@@ -297,21 +343,58 @@ def ensure_games_schema() -> None:
     _db_exec("CREATE INDEX IF NOT EXISTS idx_game_matches_status ON game_matches(status)")
 
     if DB_BACKEND == "postgres":
-        col_row = _db_query_one(
-            """
-            SELECT COUNT(*) AS c
-            FROM information_schema.columns
-            WHERE table_name='game_matches' AND column_name='expires_at'
-            """
+        pg_cols = _postgres_columns_by_table(
+            ["game_challenges", "game_matches", "game_match_participants", "game_match_moves", "game_xp_awards"]
         )
-        if int((col_row or {}).get("c") or 0) == 0:
-            _db_exec("ALTER TABLE game_matches ADD COLUMN expires_at BIGINT")
-        _db_exec("UPDATE game_matches SET expires_at = COALESCE(accepted_at, created_at) + ? WHERE expires_at IS NULL", (MATCH_TTL_SECONDS,))
+        challenge_cols = pg_cols.setdefault("game_challenges", set())
+        _ensure_column_if_missing("game_challenges", challenge_cols, "responded_at", "responded_at BIGINT")
+        _ensure_column_if_missing("game_challenges", challenge_cols, "expires_at", "expires_at BIGINT")
+        _ensure_column_if_missing("game_challenges", challenge_cols, "accepted_match_id", "accepted_match_id BIGINT")
+
+        match_cols = pg_cols.setdefault("game_matches", set())
+        _ensure_column_if_missing("game_matches", match_cols, "challenge_id", "challenge_id BIGINT")
+        _ensure_column_if_missing("game_matches", match_cols, "challenger_user_id", "challenger_user_id BIGINT")
+        _ensure_column_if_missing("game_matches", match_cols, "challenged_user_id", "challenged_user_id BIGINT")
+        _ensure_column_if_missing("game_matches", match_cols, "winner_user_id", "winner_user_id BIGINT")
+        _ensure_column_if_missing("game_matches", match_cols, "loser_user_id", "loser_user_id BIGINT")
+        _ensure_column_if_missing(
+            "game_matches", match_cols, "winner_xp_awarded", "winner_xp_awarded INTEGER NOT NULL DEFAULT 0"
+        )
+        _ensure_column_if_missing(
+            "game_matches", match_cols, "loser_xp_awarded", "loser_xp_awarded INTEGER NOT NULL DEFAULT 0"
+        )
+        _ensure_column_if_missing("game_matches", match_cols, "result_summary", "result_summary TEXT")
+        _ensure_column_if_missing("game_matches", match_cols, "accepted_at", "accepted_at BIGINT")
+        _ensure_column_if_missing("game_matches", match_cols, "completed_at", "completed_at BIGINT")
+        _ensure_column_if_missing("game_matches", match_cols, "expires_at", "expires_at BIGINT")
     else:
-        cols = {str(r["name"] if isinstance(r, dict) else r[1]) for r in _db_query_all("PRAGMA table_info(game_matches)")}
-        if cols and "expires_at" not in cols:
-            _db_exec("ALTER TABLE game_matches ADD COLUMN expires_at INTEGER")
-            _db_exec("UPDATE game_matches SET expires_at = COALESCE(accepted_at, created_at) + ? WHERE expires_at IS NULL", (MATCH_TTL_SECONDS,))
+        challenge_cols = _table_columns_sqlite("game_challenges")
+        _ensure_column_if_missing("game_challenges", challenge_cols, "responded_at", "responded_at INTEGER")
+        _ensure_column_if_missing("game_challenges", challenge_cols, "expires_at", "expires_at INTEGER")
+        _ensure_column_if_missing("game_challenges", challenge_cols, "accepted_match_id", "accepted_match_id INTEGER")
+
+        match_cols = _table_columns_sqlite("game_matches")
+        _ensure_column_if_missing("game_matches", match_cols, "challenge_id", "challenge_id INTEGER")
+        _ensure_column_if_missing("game_matches", match_cols, "challenger_user_id", "challenger_user_id INTEGER")
+        _ensure_column_if_missing("game_matches", match_cols, "challenged_user_id", "challenged_user_id INTEGER")
+        _ensure_column_if_missing("game_matches", match_cols, "winner_user_id", "winner_user_id INTEGER")
+        _ensure_column_if_missing("game_matches", match_cols, "loser_user_id", "loser_user_id INTEGER")
+        _ensure_column_if_missing(
+            "game_matches", match_cols, "winner_xp_awarded", "winner_xp_awarded INTEGER NOT NULL DEFAULT 0"
+        )
+        _ensure_column_if_missing(
+            "game_matches", match_cols, "loser_xp_awarded", "loser_xp_awarded INTEGER NOT NULL DEFAULT 0"
+        )
+        _ensure_column_if_missing("game_matches", match_cols, "result_summary", "result_summary TEXT")
+        _ensure_column_if_missing("game_matches", match_cols, "accepted_at", "accepted_at INTEGER")
+        _ensure_column_if_missing("game_matches", match_cols, "completed_at", "completed_at INTEGER")
+        _ensure_column_if_missing("game_matches", match_cols, "expires_at", "expires_at INTEGER")
+
+    _db_exec("UPDATE game_matches SET accepted_at = created_at WHERE accepted_at IS NULL")
+    _db_exec(
+        "UPDATE game_matches SET expires_at = COALESCE(accepted_at, created_at) + ? WHERE expires_at IS NULL",
+        (MATCH_TTL_SECONDS,),
+    )
 
 
 def create_challenge(challenger_user_id: int, challenged_user_id: int, game_type: str) -> Dict[str, Any]:
