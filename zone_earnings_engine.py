@@ -106,7 +106,6 @@ def build_zone_earnings_shadow_sql(
           SELECT PULocationID FROM zone_metadata WHERE airport_excluded = FALSE
         )
         AND pickup_datetime IS NOT NULL
-        AND driver_pay IS NOT NULL
     ),
     prepared AS (
       SELECT
