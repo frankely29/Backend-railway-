@@ -187,3 +187,21 @@ def test_voice_upload_rejects_unsupported_audio_type(app_env):
 
     assert response.status_code == 400, response.text
     assert response.json()["detail"] == "Unsupported audio format"
+
+
+def test_presence_endpoints_accept_fractional_zoom_query_params(app_env):
+    _main, client = app_env
+    alice = _signup(client, "presence-fractional-zoom@example.com", "PresenceFractionalZoom")
+    headers = _headers(alice["token"])
+
+    response_all = client.get("/presence/all?zoom=10.2", headers=headers)
+    assert response_all.status_code == 200, response_all.text
+    assert response_all.json().get("ok") is True
+
+    response_viewport = client.get("/presence/viewport?zoom=12.8039", headers=headers)
+    assert response_viewport.status_code == 200, response_viewport.text
+    assert response_viewport.json().get("ok") is True
+
+    response_delta = client.get("/presence/delta?zoom=11.6811", headers=headers)
+    assert response_delta.status_code == 200, response_delta.text
+    assert response_delta.json().get("ok") is True
