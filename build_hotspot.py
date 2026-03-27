@@ -429,6 +429,31 @@ def _validate_popup_metric_consistency(
     ]
     tolerance = 2.0
     failures: list[str] = []
+    failure_diagnostics: list[Dict[str, Any]] = []
+
+    def _append_failure(location_id: Any, zone_name: Any, borough: Any, reason: str) -> None:
+        location_id_int = None
+        try:
+            location_id_int = int(location_id) if location_id is not None else None
+        except Exception:
+            location_id_int = None
+        diagnostics = (diagnostics_by_location_id or {}).get(location_id_int) if location_id_int is not None else None
+        failure_payload = {
+            "LocationID": location_id,
+            "zone_name": zone_name,
+            "borough": borough,
+            "frame_time": frame_time,
+            "reason": reason,
+            "shadow_sql_row_exists": None if not diagnostics else diagnostics.get("shadow_sql_row_exists"),
+            "geometry_area_row_exists": None if not diagnostics else diagnostics.get("geometry_area_row_exists"),
+            "pickups_now_shadow": None if not diagnostics else diagnostics.get("pickups_now_shadow"),
+            "next_pickups_shadow": None if not diagnostics else diagnostics.get("next_pickups_shadow"),
+            "zone_area_sq_miles_shadow": None if not diagnostics else diagnostics.get("zone_area_sq_miles_shadow"),
+            "pickups_per_sq_mile_now_shadow": None if not diagnostics else diagnostics.get("pickups_per_sq_mile_now_shadow"),
+            "pickups_per_sq_mile_next_shadow": None if not diagnostics else diagnostics.get("pickups_per_sq_mile_next_shadow"),
+        }
+        failure_diagnostics.append(failure_payload)
+        failures.append(json.dumps(failure_payload, sort_keys=True))
 
     for feature in features:
         props = feature.get("properties") if isinstance(feature, dict) else None
@@ -437,6 +462,7 @@ def _validate_popup_metric_consistency(
 
         location_id = props.get("LocationID")
         zone_name = props.get("zone_name")
+        borough = props.get("borough")
         parsed_values: Dict[str, float] = {}
         invalid_fields: list[str] = []
         for field_name in popup_metric_fields:
@@ -446,23 +472,7 @@ def _validate_popup_metric_consistency(
                 continue
             parsed_values[field_name] = number
         if invalid_fields:
-            location_id_int = None
-            try:
-                location_id_int = int(location_id) if location_id is not None else None
-            except Exception:
-                location_id_int = None
-            diagnostics = (diagnostics_by_location_id or {}).get(location_id_int) if location_id_int is not None else None
-            failure_payload = {
-                "LocationID": location_id,
-                "zone_name": zone_name,
-                "borough": (props.get("borough") if isinstance(props, dict) else None),
-                "frame_time": frame_time,
-                "invalid_fields": invalid_fields,
-                "geometry_area_row_exists": None if not diagnostics else diagnostics.get("geometry_area_row_exists"),
-                "shadow_sql_row_exists": None if not diagnostics else diagnostics.get("shadow_sql_row_exists"),
-                "raw_popup_metric_fields": None if not diagnostics else diagnostics.get("raw_popup_metric_fields"),
-            }
-            failures.append(json.dumps(failure_payload, sort_keys=True))
+            _append_failure(location_id, zone_name, borough, f"invalid_fields={','.join(invalid_fields)}")
 
         pickups_now = parsed_values.get("pickups_now_shadow")
         pickups_next = parsed_values.get("next_pickups_shadow")
@@ -471,44 +481,38 @@ def _validate_popup_metric_consistency(
         density_next = parsed_values.get("pickups_per_sq_mile_next_shadow")
 
         if pickups_now is not None and pickups_now < 0:
-            failures.append(
-                f"LocationID={location_id} zone_name={zone_name!r} frame_time={frame_time} pickups_now_shadow must be >= 0"
-            )
+            _append_failure(location_id, zone_name, borough, "pickups_now_shadow must be >= 0")
         if pickups_next is not None and pickups_next < 0:
-            failures.append(
-                f"LocationID={location_id} zone_name={zone_name!r} frame_time={frame_time} next_pickups_shadow must be >= 0"
-            )
+            _append_failure(location_id, zone_name, borough, "next_pickups_shadow must be >= 0")
         if zone_area is not None and zone_area <= 0:
-            failures.append(
-                f"LocationID={location_id} zone_name={zone_name!r} frame_time={frame_time} zone_area_sq_miles_shadow must be > 0"
-            )
+            _append_failure(location_id, zone_name, borough, "zone_area_sq_miles_shadow must be > 0")
         if density_now is not None and density_now < 0:
-            failures.append(
-                f"LocationID={location_id} zone_name={zone_name!r} frame_time={frame_time} pickups_per_sq_mile_now_shadow must be >= 0"
-            )
+            _append_failure(location_id, zone_name, borough, "pickups_per_sq_mile_now_shadow must be >= 0")
         if density_next is not None and density_next < 0:
-            failures.append(
-                f"LocationID={location_id} zone_name={zone_name!r} frame_time={frame_time} pickups_per_sq_mile_next_shadow must be >= 0"
-            )
+            _append_failure(location_id, zone_name, borough, "pickups_per_sq_mile_next_shadow must be >= 0")
 
         if zone_area is not None and pickups_now is not None and density_now is not None:
             expected_now = zone_area * density_now
             if abs(pickups_now - expected_now) > tolerance:
-                failures.append(
-                    f"LocationID={location_id} zone_name={zone_name!r} frame_time={frame_time} "
-                    f"pickups_now_shadow mismatch: got={pickups_now:.6f} expected={expected_now:.6f}"
+                _append_failure(
+                    location_id,
+                    zone_name,
+                    borough,
+                    f"pickups_now_shadow mismatch: got={pickups_now:.6f} expected={expected_now:.6f}",
                 )
         if zone_area is not None and pickups_next is not None and density_next is not None:
             expected_next = zone_area * density_next
             if abs(pickups_next - expected_next) > tolerance:
-                failures.append(
-                    f"LocationID={location_id} zone_name={zone_name!r} frame_time={frame_time} "
-                    f"next_pickups_shadow mismatch: got={pickups_next:.6f} expected={expected_next:.6f}"
+                _append_failure(
+                    location_id,
+                    zone_name,
+                    borough,
+                    f"next_pickups_shadow mismatch: got={pickups_next:.6f} expected={expected_next:.6f}",
                 )
 
     if failures:
-        for failure in failures[:25]:
-            logger.error("popup_metric_consistency_failure %s", failure)
+        for failure in failure_diagnostics[:25]:
+            logger.error("popup_metric_consistency_failure %s", json.dumps(failure, sort_keys=True))
         sample = "; ".join(failures[:8])
         raise RuntimeError(f"Popup metric consistency validation failed ({len(failures)}): {sample}")
 
@@ -1303,13 +1307,11 @@ def build_hotspots_frames(
                         and float(zone_geometry_by_id[zid_i]["zone_area_sq_miles"]) > 0
                     ),
                     "shadow_sql_row_exists": bool(shadow_props),
-                    "raw_popup_metric_fields": {
-                        "pickups_now_shadow": shadow_props.get("pickups_now_shadow"),
-                        "next_pickups_shadow": shadow_props.get("next_pickups_shadow"),
-                        "zone_area_sq_miles_shadow": shadow_props.get("zone_area_sq_miles_shadow"),
-                        "pickups_per_sq_mile_now_shadow": shadow_props.get("pickups_per_sq_mile_now_shadow"),
-                        "pickups_per_sq_mile_next_shadow": shadow_props.get("pickups_per_sq_mile_next_shadow"),
-                    },
+                    "pickups_now_shadow": shadow_props.get("pickups_now_shadow"),
+                    "next_pickups_shadow": shadow_props.get("next_pickups_shadow"),
+                    "zone_area_sq_miles_shadow": shadow_props.get("zone_area_sq_miles_shadow"),
+                    "pickups_per_sq_mile_now_shadow": shadow_props.get("pickups_per_sq_mile_now_shadow"),
+                    "pickups_per_sq_mile_next_shadow": shadow_props.get("pickups_per_sq_mile_next_shadow"),
                 }
             if (not bool(is_airport_zone(zid_i, name_by_id.get(zid_i, ""), borough_by_id.get(zid_i, "")))) and popup_metrics is None:
                 logger.warning(
