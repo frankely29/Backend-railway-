@@ -9,6 +9,10 @@ MAX_ZONE_BIN_LOGS = 32
 MAX_MICRO_BIN_LOGS = 3
 
 
+def _bool_db_value(flag: bool):
+    return bool(flag)
+
+
 def log_zone_bins(db_exec, *, bin_time: int, rows: Iterable[ZoneScoreResult]) -> None:
     ranked = sorted(list(rows), key=lambda r: r.final_score, reverse=True)[:MAX_ZONE_BIN_LOGS]
     for r in ranked:
@@ -24,7 +28,7 @@ def log_zone_bins(db_exec, *, bin_time: int, rows: Iterable[ZoneScoreResult]) ->
                 int(bin_time), int(r.zone_id), float(r.final_score), float(r.confidence),
                 float(r.historical_component), float(r.live_component), float(r.same_timeslot_component),
                 float(r.density_penalty), float(r.weighted_trip_count), int(r.unique_driver_count),
-                bool(r.recommended),
+                _bool_db_value(bool(r.recommended)),
             ),
         )
 
@@ -41,7 +45,7 @@ def log_micro_bins(db_exec, *, bin_time: int, rows: Iterable[MicroHotspotScoreRe
             """,
             (
                 int(bin_time), int(r.zone_id), str(r.cluster_id), float(r.final_score), float(r.confidence),
-                float(r.weighted_trip_count), int(r.unique_driver_count), float(r.crowding_penalty), bool(r.recommended),
+                float(r.weighted_trip_count), int(r.unique_driver_count), float(r.crowding_penalty), _bool_db_value(bool(r.recommended)),
             ),
         )
 
@@ -71,7 +75,7 @@ def log_recommendation_outcome(
             cluster_id,
             float(score),
             float(confidence),
-            None if converted_to_trip is None else bool(converted_to_trip),
+            None if converted_to_trip is None else _bool_db_value(bool(converted_to_trip)),
             minutes_to_trip,
         ),
     )

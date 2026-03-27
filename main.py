@@ -2238,6 +2238,13 @@ from leaderboard_service import (
     get_my_rank,
     get_overview_for_user,
 )
+from games_routes import router as games_router
+from games_service import (
+    ensure_games_schema,
+    get_active_match_between_users,
+    get_battle_stats_for_user,
+    get_viewer_game_relationship,
+)
 from work_battles_routes import router as work_battles_router
 from work_battles_service import ensure_work_battles_schema
 from leaderboard_tracker import increment_pickup_count, record_presence_heartbeat
@@ -2252,6 +2259,7 @@ from pickup_recording_feature import (
 app.include_router(chat_router)
 app.include_router(leaderboard_router)
 app.include_router(pickup_recording_router)
+app.include_router(games_router)
 app.include_router(work_battles_router)
 
 # =========================================================
@@ -2264,6 +2272,7 @@ def startup():
     _db_init()
     init_leaderboard_schema()
     ensure_pickup_recording_schema()
+    ensure_games_schema()
     ensure_work_battles_schema()
     _ensure_admin_seed()
     try:
@@ -2432,6 +2441,47 @@ def admin_performance_metrics(admin: sqlite3.Row = Depends(require_admin)):
             "pickup_hotspot_cache_hit_rate": ratio("pickup_hotspot.cache_hit", "pickup_hotspot.cache_miss"),
             "pickup_score_bundle_hit_rate": ratio("pickup_score_bundle.cache_hit", "pickup_score_bundle.cache_miss"),
         },
+    }
+
+
+@app.get("/system/diagnostics")
+def system_diagnostics(admin: sqlite3.Row = Depends(require_admin)):
+    _ = admin
+    required_tables = [
+        "users",
+        "presence",
+        "presence_runtime_state",
+        "chat_messages",
+        "private_chat_messages",
+        "work_battle_challenges",
+        "game_challenges",
+        "game_matches",
+        "game_match_participants",
+        "game_match_moves",
+        "leaderboard_badges",
+        "leaderboard_refresh_jobs",
+        "recommendation_outcomes",
+        "hotspot_experiment_bins",
+    ]
+    table_state: Dict[str, bool] = {}
+    for name in required_tables:
+        if DB_BACKEND == "postgres":
+            row = _db_query_one("SELECT to_regclass(?) AS exists_name", (f"public.{name}",))
+            table_state[name] = bool(row and row.get("exists_name"))
+        else:
+            row = _db_query_one(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
+                (name,),
+            )
+            table_state[name] = row is not None
+    return {
+        "ok": True,
+        "db_backend": DB_BACKEND,
+        "backend_build_id": os.environ.get("BACKEND_BUILD_ID"),
+        "backend_release": os.environ.get("BACKEND_RELEASE"),
+        "tables": table_state,
+        "games_schema_present": all(table_state.get(n, False) for n in ["game_challenges", "game_matches", "game_match_participants", "game_match_moves"]),
+        "work_battles_schema_present": bool(table_state.get("work_battle_challenges")),
     }
 
 
@@ -2732,7 +2782,7 @@ def me(user: sqlite3.Row = Depends(require_user)):
 
 @app.get("/drivers/{user_id}/profile")
 def driver_profile(user_id: int, viewer: sqlite3.Row = Depends(require_user)):
-    _ = viewer
+    ensure_games_schema()
     target = _db_query_one(
         "SELECT id, email, display_name, avatar_url, avatar_version, is_disabled, is_suspended FROM users WHERE id=? LIMIT 1",
         (int(user_id),),
@@ -2752,6 +2802,9 @@ def driver_profile(user_id: int, viewer: sqlite3.Row = Depends(require_user)):
     hours_rank_data = get_my_rank(target_user_id, LeaderboardMetric.hours, LeaderboardPeriod.daily)
     best_badge = get_best_current_badge_for_user(target_user_id)
     progression = get_progression_for_user(target_user_id)
+    battle_payload = get_battle_stats_for_user(target_user_id)
+    relationship = get_viewer_game_relationship(target_user_id, int(viewer["id"]))
+    active_summary = get_active_match_between_users(target_user_id, int(viewer["id"]))
 
     miles_rank = miles_rank_data.get("row", {}).get("rank_position") if miles_rank_data.get("row") else None
     hours_rank = hours_rank_data.get("row", {}).get("rank_position") if hours_rank_data.get("row") else None
@@ -2789,6 +2842,12 @@ def driver_profile(user_id: int, viewer: sqlite3.Row = Depends(require_user)):
             "pickups": yearly.get("pickups", 0),
         },
         "progression": progression,
+        "battle_stats": battle_payload["battle_stats"],
+        "battle_record": battle_payload["battle_record"],
+        "recent_battles": battle_payload["recent_battles"],
+        "battle_history": battle_payload["battle_history"],
+        "viewer_game_relationship": relationship,
+        "active_match_summary": active_summary,
     }
 
 
