@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import random
 import threading
 import time
@@ -585,10 +586,51 @@ def _dominoes_initial_state(player_one_user_id: int, player_two_user_id: int, se
 
 
 def _billiards_initial_state(player_one_user_id: int, player_two_user_id: int) -> Dict[str, Any]:
-    balls = [{"number": num, "status": "table"} for num in range(1, 16)]
+    color_by_number: Dict[int, str] = {
+        1: "#f4d03f",
+        2: "#2e86de",
+        3: "#c0392b",
+        4: "#8e44ad",
+        5: "#d35400",
+        6: "#27ae60",
+        7: "#8b4513",
+        8: "#111111",
+        9: "#f4d03f",
+        10: "#2e86de",
+        11: "#c0392b",
+        12: "#8e44ad",
+        13: "#d35400",
+        14: "#27ae60",
+        15: "#8b4513",
+    }
+    cue_x = 0.24
+    cue_y = 0.5
+    rack_start_x = 0.72
+    row_spacing = 0.042
+    col_spacing = 0.05
+    rack_order = [1, 9, 2, 10, 8, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15]
+    balls: List[Dict[str, Any]] = []
+    idx = 0
+    for row in range(5):
+        x = rack_start_x + row * row_spacing
+        y_start = cue_y - (row * col_spacing) / 2.0
+        for pos in range(row + 1):
+            number = rack_order[idx]
+            idx += 1
+            balls.append(
+                {
+                    "number": number,
+                    "x": round(x, 4),
+                    "y": round(y_start + pos * col_spacing, 4),
+                    "color": color_by_number[number],
+                    "status": "table",
+                    "pocketed": False,
+                }
+            )
     return {
         "game_type": "billiards",
         "turn_user_id": int(player_one_user_id),
+        "cue_ball": {"number": 0, "x": cue_x, "y": cue_y, "color": "#ffffff", "status": "table", "pocketed": False},
         "balls": balls,
         "assignments": {},
         "players": {
@@ -656,11 +698,13 @@ def _simulate_billiards_shot(
                 pocketed.append(opponent_numbers[0])
             elif table_balls and 8 in table_balls and len(table_balls) <= 4:
                 pocketed.append(8)
+    cue_scratch = foul and normalized_power > 97.5
     return {
         "angle": normalized_angle,
         "power": normalized_power,
         "quality": quality,
         "foul": foul,
+        "cue_scratch": cue_scratch,
         "pocketed_balls": pocketed,
     }
 
@@ -940,7 +984,24 @@ def move_match(match_id: int, actor_user_id: int, payload: Dict[str, Any]) -> Di
         players = state.setdefault("players", {})
         players.setdefault(str(actor_user_id), {"targets_remaining": 7, "targets_cleared": 0})
         players.setdefault(str(opponent_user_id), {"targets_remaining": 7, "targets_cleared": 0})
-        balls = state.setdefault("balls", [{"number": i, "status": "table"} for i in range(1, 16)])
+        balls = state.setdefault("balls", _billiards_initial_state(int(match["challenger_user_id"]), int(match["challenged_user_id"]))["balls"])
+        color_by_number: Dict[int, str] = {
+            1: "#f4d03f", 2: "#2e86de", 3: "#c0392b", 4: "#8e44ad", 5: "#d35400", 6: "#27ae60", 7: "#8b4513",
+            8: "#111111", 9: "#f4d03f", 10: "#2e86de", 11: "#c0392b", 12: "#8e44ad", 13: "#d35400", 14: "#27ae60", 15: "#8b4513",
+        }
+        for ball in balls:
+            number = int(ball.get("number") or 0)
+            if 1 <= number <= 15:
+                ball.setdefault("x", round(0.58 + ((number - 1) % 5) * 0.03, 4))
+                ball.setdefault("y", round(0.30 + ((number - 1) // 5) * 0.1, 4))
+                ball.setdefault("color", color_by_number.get(number, "#777777"))
+                if ball.get("status") == "pocketed" or bool(ball.get("pocketed")):
+                    ball["status"] = "pocketed"
+                    ball["pocketed"] = True
+                else:
+                    ball["status"] = "table"
+                    ball["pocketed"] = False
+        cue_ball = state.setdefault("cue_ball", {"number": 0, "x": 0.24, "y": 0.5, "color": "#ffffff", "status": "table", "pocketed": False})
         assignments = state.setdefault("assignments", {})
         move_type = str(payload.get("move_type") or "").strip().lower()
         result_state = payload.get("result_state") or {}
@@ -962,12 +1023,24 @@ def move_match(match_id: int, actor_user_id: int, payload: Dict[str, Any]) -> Di
                 angle=shot_angle,
                 power=shot_power,
             )
+        elif result_state:
+            shot_result = {
+                "angle": result_state.get("angle"),
+                "power": result_state.get("power"),
+                "quality": result_state.get("quality"),
+                "foul": bool(result_state.get("foul")),
+                "cue_scratch": bool(result_state.get("cue_scratch")),
+                "pocketed_balls": list(result_state.get("pocketed_balls") or []),
+            }
+        else:
+            raise HTTPException(status_code=400, detail="Unsupported billiards move payload")
         pocketed_source = result_state.get("pocketed_balls")
         if not isinstance(pocketed_source, list):
             pocketed_source = shot_result.get("pocketed_balls") or []
         pocketed = [int(v) for v in pocketed_source if isinstance(v, (int, float))]
         pocketed = sorted({n for n in pocketed if 1 <= int(n) <= 15})
         foul = bool(result_state.get("foul")) if ("foul" in result_state) else bool(shot_result.get("foul"))
+        cue_scratch = bool(result_state.get("cue_scratch")) if ("cue_scratch" in result_state) else bool(shot_result.get("cue_scratch"))
         state["last_shot"] = {
             "move_type": move_type or "result",
             "actor_user_id": int(actor_user_id),
@@ -975,6 +1048,7 @@ def move_match(match_id: int, actor_user_id: int, payload: Dict[str, Any]) -> Di
             "power": shot_result.get("power"),
             "quality": shot_result.get("quality"),
             "foul": foul,
+            "cue_scratch": cue_scratch,
             "pocketed_balls": pocketed,
             "move_number": int(move_number),
         }
@@ -988,6 +1062,29 @@ def move_match(match_id: int, actor_user_id: int, payload: Dict[str, Any]) -> Di
         for ball in balls:
             if int(ball.get("number") or 0) in pocketed:
                 ball["status"] = "pocketed"
+                ball["pocketed"] = True
+                ball["x"] = None
+                ball["y"] = None
+            elif ball.get("status") != "pocketed":
+                ball["pocketed"] = False
+        if cue_scratch:
+            cue_ball["status"] = "table"
+            cue_ball["pocketed"] = False
+            cue_ball["x"] = 0.24
+            cue_ball["y"] = 0.5
+        else:
+            try:
+                shot_angle = float(shot_result.get("angle") or 0.0)
+                shot_power = float(shot_result.get("power") or 0.0)
+            except Exception:
+                shot_angle = 0.0
+                shot_power = 0.0
+            radians = math.radians(shot_angle)
+            drift = max(0.01, min(0.16, shot_power / 900.0))
+            cue_ball["status"] = "table"
+            cue_ball["pocketed"] = False
+            cue_ball["x"] = max(0.05, min(0.95, float(cue_ball.get("x") or 0.24) + drift * math.cos(radians)))
+            cue_ball["y"] = max(0.05, min(0.95, float(cue_ball.get("y") or 0.5) + drift * math.sin(radians)))
         def _remaining(group: Optional[str]) -> int:
             if group == "solids":
                 return len([b for b in balls if 1 <= int(b.get("number") or 0) <= 7 and b.get("status") != "pocketed"])

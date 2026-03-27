@@ -395,16 +395,27 @@ def _resolve_popup_metrics(
     zone_area = _as_finite_number(raw_shadow_props.get("zone_area_sq_miles_shadow"))
     if zone_area is None or zone_area <= 0:
         zone_area = _as_finite_number(geometry_area_sq_miles)
-    if zone_area is None or zone_area <= 0:
-        return None
 
     density_now = _as_finite_number(raw_shadow_props.get("pickups_per_sq_mile_now_shadow"))
-    if density_now is None or density_now < 0:
+    if (density_now is None or density_now < 0) and zone_area is not None and zone_area > 0:
         density_now = pickups_now / zone_area
 
     density_next = _as_finite_number(raw_shadow_props.get("pickups_per_sq_mile_next_shadow"))
-    if density_next is None or density_next < 0:
+    if (density_next is None or density_next < 0) and zone_area is not None and zone_area > 0:
         density_next = pickups_next / zone_area
+
+    if zone_area is None or zone_area <= 0:
+        if density_now is not None and density_now > 0:
+            zone_area = max(pickups_now / density_now, 0.01)
+        elif density_next is not None and density_next > 0:
+            zone_area = max(pickups_next / density_next, 0.01)
+        else:
+            zone_area = 1.0
+
+    if density_now is None or density_now < 0:
+        density_now = max(pickups_now / max(zone_area, 0.01), 0.0)
+    if density_next is None or density_next < 0:
+        density_next = max(pickups_next / max(zone_area, 0.01), 0.0)
 
     return {
         "pickups_now_shadow": float(pickups_now),
