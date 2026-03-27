@@ -199,6 +199,8 @@ def _frame_features(frame_payload: Any) -> list[Dict[str, Any]]:
 
 
 def sample_frame_integrity(frames_dir: Path) -> dict:
+    from build_hotspot import bucket_and_color_from_rating
+
     timeline_items = _timeline_items(frames_dir)
     if not timeline_items:
         return {
@@ -210,6 +212,7 @@ def sample_frame_integrity(frames_dir: Path) -> dict:
             "frame_has_density_fields": False,
             "frame_has_trap_fields": False,
             "frame_has_popup_metric_fields": False,
+            "frame_has_rating_bucket_color_consistency": False,
         }
 
     sample_indices = sorted(set([0, len(timeline_items) // 2, len(timeline_items) - 1]))
@@ -255,6 +258,20 @@ def sample_frame_integrity(frames_dir: Path) -> dict:
         "pickups_per_sq_mile_now_shadow",
         "pickups_per_sq_mile_next_shadow",
     ]
+    shadow_rating_families = [
+        "earnings_shadow_rating_citywide_v2",
+        "earnings_shadow_rating_citywide_v3",
+        "earnings_shadow_rating_manhattan_v2",
+        "earnings_shadow_rating_manhattan_v3",
+        "earnings_shadow_rating_bronx_wash_heights_v2",
+        "earnings_shadow_rating_bronx_wash_heights_v3",
+        "earnings_shadow_rating_queens_v2",
+        "earnings_shadow_rating_queens_v3",
+        "earnings_shadow_rating_brooklyn_v2",
+        "earnings_shadow_rating_brooklyn_v3",
+        "earnings_shadow_rating_staten_island_v2",
+        "earnings_shadow_rating_staten_island_v3",
+    ]
 
     def _all_features_have(required_fields: list[str]) -> bool:
         if not sampled_features:
@@ -267,6 +284,41 @@ def sample_frame_integrity(frames_dir: Path) -> dict:
                 return False
         return True
 
+    def _has_rating_bucket_color_consistency() -> bool:
+        if not sampled_features:
+            return False
+        for feature in sampled_features:
+            props = feature.get("properties") if isinstance(feature, dict) else None
+            if not isinstance(props, dict):
+                return False
+
+            legacy_rating = props.get("rating")
+            if legacy_rating is not None:
+                try:
+                    expected_bucket, expected_color = bucket_and_color_from_rating(int(legacy_rating))
+                except Exception:
+                    return False
+                emitted_bucket = props.get("bucket")
+                style = props.get("style") if isinstance(props.get("style"), dict) else {}
+                emitted_color = style.get("fillColor")
+                if emitted_bucket != expected_bucket or emitted_color != expected_color:
+                    return False
+
+            for family in shadow_rating_families:
+                rating_value = props.get(family)
+                if rating_value is None:
+                    continue
+                try:
+                    expected_bucket, expected_color = bucket_and_color_from_rating(int(rating_value))
+                except Exception:
+                    return False
+                emitted_bucket = props.get(f"{family}_bucket")
+                emitted_color = props.get(f"{family}_color")
+                if emitted_bucket != expected_bucket or emitted_color != expected_color:
+                    return False
+
+        return True
+
     return {
         "sampled_frame_indices": sample_indices,
         "sampled_frame_names": sampled_frame_names,
@@ -276,6 +328,7 @@ def sample_frame_integrity(frames_dir: Path) -> dict:
         "frame_has_density_fields": _all_features_have(density_required),
         "frame_has_trap_fields": _all_features_have(trap_required),
         "frame_has_popup_metric_fields": _all_features_have(popup_metric_required),
+        "frame_has_rating_bucket_color_consistency": _has_rating_bucket_color_consistency(),
     }
 
 
@@ -315,6 +368,8 @@ def evaluate_artifact_freshness(
         reason_codes.append("sampled_frames_missing_trap_fields")
     if not sampled.get("frame_has_popup_metric_fields"):
         reason_codes.append("sampled_frames_missing_popup_metric_fields")
+    if not sampled.get("frame_has_rating_bucket_color_consistency"):
+        reason_codes.append("sampled_frames_bucket_color_mismatch")
 
     if current_manifest is None:
         reason_codes.append("manifest_missing")
