@@ -22,9 +22,12 @@ def nullable_percentile_rank_expr(value_expr: str, partition_expr: str, alias_pr
     return f"""
     CASE
       WHEN {value_expr} IS NULL THEN NULL
-      ELSE ROW_NUMBER() OVER (
+      ELSE SUM(
+        CASE WHEN {value_expr} IS NULL THEN 0 ELSE 1 END
+      ) OVER (
         PARTITION BY {partition_expr}
-        ORDER BY ({value_expr} IS NULL), {value_expr}
+        ORDER BY {value_expr}
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
       )
     END AS {alias_prefix}_rn,
     COUNT({value_expr}) OVER (PARTITION BY {partition_expr}) AS {alias_prefix}_n
