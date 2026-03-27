@@ -2458,8 +2458,9 @@ def system_diagnostics(admin: sqlite3.Row = Depends(require_admin)):
         "game_matches",
         "game_match_participants",
         "game_match_moves",
-        "leaderboard_badges",
-        "leaderboard_refresh_jobs",
+        "game_xp_awards",
+        "leaderboard_badges_current",
+        "leaderboard_badges_refresh_state",
         "recommendation_outcomes",
         "hotspot_experiment_bins",
     ]
@@ -2480,7 +2481,17 @@ def system_diagnostics(admin: sqlite3.Row = Depends(require_admin)):
         "backend_build_id": os.environ.get("BACKEND_BUILD_ID"),
         "backend_release": os.environ.get("BACKEND_RELEASE"),
         "tables": table_state,
-        "games_schema_present": all(table_state.get(n, False) for n in ["game_challenges", "game_matches", "game_match_participants", "game_match_moves"]),
+        "games_schema_present": all(
+            table_state.get(n, False)
+            for n in ["game_challenges", "game_matches", "game_match_participants", "game_match_moves", "game_xp_awards"]
+        ),
+        "games_schema": {
+            "game_challenges": bool(table_state.get("game_challenges")),
+            "game_matches": bool(table_state.get("game_matches")),
+            "game_match_participants": bool(table_state.get("game_match_participants")),
+            "game_match_moves": bool(table_state.get("game_match_moves")),
+            "game_xp_awards": bool(table_state.get("game_xp_awards")),
+        },
         "work_battles_schema_present": bool(table_state.get("work_battle_challenges")),
     }
 
@@ -2782,7 +2793,6 @@ def me(user: sqlite3.Row = Depends(require_user)):
 
 @app.get("/drivers/{user_id}/profile")
 def driver_profile(user_id: int, viewer: sqlite3.Row = Depends(require_user)):
-    ensure_games_schema()
     target = _db_query_one(
         "SELECT id, email, display_name, avatar_url, avatar_version, is_disabled, is_suspended FROM users WHERE id=? LIMIT 1",
         (int(user_id),),
