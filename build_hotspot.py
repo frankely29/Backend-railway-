@@ -13,7 +13,7 @@ import duckdb
 
 from zone_earnings_engine import build_zone_earnings_shadow_sql
 from zone_geometry_metrics import build_zone_geometry_metrics_rows
-from zone_mode_profiles import ZONE_MODE_PROFILES
+from zone_mode_profiles import ZONE_MODE_PROFILES, validate_zone_mode_profiles_for_live_engine
 from artifact_freshness import build_expected_artifact_signature
 
 def ensure_zones_geojson(data_dir: Path, force: bool = False) -> Path:
@@ -268,7 +268,7 @@ def _recalibrate_visible_v3_fields(features: List[Dict[str, Any]]) -> None:
         props = feature.get("properties") or {}
         location_id = int(props.get("LocationID") or 0)
         citywide_local_rank = 0.0 if n_city <= 1 else (idx / (n_city - 1))
-        citywide_anchor_discount_factor = 0.90 if _is_core_manhattan_for_citywide_discount(props, feature.get("geometry")) else 1.0
+        citywide_anchor_discount_factor = 1.0
         citywide_anchor_input = _clamp01(float(props.get(citywide_rank_field) or 0.0))
         citywide_conf = _clamp01(float(props.get("earnings_shadow_confidence_citywide_v3") or 0.0))
         citywide_base_norm = _clamp01(
@@ -449,6 +449,77 @@ def _validate_popup_metric_consistency(features: List[Dict[str, Any]], frame_tim
         raise RuntimeError(f"Popup metric consistency validation failed ({len(failures)}): {sample}")
 
 
+def _validate_rating_bucket_color_consistency(features: List[Dict[str, Any]], frame_time: str) -> None:
+    shadow_rating_families = [
+        "citywide_v2",
+        "citywide_v3",
+        "manhattan_v2",
+        "manhattan_v3",
+        "bronx_wash_heights_v2",
+        "bronx_wash_heights_v3",
+        "queens_v2",
+        "queens_v3",
+        "brooklyn_v2",
+        "brooklyn_v3",
+        "staten_island_v2",
+        "staten_island_v3",
+    ]
+    failures: list[str] = []
+
+    def _parse_rating(props: Dict[str, Any], field_name: str) -> int | None:
+        value = props.get(field_name)
+        if value is None:
+            return None
+        try:
+            rating = int(value)
+        except Exception:
+            return None
+        return rating
+
+    for feature in features:
+        props = feature.get("properties") if isinstance(feature, dict) else None
+        if not isinstance(props, dict):
+            continue
+        location_id = props.get("LocationID")
+        zone_name = props.get("zone_name")
+
+        visible_rating = _parse_rating(props, "rating")
+        if visible_rating is not None:
+            expected_bucket, expected_color = bucket_and_color_from_rating(visible_rating)
+            emitted_bucket = props.get("bucket")
+            style = props.get("style") if isinstance(props.get("style"), dict) else {}
+            emitted_color = style.get("fillColor")
+            if emitted_bucket != expected_bucket or emitted_color != expected_color:
+                failures.append(
+                    f"LocationID={location_id} zone_name={zone_name!r} frame_time={frame_time} family=legacy_visible "
+                    f"rating={visible_rating} emitted_bucket={emitted_bucket!r} expected_bucket={expected_bucket!r} "
+                    f"emitted_color={emitted_color!r} expected_color={expected_color!r}"
+                )
+
+        for family in shadow_rating_families:
+            rating_field = f"earnings_shadow_rating_{family}"
+            bucket_field = f"earnings_shadow_bucket_{family}"
+            color_field = f"earnings_shadow_color_{family}"
+            rating_value = _parse_rating(props, rating_field)
+            if rating_value is None:
+                continue
+            expected_bucket, expected_color = bucket_and_color_from_rating(rating_value)
+            emitted_bucket = props.get(bucket_field)
+            emitted_color = props.get(color_field)
+            if emitted_bucket != expected_bucket or emitted_color != expected_color:
+                failures.append(
+                    f"LocationID={location_id} zone_name={zone_name!r} frame_time={frame_time} family={family} "
+                    f"rating={rating_value} emitted_bucket={emitted_bucket!r} expected_bucket={expected_bucket!r} "
+                    f"emitted_color={emitted_color!r} expected_color={expected_color!r}"
+                )
+
+    if failures:
+        sample = "; ".join(failures[:8])
+        raise RuntimeError(
+            f"Rating/bucket/color consistency validation failed ({len(failures)}): {sample}"
+        )
+
+
 def build_hotspots_frames(
     parquet_files: List[Path],
     zones_geojson_path: Path,
@@ -472,6 +543,7 @@ def build_hotspots_frames(
       - Baseline per-zone normalization is ALSO percentile-rank based (NOT global min/max),
         so airports cannot compress baseline scores either.
     """
+    validate_zone_mode_profiles_for_live_engine()
     out_dir.mkdir(parents=True, exist_ok=True)
     temp_root = Path(os.environ.get("ARTIFACT_BUILD_TMP_DIR", "/tmp/tlc_artifact_build"))
     temp_root.mkdir(parents=True, exist_ok=True)
@@ -1093,6 +1165,7 @@ def build_hotspots_frames(
 
         _recalibrate_visible_v3_fields(current_features)
         _validate_popup_metric_consistency(current_features, current_time_iso)
+        _validate_rating_bucket_color_consistency(current_features, current_time_iso)
         timeline.append(current_time_iso)
         frame_path = stage_dir / f"frame_{frame_count:06d}.json"
         payload = {

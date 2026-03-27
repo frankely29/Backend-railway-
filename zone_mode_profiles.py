@@ -195,3 +195,29 @@ ZONE_MODE_PROFILES: Dict[str, ZoneScoreProfileWeights] = {
         market_saturation_penalty_weight=0.0,
     ),
 }
+
+
+def validate_zone_mode_profiles_for_live_engine() -> None:
+    """
+    Guard against tuning profile fields that are currently inactive in the live SQL engine.
+    These fields are intentionally expected to remain 0.0 until the engine path is updated.
+    """
+    violations: list[str] = []
+    for profile_name, profile in ZONE_MODE_PROFILES.items():
+        if float(profile.balanced_trip_quality_weight) != 0.0:
+            violations.append(
+                f"{profile_name}.balanced_trip_quality_weight={profile.balanced_trip_quality_weight}"
+            )
+        if float(profile.saturation_penalty_weight) != 0.0:
+            violations.append(
+                f"{profile_name}.saturation_penalty_weight={profile.saturation_penalty_weight}"
+            )
+
+    if violations:
+        joined = ", ".join(violations)
+        raise RuntimeError(
+            "Zone mode profile validation failed: inactive live-engine fields were tuned. "
+            "The live SQL engine currently does not use balanced_trip_quality_weight or "
+            "saturation_penalty_weight, so they must stay 0.0 unless the engine is updated too. "
+            f"Violations: {joined}"
+        )

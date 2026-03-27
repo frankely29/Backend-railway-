@@ -544,6 +544,7 @@ def test_zone_geometry_metrics() -> Dict[str, Any]:
 
 def test_score_frame_integrity() -> Dict[str, Any]:
     from main import _generate_lock_snapshot, _get_state
+    from build_hotspot import bucket_and_color_from_rating
 
     frames_dir = _frames_dir()
     timeline_path = frames_dir / "timeline.json"
@@ -657,6 +658,8 @@ def test_score_frame_integrity() -> Dict[str, Any]:
         if not isinstance(props, dict):
             violations.append(f"feature {feature_idx}: missing properties")
             continue
+        location_id = props.get("LocationID")
+        zone_name = props.get("zone_name")
 
         for key in required_rating_fields + required_metric_fields:
             if key not in props:
@@ -691,6 +694,24 @@ def test_score_frame_integrity() -> Dict[str, Any]:
             share_value = props.get(share_key)
             if share_value is not None and not (0 <= float(share_value) <= 1):
                 violations.append(f"feature {feature_idx}: {share_key} out of range [0,1]")
+
+        rating_value = props.get("rating")
+        if rating_value is not None:
+            try:
+                expected_bucket, expected_color = bucket_and_color_from_rating(int(rating_value))
+                emitted_bucket = props.get("bucket")
+                style = props.get("style") if isinstance(props.get("style"), dict) else {}
+                emitted_color = style.get("fillColor")
+                if emitted_bucket != expected_bucket or emitted_color != expected_color:
+                    violations.append(
+                        f"feature {feature_idx}: zone_id={location_id} zone_name={zone_name!r} family=legacy_visible "
+                        f"rating={int(rating_value)} emitted_bucket={emitted_bucket!r} expected_bucket={expected_bucket!r} "
+                        f"emitted_color={emitted_color!r} expected_color={expected_color!r}"
+                    )
+            except Exception:
+                violations.append(
+                    f"feature {feature_idx}: zone_id={location_id} zone_name={zone_name!r} family=legacy_visible invalid rating"
+                )
 
         if bool(props.get("airport_excluded")):
             continue
