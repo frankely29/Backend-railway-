@@ -1073,6 +1073,12 @@ def _ghost_visible_sql(column_name: str) -> str:
     return f"({column_name} IS NULL OR CAST({column_name} AS INTEGER) = 0)"
 
 
+def _db_bool_value(flag: bool):
+    if DB_BACKEND == "postgres":
+        return bool(flag)
+    return 1 if flag else 0
+
+
 def _presence_visibility_snapshot(max_age_sec: int) -> Dict[str, Any]:
     cutoff = int(time.time()) - max(5, min(3600, int(max_age_sec)))
     ghost_visible = _ghost_visible_sql("u.ghost_mode")
@@ -1170,7 +1176,7 @@ def _presence_runtime_state_upsert(user_id: int, *, is_visible: bool, reason: Op
           is_visible=excluded.is_visible,
           reason=excluded.reason
         """,
-        (int(user_id), cursor_value, 1 if is_visible else 0, safe_reason),
+        (int(user_id), cursor_value, _db_bool_value(is_visible), safe_reason),
     )
     return cursor_value
 
