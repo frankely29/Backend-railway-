@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 import json
 import math
 import os
+import logging
 import shutil
 import tempfile
 import zipfile
@@ -15,6 +16,8 @@ from zone_earnings_engine import build_zone_earnings_shadow_sql
 from zone_geometry_metrics import build_zone_geometry_metrics_rows
 from zone_mode_profiles import ZONE_MODE_PROFILES, validate_zone_mode_profiles_for_live_engine
 from artifact_freshness import build_expected_artifact_signature
+
+logger = logging.getLogger(__name__)
 
 def ensure_zones_geojson(data_dir: Path, force: bool = False) -> Path:
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -365,7 +368,58 @@ def _recalibrate_visible_v3_fields(features: List[Dict[str, Any]]) -> None:
             props[f"earnings_shadow_color_{profile_name}"] = visible_color
 
 
-def _validate_popup_metric_consistency(features: List[Dict[str, Any]], frame_time: str) -> None:
+def _as_finite_number(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except Exception:
+        return None
+    if not math.isfinite(number):
+        return None
+    return number
+
+
+def _resolve_popup_metrics(
+    *,
+    raw_shadow_props: Dict[str, Any],
+    visible_pickups: int,
+    geometry_area_sq_miles: float | None,
+) -> Dict[str, float] | None:
+    pickups_now = _as_finite_number(raw_shadow_props.get("pickups_now_shadow"))
+    if pickups_now is None or pickups_now < 0:
+        pickups_now = float(max(0, int(visible_pickups)))
+
+    pickups_next = _as_finite_number(raw_shadow_props.get("next_pickups_shadow"))
+    if pickups_next is None or pickups_next < 0:
+        pickups_next = pickups_now
+
+    zone_area = _as_finite_number(raw_shadow_props.get("zone_area_sq_miles_shadow"))
+    if zone_area is None or zone_area <= 0:
+        zone_area = _as_finite_number(geometry_area_sq_miles)
+    if zone_area is None or zone_area <= 0:
+        return None
+
+    density_now = _as_finite_number(raw_shadow_props.get("pickups_per_sq_mile_now_shadow"))
+    if density_now is None or density_now < 0:
+        density_now = pickups_now / zone_area
+
+    density_next = _as_finite_number(raw_shadow_props.get("pickups_per_sq_mile_next_shadow"))
+    if density_next is None or density_next < 0:
+        density_next = pickups_next / zone_area
+
+    return {
+        "pickups_now_shadow": float(pickups_now),
+        "next_pickups_shadow": float(pickups_next),
+        "zone_area_sq_miles_shadow": float(zone_area),
+        "pickups_per_sq_mile_now_shadow": float(density_now),
+        "pickups_per_sq_mile_next_shadow": float(density_next),
+    }
+
+
+def _validate_popup_metric_consistency(
+    features: List[Dict[str, Any]],
+    frame_time: str,
+    diagnostics_by_location_id: Dict[int, Dict[str, Any]] | None = None,
+) -> None:
     popup_metric_fields = [
         "pickups_now_shadow",
         "next_pickups_shadow",
@@ -376,15 +430,6 @@ def _validate_popup_metric_consistency(features: List[Dict[str, Any]], frame_tim
     tolerance = 2.0
     failures: list[str] = []
 
-    def _as_finite_number(value: Any) -> float | None:
-        try:
-            number = float(value)
-        except Exception:
-            return None
-        if not math.isfinite(number):
-            return None
-        return number
-
     for feature in features:
         props = feature.get("properties") if isinstance(feature, dict) else None
         if not isinstance(props, dict) or _is_airport_props(props):
@@ -393,14 +438,31 @@ def _validate_popup_metric_consistency(features: List[Dict[str, Any]], frame_tim
         location_id = props.get("LocationID")
         zone_name = props.get("zone_name")
         parsed_values: Dict[str, float] = {}
+        invalid_fields: list[str] = []
         for field_name in popup_metric_fields:
             number = _as_finite_number(props.get(field_name))
             if number is None:
-                failures.append(
-                    f"LocationID={location_id} zone_name={zone_name!r} frame_time={frame_time} invalid {field_name}"
-                )
+                invalid_fields.append(field_name)
                 continue
             parsed_values[field_name] = number
+        if invalid_fields:
+            location_id_int = None
+            try:
+                location_id_int = int(location_id) if location_id is not None else None
+            except Exception:
+                location_id_int = None
+            diagnostics = (diagnostics_by_location_id or {}).get(location_id_int) if location_id_int is not None else None
+            failure_payload = {
+                "LocationID": location_id,
+                "zone_name": zone_name,
+                "borough": (props.get("borough") if isinstance(props, dict) else None),
+                "frame_time": frame_time,
+                "invalid_fields": invalid_fields,
+                "geometry_area_row_exists": None if not diagnostics else diagnostics.get("geometry_area_row_exists"),
+                "shadow_sql_row_exists": None if not diagnostics else diagnostics.get("shadow_sql_row_exists"),
+                "raw_popup_metric_fields": None if not diagnostics else diagnostics.get("raw_popup_metric_fields"),
+            }
+            failures.append(json.dumps(failure_payload, sort_keys=True))
 
         pickups_now = parsed_values.get("pickups_now_shadow")
         pickups_next = parsed_values.get("next_pickups_shadow")
@@ -445,6 +507,8 @@ def _validate_popup_metric_consistency(features: List[Dict[str, Any]], frame_tim
                 )
 
     if failures:
+        for failure in failures[:25]:
+            logger.error("popup_metric_consistency_failure %s", failure)
         sample = "; ".join(failures[:8])
         raise RuntimeError(f"Popup metric consistency validation failed ({len(failures)}): {sample}")
 
@@ -599,6 +663,13 @@ def build_hotspots_frames(
     available_columns = {str(row[0]) for row in schema_rows}
 
     zone_geometry_rows = build_zone_geometry_metrics_rows(zones_geojson_path)
+    zone_geometry_by_id: Dict[int, Dict[str, float | None]] = {
+        int(row["PULocationID"]): {
+            "zone_area_sq_miles": None if row["zone_area_sq_miles"] is None else float(row["zone_area_sq_miles"]),
+            "centroid_latitude": None if row.get("centroid_latitude") is None else float(row["centroid_latitude"]),
+        }
+        for row in zone_geometry_rows
+    }
     con.execute("CREATE TEMP TABLE zone_geometry_metrics (PULocationID INTEGER, zone_area_sq_miles DOUBLE, centroid_latitude DOUBLE)")
     if zone_geometry_rows:
         con.executemany(
@@ -1157,14 +1228,19 @@ def build_hotspots_frames(
     current_key: Tuple[int, int] | None = None
     current_features: List[Dict[str, Any]] = []
     current_time_iso: str | None = None
+    current_popup_metric_diagnostics_by_location_id: Dict[int, Dict[str, Any]] = {}
 
     def flush_frame():
-        nonlocal frame_count, current_features, current_time_iso
+        nonlocal frame_count, current_features, current_time_iso, current_popup_metric_diagnostics_by_location_id
         if current_time_iso is None:
             return
 
         _recalibrate_visible_v3_fields(current_features)
-        _validate_popup_metric_consistency(current_features, current_time_iso)
+        _validate_popup_metric_consistency(
+            current_features,
+            current_time_iso,
+            diagnostics_by_location_id=current_popup_metric_diagnostics_by_location_id,
+        )
         _validate_rating_bucket_color_consistency(current_features, current_time_iso)
         timeline.append(current_time_iso)
         frame_path = stage_dir / f"frame_{frame_count:06d}.json"
@@ -1177,6 +1253,7 @@ def build_hotspots_frames(
         frame_count += 1
         current_features = []
         current_time_iso = None
+        current_popup_metric_diagnostics_by_location_id = {}
 
     total_rows = 0
     any_rows = False
@@ -1210,6 +1287,40 @@ def build_hotspots_frames(
             r = int(rating)
             bucket, fill = bucket_and_color_from_rating(r)
             shadow_props = shadow_by_key.get((zid_i, int(dow_m), int(bin_start_min)), {})
+            geometry_area_sq_miles = None
+            if zid_i in zone_geometry_by_id:
+                geometry_area_sq_miles = zone_geometry_by_id[zid_i].get("zone_area_sq_miles")
+            popup_metrics = _resolve_popup_metrics(
+                raw_shadow_props=shadow_props,
+                visible_pickups=int(pickups),
+                geometry_area_sq_miles=geometry_area_sq_miles,
+            )
+            if not bool(is_airport_zone(zid_i, name_by_id.get(zid_i, ""), borough_by_id.get(zid_i, ""))):
+                current_popup_metric_diagnostics_by_location_id[zid_i] = {
+                    "geometry_area_row_exists": bool(
+                        zid_i in zone_geometry_by_id
+                        and _as_finite_number(zone_geometry_by_id[zid_i].get("zone_area_sq_miles")) is not None
+                        and float(zone_geometry_by_id[zid_i]["zone_area_sq_miles"]) > 0
+                    ),
+                    "shadow_sql_row_exists": bool(shadow_props),
+                    "raw_popup_metric_fields": {
+                        "pickups_now_shadow": shadow_props.get("pickups_now_shadow"),
+                        "next_pickups_shadow": shadow_props.get("next_pickups_shadow"),
+                        "zone_area_sq_miles_shadow": shadow_props.get("zone_area_sq_miles_shadow"),
+                        "pickups_per_sq_mile_now_shadow": shadow_props.get("pickups_per_sq_mile_now_shadow"),
+                        "pickups_per_sq_mile_next_shadow": shadow_props.get("pickups_per_sq_mile_next_shadow"),
+                    },
+                }
+            if (not bool(is_airport_zone(zid_i, name_by_id.get(zid_i, ""), borough_by_id.get(zid_i, "")))) and popup_metrics is None:
+                logger.warning(
+                    "Skipping non-airport zone due to missing popup metrics source data: LocationID=%s zone_name=%r borough=%r dow_m=%s bin_start_min=%s",
+                    zid_i,
+                    name_by_id.get(zid_i, ""),
+                    borough_by_id.get(zid_i, ""),
+                    int(dow_m),
+                    int(bin_start_min),
+                )
+                continue
 
             current_features.append({
                 "type": "Feature",
@@ -1231,17 +1342,17 @@ def build_hotspots_frames(
                         "fillColor": fill,
                         "fillOpacity": 0.82
                     },
-                    "next_pickups_shadow": shadow_props.get("next_pickups_shadow"),
-                    "pickups_now_shadow": shadow_props.get("pickups_now_shadow"),
+                    "next_pickups_shadow": popup_metrics.get("next_pickups_shadow") if popup_metrics else shadow_props.get("next_pickups_shadow"),
+                    "pickups_now_shadow": popup_metrics.get("pickups_now_shadow") if popup_metrics else shadow_props.get("pickups_now_shadow"),
                     "median_driver_pay_shadow": shadow_props.get("median_driver_pay_shadow"),
                     "median_pay_per_min_shadow": shadow_props.get("median_pay_per_min_shadow"),
                     "median_pay_per_mile_shadow": shadow_props.get("median_pay_per_mile_shadow"),
                     "median_request_to_pickup_min_shadow": shadow_props.get("median_request_to_pickup_min_shadow"),
                     "short_trip_share_shadow": shadow_props.get("short_trip_share_shadow"),
                     "shared_ride_share_shadow": shadow_props.get("shared_ride_share_shadow"),
-                    "zone_area_sq_miles_shadow": shadow_props.get("zone_area_sq_miles_shadow"),
-                    "pickups_per_sq_mile_now_shadow": shadow_props.get("pickups_per_sq_mile_now_shadow"),
-                    "pickups_per_sq_mile_next_shadow": shadow_props.get("pickups_per_sq_mile_next_shadow"),
+                    "zone_area_sq_miles_shadow": popup_metrics.get("zone_area_sq_miles_shadow") if popup_metrics else shadow_props.get("zone_area_sq_miles_shadow"),
+                    "pickups_per_sq_mile_now_shadow": popup_metrics.get("pickups_per_sq_mile_now_shadow") if popup_metrics else shadow_props.get("pickups_per_sq_mile_now_shadow"),
+                    "pickups_per_sq_mile_next_shadow": popup_metrics.get("pickups_per_sq_mile_next_shadow") if popup_metrics else shadow_props.get("pickups_per_sq_mile_next_shadow"),
                     "long_trip_share_20plus_shadow": shadow_props.get("long_trip_share_20plus_shadow"),
                     "balanced_trip_share_shadow": shadow_props.get("balanced_trip_share_shadow"),
                     "same_zone_dropoff_share_shadow": shadow_props.get("same_zone_dropoff_share_shadow"),
