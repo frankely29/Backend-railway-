@@ -383,7 +383,7 @@ def _resolve_popup_metrics(
     raw_shadow_props: Dict[str, Any],
     visible_pickups: int,
     geometry_area_sq_miles: float | None,
-) -> Dict[str, float] | None:
+) -> Dict[str, float]:
     pickups_now = _as_finite_number(raw_shadow_props.get("pickups_now_shadow"))
     if pickups_now is None or pickups_now < 0:
         pickups_now = float(max(0, int(visible_pickups)))
@@ -417,13 +417,17 @@ def _resolve_popup_metrics(
     if density_next is None or density_next < 0:
         density_next = max(pickups_next / max(zone_area, 0.01), 0.0)
 
-    return {
+    resolved = {
         "pickups_now_shadow": float(pickups_now),
         "next_pickups_shadow": float(pickups_next),
         "zone_area_sq_miles_shadow": float(zone_area),
         "pickups_per_sq_mile_now_shadow": float(density_now),
         "pickups_per_sq_mile_next_shadow": float(density_next),
     }
+    for metric_name, metric_value in resolved.items():
+        if not math.isfinite(metric_value):
+            raise ValueError(f"popup metric {metric_name} resolved to non-finite value")
+    return resolved
 
 
 def _validate_popup_metric_consistency(
@@ -1312,6 +1316,7 @@ def build_hotspots_frames(
             )
             if not bool(is_airport_zone(zid_i, name_by_id.get(zid_i, ""), borough_by_id.get(zid_i, ""))):
                 current_popup_metric_diagnostics_by_location_id[zid_i] = {
+                    "fallback_resolution_attempted": True,
                     "geometry_area_row_exists": bool(
                         zid_i in zone_geometry_by_id
                         and _as_finite_number(zone_geometry_by_id[zid_i].get("zone_area_sq_miles")) is not None
