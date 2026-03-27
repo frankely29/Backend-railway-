@@ -573,8 +573,118 @@ def test_billiards_result_state_contract_and_profile_relationship(app_env):
     assert move_response.status_code == 200, move_response.text
     payload = move_response.json()
     assert payload["match"]["status"] == "completed"
-    assert payload["match"]["result_summary"]["reason"] == "eight_ball_pocketed"
+    assert isinstance(payload["match"]["result_summary"], str)
+    assert "eight ball" in payload["match"]["result_summary"].lower()
     assert payload["public_notification"]["type"] == "battle_result"
+
+
+def test_games_state_contract_and_expiry_conflicts_and_avatar_thumb(app_env):
+    main, client = app_env
+    alice = _signup(client, "contract-alice@example.com", "ContractAlice")
+    bob = _signup(client, "contract-bob@example.com", "ContractBob")
+    cara = _signup(client, "contract-cara@example.com", "ContractCara")
+
+    main._db_exec("UPDATE users SET avatar_url=NULL, avatar_version=NULL WHERE id=?", (int(bob["id"]),))
+    users_response = client.get("/games/users?q=contract&limit=10", headers=_headers(alice["token"]))
+    assert users_response.status_code == 200, users_response.text
+    bob_row = next(item for item in users_response.json()["items"] if item["user_id"] == int(bob["id"]))
+    assert bob_row["avatar_thumb_url"] is None
+
+    challenge = client.post(
+        "/games/challenges",
+        json={"target_user_id": bob["id"], "game_type": "dominoes"},
+        headers=_headers(alice["token"]),
+    ).json()
+    accepted = client.post(
+        f"/games/challenges/{challenge['id']}/accept",
+        headers=_headers(bob["token"]),
+    ).json()
+    dom_match = accepted["match"]
+    assert dom_match["state"]["your_hand"]
+    assert "board_chain" in dom_match["state"]
+    assert "playable_tiles" in dom_match["state"]
+    assert "can_draw" in dom_match["state"]
+    assert "can_pass" in dom_match["state"]
+    assert "opponent_hand_count" in dom_match["state"]
+    assert "boneyard_count" in dom_match["state"]
+    assert "created_at" in dom_match and "updated_at" in dom_match
+
+    conflict_response = client.post(
+        "/games/challenges",
+        json={"target_user_id": bob["id"], "game_type": "dominoes"},
+        headers=_headers(alice["token"]),
+    )
+    assert conflict_response.status_code == 409
+
+    bill_challenge = client.post(
+        "/games/challenges",
+        json={"target_user_id": cara["id"], "game_type": "billiards"},
+        headers=_headers(alice["token"]),
+    ).json()
+    bill_accepted = client.post(
+        f"/games/challenges/{bill_challenge['id']}/accept",
+        headers=_headers(cara["token"]),
+    ).json()
+    bill_match = bill_accepted["match"]
+    assert "balls" in bill_match["state"]
+    assert "your_targets_remaining" in bill_match["state"]
+    assert "player_targets_remaining" in bill_match["state"]
+    assert "opponent_targets_remaining" in bill_match["state"]
+
+    # Expire a pending challenge and verify accept rejects it.
+    expired_challenge = client.post(
+        "/games/challenges",
+        json={"target_user_id": cara["id"], "game_type": "dominoes"},
+        headers=_headers(bob["token"]),
+    ).json()
+    main._db_exec(
+        "UPDATE game_challenges SET expires_at=?, status='pending' WHERE id=?",
+        (1, int(expired_challenge["id"])),
+    )
+    expired_accept = client.post(
+        f"/games/challenges/{expired_challenge['id']}/accept",
+        headers=_headers(cara["token"]),
+    )
+    assert expired_accept.status_code == 409
+
+    forfeit = client.post(f"/games/matches/{dom_match['id']}/forfeit", headers=_headers(bob["token"]))
+    assert forfeit.status_code == 200, forfeit.text
+    bundle = forfeit.json()
+    reward_contract = bundle["reward_contract"]
+    for key in ["xp_awarded", "previous_level", "new_level", "leveled_up", "total_xp", "rank_icon_key", "title"]:
+        assert key in reward_contract
+    history = client.get("/games/history/me", headers=_headers(alice["token"])).json()["items"]
+    assert history and history[0]["completed_at"] is not None
+
+
+def test_games_users_and_challenges_reject_blocked_targets(app_env):
+    main, client = app_env
+    alice = _signup(client, "block-alice@example.com", "BlockAlice")
+    bob = _signup(client, "block-bob@example.com", "BlockBob")
+    main._db_exec("UPDATE users SET is_disabled=1 WHERE id=?", (int(bob["id"]),))
+
+    users_response = client.get("/games/users?q=block&limit=10", headers=_headers(alice["token"]))
+    assert users_response.status_code == 200
+    assert all(item["user_id"] != int(bob["id"]) for item in users_response.json()["items"])
+
+    create_response = client.post(
+        "/games/challenges",
+        json={"target_user_id": bob["id"], "game_type": "dominoes"},
+        headers=_headers(alice["token"]),
+    )
+    assert create_response.status_code == 409
+
+
+def test_system_diagnostics_uses_current_leaderboard_tables(app_env):
+    _main, client = app_env
+    admin = _signup(client, "diag-admin@example.com", "DiagAdmin")
+    diagnostics = client.get("/system/diagnostics", headers=_headers(admin["token"]))
+    assert diagnostics.status_code == 200, diagnostics.text
+    payload = diagnostics.json()
+    assert "leaderboard_badges_current" in payload["tables"]
+    assert "leaderboard_badges_refresh_state" in payload["tables"]
+    assert "game_xp_awards" in payload["tables"]
+    assert payload["games_schema"]["game_challenges"] is True
 
 
 def test_public_battle_result_event_helper(app_env):
