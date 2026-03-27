@@ -18,6 +18,19 @@ def percentile_rank_expr(value_expr: str, partition_expr: str, alias_prefix: str
     """
 
 
+def nullable_percentile_rank_expr(value_expr: str, partition_expr: str, alias_prefix: str) -> str:
+    return f"""
+    CASE
+      WHEN {value_expr} IS NULL THEN NULL
+      ELSE ROW_NUMBER() OVER (
+        PARTITION BY {partition_expr}
+        ORDER BY ({value_expr} IS NULL), {value_expr}
+      )
+    END AS {alias_prefix}_rn,
+    COUNT({value_expr}) OVER (PARTITION BY {partition_expr}) AS {alias_prefix}_n
+    """
+
+
 def safe_div_sql(numerator: str, denominator: str, fallback: str = "0.0") -> str:
     return f"COALESCE(({numerator}) / NULLIF(({denominator}), 0), {fallback})"
 
@@ -292,9 +305,9 @@ def build_zone_earnings_shadow_sql(
         *,
         {percentile_rank_expr('LN(1 + pickups_now)', 'dow_m, bin_start_min', 'demand_now')},
         {percentile_rank_expr('LN(1 + pickups_next)', 'dow_m, bin_start_min', 'demand_next')},
-        {percentile_rank_expr('median_driver_pay', 'dow_m, bin_start_min', 'pay')},
-        {percentile_rank_expr('median_pay_per_min', 'dow_m, bin_start_min', 'pay_per_min')},
-        {percentile_rank_expr('median_pay_per_mile', 'dow_m, bin_start_min', 'pay_per_mile')},
+        {nullable_percentile_rank_expr('median_driver_pay', 'dow_m, bin_start_min', 'pay')},
+        {nullable_percentile_rank_expr('median_pay_per_min', 'dow_m, bin_start_min', 'pay_per_min')},
+        {nullable_percentile_rank_expr('median_pay_per_mile', 'dow_m, bin_start_min', 'pay_per_mile')},
         {percentile_rank_expr('median_request_to_pickup_min', 'dow_m, bin_start_min', 'pickup_friction_penalty')},
         {percentile_rank_expr('short_trip_share_3mi_12min', 'dow_m, bin_start_min', 'short_trip_penalty')},
         {percentile_rank_expr('shared_ride_share', 'dow_m, bin_start_min', 'shared_ride_penalty')},
@@ -335,9 +348,21 @@ def build_zone_earnings_shadow_sql(
         downstream_next_value_raw,
         CASE WHEN demand_now_n <= 1 THEN 0.0 ELSE (demand_now_rn - 1) * 1.0 / (demand_now_n - 1) END AS demand_now_n,
         CASE WHEN demand_next_n <= 1 THEN 0.0 ELSE (demand_next_rn - 1) * 1.0 / (demand_next_n - 1) END AS demand_next_n,
-        CASE WHEN pay_n <= 1 THEN 0.0 ELSE (pay_rn - 1) * 1.0 / (pay_n - 1) END AS pay_n,
-        CASE WHEN pay_per_min_n <= 1 THEN 0.0 ELSE (pay_per_min_rn - 1) * 1.0 / (pay_per_min_n - 1) END AS pay_per_min_n,
-        CASE WHEN pay_per_mile_n <= 1 THEN 0.0 ELSE (pay_per_mile_rn - 1) * 1.0 / (pay_per_mile_n - 1) END AS pay_per_mile_n,
+        CASE
+          WHEN median_driver_pay IS NULL THEN 0.0
+          WHEN pay_n <= 1 THEN 0.0
+          ELSE (pay_rn - 1) * 1.0 / (pay_n - 1)
+        END AS pay_n,
+        CASE
+          WHEN median_pay_per_min IS NULL THEN 0.0
+          WHEN pay_per_min_n <= 1 THEN 0.0
+          ELSE (pay_per_min_rn - 1) * 1.0 / (pay_per_min_n - 1)
+        END AS pay_per_min_n,
+        CASE
+          WHEN median_pay_per_mile IS NULL THEN 0.0
+          WHEN pay_per_mile_n <= 1 THEN 0.0
+          ELSE (pay_per_mile_rn - 1) * 1.0 / (pay_per_mile_n - 1)
+        END AS pay_per_mile_n,
         CASE WHEN pickup_friction_penalty_n <= 1 THEN 0.0 ELSE (pickup_friction_penalty_rn - 1) * 1.0 / (pickup_friction_penalty_n - 1) END AS pickup_friction_penalty_n,
         CASE WHEN short_trip_penalty_n <= 1 THEN 0.0 ELSE (short_trip_penalty_rn - 1) * 1.0 / (short_trip_penalty_n - 1) END AS short_trip_penalty_n,
         CASE WHEN shared_ride_penalty_n <= 1 THEN 0.0 ELSE (shared_ride_penalty_rn - 1) * 1.0 / (shared_ride_penalty_n - 1) END AS shared_ride_penalty_n,

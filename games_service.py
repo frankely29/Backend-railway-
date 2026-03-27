@@ -601,6 +601,70 @@ def _billiards_initial_state(player_one_user_id: int, player_two_user_id: int) -
     }
 
 
+def _billiards_group_for_ball(ball_number: int) -> Optional[str]:
+    n = int(ball_number)
+    if 1 <= n <= 7:
+        return "solids"
+    if 9 <= n <= 15:
+        return "stripes"
+    return None
+
+
+def _simulate_billiards_shot(
+    *,
+    state: Dict[str, Any],
+    actor_user_id: int,
+    opponent_user_id: int,
+    match_id: int,
+    move_number: int,
+    angle: float,
+    power: float,
+) -> Dict[str, Any]:
+    normalized_angle = abs(float(angle)) % 360.0
+    normalized_power = max(0.0, min(100.0, float(power)))
+    quality = (
+        0.46 * (1.0 - min(abs(normalized_angle - 180.0), 180.0) / 180.0) +
+        0.39 * (1.0 - abs(normalized_power - 68.0) / 68.0) +
+        0.15 * (((int(match_id) * 31 + int(move_number) * 17 + int(actor_user_id) * 13) % 100) / 100.0)
+    )
+    quality = max(0.0, min(1.0, quality))
+    foul = normalized_power < 12.0 or normalized_power > 97.5
+    assignments = state.get("assignments") or {}
+    actor_group = assignments.get(str(actor_user_id))
+    opponent_group = assignments.get(str(opponent_user_id))
+    balls = list(state.get("balls") or [])
+    table_balls = sorted(int(ball.get("number") or 0) for ball in balls if ball.get("status") != "pocketed")
+    target_numbers = [n for n in table_balls if _billiards_group_for_ball(n) == actor_group] if actor_group else []
+    opponent_numbers = [n for n in table_balls if _billiards_group_for_ball(n) == opponent_group] if opponent_group else []
+
+    pocketed: List[int] = []
+    if not foul:
+        if quality >= 0.83:
+            if actor_group and len(target_numbers) >= 2:
+                pocketed.extend(target_numbers[:2])
+            elif actor_group and target_numbers:
+                pocketed.append(target_numbers[0])
+            elif table_balls:
+                pocketed.append(next((n for n in table_balls if _billiards_group_for_ball(n) in {"solids", "stripes"}), table_balls[0]))
+        elif quality >= 0.60:
+            if actor_group and target_numbers:
+                pocketed.append(target_numbers[0])
+            elif table_balls:
+                pocketed.append(next((n for n in table_balls if _billiards_group_for_ball(n) in {"solids", "stripes"}), table_balls[0]))
+        elif quality >= 0.38:
+            if opponent_group and opponent_numbers:
+                pocketed.append(opponent_numbers[0])
+            elif table_balls and 8 in table_balls and len(table_balls) <= 4:
+                pocketed.append(8)
+    return {
+        "angle": normalized_angle,
+        "power": normalized_power,
+        "quality": quality,
+        "foul": foul,
+        "pocketed_balls": pocketed,
+    }
+
+
 def _default_state(game_type: str, player_one_user_id: int, player_two_user_id: int) -> Dict[str, Any]:
     if game_type == "dominoes":
         return _dominoes_initial_state(player_one_user_id, player_two_user_id, seed=int(time.time()) + int(player_one_user_id) + int(player_two_user_id))
@@ -878,9 +942,42 @@ def move_match(match_id: int, actor_user_id: int, payload: Dict[str, Any]) -> Di
         players.setdefault(str(opponent_user_id), {"targets_remaining": 7, "targets_cleared": 0})
         balls = state.setdefault("balls", [{"number": i, "status": "table"} for i in range(1, 16)])
         assignments = state.setdefault("assignments", {})
+        move_type = str(payload.get("move_type") or "").strip().lower()
         result_state = payload.get("result_state") or {}
-        pocketed = [int(v) for v in (result_state.get("pocketed_balls") or []) if isinstance(v, (int, float))]
-        foul = bool(result_state.get("foul"))
+        if not isinstance(result_state, dict):
+            result_state = {}
+        shot_result: Dict[str, Any] = {}
+        if move_type == "shot":
+            try:
+                shot_angle = float(payload.get("angle"))
+                shot_power = float(payload.get("power"))
+            except Exception:
+                raise HTTPException(status_code=400, detail="Billiards shot requires numeric angle and power")
+            shot_result = _simulate_billiards_shot(
+                state=state,
+                actor_user_id=int(actor_user_id),
+                opponent_user_id=int(opponent_user_id),
+                match_id=int(match_id),
+                move_number=int(move_number),
+                angle=shot_angle,
+                power=shot_power,
+            )
+        pocketed_source = result_state.get("pocketed_balls")
+        if not isinstance(pocketed_source, list):
+            pocketed_source = shot_result.get("pocketed_balls") or []
+        pocketed = [int(v) for v in pocketed_source if isinstance(v, (int, float))]
+        pocketed = sorted({n for n in pocketed if 1 <= int(n) <= 15})
+        foul = bool(result_state.get("foul")) if ("foul" in result_state) else bool(shot_result.get("foul"))
+        state["last_shot"] = {
+            "move_type": move_type or "result",
+            "actor_user_id": int(actor_user_id),
+            "angle": shot_result.get("angle"),
+            "power": shot_result.get("power"),
+            "quality": shot_result.get("quality"),
+            "foul": foul,
+            "pocketed_balls": pocketed,
+            "move_number": int(move_number),
+        }
         if not assignments and pocketed:
             if any(1 <= n <= 7 for n in pocketed):
                 assignments[str(actor_user_id)] = "solids"
@@ -906,11 +1003,14 @@ def move_match(match_id: int, actor_user_id: int, payload: Dict[str, Any]) -> Di
         winner_user_id = result_state.get("winner_user_id")
         if winner_user_id is not None:
             winner_user_id = int(winner_user_id)
-        elif 8 in pocketed and int(players[str(actor_user_id)]["targets_remaining"]) <= 0:
-            winner_user_id = int(actor_user_id)
+        elif 8 in pocketed:
+            if int(players[str(actor_user_id)]["targets_remaining"]) <= 0:
+                winner_user_id = int(actor_user_id)
+            else:
+                winner_user_id = int(opponent_user_id)
         if winner_user_id is not None:
             loser_user_id = int(match["challenged_user_id"]) if int(winner_user_id) == int(match["challenger_user_id"]) else int(match["challenger_user_id"])
-            reason = "eight_ball_pocketed" if (result_state.get("pocketed_balls") or [None])[-1] == 8 else "win"
+            reason = "eight_ball_pocketed" if (pocketed or [None])[-1] == 8 else "win"
             completed_row = _complete_match(int(match_id), winner_user_id=int(winner_user_id), loser_user_id=int(loser_user_id), reason=reason)
             match = completed_row
             completed = True
@@ -931,7 +1031,12 @@ def move_match(match_id: int, actor_user_id: int, payload: Dict[str, Any]) -> Di
                 }
             )
         if not completed:
-            keep_turn = bool((not foul) and actor_group and any((actor_group == "solids" and 1 <= n <= 7) or (actor_group == "stripes" and 9 <= n <= 15) for n in pocketed))
+            keep_turn = bool(
+                (not foul) and (
+                    (actor_group and any((actor_group == "solids" and 1 <= n <= 7) or (actor_group == "stripes" and 9 <= n <= 15) for n in pocketed))
+                    or ((not actor_group) and any(_billiards_group_for_ball(n) in {"solids", "stripes"} for n in pocketed))
+                )
+            )
             next_turn = int(actor_user_id) if keep_turn else int(opponent_user_id)
             state["turn_user_id"] = next_turn
             _db_exec(

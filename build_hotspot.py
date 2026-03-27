@@ -1314,15 +1314,33 @@ def build_hotspots_frames(
                     "pickups_per_sq_mile_next_shadow": shadow_props.get("pickups_per_sq_mile_next_shadow"),
                 }
             if (not bool(is_airport_zone(zid_i, name_by_id.get(zid_i, ""), borough_by_id.get(zid_i, "")))) and popup_metrics is None:
-                logger.warning(
-                    "Skipping non-airport zone due to missing popup metrics source data: LocationID=%s zone_name=%r borough=%r dow_m=%s bin_start_min=%s",
-                    zid_i,
-                    name_by_id.get(zid_i, ""),
-                    borough_by_id.get(zid_i, ""),
-                    int(dow_m),
-                    int(bin_start_min),
+                popup_diagnostics = {
+                    "LocationID": zid_i,
+                    "zone_name": name_by_id.get(zid_i, ""),
+                    "borough": borough_by_id.get(zid_i, ""),
+                    "frame_time": current_time_iso,
+                    "shadow_sql_row_exists": bool(shadow_props),
+                    "geometry_area_row_exists": bool(
+                        zid_i in zone_geometry_by_id
+                        and _as_finite_number((zone_geometry_by_id.get(zid_i) or {}).get("zone_area_sq_miles")) is not None
+                        and float((zone_geometry_by_id.get(zid_i) or {}).get("zone_area_sq_miles")) > 0
+                    ),
+                    "raw_popup_metric_inputs": {
+                        "pickups_now_shadow": shadow_props.get("pickups_now_shadow"),
+                        "next_pickups_shadow": shadow_props.get("next_pickups_shadow"),
+                        "zone_area_sq_miles_shadow": shadow_props.get("zone_area_sq_miles_shadow"),
+                        "pickups_per_sq_mile_now_shadow": shadow_props.get("pickups_per_sq_mile_now_shadow"),
+                        "pickups_per_sq_mile_next_shadow": shadow_props.get("pickups_per_sq_mile_next_shadow"),
+                        "geometry_area_sq_miles": geometry_area_sq_miles,
+                        "visible_pickups": int(pickups),
+                    },
+                    "fallback_resolution_attempted": True,
+                }
+                logger.error("non_airport_popup_metric_resolution_failed %s", json.dumps(popup_diagnostics, sort_keys=True))
+                raise RuntimeError(
+                    "Popup metric resolution failed for non-airport zone "
+                    f"LocationID={zid_i} zone_name={name_by_id.get(zid_i, '')!r} frame_time={current_time_iso}"
                 )
-                continue
 
             current_features.append({
                 "type": "Feature",
