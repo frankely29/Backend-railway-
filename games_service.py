@@ -662,8 +662,24 @@ def _simulate_billiards_shot(
     angle: float,
     power: float,
 ) -> Dict[str, Any]:
-    normalized_angle = abs(float(angle)) % 360.0
-    normalized_power = max(0.0, min(100.0, float(power)))
+    raw_angle = float(angle)
+    raw_power = float(power)
+    if abs(raw_angle) <= 6.5:
+        normalized_angle_radians = raw_angle
+        normalized_angle_degrees = math.degrees(raw_angle)
+        angle_input_unit = "radians"
+    else:
+        normalized_angle_degrees = raw_angle
+        normalized_angle_radians = math.radians(raw_angle)
+        angle_input_unit = "degrees"
+    normalized_angle = abs(normalized_angle_degrees) % 360.0
+
+    if 0.0 <= raw_power <= 1.5:
+        normalized_power = max(0.0, min(100.0, raw_power * 100.0))
+        power_input_unit = "normalized_0_1"
+    else:
+        normalized_power = max(0.0, min(100.0, raw_power))
+        power_input_unit = "percent_0_100"
     quality = (
         0.46 * (1.0 - min(abs(normalized_angle - 180.0), 180.0) / 180.0) +
         0.39 * (1.0 - abs(normalized_power - 68.0) / 68.0) +
@@ -700,8 +716,15 @@ def _simulate_billiards_shot(
                 pocketed.append(8)
     cue_scratch = foul and normalized_power > 97.5
     return {
+        "raw_angle": raw_angle,
+        "raw_power": raw_power,
+        "angle_input_unit": angle_input_unit,
+        "power_input_unit": power_input_unit,
         "angle": normalized_angle,
+        "angle_degrees": normalized_angle_degrees,
+        "angle_radians": normalized_angle_radians,
         "power": normalized_power,
+        "power_0_100": normalized_power,
         "quality": quality,
         "foul": foul,
         "cue_scratch": cue_scratch,
@@ -1044,8 +1067,15 @@ def move_match(match_id: int, actor_user_id: int, payload: Dict[str, Any]) -> Di
         state["last_shot"] = {
             "move_type": move_type or "result",
             "actor_user_id": int(actor_user_id),
+            "raw_angle": shot_result.get("raw_angle"),
+            "raw_power": shot_result.get("raw_power"),
+            "angle_input_unit": shot_result.get("angle_input_unit"),
+            "power_input_unit": shot_result.get("power_input_unit"),
             "angle": shot_result.get("angle"),
+            "angle_degrees": shot_result.get("angle_degrees"),
+            "angle_radians": shot_result.get("angle_radians"),
             "power": shot_result.get("power"),
+            "power_0_100": shot_result.get("power_0_100"),
             "quality": shot_result.get("quality"),
             "foul": foul,
             "cue_scratch": cue_scratch,
@@ -1074,17 +1104,19 @@ def move_match(match_id: int, actor_user_id: int, payload: Dict[str, Any]) -> Di
             cue_ball["y"] = 0.5
         else:
             try:
-                shot_angle = float(shot_result.get("angle") or 0.0)
+                if shot_result.get("angle_radians") is not None:
+                    shot_angle_radians = float(shot_result.get("angle_radians"))
+                else:
+                    shot_angle_radians = math.radians(float(shot_result.get("angle") or 0.0))
                 shot_power = float(shot_result.get("power") or 0.0)
             except Exception:
-                shot_angle = 0.0
+                shot_angle_radians = 0.0
                 shot_power = 0.0
-            radians = math.radians(shot_angle)
             drift = max(0.01, min(0.16, shot_power / 900.0))
             cue_ball["status"] = "table"
             cue_ball["pocketed"] = False
-            cue_ball["x"] = max(0.05, min(0.95, float(cue_ball.get("x") or 0.24) + drift * math.cos(radians)))
-            cue_ball["y"] = max(0.05, min(0.95, float(cue_ball.get("y") or 0.5) + drift * math.sin(radians)))
+            cue_ball["x"] = max(0.05, min(0.95, float(cue_ball.get("x") or 0.24) + drift * math.cos(shot_angle_radians)))
+            cue_ball["y"] = max(0.05, min(0.95, float(cue_ball.get("y") or 0.5) + drift * math.sin(shot_angle_radians)))
         def _remaining(group: Optional[str]) -> int:
             if group == "solids":
                 return len([b for b in balls if 1 <= int(b.get("number") or 0) <= 7 and b.get("status") != "pocketed"])
