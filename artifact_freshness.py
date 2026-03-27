@@ -259,18 +259,18 @@ def sample_frame_integrity(frames_dir: Path) -> dict:
         "pickups_per_sq_mile_next_shadow",
     ]
     shadow_rating_families = [
-        "earnings_shadow_rating_citywide_v2",
-        "earnings_shadow_rating_citywide_v3",
-        "earnings_shadow_rating_manhattan_v2",
-        "earnings_shadow_rating_manhattan_v3",
-        "earnings_shadow_rating_bronx_wash_heights_v2",
-        "earnings_shadow_rating_bronx_wash_heights_v3",
-        "earnings_shadow_rating_queens_v2",
-        "earnings_shadow_rating_queens_v3",
-        "earnings_shadow_rating_brooklyn_v2",
-        "earnings_shadow_rating_brooklyn_v3",
-        "earnings_shadow_rating_staten_island_v2",
-        "earnings_shadow_rating_staten_island_v3",
+        "citywide_v2",
+        "citywide_v3",
+        "manhattan_v2",
+        "manhattan_v3",
+        "bronx_wash_heights_v2",
+        "bronx_wash_heights_v3",
+        "queens_v2",
+        "queens_v3",
+        "brooklyn_v2",
+        "brooklyn_v3",
+        "staten_island_v2",
+        "staten_island_v3",
     ]
 
     def _all_features_have(required_fields: list[str]) -> bool:
@@ -305,15 +305,18 @@ def sample_frame_integrity(frames_dir: Path) -> dict:
                     return False
 
             for family in shadow_rating_families:
-                rating_value = props.get(family)
+                rating_field = f"earnings_shadow_rating_{family}"
+                bucket_field = f"earnings_shadow_bucket_{family}"
+                color_field = f"earnings_shadow_color_{family}"
+                rating_value = props.get(rating_field)
                 if rating_value is None:
                     continue
                 try:
                     expected_bucket, expected_color = bucket_and_color_from_rating(int(rating_value))
                 except Exception:
                     return False
-                emitted_bucket = props.get(f"{family}_bucket")
-                emitted_color = props.get(f"{family}_color")
+                emitted_bucket = props.get(bucket_field)
+                emitted_color = props.get(color_field)
                 if emitted_bucket != expected_bucket or emitted_color != expected_color:
                     return False
 
