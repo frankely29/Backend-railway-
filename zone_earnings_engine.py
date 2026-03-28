@@ -68,8 +68,8 @@ def build_zone_earnings_shadow_sql(
     has_shared_request_flag = "shared_request_flag" in cols if cols else False
 
     lag_min_expr = minute_diff_sql("pickup_datetime", "request_datetime")
-    pay_per_min_expr = safe_div_sql("driver_pay", "GREATEST(trip_time / 60.0, 1.0 / 60.0)")
-    pay_per_mile_expr = safe_div_sql("driver_pay", "GREATEST(trip_miles, 0.1)")
+    pay_per_min_expr = safe_div_sql("driver_pay", "GREATEST(trip_time / 60.0, 1.0 / 60.0)", "NULL")
+    pay_per_mile_expr = safe_div_sql("driver_pay", "GREATEST(trip_miles, 0.1)", "NULL")
     shared_expr_parts = []
     if has_shared_match_flag:
         shared_expr_parts.append("TRY_CAST(shared_match_flag AS INTEGER)")
