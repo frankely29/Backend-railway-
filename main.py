@@ -1163,6 +1163,37 @@ def _presence_visibility_snapshot(max_age_sec: int) -> Dict[str, Any]:
     }
 
 
+def _presence_online_summary_snapshot(max_age_sec: int) -> Dict[str, Any]:
+    cutoff = int(time.time()) - max(5, min(3600, int(max_age_sec)))
+    online_visible = _presence_online_where_sql()
+    try:
+        counts = _db_query_one(
+            f"""
+            SELECT
+              COUNT(*) AS online_count,
+              SUM(CASE WHEN COALESCE(u.ghost_mode, FALSE) THEN 1 ELSE 0 END) AS ghosted_count
+            FROM presence p
+            LEFT JOIN users u ON u.id = p.user_id
+            WHERE p.updated_at >= ?
+              AND {online_visible}
+            """,
+            (cutoff,),
+        )
+    except Exception as exc:
+        return {
+            "online_count": 0,
+            "ghosted_count": 0,
+            "ok": False,
+            "error": str(exc),
+        }
+
+    return {
+        "online_count": int(counts["online_count"] or 0) if counts else 0,
+        "ghosted_count": int(counts["ghosted_count"] or 0) if counts else 0,
+        "ok": True,
+    }
+
+
 def _presence_change_cursor_ms() -> int:
     global _presence_last_change_cursor_ms
     now_ms = int(time.time() * 1000)
@@ -1186,7 +1217,7 @@ def _presence_runtime_state_upsert(user_id: int, *, is_visible: bool, reason: Op
     if changed_at_ms is None:
         cursor_value = _presence_change_cursor_ms()
     else:
-        cursor_value = max(int(changed_at_ms), _presence_change_cursor_ms())
+        cursor_value = int(changed_at_ms)
     safe_reason = None if is_visible else (reason or "hidden")
     _db_exec(
         """
@@ -3155,7 +3186,7 @@ def presence_all(
     ghosted_count = 0
     items = _presence_row_payloads(rows, include_full_fields=(safe_mode == "full"))
     visible_count_total = _presence_visible_count_for_viewport(cutoff=cutoff, bbox=buffered_bbox)
-    snapshot = _presence_visibility_snapshot(max_age_sec)
+    snapshot = _presence_online_summary_snapshot(max_age_sec)
     if snapshot.get("ok"):
         online_count = int(snapshot.get("online_count") or online_count)
         ghosted_count = int(snapshot.get("ghosted_count") or 0)
@@ -3223,7 +3254,7 @@ def presence_viewport(
     items = _presence_row_payloads(rows, include_full_fields=False)
     visible_count_total = _presence_visible_count_for_viewport(cutoff=cutoff, bbox=buffered_bbox)
     cursor_row = _db_query_one("SELECT COALESCE(MAX(changed_at_ms), 0) AS cursor FROM presence_runtime_state")
-    snapshot = _presence_visibility_snapshot(max_age_sec)
+    snapshot = _presence_online_summary_snapshot(max_age_sec)
     snapshot_cursor = int(cursor_row["cursor"] or 0) if cursor_row else 0
     return {
         "ok": True,
