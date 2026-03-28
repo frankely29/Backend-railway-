@@ -1082,8 +1082,12 @@ def _db_bool_value(flag: bool):
     return 1 if flag else 0
 
 
+def _presence_cutoff_unix(max_age_sec: int) -> int:
+    return int(time.time()) - max(5, min(3600, int(max_age_sec)))
+
+
 def _presence_visibility_snapshot(max_age_sec: int) -> Dict[str, Any]:
-    cutoff = int(time.time()) - max(5, min(3600, int(max_age_sec)))
+    cutoff = _presence_cutoff_unix(max_age_sec)
     ghost_visible = _ghost_visible_sql("u.ghost_mode")
     online_visible = _presence_online_where_sql()
     sql_mode = "postgres_boolean" if DB_BACKEND == "postgres" else "sqlite_cast_integer"
@@ -1164,7 +1168,7 @@ def _presence_visibility_snapshot(max_age_sec: int) -> Dict[str, Any]:
 
 
 def _presence_online_summary_snapshot(max_age_sec: int) -> Dict[str, Any]:
-    cutoff = int(time.time()) - max(5, min(3600, int(max_age_sec)))
+    cutoff = _presence_cutoff_unix(max_age_sec)
     online_visible = _presence_online_where_sql()
     try:
         counts = _db_query_one(
@@ -1378,7 +1382,7 @@ def _presence_delta_payload(
     include_removed: bool,
 ) -> Dict[str, Any]:
     safe_limit = max(1, min(PRESENCE_DELTA_MAX_LIMIT, int(limit or PRESENCE_DELTA_MAX_LIMIT)))
-    cutoff = int(time.time()) - max(5, min(3600, int(max_age_sec)))
+    cutoff = _presence_cutoff_unix(max_age_sec)
     snapshot = _presence_online_summary_snapshot(max_age_sec)
     params: List[Any] = [int(updated_since_ms)]
     rows = _db_query_all(
@@ -3161,7 +3165,7 @@ def presence_all(
     viewer: sqlite3.Row = Depends(require_user),  # REQUIRE AUTH (frontend already sends token)
 ):
     del viewer
-    cutoff = int(time.time()) - max(5, min(3600, int(max_age_sec)))
+    cutoff = _presence_cutoff_unix(max_age_sec)
     safe_mode = (mode or "full").strip().lower()
     if safe_mode not in {"full", "lite"}:
         raise HTTPException(status_code=400, detail="mode must be 'full' or 'lite'")
@@ -3252,7 +3256,7 @@ def presence_viewport(
             include_removed=bool(include_removed),
         )
 
-    cutoff = int(time.time()) - max(5, min(3600, int(max_age_sec)))
+    cutoff = _presence_cutoff_unix(max_age_sec)
     rows = _presence_rows_for_viewport(cutoff=cutoff, bbox=buffered_bbox, limit=safe_snapshot_limit)
     items = _presence_row_payloads(rows, include_full_fields=False)
     visible_count_total = _presence_visible_count_for_viewport(cutoff=cutoff, bbox=buffered_bbox)
