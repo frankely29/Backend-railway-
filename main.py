@@ -1174,6 +1174,14 @@ def _presence_change_cursor_ms() -> int:
         return next_cursor
 
 
+def _presence_peek_cursor_ms() -> int:
+    now_ms = int(time.time() * 1000)
+    with _presence_cursor_lock:
+        if _presence_last_change_cursor_ms > 0:
+            return _presence_last_change_cursor_ms
+    return now_ms
+
+
 def _presence_runtime_state_upsert(user_id: int, *, is_visible: bool, reason: Optional[str] = None, changed_at_ms: Optional[int] = None) -> int:
     if changed_at_ms is None:
         cursor_value = _presence_change_cursor_ms()
@@ -1367,13 +1375,14 @@ def _presence_delta_payload(
         ORDER BY prs.changed_at_ms ASC, prs.user_id ASC
         LIMIT ?
         """,
-        tuple(params + [safe_limit]),
+        tuple(params + [safe_limit + 1]),
     )
 
     changed_rows: List[Any] = []
     removed: List[Dict[str, Any]] = []
     next_cursor = int(updated_since_ms)
-    for row in rows:
+    returned_rows = rows[:safe_limit]
+    for row in returned_rows:
         next_cursor = max(next_cursor, int(row["changed_at_ms"] or updated_since_ms))
         row_is_visible = int(row["is_visible"] or 0) == 1
         has_presence = row["user_id"] is not None and row["updated_at"] is not None
@@ -1408,8 +1417,8 @@ def _presence_delta_payload(
         "removed": removed if include_removed else [],
         "cursor": next_cursor,
         "next_updated_since_ms": next_cursor,
-        "server_time_ms": _presence_change_cursor_ms(),
-        "has_more": len(rows) >= safe_limit,
+        "server_time_ms": _presence_peek_cursor_ms(),
+        "has_more": len(rows) > safe_limit,
     }
 
 
@@ -2295,7 +2304,7 @@ from pickup_recording_feature import (
     pickup_log_not_voided_sql,
     record_pickup_presence_heartbeat,
     create_pickup_record,
-    set_pickup_cache_invalidator,
+    register_pickup_write_cache_invalidation_hook,
 )
 
 app.include_router(chat_router)
@@ -3224,7 +3233,7 @@ def presence_viewport(
         "removed": [],
         "cursor": snapshot_cursor,
         "next_updated_since_ms": snapshot_cursor,
-        "server_time_ms": _presence_change_cursor_ms(),
+        "server_time_ms": _presence_peek_cursor_ms(),
         "online_count": int(snapshot.get("online_count") or 0),
         "ghosted_count": int(snapshot.get("ghosted_count") or 0),
         "visible_count": len(items),
@@ -4224,7 +4233,7 @@ def _invalidate_pickup_overlay_caches() -> None:
         _pickup_zone_score_bundle_cache.clear()
 
 
-set_pickup_cache_invalidator(_invalidate_pickup_overlay_caches)
+register_pickup_write_cache_invalidation_hook(_invalidate_pickup_overlay_caches)
 
 
 def _pickup_zone_same_timeslot_support(zone_ids: List[int], now_ts: int) -> Dict[int, float]:
