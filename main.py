@@ -143,6 +143,8 @@ _pickup_zone_maintenance_lock = threading.Lock()
 _pickup_last_experiment_prune_monotonic = 0.0
 _presence_viewport_cache: Dict[str, Dict[str, Any]] = {}
 _presence_viewport_cache_lock = threading.Lock()
+_presence_cursor_lock = threading.Lock()
+_presence_last_change_cursor_ms = 0
 _avatar_backfill_started = False
 _perf_metrics_lock = threading.Lock()
 _perf_metrics: Dict[str, int] = defaultdict(int)
@@ -1161,11 +1163,21 @@ def _presence_visibility_snapshot(max_age_sec: int) -> Dict[str, Any]:
 
 
 def _presence_change_cursor_ms() -> int:
-    return int(time.time() * 1000)
+    global _presence_last_change_cursor_ms
+    now_ms = int(time.time() * 1000)
+    with _presence_cursor_lock:
+        next_cursor = now_ms
+        if next_cursor <= _presence_last_change_cursor_ms:
+            next_cursor = _presence_last_change_cursor_ms + 1
+        _presence_last_change_cursor_ms = next_cursor
+        return next_cursor
 
 
 def _presence_runtime_state_upsert(user_id: int, *, is_visible: bool, reason: Optional[str] = None, changed_at_ms: Optional[int] = None) -> int:
-    cursor_value = int(changed_at_ms if changed_at_ms is not None else _presence_change_cursor_ms())
+    if changed_at_ms is None:
+        cursor_value = _presence_change_cursor_ms()
+    else:
+        cursor_value = max(int(changed_at_ms), _presence_change_cursor_ms())
     safe_reason = None if is_visible else (reason or "hidden")
     _db_exec(
         """
@@ -1367,6 +1379,7 @@ def _presence_delta_payload(
         "items": items,
         "removed": removed if include_removed else [],
         "cursor": next_cursor,
+        "next_updated_since_ms": next_cursor,
         "server_time_ms": _presence_change_cursor_ms(),
         "has_more": len(rows) >= safe_limit,
     }
@@ -3167,13 +3180,15 @@ def presence_viewport(
     items = _presence_row_payloads(rows, include_full_fields=False)
     cursor_row = _db_query_one("SELECT COALESCE(MAX(changed_at_ms), 0) AS cursor FROM presence_runtime_state")
     snapshot = _presence_visibility_snapshot(max_age_sec)
+    snapshot_cursor = int(cursor_row["cursor"] or 0) if cursor_row else 0
     return {
         "ok": True,
         "mode": "snapshot",
         "count": len(items),
         "items": items,
         "removed": [],
-        "cursor": int(cursor_row["cursor"] or 0) if cursor_row else 0,
+        "cursor": snapshot_cursor,
+        "next_updated_since_ms": snapshot_cursor,
         "server_time_ms": _presence_change_cursor_ms(),
         "online_count": int(snapshot.get("online_count") or 0),
         "ghosted_count": int(snapshot.get("ghosted_count") or 0),
