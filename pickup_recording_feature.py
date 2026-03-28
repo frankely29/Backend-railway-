@@ -12,12 +12,7 @@ from pydantic import BaseModel
 
 from core import DB_BACKEND, _db, _db_exec, _db_lock, _db_query_all, _db_query_one, _sql, require_user
 from leaderboard_service import (
-    LEVEL_XP_THRESHOLDS,
-    PROGRESSION_MAX_PICKUP_REPORTS_PER_DAY_FOR_XP,
-    PROGRESSION_XP_PER_HOUR,
-    PROGRESSION_XP_PER_MILE,
-    PROGRESSION_XP_PER_REPORTED_PICKUP,
-    RANK_LADDER,
+    build_progression_from_daily_stats_rows,
 )
 
 router = APIRouter()
@@ -370,60 +365,23 @@ def _pickup_progression_rows_for_user(user_id: int, cur=None) -> List[Dict[str, 
 
 def get_pickup_progression_for_user(user_id: int, cur=None) -> Dict[str, Any]:
     rows = _pickup_progression_rows_for_user(int(user_id), cur=cur)
-    lifetime_miles = 0.0
-    lifetime_hours = 0.0
-    lifetime_pickups_recorded = 0
-    miles_xp = 0
-    hours_xp = 0
-    report_xp = 0
-    for row in rows:
-        miles = float(row.get("miles_worked") or 0.0)
-        hours = float(row.get("hours_worked") or 0.0)
-        pickups = int(row.get("pickups_recorded") or 0)
-        lifetime_miles += miles
-        lifetime_hours += hours
-        lifetime_pickups_recorded += max(0, pickups)
-        miles_xp += round(miles * PROGRESSION_XP_PER_MILE)
-        hours_xp += round(hours * PROGRESSION_XP_PER_HOUR)
-        report_xp += min(max(0, pickups), PROGRESSION_MAX_PICKUP_REPORTS_PER_DAY_FOR_XP) * PROGRESSION_XP_PER_REPORTED_PICKUP
-
-    total_xp = int(miles_xp + hours_xp + report_xp)
-    level = 1
-    for idx, threshold in enumerate(LEVEL_XP_THRESHOLDS):
-        if total_xp >= threshold:
-            level = idx + 1
+    game_xp_total = 0
+    try:
+        if cur is not None:
+            game_row = _query_one_cur(
+                cur,
+                "SELECT COALESCE(SUM(xp_awarded), 0) AS xp_total FROM game_xp_awards WHERE user_id=?",
+                (int(user_id),),
+            )
         else:
-            break
-    level = max(1, min(100, level))
-    rank_name = "Recruit"
-    rank_icon_key = "recruit"
-    for start, end, rname, rkey in RANK_LADDER:
-        if start <= level <= end:
-            rank_name = rname
-            rank_icon_key = rkey
-            break
-    current_level_xp = int(LEVEL_XP_THRESHOLDS[level - 1])
-    next_level_xp = None if level >= 100 else int(LEVEL_XP_THRESHOLDS[level])
-    xp_to_next_level = 0 if next_level_xp is None else max(0, next_level_xp - total_xp)
-    return {
-        "level": level,
-        "rank_name": rank_name,
-        "rank_icon_key": rank_icon_key,
-        "title": rank_name,
-        "total_xp": total_xp,
-        "current_level_xp": current_level_xp,
-        "next_level_xp": next_level_xp,
-        "xp_to_next_level": int(xp_to_next_level),
-        "max_level_reached": level == 100,
-        "lifetime_miles": round(lifetime_miles, 4),
-        "lifetime_hours": round(lifetime_hours, 4),
-        "lifetime_pickups_recorded": int(lifetime_pickups_recorded),
-        "xp_breakdown": {
-            "miles_xp": int(miles_xp),
-            "hours_xp": int(hours_xp),
-            "report_xp": int(report_xp),
-        },
-    }
+            game_row = _db_query_one(
+                "SELECT COALESCE(SUM(xp_awarded), 0) AS xp_total FROM game_xp_awards WHERE user_id=?",
+                (int(user_id),),
+            )
+        game_xp_total = int((game_row or {}).get("xp_total") or 0)
+    except Exception:
+        game_xp_total = 0
+    return build_progression_from_daily_stats_rows(rows, game_xp=game_xp_total)
 
 
 def _increment_pickup_count_tx(cur, user_id: int, now_ts: int, amount: int = 1) -> None:

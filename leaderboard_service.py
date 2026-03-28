@@ -171,14 +171,14 @@ def get_level_progress_from_lifetime_xp(total_xp: int) -> Dict[str, Any]:
     }
 
 
-def _build_progression_from_daily_stats_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+def build_progression_from_daily_stats_rows(rows: List[Dict[str, Any]], game_xp: int = 0) -> Dict[str, Any]:
     lifetime_miles = 0.0
     lifetime_hours = 0.0
     lifetime_pickups_recorded = 0
     miles_xp = 0
     hours_xp = 0
     report_xp = 0
-    game_xp = 0
+    normalized_game_xp = max(0, int(game_xp or 0))
 
     for raw_row in rows:
         row = dict(raw_row)
@@ -196,7 +196,7 @@ def _build_progression_from_daily_stats_rows(rows: List[Dict[str, Any]]) -> Dict
         report_xp += pickup_count_for_xp * PROGRESSION_XP_PER_REPORTED_PICKUP
 
     total_xp = int(miles_xp + hours_xp + report_xp)
-    total_xp += game_xp
+    total_xp += normalized_game_xp
     progression = get_level_progress_from_lifetime_xp(total_xp)
     progression["lifetime_miles"] = round(lifetime_miles, 4)
     progression["lifetime_hours"] = round(lifetime_hours, 4)
@@ -205,7 +205,7 @@ def _build_progression_from_daily_stats_rows(rows: List[Dict[str, Any]]) -> Dict
         "miles_xp": int(miles_xp),
         "hours_xp": int(hours_xp),
         "report_xp": int(report_xp),
-        "game_xp": int(game_xp),
+        "game_xp": int(normalized_game_xp),
     }
     return progression
 
@@ -231,7 +231,7 @@ def get_lifetime_totals_for_user(user_id: int) -> Dict[str, float]:
 
 def get_progression_for_user(user_id: int) -> Dict[str, Any]:
     by_user = get_progression_for_users([int(user_id)])
-    return by_user.get(int(user_id), _build_progression_from_daily_stats_rows([]))
+    return by_user.get(int(user_id), build_progression_from_daily_stats_rows([]))
 
 
 def get_progression_for_users(user_ids: List[int]) -> Dict[int, Dict[str, Any]]:
@@ -255,7 +255,6 @@ def get_progression_for_users(user_ids: List[int]) -> Dict[int, Dict[str, Any]]:
     rows_by_user: Dict[int, List[Dict[str, Any]]] = {uid: [] for uid in clean_user_ids}
     for row in rows:
         rows_by_user.setdefault(int(row["user_id"]), []).append(dict(row))
-    progression_by_user = {uid: _build_progression_from_daily_stats_rows(rows_by_user.get(uid, [])) for uid in clean_user_ids}
     try:
         game_rows = _db_query_all(
             f"""
@@ -269,16 +268,10 @@ def get_progression_for_users(user_ids: List[int]) -> Dict[int, Dict[str, Any]]:
     except sqlite3.OperationalError:
         game_rows = []
     game_xp_by_user = {int(row["user_id"]): int(row["xp_total"] or 0) for row in game_rows}
-    for uid in clean_user_ids:
-        progression = progression_by_user.get(uid)
-        if not progression:
-            continue
-        game_xp = int(game_xp_by_user.get(uid, 0))
-        progression["xp_breakdown"]["game_xp"] = game_xp
-        progression["total_xp"] = int(progression["total_xp"]) + game_xp
-        merged = get_level_progress_from_lifetime_xp(int(progression["total_xp"]))
-        for key in ("level", "rank_name", "rank_icon_key", "title", "current_level_xp", "next_level_xp", "xp_to_next_level", "max_level_reached"):
-            progression[key] = merged[key]
+    progression_by_user = {
+        uid: build_progression_from_daily_stats_rows(rows_by_user.get(uid, []), game_xp=int(game_xp_by_user.get(uid, 0)))
+        for uid in clean_user_ids
+    }
     return progression_by_user
 
 
