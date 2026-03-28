@@ -1379,6 +1379,7 @@ def _presence_delta_payload(
 ) -> Dict[str, Any]:
     safe_limit = max(1, min(PRESENCE_DELTA_MAX_LIMIT, int(limit or PRESENCE_DELTA_MAX_LIMIT)))
     cutoff = int(time.time()) - max(5, min(3600, int(max_age_sec)))
+    snapshot = _presence_online_summary_snapshot(max_age_sec)
     params: List[Any] = [int(updated_since_ms)]
     rows = _db_query_all(
         f"""
@@ -1449,6 +1450,8 @@ def _presence_delta_payload(
         "cursor": next_cursor,
         "next_updated_since_ms": next_cursor,
         "server_time_ms": _presence_peek_cursor_ms(),
+        "online_count": int(snapshot.get("online_count") or 0),
+        "ghosted_count": int(snapshot.get("ghosted_count") or 0),
         "has_more": len(rows) > safe_limit,
     }
 
