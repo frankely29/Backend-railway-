@@ -100,6 +100,7 @@ RESPONSE_GZIP_MIN_BYTES = int(os.environ.get("RESPONSE_GZIP_MIN_BYTES", "1024"))
 PRESENCE_VIEWPORT_CACHE_TTL_SECONDS = float(os.environ.get("PRESENCE_VIEWPORT_CACHE_TTL_SECONDS", "3"))
 PRESENCE_VIEWPORT_CACHE_MAX = int(os.environ.get("PRESENCE_VIEWPORT_CACHE_MAX", "128"))
 PRESENCE_DELTA_MAX_LIMIT = int(os.environ.get("PRESENCE_DELTA_MAX_LIMIT", "500"))
+PRESENCE_SNAPSHOT_MAX_LIMIT = int(os.environ.get("PRESENCE_SNAPSHOT_MAX_LIMIT", "1200"))
 AVATAR_THUMB_IMMUTABLE_CACHE_SECONDS = int(os.environ.get("AVATAR_THUMB_IMMUTABLE_CACHE_SECONDS", str(30 * 24 * 3600)))
 AVATAR_BACKFILL_BATCH_SIZE = int(os.environ.get("AVATAR_BACKFILL_BATCH_SIZE", "25"))
 
@@ -1260,12 +1261,11 @@ def _presence_row_payloads(rows: List[Any], *, include_full_fields: bool) -> Lis
     return items
 
 
-def _presence_rows_for_viewport(
+def _presence_viewport_where_params(
     *,
     cutoff: int,
     bbox: Optional[Tuple[float, float, float, float]],
-    limit: Optional[int],
-) -> List[Any]:
+) -> Tuple[List[str], List[Any]]:
     where_clauses = ["p.updated_at >= ?", _presence_visible_where_sql()]
     params: List[Any] = [cutoff]
     if bbox is not None:
@@ -1273,6 +1273,34 @@ def _presence_rows_for_viewport(
         where_clauses.append("p.lat BETWEEN ? AND ?")
         where_clauses.append("p.lng BETWEEN ? AND ?")
         params.extend([lo_lat, hi_lat, lo_lng, hi_lng])
+    return where_clauses, params
+
+
+def _presence_visible_count_for_viewport(
+    *,
+    cutoff: int,
+    bbox: Optional[Tuple[float, float, float, float]],
+) -> int:
+    where_clauses, params = _presence_viewport_where_params(cutoff=cutoff, bbox=bbox)
+    row = _db_query_one(
+        f"""
+        SELECT COUNT(*) AS visible_count_total
+        FROM presence p
+        JOIN users u ON u.id = p.user_id
+        WHERE {' AND '.join(where_clauses)}
+        """,
+        tuple(params),
+    )
+    return int(row["visible_count_total"] or 0) if row else 0
+
+
+def _presence_rows_for_viewport(
+    *,
+    cutoff: int,
+    bbox: Optional[Tuple[float, float, float, float]],
+    limit: Optional[int],
+) -> List[Any]:
+    where_clauses, params = _presence_viewport_where_params(cutoff=cutoff, bbox=bbox)
     limit_sql = ""
     if limit is not None:
         limit_sql = " LIMIT ?"
@@ -2267,7 +2295,7 @@ from pickup_recording_feature import (
     pickup_log_not_voided_sql,
     record_pickup_presence_heartbeat,
     create_pickup_record,
-    register_pickup_write_cache_invalidation_hook,
+    set_pickup_cache_invalidator,
 )
 
 app.include_router(chat_router)
@@ -3094,7 +3122,7 @@ def presence_all(
     safe_mode = (mode or "full").strip().lower()
     if safe_mode not in {"full", "lite"}:
         raise HTTPException(status_code=400, detail="mode must be 'full' or 'lite'")
-    safe_limit = None if limit is None else max(1, min(500, int(limit)))
+    safe_limit = None if limit is None else max(1, min(PRESENCE_SNAPSHOT_MAX_LIMIT, int(limit)))
     buffered_bbox = _presence_bbox_with_buffer(min_lat, min_lng, max_lat, max_lng, zoom)
     cache_key = _presence_cache_key(
         max_age_sec=max_age_sec,
@@ -3117,6 +3145,7 @@ def presence_all(
     online_count = len(rows)
     ghosted_count = 0
     items = _presence_row_payloads(rows, include_full_fields=(safe_mode == "full"))
+    visible_count_total = _presence_visible_count_for_viewport(cutoff=cutoff, bbox=buffered_bbox)
     snapshot = _presence_visibility_snapshot(max_age_sec)
     if snapshot.get("ok"):
         online_count = int(snapshot.get("online_count") or online_count)
@@ -3129,6 +3158,9 @@ def presence_all(
         "online_count": online_count,
         "ghosted_count": ghosted_count,
         "visible_count": visible_count,
+        "limit_applied": safe_limit,
+        "has_more": visible_count_total > visible_count,
+        "visible_count_total": visible_count_total,
     }
     with _presence_viewport_cache_lock:
         _presence_viewport_cache[cache_key] = {
@@ -3155,7 +3187,8 @@ def presence_viewport(
     viewer: sqlite3.Row = Depends(require_user),
 ):
     del viewer
-    safe_limit = max(1, min(PRESENCE_DELTA_MAX_LIMIT, int(limit)))
+    safe_delta_limit = max(1, min(PRESENCE_DELTA_MAX_LIMIT, int(limit)))
+    safe_snapshot_limit = max(1, min(PRESENCE_SNAPSHOT_MAX_LIMIT, int(limit)))
     buffered_bbox = _presence_bbox_with_buffer(min_lat, min_lng, max_lat, max_lng, zoom)
     if buffered_bbox is not None and padding_ratio > 0:
         lo_lat, lo_lng, hi_lat, hi_lng = buffered_bbox
@@ -3172,13 +3205,14 @@ def presence_viewport(
             updated_since_ms=int(updated_since_ms),
             max_age_sec=max_age_sec,
             bbox=buffered_bbox,
-            limit=safe_limit,
+            limit=safe_delta_limit,
             include_removed=bool(include_removed),
         )
 
     cutoff = int(time.time()) - max(5, min(3600, int(max_age_sec)))
-    rows = _presence_rows_for_viewport(cutoff=cutoff, bbox=buffered_bbox, limit=safe_limit)
+    rows = _presence_rows_for_viewport(cutoff=cutoff, bbox=buffered_bbox, limit=safe_snapshot_limit)
     items = _presence_row_payloads(rows, include_full_fields=False)
+    visible_count_total = _presence_visible_count_for_viewport(cutoff=cutoff, bbox=buffered_bbox)
     cursor_row = _db_query_one("SELECT COALESCE(MAX(changed_at_ms), 0) AS cursor FROM presence_runtime_state")
     snapshot = _presence_visibility_snapshot(max_age_sec)
     snapshot_cursor = int(cursor_row["cursor"] or 0) if cursor_row else 0
@@ -3194,6 +3228,9 @@ def presence_viewport(
         "online_count": int(snapshot.get("online_count") or 0),
         "ghosted_count": int(snapshot.get("ghosted_count") or 0),
         "visible_count": len(items),
+        "limit_applied": safe_snapshot_limit,
+        "has_more": visible_count_total > len(items),
+        "visible_count_total": visible_count_total,
         "viewport": {
             "min_lat": buffered_bbox[0] if buffered_bbox else None,
             "min_lng": buffered_bbox[1] if buffered_bbox else None,
@@ -4177,7 +4214,7 @@ def _maybe_prune_pickup_experiment_tables(now_ts: int) -> None:
 
 
 
-def invalidate_pickup_community_caches() -> None:
+def _invalidate_pickup_overlay_caches() -> None:
     with _pickup_recent_cache_lock:
         _pickup_recent_cache.clear()
     with _pickup_zone_hotspot_cache_lock:
@@ -4187,7 +4224,7 @@ def invalidate_pickup_community_caches() -> None:
         _pickup_zone_score_bundle_cache.clear()
 
 
-register_pickup_write_cache_invalidation_hook(invalidate_pickup_community_caches)
+set_pickup_cache_invalidator(_invalidate_pickup_overlay_caches)
 
 
 def _pickup_zone_same_timeslot_support(zone_ids: List[int], now_ts: int) -> Dict[int, float]:

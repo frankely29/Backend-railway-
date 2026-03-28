@@ -31,20 +31,25 @@ PICKUP_SAVE_RELOCATION_MIN_MILES = 0.25
 PICKUP_SAVE_SAME_POSITION_MAX_MILES = 0.08
 
 
-_pickup_write_cache_invalidation_hook: Optional[Callable[[], None]] = None
+def _noop_pickup_cache_invalidator() -> None:
+    return
+
+
+_pickup_cache_invalidator: Callable[[], None] = _noop_pickup_cache_invalidator
+
+
+def set_pickup_cache_invalidator(fn: Optional[Callable[[], None]]) -> None:
+    global _pickup_cache_invalidator
+    _pickup_cache_invalidator = fn if callable(fn) else _noop_pickup_cache_invalidator
 
 
 def register_pickup_write_cache_invalidation_hook(hook: Optional[Callable[[], None]]) -> None:
-    global _pickup_write_cache_invalidation_hook
-    _pickup_write_cache_invalidation_hook = hook
+    set_pickup_cache_invalidator(hook)
 
 
 def _invalidate_pickup_write_caches() -> None:
-    hook = _pickup_write_cache_invalidation_hook
-    if hook is None:
-        return
     try:
-        hook()
+        _pickup_cache_invalidator()
     except Exception:
         pass
 
