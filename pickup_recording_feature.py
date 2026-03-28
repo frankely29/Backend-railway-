@@ -4,7 +4,7 @@ import math
 import inspect
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -29,6 +29,25 @@ PICKUP_SAVE_SESSION_BREAK_SECONDS = 480
 PICKUP_SAVE_MOTION_STALE_SECONDS = 180
 PICKUP_SAVE_RELOCATION_MIN_MILES = 0.25
 PICKUP_SAVE_SAME_POSITION_MAX_MILES = 0.08
+
+
+_pickup_write_cache_invalidation_hook: Optional[Callable[[], None]] = None
+
+
+def register_pickup_write_cache_invalidation_hook(hook: Optional[Callable[[], None]]) -> None:
+    global _pickup_write_cache_invalidation_hook
+    _pickup_write_cache_invalidation_hook = hook
+
+
+def _invalidate_pickup_write_caches() -> None:
+    hook = _pickup_write_cache_invalidation_hook
+    if hook is None:
+        return
+    try:
+        hook()
+    except Exception:
+        pass
+
 
 class PickupRecordingPayload(BaseModel):
     lat: float
@@ -496,6 +515,8 @@ def soft_void_pickup_trip(trip_id: int, admin_user_id: int, reason: str) -> Dict
             cur = conn.cursor()
             result = _soft_void_pickup_trip_tx(cur, int(trip_id), int(admin_user_id), str(reason))
             conn.commit()
+            if not bool(result.get("already_voided")):
+                _invalidate_pickup_write_caches()
             return result
         except HTTPException:
             conn.rollback()
@@ -558,6 +579,7 @@ def create_pickup_record(payload: PickupRecordingPayload, user: Any) -> Dict[str
             _increment_pickup_count_tx(cur, int(user["id"]), now, 1)
             progression_after = get_pickup_progression_for_user(int(user["id"]), cur=cur)
             conn.commit()
+            _invalidate_pickup_write_caches()
         except HTTPException:
             conn.rollback()
             raise

@@ -2267,6 +2267,7 @@ from pickup_recording_feature import (
     pickup_log_not_voided_sql,
     record_pickup_presence_heartbeat,
     create_pickup_record,
+    register_pickup_write_cache_invalidation_hook,
 )
 
 app.include_router(chat_router)
@@ -4172,6 +4173,21 @@ def _maybe_prune_pickup_experiment_tables(now_ts: int) -> None:
             return
         prune_experiment_tables(_db_exec, now_ts=now_ts)
         _pickup_last_experiment_prune_monotonic = now_monotonic
+
+
+
+
+def invalidate_pickup_community_caches() -> None:
+    with _pickup_recent_cache_lock:
+        _pickup_recent_cache.clear()
+    with _pickup_zone_hotspot_cache_lock:
+        _pickup_zone_hotspot_feature_cache.clear()
+        _pickup_zone_score_cache.clear()
+    with _pickup_zone_score_bundle_lock:
+        _pickup_zone_score_bundle_cache.clear()
+
+
+register_pickup_write_cache_invalidation_hook(invalidate_pickup_community_caches)
 
 
 def _pickup_zone_same_timeslot_support(zone_ids: List[int], now_ts: int) -> Dict[int, float]:
