@@ -966,11 +966,9 @@ def _resolve_local_day_tendency_context(
         )
 
     scope_name = str(resolved_scope.get("scope") or "citywide")
+    scope_kind = _day_tendency_scope_kind(scope_name)
     scopes = model.get("scopes") or {}
     scoped_model = scopes.get(scope_name) if isinstance(scopes, dict) else None
-    borough_weekday_bin = (scoped_model or {}).get("borough_weekday_bin") or model.get("borough_weekday_bin") or {}
-    borough_bin = (scoped_model or {}).get("borough_bin") or model.get("borough_bin") or {}
-    borough_baseline = (scoped_model or {}).get("borough_baseline") or model.get("borough_baseline") or {}
     borough_key = str(resolved_scope.get("borough_key") or "")
     borough_context = {
         "borough": resolved_scope.get("borough"),
@@ -978,10 +976,33 @@ def _resolve_local_day_tendency_context(
     }
     key_weekday = f"{borough_key}|{weekday}|{bin_index}"
     key_bin = f"{borough_key}|{bin_index}"
+    scoped_weekday_bin = (scoped_model or {}).get("borough_weekday_bin") or {}
+    scoped_bin = (scoped_model or {}).get("borough_bin") or {}
+    scoped_baseline = (scoped_model or {}).get("borough_baseline") or {}
+    root_weekday_bin = model.get("borough_weekday_bin") or {}
+    root_bin = model.get("borough_bin") or {}
+    root_baseline = model.get("borough_baseline") or {}
+    if scope_kind == "mode":
+        candidates = [
+            ("scope", "exact_scope_weekday_bin", 0, 1.00, True, False, "borough_weekday_bin", scoped_weekday_bin, key_weekday),
+            ("scope", "exact_scope_bin", 1, 0.88, True, False, "borough_bin", scoped_bin, key_bin),
+            ("scope", "exact_scope_baseline", 2, 0.72, True, False, "borough_baseline", scoped_baseline, borough_key),
+            ("root", "root_borough_weekday_bin_fallback", 3, 0.58, False, True, "borough_weekday_bin", root_weekday_bin, key_weekday),
+            ("root", "root_borough_bin_fallback", 4, 0.44, False, True, "borough_bin", root_bin, key_bin),
+            ("root", "root_borough_baseline_fallback", 5, 0.30, False, True, "borough_baseline", root_baseline, borough_key),
+        ]
+    else:
+        candidates = [
+            ("root", "borough_scope_weekday_bin", 0, 1.00, True, False, "borough_weekday_bin", root_weekday_bin, key_weekday),
+            ("root", "borough_scope_bin", 1, 0.88, True, False, "borough_bin", root_bin, key_bin),
+            ("root", "borough_scope_baseline", 2, 0.72, True, False, "borough_baseline", root_baseline, borough_key),
+        ]
 
-    if isinstance(borough_weekday_bin, dict) and key_weekday in borough_weekday_bin:
-        return _build_day_tendency_context_success(
-            item=borough_weekday_bin[key_weekday],
+    for source_model_layer, source_scope_specificity, fallback_level, context_specificity_weight, exact_scope_specific, broad_scope_fallback, fallback_cohort_type, data_source, key in candidates:
+        if not isinstance(data_source, dict) or key not in data_source:
+            continue
+        payload = _build_day_tendency_context_success(
+            item=data_source[key],
             target_date=target_date,
             frame_time_iso=frame_time_iso,
             weekday=weekday,
@@ -996,49 +1017,21 @@ def _resolve_local_day_tendency_context(
             source_borough=resolved_scope.get("borough"),
             source_mode=resolved_scope.get("source_mode"),
             context_family="local",
-            fallback_cohort_type="borough_weekday_bin",
+            fallback_cohort_type=fallback_cohort_type,
             resolved=borough_context,
         )
-    if isinstance(borough_bin, dict) and key_bin in borough_bin:
-        return _build_day_tendency_context_success(
-            item=borough_bin[key_bin],
-            target_date=target_date,
-            frame_time_iso=frame_time_iso,
-            weekday=weekday,
-            weekday_name=weekday_name,
-            month=month,
-            bin_index=bin_index,
-            bin_minutes=bin_minutes,
-            local_time_label=local_time_label,
-            generated_at=generated_at,
-            scope=scope_name,
-            scope_label=_scope_label(scope_name),
-            source_borough=resolved_scope.get("borough"),
-            source_mode=resolved_scope.get("source_mode"),
-            context_family="local",
-            fallback_cohort_type="borough_bin",
-            resolved=borough_context,
+        payload.update(
+            {
+                "source_model_layer": source_model_layer,
+                "source_scope_specificity": source_scope_specificity,
+                "fallback_level": fallback_level,
+                "context_specificity_weight": context_specificity_weight,
+                "scope_kind": scope_kind,
+                "exact_scope_specific": exact_scope_specific,
+                "broad_scope_fallback": broad_scope_fallback,
+            }
         )
-    if isinstance(borough_baseline, dict) and borough_key in borough_baseline:
-        return _build_day_tendency_context_success(
-            item=borough_baseline[borough_key],
-            target_date=target_date,
-            frame_time_iso=frame_time_iso,
-            weekday=weekday,
-            weekday_name=weekday_name,
-            month=month,
-            bin_index=bin_index,
-            bin_minutes=bin_minutes,
-            local_time_label=local_time_label,
-            generated_at=generated_at,
-            scope=scope_name,
-            scope_label=_scope_label(scope_name),
-            source_borough=resolved_scope.get("borough"),
-            source_mode=resolved_scope.get("source_mode"),
-            context_family="local",
-            fallback_cohort_type="borough_baseline",
-            resolved=borough_context,
-        )
+        return payload
     return _build_day_tendency_context_unavailable(
         target_date=target_date,
         frame_dt=frame_dt,
@@ -1063,26 +1056,43 @@ def _resolve_local_day_tendency_context(
     )
 
 
-def _day_tendency_context_breakdown(context: Dict[str, Any], cohort_weights: Dict[str, float]) -> Dict[str, Any]:
+def _day_tendency_context_breakdown(
+    context: Dict[str, Any],
+    cohort_weights: Dict[str, float],
+    *,
+    apply_specificity_weight: bool = False,
+) -> Dict[str, Any]:
     score = context.get("score")
     confidence = float(context.get("confidence") or 0.0)
     cohort_type = str(context.get("cohort_type") or "")
-    cohort_weight = float(cohort_weights.get(cohort_type, 0.0))
+    base_cohort_weight = float(cohort_weights.get(cohort_type, 0.0))
+    context_specificity_weight = (
+        float(context.get("context_specificity_weight", 1.0)) if apply_specificity_weight else 1.0
+    )
+    effective_cohort_weight = base_cohort_weight * context_specificity_weight
     weakness = 0.0
     if score is not None:
         score_f = float(score)
         if score_f < DAY_TENDENCY_CONTEXT_WEAKNESS_SCORE_START:
             weakness = (DAY_TENDENCY_CONTEXT_WEAKNESS_SCORE_START - score_f) / DAY_TENDENCY_CONTEXT_WEAKNESS_SCORE_SPAN
             weakness = max(0.0, min(1.0, weakness))
-    cooling_strength = weakness * confidence * cohort_weight
+    cooling_strength_pre_specificity = weakness * confidence * base_cohort_weight
+    cooling_strength = weakness * confidence * effective_cohort_weight
     return {
         "status": context.get("status"),
         "score": score,
         "confidence": confidence,
         "cohort_type": cohort_type or None,
-        "cohort_weight": cohort_weight,
+        "cohort_weight": effective_cohort_weight,
+        "base_cohort_weight": base_cohort_weight,
+        "context_specificity_weight": context_specificity_weight,
+        "effective_cohort_weight": effective_cohort_weight,
         "weakness": round(weakness, 6),
+        "cooling_strength_pre_specificity": round(cooling_strength_pre_specificity, 6),
         "cooling_strength": round(cooling_strength, 6),
+        "source_scope_specificity": context.get("source_scope_specificity"),
+        "source_model_layer": context.get("source_model_layer"),
+        "broad_scope_fallback": bool(context.get("broad_scope_fallback")),
     }
 
 
@@ -1100,7 +1110,11 @@ def _build_day_tendency_advanced_context(
     resolved_scope: Dict[str, Any],
 ) -> Dict[str, Any]:
     global_breakdown = _day_tendency_context_breakdown(global_context, DAY_TENDENCY_CONTEXT_GLOBAL_COHORT_WEIGHTS)
-    local_breakdown = _day_tendency_context_breakdown(local_context, DAY_TENDENCY_CONTEXT_LOCAL_COHORT_WEIGHTS)
+    local_breakdown = _day_tendency_context_breakdown(
+        local_context,
+        DAY_TENDENCY_CONTEXT_LOCAL_COHORT_WEIGHTS,
+        apply_specificity_weight=True,
+    )
     global_penalty_points = int(round(DAY_TENDENCY_CONTEXT_GLOBAL_PENALTY_CAP * float(global_breakdown["cooling_strength"])))
     local_penalty_points = int(round(DAY_TENDENCY_CONTEXT_LOCAL_PENALTY_CAP * float(local_breakdown["cooling_strength"])))
     combined_penalty_points = min(
@@ -1108,6 +1122,9 @@ def _build_day_tendency_advanced_context(
         global_penalty_points + local_penalty_points,
     )
     ready = bool(global_context.get("status") == "ok" or local_context.get("status") == "ok")
+    global_context_ready = bool(global_context.get("status") == "ok")
+    local_context_ready = bool(local_context.get("status") == "ok")
+    has_nonzero_penalty = combined_penalty_points > 0
     local_scope = resolved_scope.get("scope") if resolved_scope.get("ready") else None
     local_scope_label = resolved_scope.get("scope_label") if resolved_scope.get("ready") else "Waiting for location"
     return {
@@ -1133,11 +1150,21 @@ def _build_day_tendency_advanced_context(
         "apply_global_everywhere": True,
         "apply_local_only_to_matching_scope": True,
         "ready_for_frontend_adjustment": ready,
+        "global_context_ready": global_context_ready,
+        "local_context_ready": local_context_ready,
+        "has_nonzero_penalty": has_nonzero_penalty,
         "local_scope": local_scope,
         "local_scope_label": local_scope_label,
         "local_scope_kind": _day_tendency_scope_kind(local_scope),
+        "resolved_local_scope": local_scope,
+        "resolved_local_scope_kind": _day_tendency_scope_kind(local_scope),
         "local_source_borough": resolved_scope.get("borough") if resolved_scope.get("ready") else None,
         "local_source_mode": resolved_scope.get("source_mode") if resolved_scope.get("ready") else None,
+        "local_context_source_scope_specificity": local_context.get("source_scope_specificity"),
+        "local_context_source_model_layer": local_context.get("source_model_layer"),
+        "local_context_context_specificity_weight": float(local_context.get("context_specificity_weight", 1.0)),
+        "local_context_exact_scope_specific": bool(local_context.get("exact_scope_specific")),
+        "local_context_broad_scope_fallback": bool(local_context.get("broad_scope_fallback")),
         "global_breakdown": {
             **global_breakdown,
             "penalty_cap": DAY_TENDENCY_CONTEXT_GLOBAL_PENALTY_CAP,
