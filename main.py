@@ -689,7 +689,7 @@ def _parse_frame_time_to_nyc(frame_time: str) -> datetime:
     if not raw:
         raise HTTPException(status_code=400, detail="frame_time is required")
     try:
-        normalized = raw.replace("Z", "+00:00")
+        normalized = raw[:-1] + "+00:00" if raw.endswith(("Z", "z")) else raw
         parsed = datetime.fromisoformat(normalized)
         if parsed.tzinfo is None:
             return parsed.replace(tzinfo=NYC_TZ)
@@ -703,7 +703,7 @@ def _parse_frame_time_to_nyc(frame_time: str) -> datetime:
     except Exception:
         raise HTTPException(
             status_code=400,
-            detail="frame_time must be an ISO datetime or unix timestamp",
+            detail=f"Invalid frame_time '{raw}'. Expected ISO datetime or unix timestamp.",
         )
 
 
