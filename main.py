@@ -76,6 +76,21 @@ DAY_TENDENCY_DIR = DATA_DIR / "day_tendency"
 DAY_TENDENCY_MODEL_PATH = DAY_TENDENCY_DIR / "model.json"
 NYC_TZ = ZoneInfo("America/New_York")
 DAY_TENDENCY_VERSION = "borough_tendency_v2"
+DAY_TENDENCY_CONTEXT_LOCAL_COHORT_WEIGHTS = {
+    "borough_weekday_bin": 1.00,
+    "borough_bin": 0.72,
+    "borough_baseline": 0.46,
+}
+DAY_TENDENCY_CONTEXT_GLOBAL_COHORT_WEIGHTS = {
+    "global_bin": 0.40,
+    "global_baseline": 0.22,
+}
+DAY_TENDENCY_CONTEXT_WEAKNESS_SCORE_START = 60.0
+DAY_TENDENCY_CONTEXT_WEAKNESS_SCORE_SPAN = 35.0
+DAY_TENDENCY_CONTEXT_GLOBAL_PENALTY_CAP = 3
+DAY_TENDENCY_CONTEXT_LOCAL_PENALTY_CAP = 5
+DAY_TENDENCY_CONTEXT_TOTAL_PENALTY_CAP = 8
+DAY_TENDENCY_CONTEXT_BUCKET_DROP_CAP = 1
 
 DEFAULT_BIN_MINUTES = int(os.environ.get("DEFAULT_BIN_MINUTES", "20"))
 DEFAULT_MIN_TRIPS_PER_WINDOW = int(os.environ.get("DEFAULT_MIN_TRIPS_PER_WINDOW", "25"))
@@ -666,6 +681,473 @@ def resolve_tendency_scope(lat: Optional[float], lng: Optional[float], mode_flag
         "borough": borough_context.get("borough"),
         "borough_key": borough_key,
         "source_mode": _source_mode_for_scope(scope),
+    }
+
+
+def _parse_frame_time_to_nyc(frame_time: str) -> datetime:
+    raw = str(frame_time or "").strip()
+    if not raw:
+        raise HTTPException(status_code=400, detail="frame_time is required")
+    try:
+        normalized = raw.replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(normalized)
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=NYC_TZ)
+        return parsed.astimezone(NYC_TZ)
+    except Exception:
+        pass
+
+    try:
+        unix_ts = float(raw)
+        return datetime.fromtimestamp(unix_ts, tz=timezone.utc).astimezone(NYC_TZ)
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="frame_time must be an ISO datetime or unix timestamp",
+        )
+
+
+def _frame_time_iso_local(dt: datetime) -> str:
+    return dt.astimezone(NYC_TZ).replace(microsecond=0).isoformat()
+
+
+def _day_tendency_scope_kind(scope: Optional[str]) -> str:
+    resolved = str(scope or "").strip()
+    if not resolved:
+        return "unknown"
+    if resolved.endswith("_mode"):
+        return "mode"
+    if resolved == "citywide":
+        return "citywide"
+    return "borough"
+
+
+def _build_day_tendency_context_unavailable(
+    *,
+    target_date: date,
+    frame_dt: datetime,
+    frame_time_iso: str,
+    weekday: int,
+    weekday_name: str,
+    month: int,
+    bin_index: int,
+    bin_minutes: int,
+    local_time_label: str,
+    generated_at: str,
+    status: str,
+    label: str,
+    explain: str,
+    scope: Optional[str],
+    scope_label: str,
+    source_borough: Optional[str],
+    source_mode: Optional[str],
+    context_family: str,
+    borough: Optional[str] = None,
+    borough_key: Optional[str] = None,
+) -> Dict[str, Any]:
+    return {
+        "version": DAY_TENDENCY_VERSION,
+        "basis": "historical_expected_borough_timeslot",
+        "tz": "America/New_York",
+        "date": target_date.isoformat(),
+        "frame_time": frame_time_iso,
+        "borough": borough,
+        "borough_key": borough_key,
+        "weekday": weekday,
+        "weekday_name": weekday_name,
+        "month": month,
+        "bin_index": bin_index,
+        "bin_minutes": bin_minutes,
+        "local_time_label": local_time_label,
+        "status": status,
+        "score": None,
+        "band": None,
+        "meter_pct": None,
+        "label": label,
+        "confidence": 0.0,
+        "sample_bins": 0,
+        "cohort_type": None,
+        "components": None,
+        "cohort_medians": None,
+        "explain": explain,
+        "generated_at": generated_at,
+        "scope": scope,
+        "scope_label": scope_label,
+        "source_borough": source_borough,
+        "source_mode": source_mode,
+        "context_family": context_family,
+    }
+
+
+def _build_day_tendency_context_success(
+    *,
+    item: Dict[str, Any],
+    target_date: date,
+    frame_time_iso: str,
+    weekday: int,
+    weekday_name: str,
+    month: int,
+    bin_index: int,
+    bin_minutes: int,
+    local_time_label: str,
+    generated_at: str,
+    scope: str,
+    scope_label: str,
+    source_borough: Optional[str],
+    source_mode: Optional[str],
+    context_family: str,
+    fallback_cohort_type: str,
+    resolved: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    score = int(max(0, min(100, int(item.get("score", round(float(item.get("score_raw", 0.5)) * 100))))))
+    band = _band_from_score(score)
+    borough_name = item.get("borough")
+    borough_key = item.get("borough_key")
+    if resolved and not borough_name:
+        borough_name = resolved.get("borough")
+        borough_key = resolved.get("borough_key")
+    return {
+        "version": DAY_TENDENCY_VERSION,
+        "basis": "historical_expected_borough_timeslot",
+        "tz": "America/New_York",
+        "date": target_date.isoformat(),
+        "frame_time": frame_time_iso,
+        "borough": borough_name,
+        "borough_key": borough_key,
+        "weekday": weekday,
+        "weekday_name": weekday_name,
+        "month": month,
+        "bin_index": bin_index,
+        "bin_minutes": bin_minutes,
+        "local_time_label": str(item.get("bin_label") or local_time_label),
+        "status": "ok",
+        "score": score,
+        "band": band,
+        "meter_pct": round(score / 100.0, 4),
+        "label": _label_from_band(band),
+        "confidence": float(item.get("confidence", 0.0)),
+        "sample_bins": int(item.get("sample_bins", 0)),
+        "cohort_type": str(item.get("cohort_type") or fallback_cohort_type),
+        "components": {
+            "pickup_strength": float(item.get("pickup_strength", 0.5)),
+            "pay_strength": float(item.get("pay_strength", 0.5)),
+            "breadth_strength": float(item.get("breadth_strength", 0.5)),
+        },
+        "cohort_medians": {
+            "pickups_bin": float(item.get("pickups_bin_avg", 0.0)),
+            "avg_driver_pay_bin": float(item.get("avg_driver_pay_bin_avg", 0.0)),
+            "active_zones_bin": float(item.get("active_zones_bin_avg", 0.0)),
+        },
+        "explain": str(item.get("explain", "")),
+        "generated_at": generated_at,
+        "scope": scope,
+        "scope_label": scope_label,
+        "source_borough": source_borough,
+        "source_mode": source_mode,
+        "context_family": context_family,
+    }
+
+
+def _resolve_global_day_tendency_context(
+    *,
+    model: Dict[str, Any],
+    target_date: date,
+    frame_dt: datetime,
+    frame_time_iso: str,
+    generated_at: str,
+    weekday: int,
+    weekday_name: str,
+    month: int,
+    bin_index: int,
+    bin_minutes: int,
+    local_time_label: str,
+) -> Dict[str, Any]:
+    global_bin = model.get("global_bin") or {}
+    global_baseline = model.get("global_baseline") or {}
+    key_global_bin = f"{bin_index}"
+    if isinstance(global_bin, dict) and key_global_bin in global_bin:
+        return _build_day_tendency_context_success(
+            item=global_bin[key_global_bin],
+            target_date=target_date,
+            frame_time_iso=frame_time_iso,
+            weekday=weekday,
+            weekday_name=weekday_name,
+            month=month,
+            bin_index=bin_index,
+            bin_minutes=bin_minutes,
+            local_time_label=local_time_label,
+            generated_at=generated_at,
+            scope="citywide",
+            scope_label=_scope_label("citywide"),
+            source_borough=None,
+            source_mode="citywide",
+            context_family="global",
+            fallback_cohort_type="global_bin",
+            resolved=None,
+        )
+    if isinstance(global_baseline, dict) and global_baseline:
+        return _build_day_tendency_context_success(
+            item=global_baseline,
+            target_date=target_date,
+            frame_time_iso=frame_time_iso,
+            weekday=weekday,
+            weekday_name=weekday_name,
+            month=month,
+            bin_index=bin_index,
+            bin_minutes=bin_minutes,
+            local_time_label=local_time_label,
+            generated_at=generated_at,
+            scope="citywide",
+            scope_label=_scope_label("citywide"),
+            source_borough=None,
+            source_mode="citywide",
+            context_family="global",
+            fallback_cohort_type="global_baseline",
+            resolved=None,
+        )
+    return _build_day_tendency_context_unavailable(
+        target_date=target_date,
+        frame_dt=frame_dt,
+        frame_time_iso=frame_time_iso,
+        weekday=weekday,
+        weekday_name=weekday_name,
+        month=month,
+        bin_index=bin_index,
+        bin_minutes=bin_minutes,
+        local_time_label=local_time_label,
+        generated_at=generated_at,
+        status="insufficient_data",
+        label="No data",
+        explain="No global day tendency cohort data available.",
+        scope="citywide",
+        scope_label=_scope_label("citywide"),
+        source_borough=None,
+        source_mode="citywide",
+        context_family="global",
+    )
+
+
+def _resolve_local_day_tendency_context(
+    *,
+    model: Dict[str, Any],
+    target_date: date,
+    frame_dt: datetime,
+    frame_time_iso: str,
+    generated_at: str,
+    resolved_scope: Dict[str, Any],
+    weekday: int,
+    weekday_name: str,
+    month: int,
+    bin_index: int,
+    bin_minutes: int,
+    local_time_label: str,
+) -> Dict[str, Any]:
+    if not resolved_scope.get("ready"):
+        reason = str(resolved_scope.get("reason") or "waiting_for_location")
+        return _build_day_tendency_context_unavailable(
+            target_date=target_date,
+            frame_dt=frame_dt,
+            frame_time_iso=frame_time_iso,
+            weekday=weekday,
+            weekday_name=weekday_name,
+            month=month,
+            bin_index=bin_index,
+            bin_minutes=bin_minutes,
+            local_time_label=local_time_label,
+            generated_at=generated_at,
+            status=reason,
+            label="Waiting" if reason == "waiting_for_location" else "No data",
+            explain="Waiting for valid GPS location." if reason == "waiting_for_location" else "Unable to resolve local scope.",
+            scope=None,
+            scope_label="Waiting for location",
+            source_borough=None,
+            source_mode=None,
+            context_family="local",
+        )
+
+    scope_name = str(resolved_scope.get("scope") or "citywide")
+    scopes = model.get("scopes") or {}
+    scoped_model = scopes.get(scope_name) if isinstance(scopes, dict) else None
+    borough_weekday_bin = (scoped_model or {}).get("borough_weekday_bin") or model.get("borough_weekday_bin") or {}
+    borough_bin = (scoped_model or {}).get("borough_bin") or model.get("borough_bin") or {}
+    borough_baseline = (scoped_model or {}).get("borough_baseline") or model.get("borough_baseline") or {}
+    borough_key = str(resolved_scope.get("borough_key") or "")
+    borough_context = {
+        "borough": resolved_scope.get("borough"),
+        "borough_key": borough_key,
+    }
+    key_weekday = f"{borough_key}|{weekday}|{bin_index}"
+    key_bin = f"{borough_key}|{bin_index}"
+
+    if isinstance(borough_weekday_bin, dict) and key_weekday in borough_weekday_bin:
+        return _build_day_tendency_context_success(
+            item=borough_weekday_bin[key_weekday],
+            target_date=target_date,
+            frame_time_iso=frame_time_iso,
+            weekday=weekday,
+            weekday_name=weekday_name,
+            month=month,
+            bin_index=bin_index,
+            bin_minutes=bin_minutes,
+            local_time_label=local_time_label,
+            generated_at=generated_at,
+            scope=scope_name,
+            scope_label=_scope_label(scope_name),
+            source_borough=resolved_scope.get("borough"),
+            source_mode=resolved_scope.get("source_mode"),
+            context_family="local",
+            fallback_cohort_type="borough_weekday_bin",
+            resolved=borough_context,
+        )
+    if isinstance(borough_bin, dict) and key_bin in borough_bin:
+        return _build_day_tendency_context_success(
+            item=borough_bin[key_bin],
+            target_date=target_date,
+            frame_time_iso=frame_time_iso,
+            weekday=weekday,
+            weekday_name=weekday_name,
+            month=month,
+            bin_index=bin_index,
+            bin_minutes=bin_minutes,
+            local_time_label=local_time_label,
+            generated_at=generated_at,
+            scope=scope_name,
+            scope_label=_scope_label(scope_name),
+            source_borough=resolved_scope.get("borough"),
+            source_mode=resolved_scope.get("source_mode"),
+            context_family="local",
+            fallback_cohort_type="borough_bin",
+            resolved=borough_context,
+        )
+    if isinstance(borough_baseline, dict) and borough_key in borough_baseline:
+        return _build_day_tendency_context_success(
+            item=borough_baseline[borough_key],
+            target_date=target_date,
+            frame_time_iso=frame_time_iso,
+            weekday=weekday,
+            weekday_name=weekday_name,
+            month=month,
+            bin_index=bin_index,
+            bin_minutes=bin_minutes,
+            local_time_label=local_time_label,
+            generated_at=generated_at,
+            scope=scope_name,
+            scope_label=_scope_label(scope_name),
+            source_borough=resolved_scope.get("borough"),
+            source_mode=resolved_scope.get("source_mode"),
+            context_family="local",
+            fallback_cohort_type="borough_baseline",
+            resolved=borough_context,
+        )
+    return _build_day_tendency_context_unavailable(
+        target_date=target_date,
+        frame_dt=frame_dt,
+        frame_time_iso=frame_time_iso,
+        weekday=weekday,
+        weekday_name=weekday_name,
+        month=month,
+        bin_index=bin_index,
+        bin_minutes=bin_minutes,
+        local_time_label=local_time_label,
+        generated_at=generated_at,
+        status="insufficient_data",
+        label="No data",
+        explain="No local day tendency cohort data available for resolved scope.",
+        scope=scope_name,
+        scope_label=_scope_label(scope_name),
+        source_borough=resolved_scope.get("borough"),
+        source_mode=resolved_scope.get("source_mode"),
+        context_family="local",
+        borough=resolved_scope.get("borough"),
+        borough_key=resolved_scope.get("borough_key"),
+    )
+
+
+def _day_tendency_context_breakdown(context: Dict[str, Any], cohort_weights: Dict[str, float]) -> Dict[str, Any]:
+    score = context.get("score")
+    confidence = float(context.get("confidence") or 0.0)
+    cohort_type = str(context.get("cohort_type") or "")
+    cohort_weight = float(cohort_weights.get(cohort_type, 0.0))
+    weakness = 0.0
+    if score is not None:
+        score_f = float(score)
+        if score_f < DAY_TENDENCY_CONTEXT_WEAKNESS_SCORE_START:
+            weakness = (DAY_TENDENCY_CONTEXT_WEAKNESS_SCORE_START - score_f) / DAY_TENDENCY_CONTEXT_WEAKNESS_SCORE_SPAN
+            weakness = max(0.0, min(1.0, weakness))
+    cooling_strength = weakness * confidence * cohort_weight
+    return {
+        "status": context.get("status"),
+        "score": score,
+        "confidence": confidence,
+        "cohort_type": cohort_type or None,
+        "cohort_weight": cohort_weight,
+        "weakness": round(weakness, 6),
+        "cooling_strength": round(cooling_strength, 6),
+    }
+
+
+def _build_day_tendency_advanced_context(
+    *,
+    frame_time_iso: str,
+    frame_date: str,
+    frame_weekday: int,
+    frame_weekday_name: str,
+    frame_bin_index: int,
+    frame_bin_minutes: int,
+    frame_local_time_label: str,
+    global_context: Dict[str, Any],
+    local_context: Dict[str, Any],
+    resolved_scope: Dict[str, Any],
+) -> Dict[str, Any]:
+    global_breakdown = _day_tendency_context_breakdown(global_context, DAY_TENDENCY_CONTEXT_GLOBAL_COHORT_WEIGHTS)
+    local_breakdown = _day_tendency_context_breakdown(local_context, DAY_TENDENCY_CONTEXT_LOCAL_COHORT_WEIGHTS)
+    global_penalty_points = int(round(DAY_TENDENCY_CONTEXT_GLOBAL_PENALTY_CAP * float(global_breakdown["cooling_strength"])))
+    local_penalty_points = int(round(DAY_TENDENCY_CONTEXT_LOCAL_PENALTY_CAP * float(local_breakdown["cooling_strength"])))
+    combined_penalty_points = min(
+        DAY_TENDENCY_CONTEXT_TOTAL_PENALTY_CAP,
+        global_penalty_points + local_penalty_points,
+    )
+    ready = bool(global_context.get("status") == "ok" or local_context.get("status") == "ok")
+    local_scope = resolved_scope.get("scope") if resolved_scope.get("ready") else None
+    local_scope_label = resolved_scope.get("scope_label") if resolved_scope.get("ready") else "Waiting for location"
+    return {
+        "status": "ok",
+        "frame_time": frame_time_iso,
+        "frame_date": frame_date,
+        "frame_weekday": frame_weekday,
+        "frame_weekday_name": frame_weekday_name,
+        "frame_bin_index": frame_bin_index,
+        "frame_bin_minutes": frame_bin_minutes,
+        "frame_local_time_label": frame_local_time_label,
+        "weakness_threshold_score": DAY_TENDENCY_CONTEXT_WEAKNESS_SCORE_START,
+        "weakness_full_scale_span": DAY_TENDENCY_CONTEXT_WEAKNESS_SCORE_SPAN,
+        "global_penalty_cap": DAY_TENDENCY_CONTEXT_GLOBAL_PENALTY_CAP,
+        "local_penalty_cap": DAY_TENDENCY_CONTEXT_LOCAL_PENALTY_CAP,
+        "total_penalty_cap": DAY_TENDENCY_CONTEXT_TOTAL_PENALTY_CAP,
+        "bucket_drop_cap": DAY_TENDENCY_CONTEXT_BUCKET_DROP_CAP,
+        "global_cooling_strength": global_breakdown["cooling_strength"],
+        "local_cooling_strength": local_breakdown["cooling_strength"],
+        "global_penalty_points": global_penalty_points,
+        "local_penalty_points": local_penalty_points,
+        "combined_penalty_points": combined_penalty_points,
+        "apply_global_everywhere": True,
+        "apply_local_only_to_matching_scope": True,
+        "ready_for_frontend_adjustment": ready,
+        "local_scope": local_scope,
+        "local_scope_label": local_scope_label,
+        "local_scope_kind": _day_tendency_scope_kind(local_scope),
+        "local_source_borough": resolved_scope.get("borough") if resolved_scope.get("ready") else None,
+        "local_source_mode": resolved_scope.get("source_mode") if resolved_scope.get("ready") else None,
+        "global_breakdown": {
+            **global_breakdown,
+            "penalty_cap": DAY_TENDENCY_CONTEXT_GLOBAL_PENALTY_CAP,
+            "penalty_points": global_penalty_points,
+        },
+        "local_breakdown": {
+            **local_breakdown,
+            "penalty_cap": DAY_TENDENCY_CONTEXT_LOCAL_PENALTY_CAP,
+            "penalty_points": local_penalty_points,
+        },
     }
 
 
@@ -2453,6 +2935,7 @@ def root():
             "/generate_status",
             "/day_tendency/today",
             "/day_tendency/date/{ymd}",
+            "/day_tendency/frame_context",
             "/timeline",
             "/frame/{idx}",
             "/auth/signup",
@@ -2655,6 +3138,133 @@ def day_tendency_for_date(
     payload = _resolve_day_tendency_payload(parsed_date, lat=lat, lng=lng, mode_flags=mode_flags)
     _debug_log("[debug] day_tendency_for_date payload:", payload)
     return payload
+
+
+@app.get("/day_tendency/frame_context")
+def day_tendency_frame_context(
+    frame_time: str,
+    lat: Optional[float] = None,
+    lng: Optional[float] = None,
+    manhattan_mode: Optional[int] = None,
+    staten_island_mode: Optional[int] = None,
+    bronx_wash_heights_mode: Optional[int] = None,
+    queens_mode: Optional[int] = None,
+    brooklyn_mode: Optional[int] = None,
+):
+    if not _has_day_tendency_model():
+        print("[warn] day tendency model missing; call /generate or allow startup backfill")
+        raise HTTPException(status_code=409, detail="day tendency not ready. Call /generate first.")
+
+    model = _read_day_tendency_model()
+    generated_at = model.get("generated_at") or datetime.now(timezone.utc).isoformat()
+    frame_dt = _parse_frame_time_to_nyc(frame_time)
+    frame_time_iso = _frame_time_iso_local(frame_dt)
+    frame_date = frame_dt.date()
+    weekday = frame_date.weekday()
+    weekday_name = _weekday_name_from_mon0(weekday)
+    month = int(frame_date.month)
+    bin_minutes = int(model.get("bin_minutes") or 20)
+    bin_index = _current_bin_index_from_dt(frame_dt, bin_minutes=bin_minutes)
+    local_time_label = _bin_label(bin_index, bin_minutes=bin_minutes)
+    mode_flags = {
+        "manhattan_mode": manhattan_mode,
+        "staten_island_mode": staten_island_mode,
+        "bronx_wash_heights_mode": bronx_wash_heights_mode,
+        "queens_mode": queens_mode,
+        "brooklyn_mode": brooklyn_mode,
+    }
+    resolved_scope = resolve_tendency_scope(lat=lat, lng=lng, mode_flags=mode_flags)
+    if model.get("status") == "insufficient_data":
+        global_context = _build_day_tendency_context_unavailable(
+            target_date=frame_date,
+            frame_dt=frame_dt,
+            frame_time_iso=frame_time_iso,
+            weekday=weekday,
+            weekday_name=weekday_name,
+            month=month,
+            bin_index=bin_index,
+            bin_minutes=bin_minutes,
+            local_time_label=local_time_label,
+            generated_at=generated_at,
+            status="insufficient_data",
+            label="No data",
+            explain="Global day tendency model has insufficient_data status.",
+            scope="citywide",
+            scope_label=_scope_label("citywide"),
+            source_borough=None,
+            source_mode="citywide",
+            context_family="global",
+        )
+        local_context = _build_day_tendency_context_unavailable(
+            target_date=frame_date,
+            frame_dt=frame_dt,
+            frame_time_iso=frame_time_iso,
+            weekday=weekday,
+            weekday_name=weekday_name,
+            month=month,
+            bin_index=bin_index,
+            bin_minutes=bin_minutes,
+            local_time_label=local_time_label,
+            generated_at=generated_at,
+            status="insufficient_data",
+            label="No data",
+            explain="Local day tendency model has insufficient_data status.",
+            scope=resolved_scope.get("scope") if resolved_scope.get("ready") else None,
+            scope_label=resolved_scope.get("scope_label") if resolved_scope.get("ready") else "Waiting for location",
+            source_borough=resolved_scope.get("borough") if resolved_scope.get("ready") else None,
+            source_mode=resolved_scope.get("source_mode") if resolved_scope.get("ready") else None,
+            context_family="local",
+            borough=resolved_scope.get("borough") if resolved_scope.get("ready") else None,
+            borough_key=resolved_scope.get("borough_key") if resolved_scope.get("ready") else None,
+        )
+    else:
+        global_context = _resolve_global_day_tendency_context(
+            model=model,
+            target_date=frame_date,
+            frame_dt=frame_dt,
+            frame_time_iso=frame_time_iso,
+            generated_at=generated_at,
+            weekday=weekday,
+            weekday_name=weekday_name,
+            month=month,
+            bin_index=bin_index,
+            bin_minutes=bin_minutes,
+            local_time_label=local_time_label,
+        )
+        local_context = _resolve_local_day_tendency_context(
+            model=model,
+            target_date=frame_date,
+            frame_dt=frame_dt,
+            frame_time_iso=frame_time_iso,
+            generated_at=generated_at,
+            resolved_scope=resolved_scope,
+            weekday=weekday,
+            weekday_name=weekday_name,
+            month=month,
+            bin_index=bin_index,
+            bin_minutes=bin_minutes,
+            local_time_label=local_time_label,
+        )
+
+    advanced_context = _build_day_tendency_advanced_context(
+        frame_time_iso=frame_time_iso,
+        frame_date=frame_date.isoformat(),
+        frame_weekday=weekday,
+        frame_weekday_name=weekday_name,
+        frame_bin_index=bin_index,
+        frame_bin_minutes=bin_minutes,
+        frame_local_time_label=local_time_label,
+        global_context=global_context,
+        local_context=local_context,
+        resolved_scope=resolved_scope,
+    )
+    return {
+        "ok": True,
+        "resolved_scope": resolved_scope,
+        "global_context": global_context,
+        "local_context": local_context,
+        "advanced_context": advanced_context,
+    }
 
 
 @app.get("/timeline")
