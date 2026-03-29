@@ -187,6 +187,10 @@ def test_day_tendency_frame_context_keeps_global_context_when_location_is_missin
     assert payload["local_context"]["status"] == "waiting_for_location"
     assert payload["local_context"]["context_family"] == "local"
     assert payload["local_context"]["scope"] is None
+    assert payload["local_context"]["source_scope_specificity"] is None
+    assert payload["local_context"]["source_model_layer"] is None
+    assert payload["local_context"]["context_specificity_weight"] == pytest.approx(1.0)
+    assert payload["local_context"]["broad_scope_fallback"] is False
     assert payload["advanced_context"]["local_penalty_points"] == 0
     assert payload["advanced_context"]["global_penalty_points"] >= 0
 
