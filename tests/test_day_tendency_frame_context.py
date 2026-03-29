@@ -144,11 +144,13 @@ def test_day_tendency_frame_context_returns_separated_global_and_local_contexts(
     assert payload["global_context"]["context_family"] == "global"
     assert payload["global_context"]["scope"] == "citywide"
     assert payload["global_context"]["cohort_type"] == "global_bin"
+    assert payload["global_context"]["bin_index"] == 24
 
     assert payload["local_context"]["status"] == "ok"
     assert payload["local_context"]["context_family"] == "local"
     assert payload["local_context"]["scope"] == "manhattan_mode"
     assert payload["local_context"]["cohort_type"] == "borough_weekday_bin"
+    assert payload["local_context"]["bin_index"] == 24
 
     assert payload["advanced_context"]["global_penalty_cap"] == 3
     assert payload["advanced_context"]["local_penalty_cap"] == 5
@@ -173,9 +175,12 @@ def test_day_tendency_frame_context_keeps_global_context_when_location_is_missin
     assert payload["global_context"]["status"] == "ok"
     assert payload["global_context"]["scope"] == "citywide"
     assert payload["global_context"]["context_family"] == "global"
+    assert payload["global_context"]["bin_index"] == 24
 
     assert payload["local_context"]["status"] == "waiting_for_location"
     assert payload["local_context"]["context_family"] == "local"
+    assert payload["local_context"]["scope"] is None
+    assert payload["advanced_context"]["local_penalty_points"] == 0
     assert payload["advanced_context"]["global_penalty_points"] >= 0
 
 
@@ -188,4 +193,4 @@ def test_day_tendency_frame_context_invalid_frame_time_returns_400(app_env):
     )
 
     assert response.status_code == 400, response.text
-    assert "frame_time" in response.json()["detail"]
+    assert "Invalid frame_time" in response.json()["detail"]
