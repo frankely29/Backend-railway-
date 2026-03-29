@@ -35,6 +35,21 @@ def safe_div_sql(numerator: str, denominator: str, fallback: str = "0.0") -> str
     return f"COALESCE(({numerator}) / NULLIF(({denominator}), 0), {fallback})"
 
 
+def nullable_weighted_average_sql(weight_expr_pairs: Iterable[tuple[str, str]], fallback: str = "0.0") -> str:
+    pairs = list(weight_expr_pairs)
+    if not pairs:
+        return fallback
+    numerator = " + ".join(
+        f"(CASE WHEN {expr_sql} IS NULL THEN 0.0 ELSE ({weight_sql}) * ({expr_sql}) END)"
+        for weight_sql, expr_sql in pairs
+    )
+    denominator = " + ".join(
+        f"(CASE WHEN {expr_sql} IS NULL THEN 0.0 ELSE ({weight_sql}) END)"
+        for weight_sql, expr_sql in pairs
+    )
+    return f"CASE WHEN ({denominator}) <= 0 THEN {fallback} ELSE ({numerator}) / ({denominator}) END"
+
+
 def minute_diff_sql(end_ts_expr: str, start_ts_expr: str) -> str:
     return f"(EXTRACT(EPOCH FROM ({end_ts_expr} - {start_ts_expr})) / 60.0)"
 
@@ -349,17 +364,17 @@ def build_zone_earnings_shadow_sql(
         CASE WHEN demand_now_n <= 1 THEN 0.0 ELSE (demand_now_rn - 1) * 1.0 / (demand_now_n - 1) END AS demand_now_n,
         CASE WHEN demand_next_n <= 1 THEN 0.0 ELSE (demand_next_rn - 1) * 1.0 / (demand_next_n - 1) END AS demand_next_n,
         CASE
-          WHEN median_driver_pay IS NULL THEN 0.0
+          WHEN median_driver_pay IS NULL THEN NULL
           WHEN pay_n <= 1 THEN 0.0
           ELSE (pay_rn - 1) * 1.0 / (pay_n - 1)
         END AS pay_n,
         CASE
-          WHEN median_pay_per_min IS NULL THEN 0.0
+          WHEN median_pay_per_min IS NULL THEN NULL
           WHEN pay_per_min_n <= 1 THEN 0.0
           ELSE (pay_per_min_rn - 1) * 1.0 / (pay_per_min_n - 1)
         END AS pay_per_min_n,
         CASE
-          WHEN median_pay_per_mile IS NULL THEN 0.0
+          WHEN median_pay_per_mile IS NULL THEN NULL
           WHEN pay_per_mile_n <= 1 THEN 0.0
           ELSE (pay_per_mile_rn - 1) * 1.0 / (pay_per_mile_n - 1)
         END AS pay_per_mile_n,
@@ -515,94 +530,94 @@ def build_zone_earnings_shadow_sql(
     scored AS (
       SELECT
         *,
-        (
-          {w.demand_now_weight:.8f} * demand_now_n +
-          {w.demand_next_weight:.8f} * demand_next_n +
-          {w.pay_weight:.8f} * pay_n +
-          {w.pay_per_min_weight:.8f} * pay_per_min_n +
-          {w.pay_per_mile_weight:.8f} * pay_per_mile_n +
-          {w.downstream_weight:.8f} * downstream_value_n
-        ) AS positive_score,
+        {nullable_weighted_average_sql([
+          (f"{w.demand_now_weight:.8f}", "demand_now_n"),
+          (f"{w.demand_next_weight:.8f}", "demand_next_n"),
+          (f"{w.pay_weight:.8f}", "pay_n"),
+          (f"{w.pay_per_min_weight:.8f}", "pay_per_min_n"),
+          (f"{w.pay_per_mile_weight:.8f}", "pay_per_mile_n"),
+          (f"{w.downstream_weight:.8f}", "downstream_value_n"),
+        ])} AS positive_score,
         (
           {w.short_trip_penalty_weight:.8f} * short_trip_penalty_n +
           {w.pickup_friction_penalty_weight:.8f} * pickup_friction_penalty_n +
           {w.shared_ride_penalty_weight:.8f} * shared_ride_penalty_n
         ) AS negative_score,
-        (
-          {mw.demand_now_weight:.8f} * demand_now_n +
-          {mw.demand_next_weight:.8f} * demand_next_n +
-          {mw.pay_weight:.8f} * pay_n +
-          {mw.pay_per_min_weight:.8f} * pay_per_min_n +
-          {mw.pay_per_mile_weight:.8f} * pay_per_mile_n +
-          {mw.downstream_weight:.8f} * downstream_value_n
-        ) AS positive_score_manhattan_v2,
+        {nullable_weighted_average_sql([
+          (f"{mw.demand_now_weight:.8f}", "demand_now_n"),
+          (f"{mw.demand_next_weight:.8f}", "demand_next_n"),
+          (f"{mw.pay_weight:.8f}", "pay_n"),
+          (f"{mw.pay_per_min_weight:.8f}", "pay_per_min_n"),
+          (f"{mw.pay_per_mile_weight:.8f}", "pay_per_mile_n"),
+          (f"{mw.downstream_weight:.8f}", "downstream_value_n"),
+        ])} AS positive_score_manhattan_v2,
         (
           {mw.short_trip_penalty_weight:.8f} * short_trip_penalty_n +
           {mw.pickup_friction_penalty_weight:.8f} * pickup_friction_penalty_n +
           {mw.shared_ride_penalty_weight:.8f} * shared_ride_penalty_n
         ) AS negative_score_manhattan_v2,
-        (
-          {bw.demand_now_weight:.8f} * demand_now_n +
-          {bw.demand_next_weight:.8f} * demand_next_n +
-          {bw.pay_weight:.8f} * pay_n +
-          {bw.pay_per_min_weight:.8f} * pay_per_min_n +
-          {bw.pay_per_mile_weight:.8f} * pay_per_mile_n +
-          {bw.downstream_weight:.8f} * downstream_value_n
-        ) AS positive_score_bronx_wash_heights_v2,
+        {nullable_weighted_average_sql([
+          (f"{bw.demand_now_weight:.8f}", "demand_now_n"),
+          (f"{bw.demand_next_weight:.8f}", "demand_next_n"),
+          (f"{bw.pay_weight:.8f}", "pay_n"),
+          (f"{bw.pay_per_min_weight:.8f}", "pay_per_min_n"),
+          (f"{bw.pay_per_mile_weight:.8f}", "pay_per_mile_n"),
+          (f"{bw.downstream_weight:.8f}", "downstream_value_n"),
+        ])} AS positive_score_bronx_wash_heights_v2,
         (
           {bw.short_trip_penalty_weight:.8f} * short_trip_penalty_n +
           {bw.pickup_friction_penalty_weight:.8f} * pickup_friction_penalty_n +
           {bw.shared_ride_penalty_weight:.8f} * shared_ride_penalty_n
         ) AS negative_score_bronx_wash_heights_v2,
-        (
-          {qw.demand_now_weight:.8f} * demand_now_n +
-          {qw.demand_next_weight:.8f} * demand_next_n +
-          {qw.pay_weight:.8f} * pay_n +
-          {qw.pay_per_min_weight:.8f} * pay_per_min_n +
-          {qw.pay_per_mile_weight:.8f} * pay_per_mile_n +
-          {qw.downstream_weight:.8f} * downstream_value_n
-        ) AS positive_score_queens_v2,
+        {nullable_weighted_average_sql([
+          (f"{qw.demand_now_weight:.8f}", "demand_now_n"),
+          (f"{qw.demand_next_weight:.8f}", "demand_next_n"),
+          (f"{qw.pay_weight:.8f}", "pay_n"),
+          (f"{qw.pay_per_min_weight:.8f}", "pay_per_min_n"),
+          (f"{qw.pay_per_mile_weight:.8f}", "pay_per_mile_n"),
+          (f"{qw.downstream_weight:.8f}", "downstream_value_n"),
+        ])} AS positive_score_queens_v2,
         (
           {qw.short_trip_penalty_weight:.8f} * short_trip_penalty_n +
           {qw.pickup_friction_penalty_weight:.8f} * pickup_friction_penalty_n +
           {qw.shared_ride_penalty_weight:.8f} * shared_ride_penalty_n
         ) AS negative_score_queens_v2,
-        (
-          {bkw.demand_now_weight:.8f} * demand_now_n +
-          {bkw.demand_next_weight:.8f} * demand_next_n +
-          {bkw.pay_weight:.8f} * pay_n +
-          {bkw.pay_per_min_weight:.8f} * pay_per_min_n +
-          {bkw.pay_per_mile_weight:.8f} * pay_per_mile_n +
-          {bkw.downstream_weight:.8f} * downstream_value_n
-        ) AS positive_score_brooklyn_v2,
+        {nullable_weighted_average_sql([
+          (f"{bkw.demand_now_weight:.8f}", "demand_now_n"),
+          (f"{bkw.demand_next_weight:.8f}", "demand_next_n"),
+          (f"{bkw.pay_weight:.8f}", "pay_n"),
+          (f"{bkw.pay_per_min_weight:.8f}", "pay_per_min_n"),
+          (f"{bkw.pay_per_mile_weight:.8f}", "pay_per_mile_n"),
+          (f"{bkw.downstream_weight:.8f}", "downstream_value_n"),
+        ])} AS positive_score_brooklyn_v2,
         (
           {bkw.short_trip_penalty_weight:.8f} * short_trip_penalty_n +
           {bkw.pickup_friction_penalty_weight:.8f} * pickup_friction_penalty_n +
           {bkw.shared_ride_penalty_weight:.8f} * shared_ride_penalty_n
         ) AS negative_score_brooklyn_v2,
-        (
-          {sw.demand_now_weight:.8f} * demand_now_n +
-          {sw.demand_next_weight:.8f} * demand_next_n +
-          {sw.pay_weight:.8f} * pay_n +
-          {sw.pay_per_min_weight:.8f} * pay_per_min_n +
-          {sw.pay_per_mile_weight:.8f} * pay_per_mile_n +
-          {sw.downstream_weight:.8f} * downstream_value_n
-        ) AS positive_score_staten_island_v2,
+        {nullable_weighted_average_sql([
+          (f"{sw.demand_now_weight:.8f}", "demand_now_n"),
+          (f"{sw.demand_next_weight:.8f}", "demand_next_n"),
+          (f"{sw.pay_weight:.8f}", "pay_n"),
+          (f"{sw.pay_per_min_weight:.8f}", "pay_per_min_n"),
+          (f"{sw.pay_per_mile_weight:.8f}", "pay_per_mile_n"),
+          (f"{sw.downstream_weight:.8f}", "downstream_value_n"),
+        ])} AS positive_score_staten_island_v2,
         (
           {sw.short_trip_penalty_weight:.8f} * short_trip_penalty_n +
           {sw.pickup_friction_penalty_weight:.8f} * pickup_friction_penalty_n +
           {sw.shared_ride_penalty_weight:.8f} * shared_ride_penalty_n
         ) AS negative_score_staten_island_v2,
-        (
-          {c3_busy_now_weight:.8f} * busy_now_base_n +
-          {c3_busy_next_weight:.8f} * busy_next_base_n +
-          {c3w.pay_weight:.8f} * pay_n +
-          {c3w.pay_per_min_weight:.8f} * pay_per_min_n +
-          {c3w.pay_per_mile_weight:.8f} * pay_per_mile_n +
-          {c3w.balanced_trip_share_weight:.8f} * COALESCE(balanced_trip_share_n, 0.0) +
-          {c3w.long_trip_share_20plus_weight:.8f} * COALESCE(long_trip_share_20plus_n, 0.0) +
-          {c3w.downstream_weight:.8f} * downstream_value_n
-        ) AS positive_score_citywide_v3,
+        {nullable_weighted_average_sql([
+          (f"{c3_busy_now_weight:.8f}", "busy_now_base_n"),
+          (f"{c3_busy_next_weight:.8f}", "busy_next_base_n"),
+          (f"{c3w.pay_weight:.8f}", "pay_n"),
+          (f"{c3w.pay_per_min_weight:.8f}", "pay_per_min_n"),
+          (f"{c3w.pay_per_mile_weight:.8f}", "pay_per_mile_n"),
+          (f"{c3w.balanced_trip_share_weight:.8f}", "COALESCE(balanced_trip_share_n, 0.0)"),
+          (f"{c3w.long_trip_share_20plus_weight:.8f}", "COALESCE(long_trip_share_20plus_n, 0.0)"),
+          (f"{c3w.downstream_weight:.8f}", "downstream_value_n"),
+        ])} AS positive_score_citywide_v3,
         (
           {c3w.short_trip_penalty_weight:.8f} * short_trip_penalty_n +
           {c3w.same_zone_retention_penalty_weight:.8f} * COALESCE(same_zone_retention_penalty_n, 0.0) +
@@ -611,16 +626,16 @@ def build_zone_earnings_shadow_sql(
           {c3w.market_saturation_penalty_weight:.8f} * market_saturation_penalty_n +
           0.0 * manhattan_core_saturation_penalty_n
         ) AS negative_score_citywide_v3,
-        (
-          {mw3_busy_now_weight:.8f} * busy_now_base_n +
-          {mw3_busy_next_weight:.8f} * busy_next_base_n +
-          {mw3.pay_weight:.8f} * pay_n +
-          {mw3.pay_per_min_weight:.8f} * pay_per_min_n +
-          {mw3.pay_per_mile_weight:.8f} * pay_per_mile_n +
-          {mw3.balanced_trip_share_weight:.8f} * COALESCE(balanced_trip_share_n, 0.0) +
-          {mw3.long_trip_share_20plus_weight:.8f} * COALESCE(long_trip_share_20plus_n, 0.0) +
-          {mw3.downstream_weight:.8f} * downstream_value_n
-        ) AS positive_score_manhattan_v3,
+        {nullable_weighted_average_sql([
+          (f"{mw3_busy_now_weight:.8f}", "busy_now_base_n"),
+          (f"{mw3_busy_next_weight:.8f}", "busy_next_base_n"),
+          (f"{mw3.pay_weight:.8f}", "pay_n"),
+          (f"{mw3.pay_per_min_weight:.8f}", "pay_per_min_n"),
+          (f"{mw3.pay_per_mile_weight:.8f}", "pay_per_mile_n"),
+          (f"{mw3.balanced_trip_share_weight:.8f}", "COALESCE(balanced_trip_share_n, 0.0)"),
+          (f"{mw3.long_trip_share_20plus_weight:.8f}", "COALESCE(long_trip_share_20plus_n, 0.0)"),
+          (f"{mw3.downstream_weight:.8f}", "downstream_value_n"),
+        ])} AS positive_score_manhattan_v3,
         (
           {mw3.short_trip_penalty_weight:.8f} * short_trip_penalty_n +
           {mw3.same_zone_retention_penalty_weight:.8f} * COALESCE(same_zone_retention_penalty_n, 0.0) +
@@ -629,16 +644,16 @@ def build_zone_earnings_shadow_sql(
           {mw3.market_saturation_penalty_weight:.8f} * market_saturation_penalty_n +
           0.0 * manhattan_core_saturation_penalty_n
         ) AS negative_score_manhattan_v3,
-        (
-          {bw3_busy_now_weight:.8f} * busy_now_base_n +
-          {bw3_busy_next_weight:.8f} * busy_next_base_n +
-          {bw3.pay_weight:.8f} * pay_n +
-          {bw3.pay_per_min_weight:.8f} * pay_per_min_n +
-          {bw3.pay_per_mile_weight:.8f} * pay_per_mile_n +
-          {bw3.balanced_trip_share_weight:.8f} * COALESCE(balanced_trip_share_n, 0.0) +
-          {bw3.long_trip_share_20plus_weight:.8f} * COALESCE(long_trip_share_20plus_n, 0.0) +
-          {bw3.downstream_weight:.8f} * downstream_value_n
-        ) AS positive_score_bronx_wash_heights_v3,
+        {nullable_weighted_average_sql([
+          (f"{bw3_busy_now_weight:.8f}", "busy_now_base_n"),
+          (f"{bw3_busy_next_weight:.8f}", "busy_next_base_n"),
+          (f"{bw3.pay_weight:.8f}", "pay_n"),
+          (f"{bw3.pay_per_min_weight:.8f}", "pay_per_min_n"),
+          (f"{bw3.pay_per_mile_weight:.8f}", "pay_per_mile_n"),
+          (f"{bw3.balanced_trip_share_weight:.8f}", "COALESCE(balanced_trip_share_n, 0.0)"),
+          (f"{bw3.long_trip_share_20plus_weight:.8f}", "COALESCE(long_trip_share_20plus_n, 0.0)"),
+          (f"{bw3.downstream_weight:.8f}", "downstream_value_n"),
+        ])} AS positive_score_bronx_wash_heights_v3,
         (
           {bw3.short_trip_penalty_weight:.8f} * short_trip_penalty_n +
           {bw3.same_zone_retention_penalty_weight:.8f} * COALESCE(same_zone_retention_penalty_n, 0.0) +
@@ -646,16 +661,16 @@ def build_zone_earnings_shadow_sql(
           {bw3.shared_ride_penalty_weight:.8f} * shared_ride_penalty_n +
           {bw3.market_saturation_penalty_weight:.8f} * market_saturation_penalty_n
         ) AS negative_score_bronx_wash_heights_v3,
-        (
-          {qw3_busy_now_weight:.8f} * busy_now_base_n +
-          {qw3_busy_next_weight:.8f} * busy_next_base_n +
-          {qw3.pay_weight:.8f} * pay_n +
-          {qw3.pay_per_min_weight:.8f} * pay_per_min_n +
-          {qw3.pay_per_mile_weight:.8f} * pay_per_mile_n +
-          {qw3.balanced_trip_share_weight:.8f} * COALESCE(balanced_trip_share_n, 0.0) +
-          {qw3.long_trip_share_20plus_weight:.8f} * COALESCE(long_trip_share_20plus_n, 0.0) +
-          {qw3.downstream_weight:.8f} * downstream_value_n
-        ) AS positive_score_queens_v3,
+        {nullable_weighted_average_sql([
+          (f"{qw3_busy_now_weight:.8f}", "busy_now_base_n"),
+          (f"{qw3_busy_next_weight:.8f}", "busy_next_base_n"),
+          (f"{qw3.pay_weight:.8f}", "pay_n"),
+          (f"{qw3.pay_per_min_weight:.8f}", "pay_per_min_n"),
+          (f"{qw3.pay_per_mile_weight:.8f}", "pay_per_mile_n"),
+          (f"{qw3.balanced_trip_share_weight:.8f}", "COALESCE(balanced_trip_share_n, 0.0)"),
+          (f"{qw3.long_trip_share_20plus_weight:.8f}", "COALESCE(long_trip_share_20plus_n, 0.0)"),
+          (f"{qw3.downstream_weight:.8f}", "downstream_value_n"),
+        ])} AS positive_score_queens_v3,
         (
           {qw3.short_trip_penalty_weight:.8f} * short_trip_penalty_n +
           {qw3.same_zone_retention_penalty_weight:.8f} * COALESCE(same_zone_retention_penalty_n, 0.0) +
@@ -663,16 +678,16 @@ def build_zone_earnings_shadow_sql(
           {qw3.shared_ride_penalty_weight:.8f} * shared_ride_penalty_n +
           {qw3.market_saturation_penalty_weight:.8f} * market_saturation_penalty_n
         ) AS negative_score_queens_v3,
-        (
-          {bkw3_busy_now_weight:.8f} * busy_now_base_n +
-          {bkw3_busy_next_weight:.8f} * busy_next_base_n +
-          {bkw3.pay_weight:.8f} * pay_n +
-          {bkw3.pay_per_min_weight:.8f} * pay_per_min_n +
-          {bkw3.pay_per_mile_weight:.8f} * pay_per_mile_n +
-          {bkw3.balanced_trip_share_weight:.8f} * COALESCE(balanced_trip_share_n, 0.0) +
-          {bkw3.long_trip_share_20plus_weight:.8f} * COALESCE(long_trip_share_20plus_n, 0.0) +
-          {bkw3.downstream_weight:.8f} * downstream_value_n
-        ) AS positive_score_brooklyn_v3,
+        {nullable_weighted_average_sql([
+          (f"{bkw3_busy_now_weight:.8f}", "busy_now_base_n"),
+          (f"{bkw3_busy_next_weight:.8f}", "busy_next_base_n"),
+          (f"{bkw3.pay_weight:.8f}", "pay_n"),
+          (f"{bkw3.pay_per_min_weight:.8f}", "pay_per_min_n"),
+          (f"{bkw3.pay_per_mile_weight:.8f}", "pay_per_mile_n"),
+          (f"{bkw3.balanced_trip_share_weight:.8f}", "COALESCE(balanced_trip_share_n, 0.0)"),
+          (f"{bkw3.long_trip_share_20plus_weight:.8f}", "COALESCE(long_trip_share_20plus_n, 0.0)"),
+          (f"{bkw3.downstream_weight:.8f}", "downstream_value_n"),
+        ])} AS positive_score_brooklyn_v3,
         (
           {bkw3.short_trip_penalty_weight:.8f} * short_trip_penalty_n +
           {bkw3.same_zone_retention_penalty_weight:.8f} * COALESCE(same_zone_retention_penalty_n, 0.0) +
@@ -680,16 +695,16 @@ def build_zone_earnings_shadow_sql(
           {bkw3.shared_ride_penalty_weight:.8f} * shared_ride_penalty_n +
           {bkw3.market_saturation_penalty_weight:.8f} * market_saturation_penalty_n
         ) AS negative_score_brooklyn_v3,
-        (
-          {sw3_busy_now_weight:.8f} * busy_now_base_n +
-          {sw3_busy_next_weight:.8f} * busy_next_base_n +
-          {sw3.pay_weight:.8f} * pay_n +
-          {sw3.pay_per_min_weight:.8f} * pay_per_min_n +
-          {sw3.pay_per_mile_weight:.8f} * pay_per_mile_n +
-          {sw3.balanced_trip_share_weight:.8f} * COALESCE(balanced_trip_share_n, 0.0) +
-          {sw3.long_trip_share_20plus_weight:.8f} * COALESCE(long_trip_share_20plus_n, 0.0) +
-          {sw3.downstream_weight:.8f} * downstream_value_n
-        ) AS positive_score_staten_island_v3,
+        {nullable_weighted_average_sql([
+          (f"{sw3_busy_now_weight:.8f}", "busy_now_base_n"),
+          (f"{sw3_busy_next_weight:.8f}", "busy_next_base_n"),
+          (f"{sw3.pay_weight:.8f}", "pay_n"),
+          (f"{sw3.pay_per_min_weight:.8f}", "pay_per_min_n"),
+          (f"{sw3.pay_per_mile_weight:.8f}", "pay_per_mile_n"),
+          (f"{sw3.balanced_trip_share_weight:.8f}", "COALESCE(balanced_trip_share_n, 0.0)"),
+          (f"{sw3.long_trip_share_20plus_weight:.8f}", "COALESCE(long_trip_share_20plus_n, 0.0)"),
+          (f"{sw3.downstream_weight:.8f}", "downstream_value_n"),
+        ])} AS positive_score_staten_island_v3,
         (
           {sw3.short_trip_penalty_weight:.8f} * short_trip_penalty_n +
           {sw3.same_zone_retention_penalty_weight:.8f} * COALESCE(same_zone_retention_penalty_n, 0.0) +
