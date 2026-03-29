@@ -944,7 +944,7 @@ def _resolve_local_day_tendency_context(
 ) -> Dict[str, Any]:
     if not resolved_scope.get("ready"):
         reason = str(resolved_scope.get("reason") or "waiting_for_location")
-        return _build_day_tendency_context_unavailable(
+        payload = _build_day_tendency_context_unavailable(
             target_date=target_date,
             frame_dt=frame_dt,
             frame_time_iso=frame_time_iso,
@@ -964,6 +964,18 @@ def _resolve_local_day_tendency_context(
             source_mode=None,
             context_family="local",
         )
+        payload.update(
+            {
+                "source_model_layer": None,
+                "source_scope_specificity": None,
+                "fallback_level": None,
+                "context_specificity_weight": 1.0,
+                "scope_kind": None,
+                "exact_scope_specific": False,
+                "broad_scope_fallback": False,
+            }
+        )
+        return payload
 
     scope_name = str(resolved_scope.get("scope") or "citywide")
     scope_kind = _day_tendency_scope_kind(scope_name)
@@ -1032,7 +1044,7 @@ def _resolve_local_day_tendency_context(
             }
         )
         return payload
-    return _build_day_tendency_context_unavailable(
+    payload = _build_day_tendency_context_unavailable(
         target_date=target_date,
         frame_dt=frame_dt,
         frame_time_iso=frame_time_iso,
@@ -1054,6 +1066,18 @@ def _resolve_local_day_tendency_context(
         borough=resolved_scope.get("borough"),
         borough_key=resolved_scope.get("borough_key"),
     )
+    payload.update(
+        {
+            "source_model_layer": None,
+            "source_scope_specificity": None,
+            "fallback_level": None,
+            "context_specificity_weight": 1.0,
+            "scope_kind": scope_kind,
+            "exact_scope_specific": False,
+            "broad_scope_fallback": False,
+        }
+    )
+    return payload
 
 
 def _day_tendency_context_breakdown(
