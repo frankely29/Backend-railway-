@@ -454,8 +454,6 @@ def refresh_current_badges_if_needed(max_staleness_seconds: int = 30) -> None:
         "monthly_period_key": current_period_bounds(LeaderboardPeriod.monthly).period_key,
         "yearly_period_key": current_period_bounds(LeaderboardPeriod.yearly).period_key,
     }
-    source_row = _db_query_one("SELECT COALESCE(MAX(updated_at), 0) AS max_updated_at FROM driver_daily_stats")
-    source_updated_at = int(source_row["max_updated_at"] or 0) if source_row else 0
 
     state = _db_query_one(
         """
@@ -469,8 +467,7 @@ def refresh_current_badges_if_needed(max_staleness_seconds: int = 30) -> None:
         state_dict = dict(state)
         keys_match = all((state_dict.get(key) or "") == value for key, value in expected_keys.items())
         recently_refreshed = now - int(state_dict.get("refreshed_at") or 0) <= max(1, int(max_staleness_seconds))
-        source_match = int(state_dict.get("source_updated_at") or 0) == source_updated_at
-        if keys_match and recently_refreshed and source_match:
+        if keys_match and recently_refreshed:
             return
 
     refresh_current_badges()
