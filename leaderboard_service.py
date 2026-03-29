@@ -476,8 +476,9 @@ def refresh_current_badges_if_needed(max_staleness_seconds: int = 30) -> None:
     refresh_current_badges()
 
 
-def get_current_badges_for_user(user_id: int) -> List[Dict]:
-    refresh_current_badges_if_needed()
+def get_current_badges_for_user(user_id: int, refresh_if_needed: bool = True) -> List[Dict]:
+    if refresh_if_needed:
+        refresh_current_badges_if_needed()
     rows = _db_query_all(
         """
         SELECT metric, period, period_key, rank_position, badge_code
@@ -502,8 +503,9 @@ def get_current_badges_for_user(user_id: int) -> List[Dict]:
 
 
 
-def get_best_current_badge_for_user(user_id: int) -> Dict:
-    refresh_current_badges_if_needed()
+def get_best_current_badge_for_user(user_id: int, refresh_if_needed: bool = True) -> Dict:
+    if refresh_if_needed:
+        refresh_current_badges_if_needed()
     rows = _db_query_all(
         """
         SELECT user_id, metric, period, period_key, rank_position
@@ -523,8 +525,9 @@ def get_best_current_badge_for_user(user_id: int) -> Dict:
     return {"leaderboard_badge_code": _badge_for_rank(int(best.get("rank_position") or 0))}
 
 
-def get_best_current_badges_for_users(user_ids: List[int]) -> Dict[int, Dict]:
-    refresh_current_badges_if_needed()
+def get_best_current_badges_for_users(user_ids: List[int], refresh_if_needed: bool = True) -> Dict[int, Dict]:
+    if refresh_if_needed:
+        refresh_current_badges_if_needed()
     if not user_ids:
         return {}
     placeholders = ",".join(["?" for _ in user_ids])
