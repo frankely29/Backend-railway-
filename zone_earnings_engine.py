@@ -529,8 +529,7 @@ def build_zone_earnings_shadow_sql(
         LEAST(
           GREATEST(
             (
-              market_saturation_pressure_n * borough_multiplier +
-              manhattan_core_saturation_penalty_n
+              market_saturation_pressure_n * borough_multiplier
             ),
             0.0
           ),
