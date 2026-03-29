@@ -97,6 +97,9 @@ EVENT_DEFAULT_WINDOW_SECONDS = int(os.environ.get("EVENT_DEFAULT_WINDOW_SECONDS"
 MAX_AVATAR_DATA_URL_LENGTH = int(os.environ.get("MAX_AVATAR_DATA_URL_LENGTH", "20000"))
 ALLOWED_MAP_IDENTITY_MODES = {"name", "avatar"}
 RESPONSE_GZIP_MIN_BYTES = int(os.environ.get("RESPONSE_GZIP_MIN_BYTES", "1024"))
+PRESENCE_COMMUNITY_ACCURACY_MAX_METERS = int(
+    os.environ.get("PRESENCE_COMMUNITY_ACCURACY_MAX_METERS", "120")
+)
 PRESENCE_VIEWPORT_CACHE_TTL_SECONDS = float(os.environ.get("PRESENCE_VIEWPORT_CACHE_TTL_SECONDS", "3"))
 PRESENCE_VIEWPORT_CACHE_MAX = int(os.environ.get("PRESENCE_VIEWPORT_CACHE_MAX", "128"))
 PRESENCE_DELTA_MAX_LIMIT = int(os.environ.get("PRESENCE_DELTA_MAX_LIMIT", "500"))
@@ -3126,7 +3129,10 @@ def presence_update(payload: PresencePayload, user: sqlite3.Row = Depends(requir
     now = int(time.time())
     changed_at_ms = _presence_change_cursor_ms()
 
-    if payload.accuracy is not None and float(payload.accuracy) > 50:
+    if (
+        payload.accuracy is not None
+        and float(payload.accuracy) > PRESENCE_COMMUNITY_ACCURACY_MAX_METERS
+    ):
         return {"ok": True}
 
     # if ghost mode is on, we still accept updates but do not show in /presence/all
