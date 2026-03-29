@@ -263,11 +263,11 @@ def build_zone_earnings_shadow_sql(
         d.bin_start_min,
         SUM(
           {safe_div_sql('d.edge_trips', 'd.edge_total')} *
-          (
-            0.50 * LN(1 + COALESCE(z.pickups_now, 0)) +
-            0.35 * COALESCE(z.median_driver_pay, 0) +
-            0.15 * COALESCE(z.median_pay_per_min, 0)
-          )
+          {nullable_weighted_average_sql([
+            ("0.50", "LN(1 + COALESCE(z.pickups_now, 0))"),
+            ("0.35", "z.median_driver_pay"),
+            ("0.15", "z.median_pay_per_min"),
+          ])}
         ) AS downstream_next_value_raw,
         SUM(CASE WHEN z.PULocationID IS NULL THEN 0 ELSE d.edge_trips END) * 1.0 / NULLIF(SUM(d.edge_trips), 0) AS downstream_coverage
       FROM dest_edges_norm d
