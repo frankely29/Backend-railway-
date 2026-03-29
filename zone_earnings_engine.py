@@ -435,7 +435,7 @@ def build_zone_earnings_shadow_sql(
               0.15 * demand_support_n +
               0.18 * short_trip_penalty_n +
               0.16 * COALESCE(same_zone_retention_penalty_n, 0.0) +
-              0.11 * (1.0 - pay_per_mile_n) +
+              0.11 * (1.0 - COALESCE(pay_per_mile_n, 0.5)) +
               0.10 * (1.0 - downstream_value_n)
             ),
             0.0
@@ -623,7 +623,7 @@ def build_zone_earnings_shadow_sql(
           {c3w.same_zone_retention_penalty_weight:.8f} * COALESCE(same_zone_retention_penalty_n, 0.0) +
           {c3w.pickup_friction_penalty_weight:.8f} * pickup_friction_penalty_n +
           {c3w.shared_ride_penalty_weight:.8f} * shared_ride_penalty_n +
-          {c3w.market_saturation_penalty_weight:.8f} * market_saturation_penalty_n +
+          {c3w.market_saturation_penalty_weight:.8f} * COALESCE(market_saturation_penalty_n, 0.0) +
           0.0 * manhattan_core_saturation_penalty_n
         ) AS negative_score_citywide_v3,
         {nullable_weighted_average_sql([
@@ -641,7 +641,7 @@ def build_zone_earnings_shadow_sql(
           {mw3.same_zone_retention_penalty_weight:.8f} * COALESCE(same_zone_retention_penalty_n, 0.0) +
           {mw3.pickup_friction_penalty_weight:.8f} * pickup_friction_penalty_n +
           {mw3.shared_ride_penalty_weight:.8f} * shared_ride_penalty_n +
-          {mw3.market_saturation_penalty_weight:.8f} * market_saturation_penalty_n +
+          {mw3.market_saturation_penalty_weight:.8f} * COALESCE(market_saturation_penalty_n, 0.0) +
           0.0 * manhattan_core_saturation_penalty_n
         ) AS negative_score_manhattan_v3,
         {nullable_weighted_average_sql([
@@ -659,7 +659,7 @@ def build_zone_earnings_shadow_sql(
           {bw3.same_zone_retention_penalty_weight:.8f} * COALESCE(same_zone_retention_penalty_n, 0.0) +
           {bw3.pickup_friction_penalty_weight:.8f} * pickup_friction_penalty_n +
           {bw3.shared_ride_penalty_weight:.8f} * shared_ride_penalty_n +
-          {bw3.market_saturation_penalty_weight:.8f} * market_saturation_penalty_n
+          {bw3.market_saturation_penalty_weight:.8f} * COALESCE(market_saturation_penalty_n, 0.0)
         ) AS negative_score_bronx_wash_heights_v3,
         {nullable_weighted_average_sql([
           (f"{qw3_busy_now_weight:.8f}", "busy_now_base_n"),
@@ -676,7 +676,7 @@ def build_zone_earnings_shadow_sql(
           {qw3.same_zone_retention_penalty_weight:.8f} * COALESCE(same_zone_retention_penalty_n, 0.0) +
           {qw3.pickup_friction_penalty_weight:.8f} * pickup_friction_penalty_n +
           {qw3.shared_ride_penalty_weight:.8f} * shared_ride_penalty_n +
-          {qw3.market_saturation_penalty_weight:.8f} * market_saturation_penalty_n
+          {qw3.market_saturation_penalty_weight:.8f} * COALESCE(market_saturation_penalty_n, 0.0)
         ) AS negative_score_queens_v3,
         {nullable_weighted_average_sql([
           (f"{bkw3_busy_now_weight:.8f}", "busy_now_base_n"),
@@ -693,7 +693,7 @@ def build_zone_earnings_shadow_sql(
           {bkw3.same_zone_retention_penalty_weight:.8f} * COALESCE(same_zone_retention_penalty_n, 0.0) +
           {bkw3.pickup_friction_penalty_weight:.8f} * pickup_friction_penalty_n +
           {bkw3.shared_ride_penalty_weight:.8f} * shared_ride_penalty_n +
-          {bkw3.market_saturation_penalty_weight:.8f} * market_saturation_penalty_n
+          {bkw3.market_saturation_penalty_weight:.8f} * COALESCE(market_saturation_penalty_n, 0.0)
         ) AS negative_score_brooklyn_v3,
         {nullable_weighted_average_sql([
           (f"{sw3_busy_now_weight:.8f}", "busy_now_base_n"),
@@ -710,7 +710,7 @@ def build_zone_earnings_shadow_sql(
           {sw3.same_zone_retention_penalty_weight:.8f} * COALESCE(same_zone_retention_penalty_n, 0.0) +
           {sw3.pickup_friction_penalty_weight:.8f} * pickup_friction_penalty_n +
           {sw3.shared_ride_penalty_weight:.8f} * shared_ride_penalty_n +
-          {sw3.market_saturation_penalty_weight:.8f} * market_saturation_penalty_n
+          {sw3.market_saturation_penalty_weight:.8f} * COALESCE(market_saturation_penalty_n, 0.0)
         ) AS negative_score_staten_island_v3,
         LEAST(1.0, pickups_now / 40.0) * (0.70 + 0.30 * downstream_coverage) AS earnings_shadow_confidence_citywide_v2
       FROM normalized_support_enriched
