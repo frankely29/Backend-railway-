@@ -1274,7 +1274,7 @@ def _presence_state_from_user_row(user: Any) -> Tuple[bool, Optional[str]]:
 
 
 def _presence_row_payloads(rows: List[Any], *, include_full_fields: bool) -> List[Dict[str, Any]]:
-    badge_by_user = get_best_current_badges_for_users([int(r["user_id"]) for r in rows])
+    badge_by_user = get_best_current_badges_for_users([int(r["user_id"]) for r in rows], refresh_if_needed=False)
     items: List[Dict[str, Any]] = []
     for r in rows:
         best_badge = badge_by_user.get(int(r["user_id"]), {})
