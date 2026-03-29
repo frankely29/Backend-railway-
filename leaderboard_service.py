@@ -62,6 +62,18 @@ def _bool_db_value(flag: bool):
     return 1 if flag else 0
 
 
+def _leaderboard_active_user_where_sql(alias: str = "u") -> str:
+    if DB_BACKEND == "postgres":
+        return (
+            f"COALESCE({alias}.is_disabled, FALSE) = FALSE "
+            f"AND COALESCE({alias}.is_suspended, FALSE) = FALSE"
+        )
+    return (
+        f"COALESCE(CAST({alias}.is_disabled AS INTEGER), 0) = 0 "
+        f"AND COALESCE(CAST({alias}.is_suspended AS INTEGER), 0) = 0"
+    )
+
+
 
 @dataclass
 class PeriodBounds:
@@ -299,6 +311,7 @@ def _aggregate_rows(metric: LeaderboardMetric, period: LeaderboardPeriod) -> Dic
         FROM driver_daily_stats s
         JOIN users u ON u.id = s.user_id
         WHERE s.nyc_date >= ? AND s.nyc_date <= ?
+          AND {_leaderboard_active_user_where_sql("u")}
         GROUP BY s.user_id, u.display_name, u.email
         ORDER BY metric_value DESC, s.user_id ASC
         """,
@@ -339,6 +352,7 @@ def get_my_rank(user_id: int, metric: LeaderboardMetric, period: LeaderboardPeri
         FROM driver_daily_stats s
         JOIN users u ON u.id = s.user_id
         WHERE s.user_id = ? AND s.nyc_date >= ? AND s.nyc_date <= ?
+          AND {_leaderboard_active_user_where_sql("u")}
         GROUP BY s.user_id, u.display_name, u.email
         LIMIT 1
         """,
@@ -355,7 +369,9 @@ def get_my_rank(user_id: int, metric: LeaderboardMetric, period: LeaderboardPeri
         FROM (
           SELECT s.user_id, COALESCE(SUM(s.{metric_col}), 0) AS metric_value
           FROM driver_daily_stats s
+          JOIN users u ON u.id = s.user_id
           WHERE s.nyc_date >= ? AND s.nyc_date <= ?
+            AND {_leaderboard_active_user_where_sql("u")}
           GROUP BY s.user_id
         ) ranked
         WHERE ranked.metric_value > ?
