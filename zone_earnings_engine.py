@@ -143,7 +143,7 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
           {c3w.same_zone_retention_penalty_weight:.8f} * COALESCE(same_zone_retention_penalty_n, 0.0) +
           {c3w.pickup_friction_penalty_weight:.8f} * pickup_friction_penalty_n +
           {c3w.shared_ride_penalty_weight:.8f} * shared_ride_penalty_n +
-          {c3w.market_saturation_penalty_weight:.8f} * COALESCE(market_saturation_penalty_n, 0.0) +
+          citywide_v3_effective_saturation_weight * COALESCE(market_saturation_penalty_n, 0.0) +
           CASE
             WHEN {manhattan_core_citywide_guard_sql}
             THEN
@@ -808,7 +808,14 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
             WHEN earnings_shadow_rating_citywide_v3_pre_tier >= 60 THEN 0.070
             WHEN earnings_shadow_rating_citywide_v3_pre_tier >= 48 THEN 0.065
             ELSE 0.060
-          END AS citywide_v3_effective_long_trip_weight
+          END AS citywide_v3_effective_long_trip_weight,
+          CASE
+            WHEN earnings_shadow_rating_citywide_v3_pre_tier >= 87 THEN 0.060
+            WHEN earnings_shadow_rating_citywide_v3_pre_tier >= 73 THEN 0.055
+            WHEN earnings_shadow_rating_citywide_v3_pre_tier >= 60 THEN 0.045
+            WHEN earnings_shadow_rating_citywide_v3_pre_tier >= 48 THEN 0.040
+            ELSE 0.030
+          END AS citywide_v3_effective_saturation_weight
         FROM scored_pre_tier
       ) scored_pre_tier_weighted
     ),
@@ -905,6 +912,7 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
       earnings_shadow_rating_citywide_v3_pre_tier,
       citywide_v3_effective_balanced_trip_weight,
       citywide_v3_effective_long_trip_weight,
+      citywide_v3_effective_saturation_weight,
       shadow_score_raw_citywide_v3 AS earnings_shadow_score_raw_citywide_v3,
       shadow_score_raw_citywide_v3 AS earnings_shadow_score_raw_citywide_v3_pre_manhattan_discount_shadow,
       {clip01('shadow_score_raw_citywide_v3 * citywide_manhattan_saturation_discount_factor_n')} AS earnings_shadow_score_citywide_v3_anchor_shadow,
@@ -925,7 +933,7 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
       ({c3w.short_trip_penalty_weight:.8f} * short_trip_penalty_n) AS earnings_shadow_short_trip_penalty_citywide_v3,
       ({c3w.same_zone_retention_penalty_weight:.8f} * COALESCE(same_zone_retention_penalty_n, 0.0)) AS earnings_shadow_retention_penalty_citywide_v3,
       ({c3w.pickup_friction_penalty_weight:.8f} * pickup_friction_penalty_n + {c3w.shared_ride_penalty_weight:.8f} * shared_ride_penalty_n) AS earnings_shadow_friction_penalty_citywide_v3,
-      ({c3w.market_saturation_penalty_weight:.8f} * market_saturation_penalty_n) +
+      (citywide_v3_effective_saturation_weight * market_saturation_penalty_n) +
       CASE
         WHEN {manhattan_core_citywide_guard_sql}
         THEN
