@@ -121,6 +121,40 @@ POSITION('manhattan' IN LOWER(COALESCE(borough_name, ''))) > 0
 AND COALESCE(centroid_latitude, 999.0) <= 40.795
 AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
 """.strip()
+    citywide_v3_positive_pre_tier_sql = f"""
+        {nullable_weighted_average_sql([
+          (f"{c3_busy_now_weight:.8f}", "busy_now_base_n"),
+          (f"{c3_busy_next_weight:.8f}", "busy_next_base_n"),
+          (f"{c3w.pay_weight:.8f}", "pay_n"),
+          (f"{c3w.pay_per_min_weight:.8f}", "pay_per_min_n"),
+          (f"{c3w.pay_per_mile_weight:.8f}", "pay_per_mile_n"),
+          (f"{c3w.balanced_trip_share_weight:.8f}", "COALESCE(balanced_trip_share_n, 0.0)"),
+          (f"{c3w.long_trip_share_20plus_weight:.8f}", "COALESCE(long_trip_share_20plus_n, 0.0)"),
+          (f"{c3w.downstream_weight:.8f}", "downstream_value_n"),
+        ])}
+        + CASE
+            WHEN {manhattan_core_citywide_guard_sql}
+            THEN 0.045 * citywide_manhattan_escape_bonus_n
+            ELSE 0.0
+          END
+    """.strip()
+    citywide_v3_negative_sql = f"""(
+          {c3w.short_trip_penalty_weight:.8f} * short_trip_penalty_n +
+          {c3w.same_zone_retention_penalty_weight:.8f} * COALESCE(same_zone_retention_penalty_n, 0.0) +
+          {c3w.pickup_friction_penalty_weight:.8f} * pickup_friction_penalty_n +
+          {c3w.shared_ride_penalty_weight:.8f} * shared_ride_penalty_n +
+          {c3w.market_saturation_penalty_weight:.8f} * COALESCE(market_saturation_penalty_n, 0.0) +
+          CASE
+            WHEN {manhattan_core_citywide_guard_sql}
+            THEN
+              0.060 * manhattan_core_saturation_penalty_n +
+              0.070 * citywide_manhattan_short_trip_trap_penalty_n
+            ELSE 0.0
+          END
+        )"""
+    citywide_v3_pre_tier_rating_sql = (
+        f"CAST(ROUND(1 + 99 * LEAST(GREATEST(({citywide_v3_positive_pre_tier_sql} - {citywide_v3_negative_sql}), 0.0), 1.0)) AS INTEGER)"
+    )
 
     return f"""
     WITH base AS (
@@ -657,8 +691,8 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
           (f"{c3w.pay_weight:.8f}", "pay_n"),
           (f"{c3w.pay_per_min_weight:.8f}", "pay_per_min_n"),
           (f"{c3w.pay_per_mile_weight:.8f}", "pay_per_mile_n"),
-          (f"{c3w.balanced_trip_share_weight:.8f}", "COALESCE(balanced_trip_share_n, 0.0)"),
-          (f"{c3w.long_trip_share_20plus_weight:.8f}", "COALESCE(long_trip_share_20plus_n, 0.0)"),
+          (f"CASE WHEN {citywide_v3_pre_tier_rating_sql} >= 87 THEN 0.080 WHEN {citywide_v3_pre_tier_rating_sql} >= 73 THEN 0.085 WHEN {citywide_v3_pre_tier_rating_sql} >= 60 THEN 0.090 WHEN {citywide_v3_pre_tier_rating_sql} >= 48 THEN 0.095 ELSE 0.100 END", "COALESCE(balanced_trip_share_n, 0.0)"),
+          (f"CASE WHEN {citywide_v3_pre_tier_rating_sql} >= 87 THEN 0.080 WHEN {citywide_v3_pre_tier_rating_sql} >= 73 THEN 0.075 WHEN {citywide_v3_pre_tier_rating_sql} >= 60 THEN 0.070 WHEN {citywide_v3_pre_tier_rating_sql} >= 48 THEN 0.065 ELSE 0.060 END", "COALESCE(long_trip_share_20plus_n, 0.0)"),
           (f"{c3w.downstream_weight:.8f}", "downstream_value_n"),
         ])}
         + CASE
@@ -776,19 +810,20 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
         (positive_score_citywide_v3 - negative_score_citywide_v3) AS shadow_score_raw_citywide_v3_pre_tier,
         CAST(ROUND(1 + 99 * LEAST(GREATEST(shadow_score_raw_citywide_v3_pre_tier, 0.0), 1.0)) AS INTEGER) AS earnings_shadow_rating_citywide_v3_pre_tier,
         CASE
-          WHEN earnings_shadow_rating_citywide_v3_pre_tier >= 87 THEN 0.030 * COALESCE(long_trip_share_20plus_n, 0.0)
-          WHEN earnings_shadow_rating_citywide_v3_pre_tier >= 73 THEN 0.020 * COALESCE(long_trip_share_20plus_n, 0.0)
-          WHEN earnings_shadow_rating_citywide_v3_pre_tier >= 60 THEN 0.012 * COALESCE(long_trip_share_20plus_n, 0.0)
-          WHEN earnings_shadow_rating_citywide_v3_pre_tier >= 48 THEN 0.006 * COALESCE(long_trip_share_20plus_n, 0.0)
-          ELSE 0.0
-        END AS citywide_v3_long_trip_tier_bonus_n,
-        LEAST(
-          GREATEST(
-            shadow_score_raw_citywide_v3_pre_tier + citywide_v3_long_trip_tier_bonus_n,
-            0.0
-          ),
-          1.0
-        ) AS shadow_score_raw_citywide_v3,
+          WHEN earnings_shadow_rating_citywide_v3_pre_tier >= 87 THEN 0.080
+          WHEN earnings_shadow_rating_citywide_v3_pre_tier >= 73 THEN 0.085
+          WHEN earnings_shadow_rating_citywide_v3_pre_tier >= 60 THEN 0.090
+          WHEN earnings_shadow_rating_citywide_v3_pre_tier >= 48 THEN 0.095
+          ELSE 0.100
+        END AS citywide_v3_effective_balanced_trip_weight,
+        CASE
+          WHEN earnings_shadow_rating_citywide_v3_pre_tier >= 87 THEN 0.080
+          WHEN earnings_shadow_rating_citywide_v3_pre_tier >= 73 THEN 0.075
+          WHEN earnings_shadow_rating_citywide_v3_pre_tier >= 60 THEN 0.070
+          WHEN earnings_shadow_rating_citywide_v3_pre_tier >= 48 THEN 0.065
+          ELSE 0.060
+        END AS citywide_v3_effective_long_trip_weight,
+        LEAST(GREATEST(shadow_score_raw_citywide_v3_pre_tier, 0.0), 1.0) AS shadow_score_raw_citywide_v3,
         {clip01('positive_score_manhattan_v2 - negative_score_manhattan_v2')} AS shadow_score_raw_manhattan_v2,
         {clip01('positive_score_bronx_wash_heights_v2 - negative_score_bronx_wash_heights_v2')} AS shadow_score_raw_bronx_wash_heights_v2,
         {clip01('positive_score_queens_v2 - negative_score_queens_v2')} AS shadow_score_raw_queens_v2,
@@ -875,7 +910,8 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
       negative_score_citywide_v3 AS earnings_shadow_negative_citywide_v3,
       shadow_score_raw_citywide_v3_pre_tier,
       earnings_shadow_rating_citywide_v3_pre_tier,
-      citywide_v3_long_trip_tier_bonus_n,
+      citywide_v3_effective_balanced_trip_weight,
+      citywide_v3_effective_long_trip_weight,
       shadow_score_raw_citywide_v3 AS earnings_shadow_score_raw_citywide_v3,
       shadow_score_raw_citywide_v3 AS earnings_shadow_score_raw_citywide_v3_pre_manhattan_discount_shadow,
       {clip01('shadow_score_raw_citywide_v3 * citywide_manhattan_saturation_discount_factor_n')} AS earnings_shadow_score_citywide_v3_anchor_shadow,
@@ -886,13 +922,12 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
       shadow_score_raw_staten_island_v3 AS earnings_shadow_score_raw_staten_island_v3,
       ({c3_busy_now_weight:.8f} * busy_now_base_n + {c3_busy_next_weight:.8f} * busy_next_base_n) AS earnings_shadow_busy_size_positive_citywide_v3,
       ({c3w.pay_weight:.8f} * pay_n + {c3w.pay_per_min_weight:.8f} * pay_per_min_n + {c3w.pay_per_mile_weight:.8f} * pay_per_mile_n) AS earnings_shadow_pay_quality_positive_citywide_v3,
-      ({c3w.balanced_trip_share_weight:.8f} * COALESCE(balanced_trip_share_n, 0.0) + {c3w.long_trip_share_20plus_weight:.8f} * COALESCE(long_trip_share_20plus_n, 0.0)) +
+      (citywide_v3_effective_balanced_trip_weight * COALESCE(balanced_trip_share_n, 0.0) + citywide_v3_effective_long_trip_weight * COALESCE(long_trip_share_20plus_n, 0.0)) +
       CASE
         WHEN {manhattan_core_citywide_guard_sql}
         THEN 0.045 * citywide_manhattan_escape_bonus_n
         ELSE 0.0
-      END +
-      citywide_v3_long_trip_tier_bonus_n AS earnings_shadow_trip_mix_positive_citywide_v3,
+      END AS earnings_shadow_trip_mix_positive_citywide_v3,
       ({c3w.downstream_weight:.8f} * downstream_value_n) AS earnings_shadow_continuation_positive_citywide_v3,
       ({c3w.short_trip_penalty_weight:.8f} * short_trip_penalty_n) AS earnings_shadow_short_trip_penalty_citywide_v3,
       ({c3w.same_zone_retention_penalty_weight:.8f} * COALESCE(same_zone_retention_penalty_n, 0.0)) AS earnings_shadow_retention_penalty_citywide_v3,
