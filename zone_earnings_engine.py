@@ -147,8 +147,8 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
           CASE
             WHEN {manhattan_core_citywide_guard_sql}
             THEN
-              0.085 * manhattan_core_saturation_penalty_n +
-              0.095 * citywide_manhattan_short_trip_trap_penalty_n
+              0.100 * manhattan_core_saturation_penalty_n +
+              0.110 * citywide_manhattan_short_trip_trap_penalty_n
             ELSE 0.0
           END
         )"""
@@ -161,8 +161,8 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
           CASE
             WHEN {manhattan_core_citywide_guard_sql}
             THEN
-              0.085 * manhattan_core_saturation_penalty_n +
-              0.095 * citywide_manhattan_short_trip_trap_penalty_n
+              0.100 * manhattan_core_saturation_penalty_n +
+              0.110 * citywide_manhattan_short_trip_trap_penalty_n
             ELSE 0.0
           END
         )"""
@@ -952,8 +952,8 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
       CASE
         WHEN {manhattan_core_citywide_guard_sql}
         THEN
-          0.085 * manhattan_core_saturation_penalty_n +
-          0.095 * citywide_manhattan_short_trip_trap_penalty_n
+          0.100 * manhattan_core_saturation_penalty_n +
+          0.110 * citywide_manhattan_short_trip_trap_penalty_n
         ELSE 0.0
       END AS earnings_shadow_saturation_penalty_citywide_v3,
       ({mw3_busy_now_weight:.8f} * busy_now_base_n + {mw3_busy_next_weight:.8f} * busy_next_base_n) AS earnings_shadow_busy_size_positive_manhattan_v3,
