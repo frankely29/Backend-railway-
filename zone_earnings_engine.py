@@ -116,6 +116,11 @@ def build_zone_earnings_shadow_sql(
     bkw3_busy_next_weight = bkw3.demand_next_weight + bkw3.demand_density_next_weight
     sw3_busy_now_weight = sw3.demand_now_weight + sw3.demand_density_now_weight
     sw3_busy_next_weight = sw3.demand_next_weight + sw3.demand_density_next_weight
+    manhattan_core_citywide_guard_sql = f"""
+POSITION('manhattan' IN LOWER(COALESCE(borough_name, ''))) > 0
+AND COALESCE(centroid_latitude, 999.0) <= 40.795
+AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
+""".strip()
 
     return f"""
     WITH base AS (
@@ -462,9 +467,7 @@ def build_zone_earnings_shadow_sql(
           1.0
         ) AS churn_pressure_n,
         CASE
-          WHEN POSITION('manhattan' IN LOWER(COALESCE(borough_name, ''))) > 0
-            AND COALESCE(centroid_latitude, 999.0) <= 40.795
-            AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
+          WHEN {manhattan_core_citywide_guard_sql}
           THEN LEAST(
             GREATEST(
               (
@@ -479,9 +482,7 @@ def build_zone_earnings_shadow_sql(
           ELSE 0.0
         END AS manhattan_core_saturation_proxy_n,
         CASE
-          WHEN POSITION('manhattan' IN LOWER(COALESCE(borough_name, ''))) > 0
-            AND COALESCE(centroid_latitude, 999.0) <= 40.795
-            AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
+          WHEN {manhattan_core_citywide_guard_sql}
           THEN LEAST(
             GREATEST(
               (
@@ -515,12 +516,44 @@ def build_zone_earnings_shadow_sql(
           ELSE 0.0
         END AS manhattan_core_saturation_penalty_n,
         CASE
-          WHEN POSITION('manhattan' IN LOWER(COALESCE(borough_name, ''))) > 0
-            AND COALESCE(centroid_latitude, 999.0) <= 40.795
-            AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
-          THEN LEAST(GREATEST(1.0 - (0.10 * manhattan_core_saturation_penalty_n), 0.90), 1.00)
+          WHEN {manhattan_core_citywide_guard_sql}
+          THEN LEAST(GREATEST(1.0 - (0.14 * manhattan_core_saturation_penalty_n), 0.86), 1.00)
           ELSE 1.00
-        END AS citywide_manhattan_saturation_discount_factor_n
+        END AS citywide_manhattan_saturation_discount_factor_n,
+        CASE
+          WHEN {manhattan_core_citywide_guard_sql}
+          THEN LEAST(
+            GREATEST(
+              (
+                0.52 * short_trip_penalty_n +
+                0.30 * COALESCE(same_zone_retention_penalty_n, 0.0) +
+                0.18 * GREATEST(
+                  COALESCE(demand_density_now_n, 0.0) -
+                  GREATEST(COALESCE(downstream_value_n, 0.0), COALESCE(busy_next_base_n, 0.0)),
+                  0.0
+                )
+              ),
+              0.0
+            ),
+            1.0
+          )
+          ELSE 0.0
+        END AS citywide_manhattan_short_trip_trap_penalty_n,
+        CASE
+          WHEN {manhattan_core_citywide_guard_sql}
+          THEN LEAST(
+            GREATEST(
+              (
+                0.52 * COALESCE(balanced_trip_share_n, 0.0) +
+                0.28 * COALESCE(long_trip_share_20plus_n, 0.0) +
+                0.20 * COALESCE(downstream_value_n, 0.0)
+              ),
+              0.0
+            ),
+            1.0
+          )
+          ELSE 0.0
+        END AS citywide_manhattan_escape_bonus_n
       FROM normalized
     ),
     normalized_support_enriched AS (
@@ -627,14 +660,25 @@ def build_zone_earnings_shadow_sql(
           (f"{c3w.balanced_trip_share_weight:.8f}", "COALESCE(balanced_trip_share_n, 0.0)"),
           (f"{c3w.long_trip_share_20plus_weight:.8f}", "COALESCE(long_trip_share_20plus_n, 0.0)"),
           (f"{c3w.downstream_weight:.8f}", "downstream_value_n"),
-        ])} AS positive_score_citywide_v3,
+        ])}
+        + CASE
+            WHEN {manhattan_core_citywide_guard_sql}
+            THEN 0.045 * citywide_manhattan_escape_bonus_n
+            ELSE 0.0
+          END AS positive_score_citywide_v3,
         (
           {c3w.short_trip_penalty_weight:.8f} * short_trip_penalty_n +
           {c3w.same_zone_retention_penalty_weight:.8f} * COALESCE(same_zone_retention_penalty_n, 0.0) +
           {c3w.pickup_friction_penalty_weight:.8f} * pickup_friction_penalty_n +
           {c3w.shared_ride_penalty_weight:.8f} * shared_ride_penalty_n +
           {c3w.market_saturation_penalty_weight:.8f} * COALESCE(market_saturation_penalty_n, 0.0) +
-          0.0 * manhattan_core_saturation_penalty_n
+          CASE
+            WHEN {manhattan_core_citywide_guard_sql}
+            THEN
+              0.060 * manhattan_core_saturation_penalty_n +
+              0.070 * citywide_manhattan_short_trip_trap_penalty_n
+            ELSE 0.0
+          END
         ) AS negative_score_citywide_v3,
         {nullable_weighted_average_sql([
           (f"{mw3_busy_now_weight:.8f}", "busy_now_base_n"),
@@ -824,12 +868,24 @@ def build_zone_earnings_shadow_sql(
       shadow_score_raw_staten_island_v3 AS earnings_shadow_score_raw_staten_island_v3,
       ({c3_busy_now_weight:.8f} * busy_now_base_n + {c3_busy_next_weight:.8f} * busy_next_base_n) AS earnings_shadow_busy_size_positive_citywide_v3,
       ({c3w.pay_weight:.8f} * pay_n + {c3w.pay_per_min_weight:.8f} * pay_per_min_n + {c3w.pay_per_mile_weight:.8f} * pay_per_mile_n) AS earnings_shadow_pay_quality_positive_citywide_v3,
-      ({c3w.balanced_trip_share_weight:.8f} * COALESCE(balanced_trip_share_n, 0.0) + {c3w.long_trip_share_20plus_weight:.8f} * COALESCE(long_trip_share_20plus_n, 0.0)) AS earnings_shadow_trip_mix_positive_citywide_v3,
+      ({c3w.balanced_trip_share_weight:.8f} * COALESCE(balanced_trip_share_n, 0.0) + {c3w.long_trip_share_20plus_weight:.8f} * COALESCE(long_trip_share_20plus_n, 0.0)) +
+      CASE
+        WHEN {manhattan_core_citywide_guard_sql}
+        THEN 0.045 * citywide_manhattan_escape_bonus_n
+        ELSE 0.0
+      END AS earnings_shadow_trip_mix_positive_citywide_v3,
       ({c3w.downstream_weight:.8f} * downstream_value_n) AS earnings_shadow_continuation_positive_citywide_v3,
       ({c3w.short_trip_penalty_weight:.8f} * short_trip_penalty_n) AS earnings_shadow_short_trip_penalty_citywide_v3,
       ({c3w.same_zone_retention_penalty_weight:.8f} * COALESCE(same_zone_retention_penalty_n, 0.0)) AS earnings_shadow_retention_penalty_citywide_v3,
       ({c3w.pickup_friction_penalty_weight:.8f} * pickup_friction_penalty_n + {c3w.shared_ride_penalty_weight:.8f} * shared_ride_penalty_n) AS earnings_shadow_friction_penalty_citywide_v3,
-      ({c3w.market_saturation_penalty_weight:.8f} * market_saturation_penalty_n + 0.0 * manhattan_core_saturation_penalty_n) AS earnings_shadow_saturation_penalty_citywide_v3,
+      ({c3w.market_saturation_penalty_weight:.8f} * market_saturation_penalty_n) +
+      CASE
+        WHEN {manhattan_core_citywide_guard_sql}
+        THEN
+          0.060 * manhattan_core_saturation_penalty_n +
+          0.070 * citywide_manhattan_short_trip_trap_penalty_n
+        ELSE 0.0
+      END AS earnings_shadow_saturation_penalty_citywide_v3,
       ({mw3_busy_now_weight:.8f} * busy_now_base_n + {mw3_busy_next_weight:.8f} * busy_next_base_n) AS earnings_shadow_busy_size_positive_manhattan_v3,
       ({mw3.pay_weight:.8f} * pay_n + {mw3.pay_per_min_weight:.8f} * pay_per_min_n + {mw3.pay_per_mile_weight:.8f} * pay_per_mile_n) AS earnings_shadow_pay_quality_positive_manhattan_v3,
       ({mw3.balanced_trip_share_weight:.8f} * COALESCE(balanced_trip_share_n, 0.0) + {mw3.long_trip_share_20plus_weight:.8f} * COALESCE(long_trip_share_20plus_n, 0.0)) AS earnings_shadow_trip_mix_positive_manhattan_v3,
