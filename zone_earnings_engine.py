@@ -147,8 +147,8 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
           CASE
             WHEN {manhattan_core_citywide_guard_sql}
             THEN
-              0.060 * manhattan_core_saturation_penalty_n +
-              0.070 * citywide_manhattan_short_trip_trap_penalty_n
+              0.070 * manhattan_core_saturation_penalty_n +
+              0.080 * citywide_manhattan_short_trip_trap_penalty_n
             ELSE 0.0
           END
         )"""
@@ -161,8 +161,8 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
           CASE
             WHEN {manhattan_core_citywide_guard_sql}
             THEN
-              0.060 * manhattan_core_saturation_penalty_n +
-              0.070 * citywide_manhattan_short_trip_trap_penalty_n
+              0.070 * manhattan_core_saturation_penalty_n +
+              0.080 * citywide_manhattan_short_trip_trap_penalty_n
             ELSE 0.0
           END
         )"""
@@ -812,14 +812,14 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
           *,
           CASE
             WHEN earnings_shadow_rating_citywide_v3_pre_tier >= 87 THEN 0.080
-            WHEN earnings_shadow_rating_citywide_v3_pre_tier >= 73 THEN 0.085
+            WHEN earnings_shadow_rating_citywide_v3_pre_tier >= 73 THEN 0.082
             WHEN earnings_shadow_rating_citywide_v3_pre_tier >= 60 THEN 0.090
             WHEN earnings_shadow_rating_citywide_v3_pre_tier >= 48 THEN 0.095
             ELSE 0.100
           END AS citywide_v3_effective_balanced_trip_weight,
           CASE
             WHEN earnings_shadow_rating_citywide_v3_pre_tier >= 87 THEN 0.080
-            WHEN earnings_shadow_rating_citywide_v3_pre_tier >= 73 THEN 0.075
+            WHEN earnings_shadow_rating_citywide_v3_pre_tier >= 73 THEN 0.078
             WHEN earnings_shadow_rating_citywide_v3_pre_tier >= 60 THEN 0.070
             WHEN earnings_shadow_rating_citywide_v3_pre_tier >= 48 THEN 0.065
             ELSE 0.060
