@@ -3354,12 +3354,10 @@ def timeline(request: Request):
     return _json_cached_response(request, cached["data"], etag=cached.get("etag"))
 
 
-def _parse_assistant_location_ids(location_ids: Optional[str], location_id: Optional[str]) -> List[str]:
+def _parse_assistant_location_ids(location_ids: Optional[str]) -> List[str]:
     candidates: List[str] = []
     if location_ids:
         candidates.extend(part.strip() for part in str(location_ids).split(","))
-    if location_id:
-        candidates.append(str(location_id).strip())
 
     normalized: List[str] = []
     seen: set[str] = set()
@@ -3380,8 +3378,7 @@ def _parse_assistant_location_ids(location_ids: Optional[str], location_id: Opti
 def assistant_outlook(
     request: Request,
     frame_time: str,
-    location_ids: Optional[str] = None,
-    location_id: Optional[str] = None,
+    location_ids: str,
 ):
     if not _has_assistant_outlook():
         raise HTTPException(
@@ -3389,9 +3386,10 @@ def assistant_outlook(
             detail="assistant outlook not ready. Call /generate first to build assistant_outlook.json.",
         )
 
-    requested_location_ids = _parse_assistant_location_ids(location_ids, location_id)
+    # Assistant outlook is prebuilt from artifacts; this route only performs indexed lookup.
+    requested_location_ids = _parse_assistant_location_ids(location_ids)
     if not requested_location_ids:
-        raise HTTPException(status_code=400, detail="location_ids is required (comma-separated) or provide location_id.")
+        raise HTTPException(status_code=400, detail="location_ids is required and must include at least one id.")
 
     cached = _read_assistant_outlook_cached()
     data = cached.get("data") or {}

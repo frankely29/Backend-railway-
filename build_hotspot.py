@@ -16,10 +16,7 @@ from zone_earnings_engine import build_zone_earnings_shadow_sql
 from zone_geometry_metrics import build_zone_geometry_metrics_rows
 from zone_mode_profiles import ZONE_MODE_PROFILES, validate_zone_mode_profiles_for_live_engine
 from artifact_freshness import build_expected_artifact_signature
-from assistant_outlook_engine import (
-    build_assistant_outlook_index,
-    load_timeline_and_frames_from_artifacts,
-)
+from assistant_outlook_engine import build_assistant_outlook_index
 
 logger = logging.getLogger(__name__)
 
@@ -1613,10 +1610,9 @@ def build_hotspots_frames(
         json.dumps({"timeline": timeline, "count": len(timeline)}, separators=(",", ":")),
         encoding="utf-8"
     )
-    assistant_timeline, assistant_frames_by_time = load_timeline_and_frames_from_artifacts(stage_dir)
     assistant_outlook_payload = build_assistant_outlook_index(
-        assistant_timeline,
-        assistant_frames_by_time,
+        {"timeline": timeline},
+        stage_dir,
         bin_minutes=int(bin_minutes),
     )
     (stage_dir / "assistant_outlook.json").write_text(
@@ -1904,4 +1900,14 @@ def build_hotspots_frames(
         pass
     temp_run_dir_ctx.cleanup()
 
-    return {"ok": True, "count": len(timeline), "frames_dir": str(out_dir), "rows": total_rows}
+    return {
+        "ok": True,
+        "count": len(timeline),
+        "frames_dir": str(out_dir),
+        "rows": total_rows,
+        "assistant_outlook": {
+            "path": str(out_dir / "assistant_outlook.json"),
+            "version": 1,
+            "horizon_bins": 6,
+        },
+    }
