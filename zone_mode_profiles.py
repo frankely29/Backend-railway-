@@ -52,7 +52,7 @@ ZONE_MODE_PROFILES: Dict[str, ZoneScoreProfileWeights] = {
         same_zone_retention_penalty_weight=0.09,
         pickup_friction_penalty_weight=0.045,
         shared_ride_penalty_weight=0.027,
-        market_saturation_penalty_weight=0.0,
+        market_saturation_penalty_weight=0.03,
     ),
     "manhattan_v2": ZoneScoreProfileWeights(
         demand_now_weight=0.14,
