@@ -31,6 +31,7 @@ from hotspot_experiments import (
     log_zone_bins,
     prune_experiment_tables,
 )
+from assistant_outlook_engine import get_assistant_outlook_payload
 from hotspot_scoring import score_zones
 from artifact_freshness import evaluate_artifact_freshness
 from artifact_storage_service import cleanup_artifact_storage, get_artifact_storage_report
@@ -72,6 +73,7 @@ from core import (
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 FRAMES_DIR = Path(os.environ.get("FRAMES_DIR", str(DATA_DIR / "frames")))
 TIMELINE_PATH = FRAMES_DIR / "timeline.json"
+ASSISTANT_OUTLOOK_PATH = FRAMES_DIR / "assistant_outlook.json"
 DAY_TENDENCY_DIR = DATA_DIR / "day_tendency"
 DAY_TENDENCY_MODEL_PATH = DAY_TENDENCY_DIR / "model.json"
 NYC_TZ = ZoneInfo("America/New_York")
@@ -143,6 +145,8 @@ _pickup_zone_score_cache: Dict[int, float] = {}
 _pickup_zone_hotspot_cache_lock = threading.Lock()
 _timeline_cache_entry: Dict[str, Any] = {}
 _timeline_cache_lock = threading.Lock()
+_assistant_outlook_cache_entry: Dict[str, Any] = {}
+_assistant_outlook_cache_lock = threading.Lock()
 _frame_cache: Dict[int, Dict[str, Any]] = {}
 _frame_cache_order: deque[int] = deque()
 _frame_cache_lock = threading.Lock()
@@ -486,6 +490,30 @@ def _read_frame_cached(idx: int) -> Dict[str, Any]:
             evicted_idx = _frame_cache_order.popleft()
             _frame_cache.pop(evicted_idx, None)
         return _frame_cache[idx]
+
+
+def _has_assistant_outlook() -> bool:
+    try:
+        return ASSISTANT_OUTLOOK_PATH.exists() and ASSISTANT_OUTLOOK_PATH.stat().st_size > 0
+    except Exception:
+        return False
+
+
+def _read_assistant_outlook_cached() -> Dict[str, Any]:
+    stat_result = ASSISTANT_OUTLOOK_PATH.stat()
+    mtime = stat_result.st_mtime
+    size = int(stat_result.st_size)
+    etag = _etag_for_path(ASSISTANT_OUTLOOK_PATH, mtime, size)
+    with _assistant_outlook_cache_lock:
+        cached = _assistant_outlook_cache_entry
+        if cached and cached.get("mtime") == mtime and cached.get("size") == size:
+            _record_perf_metric("assistant_outlook.cache_hit")
+            return cached
+        _record_perf_metric("assistant_outlook.cache_miss")
+        data = _read_json(ASSISTANT_OUTLOOK_PATH)
+        _assistant_outlook_cache_entry.clear()
+        _assistant_outlook_cache_entry.update({"data": data, "mtime": mtime, "size": size, "etag": etag})
+        return dict(_assistant_outlook_cache_entry)
 
 
 def _has_day_tendency_model() -> bool:
@@ -3324,6 +3352,59 @@ def timeline(request: Request):
         raise HTTPException(status_code=409, detail="timeline not ready. Call /generate first.")
     cached = _read_timeline_cached()
     return _json_cached_response(request, cached["data"], etag=cached.get("etag"))
+
+
+def _parse_assistant_location_ids(location_ids: Optional[str], location_id: Optional[str]) -> List[str]:
+    candidates: List[str] = []
+    if location_ids:
+        candidates.extend(part.strip() for part in str(location_ids).split(","))
+    if location_id:
+        candidates.append(str(location_id).strip())
+
+    normalized: List[str] = []
+    seen: set[str] = set()
+    for raw in candidates:
+        if not raw:
+            continue
+        try:
+            cleaned = str(int(raw))
+        except Exception:
+            cleaned = raw
+        if cleaned and cleaned not in seen:
+            seen.add(cleaned)
+            normalized.append(cleaned)
+    return normalized
+
+
+@app.get("/assistant/outlook")
+def assistant_outlook(
+    request: Request,
+    frame_time: str,
+    location_ids: Optional[str] = None,
+    location_id: Optional[str] = None,
+):
+    if not _has_assistant_outlook():
+        raise HTTPException(
+            status_code=409,
+            detail="assistant outlook not ready. Call /generate first to build assistant_outlook.json.",
+        )
+
+    requested_location_ids = _parse_assistant_location_ids(location_ids, location_id)
+    if not requested_location_ids:
+        raise HTTPException(status_code=400, detail="location_ids is required (comma-separated) or provide location_id.")
+
+    cached = _read_assistant_outlook_cached()
+    data = cached.get("data") or {}
+    timeline = set((data.get("timeline") or []))
+    if frame_time not in timeline:
+        raise HTTPException(status_code=404, detail=f"Unknown frame_time: {frame_time}")
+
+    try:
+        payload = get_assistant_outlook_payload(data, frame_time, requested_location_ids)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"Unknown frame_time: {frame_time}")
+
+    return _json_cached_response(request, payload, etag=cached.get("etag"))
 
 
 @app.get("/frame/{idx}")

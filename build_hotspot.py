@@ -16,6 +16,10 @@ from zone_earnings_engine import build_zone_earnings_shadow_sql
 from zone_geometry_metrics import build_zone_geometry_metrics_rows
 from zone_mode_profiles import ZONE_MODE_PROFILES, validate_zone_mode_profiles_for_live_engine
 from artifact_freshness import build_expected_artifact_signature
+from assistant_outlook_engine import (
+    build_assistant_outlook_index,
+    load_timeline_and_frames_from_artifacts,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1609,6 +1613,16 @@ def build_hotspots_frames(
         json.dumps({"timeline": timeline, "count": len(timeline)}, separators=(",", ":")),
         encoding="utf-8"
     )
+    assistant_timeline, assistant_frames_by_time = load_timeline_and_frames_from_artifacts(stage_dir)
+    assistant_outlook_payload = build_assistant_outlook_index(
+        assistant_timeline,
+        assistant_frames_by_time,
+        bin_minutes=int(bin_minutes),
+    )
+    (stage_dir / "assistant_outlook.json").write_text(
+        json.dumps(assistant_outlook_payload, separators=(",", ":")),
+        encoding="utf-8",
+    )
     live_shadow_profiles = [
         "citywide_v2",
         "citywide_v3",
@@ -1865,7 +1879,8 @@ def build_hotspots_frames(
     staged_timeline = stage_dir / "timeline.json"
     staged_manifest = stage_dir / "scoring_shadow_manifest.json"
     staged_frames = sorted(stage_dir.glob("frame_*.json"))
-    if not staged_timeline.exists() or not staged_manifest.exists() or not staged_frames:
+    staged_assistant_outlook = stage_dir / "assistant_outlook.json"
+    if not staged_timeline.exists() or not staged_manifest.exists() or not staged_assistant_outlook.exists() or not staged_frames:
         raise RuntimeError("Staged artifact build did not produce required files.")
 
     for generated in out_dir.glob("frame_*.json"):
@@ -1873,7 +1888,7 @@ def build_hotspots_frames(
             generated.unlink()
         except Exception:
             pass
-    for generated_name in ("timeline.json", "scoring_shadow_manifest.json"):
+    for generated_name in ("timeline.json", "scoring_shadow_manifest.json", "assistant_outlook.json"):
         generated_path = out_dir / generated_name
         try:
             if generated_path.exists() and generated_path.is_file():
