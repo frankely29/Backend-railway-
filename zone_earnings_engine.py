@@ -773,7 +773,22 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
       SELECT
         *,
         {clip01('positive_score - negative_score')} AS shadow_score_raw,
-        (positive_score_citywide_v3 - negative_score_citywide_v3) AS shadow_score_raw_citywide_v3,
+        (positive_score_citywide_v3 - negative_score_citywide_v3) AS shadow_score_raw_citywide_v3_pre_tier,
+        CAST(ROUND(1 + 99 * LEAST(GREATEST(shadow_score_raw_citywide_v3_pre_tier, 0.0), 1.0)) AS INTEGER) AS earnings_shadow_rating_citywide_v3_pre_tier,
+        CASE
+          WHEN earnings_shadow_rating_citywide_v3_pre_tier >= 87 THEN 0.030 * COALESCE(long_trip_share_20plus_n, 0.0)
+          WHEN earnings_shadow_rating_citywide_v3_pre_tier >= 73 THEN 0.020 * COALESCE(long_trip_share_20plus_n, 0.0)
+          WHEN earnings_shadow_rating_citywide_v3_pre_tier >= 60 THEN 0.012 * COALESCE(long_trip_share_20plus_n, 0.0)
+          WHEN earnings_shadow_rating_citywide_v3_pre_tier >= 48 THEN 0.006 * COALESCE(long_trip_share_20plus_n, 0.0)
+          ELSE 0.0
+        END AS citywide_v3_long_trip_tier_bonus_n,
+        LEAST(
+          GREATEST(
+            shadow_score_raw_citywide_v3_pre_tier + citywide_v3_long_trip_tier_bonus_n,
+            0.0
+          ),
+          1.0
+        ) AS shadow_score_raw_citywide_v3,
         {clip01('positive_score_manhattan_v2 - negative_score_manhattan_v2')} AS shadow_score_raw_manhattan_v2,
         {clip01('positive_score_bronx_wash_heights_v2 - negative_score_bronx_wash_heights_v2')} AS shadow_score_raw_bronx_wash_heights_v2,
         {clip01('positive_score_queens_v2 - negative_score_queens_v2')} AS shadow_score_raw_queens_v2,
@@ -807,7 +822,7 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
         {clip01(f"{clip01('positive_score_staten_island_v3 - negative_score_staten_island_v3')} * {clip01('0.80 * earnings_shadow_confidence_citywide_v2 + 0.20 * COALESCE(balanced_trip_share_n, 0.0)')}")} AS earnings_shadow_score_staten_island_v3,
         {clip01('0.85 * earnings_shadow_confidence_citywide_v2 + 0.15 * demand_support_n')} AS earnings_shadow_confidence_citywide_v3,
         {clip01('shadow_score_raw_citywide_v3 * citywide_manhattan_saturation_discount_factor_n')} AS earnings_shadow_score_citywide_v3_anchor_shadow,
-        {clip01(f"{clip01('positive_score_citywide_v3 - negative_score_citywide_v3')} * {clip01('0.85 * earnings_shadow_confidence_citywide_v2 + 0.15 * demand_support_n')} * citywide_manhattan_saturation_discount_factor_n")} AS earnings_shadow_score_citywide_v3
+        {clip01(f"shadow_score_raw_citywide_v3 * {clip01('0.85 * earnings_shadow_confidence_citywide_v2 + 0.15 * demand_support_n')} * citywide_manhattan_saturation_discount_factor_n")} AS earnings_shadow_score_citywide_v3
       FROM scored
     )
     SELECT
@@ -858,6 +873,9 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
       citywide_manhattan_saturation_discount_factor_n AS citywide_manhattan_saturation_discount_factor_shadow,
       positive_score_citywide_v3 AS earnings_shadow_positive_citywide_v3,
       negative_score_citywide_v3 AS earnings_shadow_negative_citywide_v3,
+      shadow_score_raw_citywide_v3_pre_tier,
+      earnings_shadow_rating_citywide_v3_pre_tier,
+      citywide_v3_long_trip_tier_bonus_n,
       shadow_score_raw_citywide_v3 AS earnings_shadow_score_raw_citywide_v3,
       shadow_score_raw_citywide_v3 AS earnings_shadow_score_raw_citywide_v3_pre_manhattan_discount_shadow,
       {clip01('shadow_score_raw_citywide_v3 * citywide_manhattan_saturation_discount_factor_n')} AS earnings_shadow_score_citywide_v3_anchor_shadow,
@@ -873,7 +891,8 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
         WHEN {manhattan_core_citywide_guard_sql}
         THEN 0.045 * citywide_manhattan_escape_bonus_n
         ELSE 0.0
-      END AS earnings_shadow_trip_mix_positive_citywide_v3,
+      END +
+      citywide_v3_long_trip_tier_bonus_n AS earnings_shadow_trip_mix_positive_citywide_v3,
       ({c3w.downstream_weight:.8f} * downstream_value_n) AS earnings_shadow_continuation_positive_citywide_v3,
       ({c3w.short_trip_penalty_weight:.8f} * short_trip_penalty_n) AS earnings_shadow_short_trip_penalty_citywide_v3,
       ({c3w.same_zone_retention_penalty_weight:.8f} * COALESCE(same_zone_retention_penalty_n, 0.0)) AS earnings_shadow_retention_penalty_citywide_v3,
