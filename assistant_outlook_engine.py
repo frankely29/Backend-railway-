@@ -120,6 +120,13 @@ def extract_assistant_feature_payload(feature: Dict[str, Any]) -> Dict[str, Any]
             ),
         ),
     }
+    balanced_trip_share = _first_present(
+        raw,
+        (
+            "balanced_trip_share_shadow",
+            "balanced_trip_share",
+        ),
+    )
 
     return {
         "location_id": location_id,
@@ -127,6 +134,15 @@ def extract_assistant_feature_payload(feature: Dict[str, Any]) -> Dict[str, Any]
         "borough": props.get("borough"),
         "tracks": tracks,
         "raw": raw,
+        "busy_now_base": raw.get("busy_now_base_n_shadow"),
+        "busy_next_base": raw.get("busy_next_base_n_shadow"),
+        "short_trip_penalty": raw.get("short_trip_penalty_n_shadow"),
+        "long_trip_share_20plus": raw.get("long_trip_share_20plus"),
+        "balanced_trip_share": balanced_trip_share,
+        "churn_pressure": raw.get("churn_pressure_n_shadow"),
+        "market_saturation_penalty": raw.get("market_saturation_penalty_n_shadow"),
+        "manhattan_core_saturation_penalty": raw.get("manhattan_core_saturation_penalty_n_shadow"),
+        "continuation_raw": raw.get("downstream_next_value_raw"),
     }
 
 
@@ -179,6 +195,15 @@ def build_zone_outlook_for_frame(
                     "frame_time": future_time,
                     "tracks": payload.get("tracks") or {},
                     "raw": payload.get("raw") or {},
+                    "busy_now_base": payload.get("busy_now_base"),
+                    "busy_next_base": payload.get("busy_next_base"),
+                    "short_trip_penalty": payload.get("short_trip_penalty"),
+                    "long_trip_share_20plus": payload.get("long_trip_share_20plus"),
+                    "balanced_trip_share": payload.get("balanced_trip_share"),
+                    "churn_pressure": payload.get("churn_pressure"),
+                    "market_saturation_penalty": payload.get("market_saturation_penalty"),
+                    "manhattan_core_saturation_penalty": payload.get("manhattan_core_saturation_penalty"),
+                    "continuation_raw": payload.get("continuation_raw"),
                 }
             )
 
@@ -243,4 +268,5 @@ def get_assistant_outlook_payload(
         "returned_count": len(zones),
         "zones": zones,
         "zones_by_location_id": zones_by_location_id,
+        "by_location_id": zones_by_location_id,
     }
