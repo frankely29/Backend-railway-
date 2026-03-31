@@ -194,6 +194,9 @@ def build_zone_outlook_for_frame(
             zone_payload["points"].append(
                 {
                     "frame_time": future_time,
+                    "location_id": location_id,
+                    "zone_name": zone_payload.get("zone_name"),
+                    "borough": zone_payload.get("borough"),
                     "tracks": payload.get("tracks") or {},
                     "raw": payload.get("raw") or {},
                     "busy_now_base": payload.get("busy_now_base"),
@@ -267,6 +270,7 @@ def get_assistant_outlook_payload(
     }
     return {
         "frame_time": frame_key,
+        "location_ids": requested,
         "bin_minutes": int((index or {}).get("bin_minutes") or 20),
         "horizon_bins": int((index or {}).get("horizon_bins") or HORIZON_BINS_DEFAULT),
         "requested_count": len(requested),
