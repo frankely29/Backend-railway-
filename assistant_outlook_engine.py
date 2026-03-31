@@ -154,8 +154,10 @@ def build_zone_outlook_for_frame(
     zone_lookup: Dict[str, Dict[str, Any]] = {}
     max_bins = max(1, int(horizon_bins))
 
-    for offset in range(max_bins):
-        future_idx = (int(frame_idx) + offset) % total_frames
+    start_idx = max(0, int(frame_idx))
+    end_exclusive = min(total_frames, start_idx + max_bins)
+
+    for future_idx in range(start_idx, end_exclusive):
         future_time = str(timeline[future_idx])
         for feature in _load_frame_features(frames_dir, future_idx):
             payload = extract_assistant_feature_payload(feature)
@@ -232,6 +234,7 @@ def get_assistant_outlook_payload(
         requested.append(normalized)
 
     zones = [frame_bucket[zone_id] for zone_id in requested if zone_id in frame_bucket]
+    zones_by_location_id = {zone.get("location_id"): zone for zone in zones if zone.get("location_id")}
     return {
         "frame_time": frame_key,
         "bin_minutes": int((index or {}).get("bin_minutes") or 20),
@@ -239,4 +242,5 @@ def get_assistant_outlook_payload(
         "requested_count": len(requested),
         "returned_count": len(zones),
         "zones": zones,
+        "zones_by_location_id": zones_by_location_id,
     }
