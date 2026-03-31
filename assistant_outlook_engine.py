@@ -109,6 +109,7 @@ def extract_assistant_feature_payload(feature: Dict[str, Any]) -> Dict[str, Any]
                 "balanced_trip_share",
             ),
         ),
+        "balanced_trip_share": props.get("balanced_trip_share"),
         "churn_pressure_n_shadow": props.get("churn_pressure_n_shadow"),
         "market_saturation_penalty_n_shadow": props.get("market_saturation_penalty_n_shadow"),
         "manhattan_core_saturation_penalty_n_shadow": props.get("manhattan_core_saturation_penalty_n_shadow"),
@@ -260,6 +261,10 @@ def get_assistant_outlook_payload(
 
     zones = [frame_bucket[zone_id] for zone_id in requested if zone_id in frame_bucket]
     zones_by_location_id = {zone.get("location_id"): zone for zone in zones if zone.get("location_id")}
+    by_location_id = {
+        location_id: (zone_payload.get("points") or [])
+        for location_id, zone_payload in zones_by_location_id.items()
+    }
     return {
         "frame_time": frame_key,
         "bin_minutes": int((index or {}).get("bin_minutes") or 20),
@@ -267,6 +272,7 @@ def get_assistant_outlook_payload(
         "requested_count": len(requested),
         "returned_count": len(zones),
         "zones": zones,
+        "items": zones,
         "zones_by_location_id": zones_by_location_id,
-        "by_location_id": zones_by_location_id,
+        "by_location_id": by_location_id,
     }
