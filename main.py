@@ -31,7 +31,7 @@ from hotspot_experiments import (
     log_zone_bins,
     prune_experiment_tables,
 )
-from assistant_outlook_engine import get_assistant_outlook_payload
+from assistant_outlook_engine import build_assistant_outlook_index, get_assistant_outlook_payload
 from hotspot_scoring import score_zones
 from artifact_freshness import evaluate_artifact_freshness
 from artifact_storage_service import cleanup_artifact_storage, get_artifact_storage_report
@@ -1410,6 +1410,25 @@ def _build_day_tendency_only(bin_minutes: int = DEFAULT_BIN_MINUTES) -> Dict[str
         zones_geojson_path=zones_path,
         bin_minutes=bin_minutes,
     )
+
+
+def _build_assistant_outlook_only() -> Dict[str, Any]:
+    if not TIMELINE_PATH.exists() or TIMELINE_PATH.stat().st_size <= 0:
+        raise RuntimeError("timeline.json missing. Cannot build assistant outlook index.")
+
+    frame_paths = sorted(FRAMES_DIR.glob("frame_*.json"))
+    if not frame_paths:
+        raise RuntimeError("frame artifacts missing. Cannot build assistant outlook index.")
+
+    timeline_payload = _read_json(TIMELINE_PATH)
+    timeline_bin_minutes = int((timeline_payload or {}).get("bin_minutes") or DEFAULT_BIN_MINUTES)
+    assistant_outlook = build_assistant_outlook_index(
+        timeline_payload=timeline_payload,
+        frames_dir=FRAMES_DIR,
+        bin_minutes=timeline_bin_minutes,
+    )
+    ASSISTANT_OUTLOOK_PATH.write_text(json.dumps(assistant_outlook, ensure_ascii=False), encoding="utf-8")
+    return assistant_outlook
 
 
 def _write_lock() -> None:
@@ -2944,6 +2963,7 @@ def startup():
     # Auto-fill generate state and self-heal stale artifacts/day tendency.
     try:
         frames_ready = _has_frames()
+        assistant_outlook_ready = _has_assistant_outlook()
         day_tendency_ready = _day_tendency_model_is_current()
         zones_ok = (DATA_DIR / "taxi_zones.geojson").exists()
         parquets_ok = len(_list_parquets()) > 0
@@ -2963,6 +2983,14 @@ def startup():
 
         if frames_ready and freshness.get("fresh"):
             print(f"[artifact-freshness] fresh reason_codes={reason_codes}")
+            if not assistant_outlook_ready:
+                print("[warn] assistant outlook missing; rebuilding from existing frames")
+                try:
+                    _build_assistant_outlook_only()
+                    assistant_outlook_ready = _has_assistant_outlook()
+                except Exception:
+                    print("[warn] startup assistant outlook backfill failed")
+                    print(traceback.format_exc())
             if not day_tendency_ready:
                 print("[warn] day tendency model missing or stale; rebuilding at startup")
                 try:
@@ -3058,6 +3086,7 @@ def status():
         "manifest_present": manifest_present,
         "timeline_present": timeline_present,
         "has_timeline": _has_frames(),
+        "assistant_outlook_present": _has_assistant_outlook(),
         "generate_state": _get_state(),
         "generate_lock": _generate_lock_snapshot(),
         "artifact_freshness": freshness,
@@ -3380,6 +3409,12 @@ def assistant_outlook(
     frame_time: str,
     location_ids: str,
 ):
+    if not _has_assistant_outlook():
+        if _has_frames():
+            try:
+                _build_assistant_outlook_only()
+            except Exception:
+                pass
     if not _has_assistant_outlook():
         raise HTTPException(
             status_code=409,
