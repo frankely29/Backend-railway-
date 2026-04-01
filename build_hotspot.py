@@ -1625,8 +1625,13 @@ def build_hotspots_frames(
         # assistant_outlook is DB-first; do not keep a file copy on volume.
         save_generated_artifact("assistant_outlook", assistant_outlook_payload, compress=True)
         legacy_assistant_outlook_path = out_dir / "assistant_outlook.json"
+        stage_assistant_outlook_path = stage_dir / "assistant_outlook.json"
         try:
             legacy_assistant_outlook_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        try:
+            stage_assistant_outlook_path.unlink(missing_ok=True)
         except Exception:
             pass
         live_shadow_profiles = [
