@@ -539,15 +539,70 @@ def _read_frame_cached(idx: int) -> Dict[str, Any]:
 def _has_assistant_outlook() -> bool:
     try:
         if generated_artifact_present("assistant_outlook"):
+            _prune_assistant_outlook_file_if_db_ready()
             return True
-        return ASSISTANT_OUTLOOK_PATH.exists() and ASSISTANT_OUTLOOK_PATH.stat().st_size > 0
+        return _assistant_outlook_file_is_valid_json()
     except Exception:
         return False
 
 
-def _read_assistant_outlook_cached() -> Dict[str, Any]:
+def _prune_assistant_outlook_file_if_db_ready() -> int:
+    try:
+        artifact = load_generated_artifact("assistant_outlook")
+        if not artifact:
+            return 0
+    except Exception:
+        return 0
+    try:
+        if not ASSISTANT_OUTLOOK_PATH.exists() or not ASSISTANT_OUTLOOK_PATH.is_file():
+            return 0
+        size = int(ASSISTANT_OUTLOOK_PATH.stat().st_size)
+        ASSISTANT_OUTLOOK_PATH.unlink(missing_ok=True)
+        if not ASSISTANT_OUTLOOK_PATH.exists():
+            print(f"[artifact-prune] removed redundant assistant_outlook file copy: {ASSISTANT_OUTLOOK_PATH}")
+            return size
+    except Exception:
+        traceback.print_exc()
+    return 0
+
+
+def _assistant_outlook_file_is_valid_json() -> bool:
+    try:
+        if not ASSISTANT_OUTLOOK_PATH.exists() or not ASSISTANT_OUTLOOK_PATH.is_file():
+            return False
+        payload = _read_json(ASSISTANT_OUTLOOK_PATH)
+        return isinstance(payload, dict)
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError, ValueError):
+        print(f"[warn] invalid assistant outlook JSON on volume: {ASSISTANT_OUTLOOK_PATH}")
+        return False
+    except Exception:
+        traceback.print_exc()
+        return False
+
+
+def _prune_invalid_assistant_outlook_file_if_needed() -> int:
+    try:
+        if not ASSISTANT_OUTLOOK_PATH.exists() or not ASSISTANT_OUTLOOK_PATH.is_file():
+            return 0
+        if _assistant_outlook_file_is_valid_json():
+            return 0
+        if generated_artifact_present("assistant_outlook"):
+            return _prune_assistant_outlook_file_if_db_ready()
+        size = int(ASSISTANT_OUTLOOK_PATH.stat().st_size)
+        corrupt_path = ASSISTANT_OUTLOOK_PATH.with_suffix(".json.corrupt")
+        corrupt_path.unlink(missing_ok=True)
+        ASSISTANT_OUTLOOK_PATH.rename(corrupt_path)
+        print(f"[artifact-prune] quarantined invalid assistant outlook file: {corrupt_path}")
+        return size
+    except Exception:
+        traceback.print_exc()
+        return 0
+
+
+def _read_assistant_outlook_cached() -> Optional[Dict[str, Any]]:
     artifact = load_generated_artifact("assistant_outlook")
     if artifact:
+        _prune_assistant_outlook_file_if_db_ready()
         metadata = artifact.get("metadata") or {}
         cache_token = (
             f"{metadata.get('updated_at_unix')}:"
@@ -568,23 +623,38 @@ def _read_assistant_outlook_cached() -> Dict[str, Any]:
                     "cache_token": cache_token,
                     "size": int(metadata.get("payload_uncompressed_bytes") or 0),
                     "etag": etag,
+                    "source_mode": "db",
                 }
             )
             return dict(_assistant_outlook_cache_entry)
 
-    stat_result = ASSISTANT_OUTLOOK_PATH.stat()
-    mtime = stat_result.st_mtime
-    size = int(stat_result.st_size)
-    etag = _etag_for_path(ASSISTANT_OUTLOOK_PATH, mtime, size)
+    try:
+        stat_result = ASSISTANT_OUTLOOK_PATH.stat()
+        mtime = stat_result.st_mtime
+        size = int(stat_result.st_size)
+        etag = _etag_for_path(ASSISTANT_OUTLOOK_PATH, mtime, size)
+    except Exception:
+        return None
     with _assistant_outlook_cache_lock:
         cached = _assistant_outlook_cache_entry
         if cached and cached.get("mtime") == mtime and cached.get("size") == size:
             _record_perf_metric("assistant_outlook.cache_hit")
-            return cached
+            return dict(cached)
         _record_perf_metric("assistant_outlook.cache_miss")
-        data = _read_json(ASSISTANT_OUTLOOK_PATH)
+        try:
+            data = _read_json(ASSISTANT_OUTLOOK_PATH)
+            if not isinstance(data, dict):
+                raise ValueError("assistant_outlook file payload is not a JSON object")
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError, ValueError):
+            print(f"[warn] assistant outlook file fallback invalid; ignoring: {ASSISTANT_OUTLOOK_PATH}")
+            return None
+        except Exception:
+            traceback.print_exc()
+            return None
         _assistant_outlook_cache_entry.clear()
-        _assistant_outlook_cache_entry.update({"data": data, "mtime": mtime, "size": size, "etag": etag})
+        _assistant_outlook_cache_entry.update(
+            {"data": data, "mtime": mtime, "size": size, "etag": etag, "source_mode": "file_fallback"}
+        )
         return dict(_assistant_outlook_cache_entry)
 
 
@@ -629,8 +699,15 @@ def _day_tendency_model_is_current() -> bool:
 def _prune_redundant_db_backed_artifact_files() -> Dict[str, Any]:
     removed_paths: List[str] = []
     bytes_freed_estimate = 0
+    invalid_file_pruned_bytes = _prune_invalid_assistant_outlook_file_if_needed()
+    if invalid_file_pruned_bytes > 0:
+        removed_paths.append(str(ASSISTANT_OUTLOOK_PATH))
+        bytes_freed_estimate += int(invalid_file_pruned_bytes)
+    assistant_outlook_pruned_bytes = _prune_assistant_outlook_file_if_db_ready()
+    if assistant_outlook_pruned_bytes > 0:
+        removed_paths.append(str(ASSISTANT_OUTLOOK_PATH))
+        bytes_freed_estimate += int(assistant_outlook_pruned_bytes)
     prune_targets = [
-        (ASSISTANT_OUTLOOK_PATH, "assistant_outlook"),
         (DAY_TENDENCY_MODEL_PATH, "day_tendency_model"),
         (FRAMES_DIR / "scoring_shadow_manifest.json", "scoring_shadow_manifest"),
     ]
@@ -1678,7 +1755,7 @@ def _build_assistant_outlook_only() -> Dict[str, Any]:
         bin_minutes=timeline_bin_minutes,
     )
     save_generated_artifact("assistant_outlook", assistant_outlook, compress=True)
-    ASSISTANT_OUTLOOK_PATH.unlink(missing_ok=True)
+    _prune_assistant_outlook_file_if_db_ready()
     _prune_redundant_db_backed_artifact_files()
     return assistant_outlook
 
@@ -3372,6 +3449,9 @@ def status():
     day_tendency_artifact_in_db = generated_artifact_present("day_tendency_model")
     assistant_outlook_artifact_in_db = generated_artifact_present("assistant_outlook")
     assistant_outlook_file_present = ASSISTANT_OUTLOOK_PATH.exists() and ASSISTANT_OUTLOOK_PATH.stat().st_size > 0 if ASSISTANT_OUTLOOK_PATH.exists() else False
+    assistant_outlook_file_bytes = int(ASSISTANT_OUTLOOK_PATH.stat().st_size) if ASSISTANT_OUTLOOK_PATH.exists() and ASSISTANT_OUTLOOK_PATH.is_file() else 0
+    assistant_outlook_file_valid_json = _assistant_outlook_file_is_valid_json() if assistant_outlook_file_present else False
+    assistant_outlook_source_mode = "db" if assistant_outlook_artifact_in_db else ("file_fallback" if assistant_outlook_file_valid_json else "missing")
     day_tendency_file_present = DAY_TENDENCY_MODEL_PATH.exists() and DAY_TENDENCY_MODEL_PATH.stat().st_size > 0 if DAY_TENDENCY_MODEL_PATH.exists() else False
     manifest_file_present = manifest_path.exists() and manifest_path.stat().st_size > 0 if manifest_path.exists() else False
     timeline_file_present = TIMELINE_PATH.exists() and TIMELINE_PATH.stat().st_size > 0 if TIMELINE_PATH.exists() else False
@@ -3407,6 +3487,9 @@ def status():
         "assistant_outlook_in_db": assistant_outlook_artifact_in_db,
         "assistant_outlook_artifact_in_db": assistant_outlook_artifact_in_db,
         "assistant_outlook_file_present": assistant_outlook_file_present,
+        "assistant_outlook_file_bytes": assistant_outlook_file_bytes,
+        "assistant_outlook_file_valid_json": assistant_outlook_file_valid_json,
+        "assistant_outlook_source_mode": assistant_outlook_source_mode,
         "day_tendency_file_present": day_tendency_file_present,
         "manifest_file_present": manifest_file_present,
         "timeline_file_present": timeline_file_present,
@@ -3747,24 +3830,25 @@ def assistant_outlook(
     frame_time: str,
     location_ids: str,
 ):
-    if not _has_assistant_outlook():
-        if _has_frames():
-            try:
-                _build_assistant_outlook_only()
-            except Exception:
-                pass
-    if not _has_assistant_outlook():
-        raise HTTPException(
-            status_code=409,
-            detail="assistant outlook not ready. Call /generate first to build assistant_outlook.",
-        )
-
     # Assistant outlook is prebuilt from artifacts; this route only performs indexed lookup.
     requested_location_ids = _parse_assistant_location_ids(location_ids)
     if not requested_location_ids:
         raise HTTPException(status_code=400, detail="location_ids is required and must include at least one id.")
 
     cached = _read_assistant_outlook_cached()
+    if not cached:
+        if _has_frames():
+            try:
+                _build_assistant_outlook_only()
+            except Exception:
+                print("[warn] assistant outlook rebuild from existing frames failed")
+                print(traceback.format_exc())
+        cached = _read_assistant_outlook_cached()
+    if not cached:
+        raise HTTPException(
+            status_code=503,
+            detail="assistant outlook temporarily unavailable. Retry shortly or run /generate.",
+        )
     data = cached.get("data") or {}
     timeline = set((data.get("timeline") or []))
     if frame_time not in timeline:
