@@ -69,7 +69,9 @@ def _stale_temp_root_build_dirs() -> List[Path]:
 def _cleanup_candidates(data_dir: Path, frames_dir: Path) -> List[Path]:
     # Safety: parquet files are source-of-truth raw data and must never be auto-deleted.
     # Safety: live frame_*.json, timeline/manifest/assistant_outlook files, and taxi_zones.geojson
-    # must never be cleanup targets. Cleanup is intentionally restricted to temp/build leftovers only.
+    # must never be cleanup targets. DB-backed assistant_outlook/day_tendency/manifest file copies
+    # are pruned by main.py helper only after DB readability checks, not by broad cleanup globs.
+    # Cleanup is intentionally restricted to temp/build leftovers only.
     candidates: List[Path] = [
         data_dir / "duckdb_tmp",
         data_dir / "frames.__building__",
