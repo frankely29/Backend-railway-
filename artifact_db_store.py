@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from core import DB_BACKEND, _db_exec, _db_query_all, _db_query_one
 
 # This table is intentionally scoped to small generated JSON artifacts only.
-# Do NOT store parquet files or frame_*.json blobs here.
+# Do NOT store parquet files or frame_*.json blobs here (runtime serves those from volume).
 # Do NOT mix pickup_logs, leaderboard, miles/hours, or other runtime app tables here.
 ALLOWED_ARTIFACT_KEYS = {
     "assistant_outlook",
