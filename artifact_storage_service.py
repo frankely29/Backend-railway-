@@ -31,15 +31,6 @@ def _safe_size(path: Path) -> int:
     return 0
 
 
-def _legacy_candidates(data_dir: Path) -> List[Path]:
-    candidates: List[Path] = []
-    for name in ("timeline.json", "scoring_shadow_manifest.json", "assistant_outlook.json", "hotspots_20min.json"):
-        p = data_dir / name
-        if p.exists():
-            candidates.append(p)
-    return candidates
-
-
 def _stale_temp_build_dirs(data_dir: Path) -> List[Path]:
     dirs: List[Path] = []
     for pattern in ("build_*", "tmp_build_*", "frames.__building__*"):
@@ -70,6 +61,7 @@ def _stale_temp_root_build_dirs() -> List[Path]:
 def _cleanup_candidates(data_dir: Path, frames_dir: Path) -> List[Path]:
     # Safety: parquet files are source-of-truth raw data and must never be auto-deleted.
     # Safety: live frame_*.json and taxi_zones.geojson must never be cleanup targets.
+    # Cleanup in this module is intentionally restricted to temp/build leftovers only.
     candidates: List[Path] = [
         data_dir / "duckdb_tmp",
         data_dir / "frames.__building__",
@@ -78,8 +70,7 @@ def _cleanup_candidates(data_dir: Path, frames_dir: Path) -> List[Path]:
     # Safety: temp-root cleanup only targets stale build_* directories.
     # Never target parquet files, frame_*.json, or taxi_zones.geojson.
     candidates.extend(_stale_temp_root_build_dirs())
-    if frames_dir.resolve() != data_dir.resolve():
-        candidates.extend(_legacy_candidates(data_dir))
+    _ = frames_dir
     return candidates
 
 
@@ -105,7 +96,6 @@ def _is_build_tmp_on_data_volume(data_dir: Path, build_tmp_dir: Path) -> bool:
 def get_artifact_storage_report(data_dir: Path, frames_dir: Path) -> Dict[str, Any]:
     usage = shutil.disk_usage(str(data_dir))
     parquet_files = sorted(data_dir.glob("*.parquet"))
-    legacy_files = _legacy_candidates(data_dir) if frames_dir.resolve() != data_dir.resolve() else []
     frames_dir_bytes = _safe_size(frames_dir)
     build_tmp_dir = Path(os.environ.get("ARTIFACT_BUILD_TMP_DIR", "/tmp/tlc_artifact_build"))
     build_tmp_on_data_volume = _is_build_tmp_on_data_volume(data_dir, build_tmp_dir)
@@ -139,7 +129,7 @@ def get_artifact_storage_report(data_dir: Path, frames_dir: Path) -> Dict[str, A
         "zones_geojson_bytes": _safe_size(data_dir / "taxi_zones.geojson"),
         "old_volume_duckdb_tmp_bytes": _safe_size(data_dir / "duckdb_tmp"),
         "old_volume_stage_dir_bytes": _safe_size(data_dir / "frames.__building__"),
-        "legacy_root_artifacts_bytes": _sum_sizes(legacy_files),
+        "legacy_root_artifacts_bytes": 0,
         "cleanup_candidates": cleanup_candidates,
         "low_space": not can_stage_rebuild,
         "can_stage_rebuild": can_stage_rebuild,
