@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import os
 import shutil
+import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
@@ -48,6 +49,24 @@ def _stale_temp_build_dirs(data_dir: Path) -> List[Path]:
     return sorted(dirs)
 
 
+def _stale_temp_root_build_dirs() -> List[Path]:
+    temp_root = Path(os.environ.get("ARTIFACT_BUILD_TMP_DIR", "/tmp/tlc_artifact_build"))
+    if not temp_root.exists() or not temp_root.is_dir():
+        return []
+    cutoff_unix = time.time() - (6 * 3600)
+    stale: List[Path] = []
+    for candidate in temp_root.glob("build_*"):
+        if not candidate.is_dir():
+            continue
+        try:
+            if candidate.stat().st_mtime >= cutoff_unix:
+                continue
+        except Exception:
+            continue
+        stale.append(candidate)
+    return sorted(stale)
+
+
 def _cleanup_candidates(data_dir: Path, frames_dir: Path) -> List[Path]:
     # Safety: parquet files are source-of-truth raw data and must never be auto-deleted.
     # Safety: live frame_*.json and taxi_zones.geojson must never be cleanup targets.
@@ -56,6 +75,9 @@ def _cleanup_candidates(data_dir: Path, frames_dir: Path) -> List[Path]:
         data_dir / "frames.__building__",
     ]
     candidates.extend(_stale_temp_build_dirs(data_dir))
+    # Safety: temp-root cleanup only targets stale build_* directories.
+    # Never target parquet files, frame_*.json, or taxi_zones.geojson.
+    candidates.extend(_stale_temp_root_build_dirs())
     if frames_dir.resolve() != data_dir.resolve():
         candidates.extend(_legacy_candidates(data_dir))
     return candidates

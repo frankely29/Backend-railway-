@@ -1612,12 +1612,14 @@ def build_hotspots_frames(
         encoding="utf-8"
     )
     timeline_payload = {"timeline": timeline, "count": len(timeline)}
+    # Keep timeline.json on volume for compatibility while mirroring metadata copy in DB.
     save_generated_artifact("timeline", timeline_payload, compress=False)
     assistant_outlook_payload = build_assistant_outlook_index(
         timeline_payload,
         stage_dir,
         bin_minutes=int(bin_minutes),
     )
+    # assistant_outlook is primary in DB; file copy is transitional compatibility.
     save_generated_artifact("assistant_outlook", assistant_outlook_payload, compress=True)
     (stage_dir / "assistant_outlook.json").write_text(
         json.dumps(assistant_outlook_payload, separators=(",", ":")),
@@ -1876,6 +1878,7 @@ def build_hotspots_frames(
         json.dumps(manifest_payload, separators=(",", ":")),
         encoding="utf-8",
     )
+    # Keep scoring_shadow_manifest.json on volume while mirroring to DB for status visibility.
     save_generated_artifact("scoring_shadow_manifest", manifest_payload, compress=False)
     staged_timeline = stage_dir / "timeline.json"
     staged_manifest = stage_dir / "scoring_shadow_manifest.json"

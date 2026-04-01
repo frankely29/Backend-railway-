@@ -450,10 +450,31 @@ def _json_cached_response(
 
 
 def _read_timeline_cached() -> Dict[str, Any]:
+    if TIMELINE_PATH.exists() and TIMELINE_PATH.stat().st_size > 0:
+        stat_result = TIMELINE_PATH.stat()
+        mtime = stat_result.st_mtime
+        size = int(stat_result.st_size)
+        etag = _etag_for_path(TIMELINE_PATH, mtime, size)
+        with _timeline_cache_lock:
+            cached = _timeline_cache_entry
+            if cached and cached.get("mtime") == mtime and cached.get("size") == size:
+                _record_perf_metric("timeline.cache_hit")
+                return cached
+            _record_perf_metric("timeline.cache_miss")
+            data = _read_json(TIMELINE_PATH)
+            _timeline_cache_entry.clear()
+            _timeline_cache_entry.update({"data": data, "mtime": mtime, "size": size, "etag": etag})
+            return dict(_timeline_cache_entry)
+
     artifact = load_generated_artifact("timeline")
     if artifact:
-        cache_token = f"{artifact.get('updated_at_unix')}:{artifact.get('content_sha256')}:{artifact.get('payload_bytes')}"
-        etag = f"\"sha256:{artifact.get('content_sha256')}\""
+        metadata = artifact.get("metadata") or {}
+        cache_token = (
+            f"{metadata.get('updated_at_unix')}:"
+            f"{metadata.get('content_sha256')}:"
+            f"{metadata.get('payload_uncompressed_bytes')}"
+        )
+        etag = f"\"sha256:{metadata.get('content_sha256')}\""
         with _timeline_cache_lock:
             cached = _timeline_cache_entry
             if cached and cached.get("cache_token") == cache_token:
@@ -465,26 +486,12 @@ def _read_timeline_cached() -> Dict[str, Any]:
                 {
                     "data": artifact.get("payload") or {},
                     "cache_token": cache_token,
-                    "size": int(artifact.get("payload_bytes") or 0),
+                    "size": int(metadata.get("payload_uncompressed_bytes") or 0),
                     "etag": etag,
                 }
             )
             return dict(_timeline_cache_entry)
-
-    stat_result = TIMELINE_PATH.stat()
-    mtime = stat_result.st_mtime
-    size = int(stat_result.st_size)
-    etag = _etag_for_path(TIMELINE_PATH, mtime, size)
-    with _timeline_cache_lock:
-        cached = _timeline_cache_entry
-        if cached and cached.get("mtime") == mtime and cached.get("size") == size:
-            _record_perf_metric("timeline.cache_hit")
-            return cached
-        _record_perf_metric("timeline.cache_miss")
-        data = _read_json(TIMELINE_PATH)
-        _timeline_cache_entry.clear()
-        _timeline_cache_entry.update({"data": data, "mtime": mtime, "size": size, "etag": etag})
-        return dict(_timeline_cache_entry)
+    raise FileNotFoundError(f"Missing timeline artifact: {TIMELINE_PATH}")
 
 
 def _read_frame_cached(idx: int) -> Dict[str, Any]:
@@ -533,8 +540,13 @@ def _has_assistant_outlook() -> bool:
 def _read_assistant_outlook_cached() -> Dict[str, Any]:
     artifact = load_generated_artifact("assistant_outlook")
     if artifact:
-        cache_token = f"{artifact.get('updated_at_unix')}:{artifact.get('content_sha256')}:{artifact.get('payload_bytes')}"
-        etag = f"\"sha256:{artifact.get('content_sha256')}\""
+        metadata = artifact.get("metadata") or {}
+        cache_token = (
+            f"{metadata.get('updated_at_unix')}:"
+            f"{metadata.get('content_sha256')}:"
+            f"{metadata.get('payload_uncompressed_bytes')}"
+        )
+        etag = f"\"sha256:{metadata.get('content_sha256')}\""
         with _assistant_outlook_cache_lock:
             cached = _assistant_outlook_cache_entry
             if cached and cached.get("cache_token") == cache_token:
@@ -546,7 +558,7 @@ def _read_assistant_outlook_cached() -> Dict[str, Any]:
                 {
                     "data": artifact.get("payload") or {},
                     "cache_token": cache_token,
-                    "size": int(artifact.get("payload_bytes") or 0),
+                    "size": int(metadata.get("payload_uncompressed_bytes") or 0),
                     "etag": etag,
                 }
             )
@@ -1468,7 +1480,7 @@ def _build_day_tendency_only(bin_minutes: int = DEFAULT_BIN_MINUTES) -> Dict[str
         bin_minutes=bin_minutes,
     )
     try:
-        model_payload = _read_json(DAY_TENDENCY_MODEL_PATH)
+        model_payload = result if isinstance(result, dict) else _read_json(DAY_TENDENCY_MODEL_PATH)
         save_generated_artifact("day_tendency_model", model_payload, compress=False)
     except Exception:
         print("[warn] unable to persist day tendency model into generated_artifact_store")
@@ -1485,7 +1497,9 @@ def _build_assistant_outlook_only() -> Dict[str, Any]:
     if not frame_paths:
         raise RuntimeError("frame artifacts missing. Cannot build assistant outlook index.")
 
-    timeline_payload = (timeline_artifact or {}).get("payload") or _read_json(TIMELINE_PATH)
+    timeline_payload = _read_json(TIMELINE_PATH)
+    if not timeline_payload and timeline_artifact:
+        timeline_payload = (timeline_artifact or {}).get("payload") or {}
     timeline_bin_minutes = int((timeline_payload or {}).get("bin_minutes") or DEFAULT_BIN_MINUTES)
     assistant_outlook = build_assistant_outlook_index(
         timeline_payload=timeline_payload,
@@ -1613,7 +1627,7 @@ def _generate_worker(bin_minutes: int, min_trips_per_window: int) -> None:
             bin_minutes=bin_minutes,
         )
         try:
-            model_payload = _read_json(DAY_TENDENCY_MODEL_PATH)
+            model_payload = day_tendency_result if isinstance(day_tendency_result, dict) else _read_json(DAY_TENDENCY_MODEL_PATH)
             save_generated_artifact("day_tendency_model", model_payload, compress=False)
         except Exception:
             print("[warn] unable to persist day tendency model into generated_artifact_store")
@@ -3033,6 +3047,8 @@ def startup():
     except Exception:
         traceback.print_exc()
     try:
+        # Cleanup is intentionally limited to temp/build leftovers.
+        # Parquet inputs and frame_*.json artifacts remain protected source-of-truth files.
         cleanup_artifact_storage(DATA_DIR, FRAMES_DIR)
     except Exception:
         traceback.print_exc()
@@ -3171,6 +3187,7 @@ def status():
         "timeline_artifact_in_db": timeline_artifact_in_db,
         "manifest_artifact_in_db": manifest_artifact_in_db,
         "day_tendency_artifact_in_db": day_tendency_artifact_in_db,
+        "assistant_outlook_in_db": assistant_outlook_artifact_in_db,
         "assistant_outlook_artifact_in_db": assistant_outlook_artifact_in_db,
         "generated_artifact_store_report": generated_artifact_report(),
         "generate_state": _get_state(),
