@@ -17,6 +17,7 @@ from zone_geometry_metrics import build_zone_geometry_metrics_rows
 from zone_mode_profiles import ZONE_MODE_PROFILES, validate_zone_mode_profiles_for_live_engine
 from artifact_freshness import build_expected_artifact_signature
 from assistant_outlook_engine import build_assistant_outlook_index
+from artifact_db_store import save_generated_artifact
 
 logger = logging.getLogger(__name__)
 
@@ -1610,11 +1611,14 @@ def build_hotspots_frames(
         json.dumps({"timeline": timeline, "count": len(timeline)}, separators=(",", ":")),
         encoding="utf-8"
     )
+    timeline_payload = {"timeline": timeline, "count": len(timeline)}
+    save_generated_artifact("timeline", timeline_payload, compress=False)
     assistant_outlook_payload = build_assistant_outlook_index(
-        {"timeline": timeline},
+        timeline_payload,
         stage_dir,
         bin_minutes=int(bin_minutes),
     )
+    save_generated_artifact("assistant_outlook", assistant_outlook_payload, compress=True)
     (stage_dir / "assistant_outlook.json").write_text(
         json.dumps(assistant_outlook_payload, separators=(",", ":")),
         encoding="utf-8",
@@ -1872,6 +1876,7 @@ def build_hotspots_frames(
         json.dumps(manifest_payload, separators=(",", ":")),
         encoding="utf-8",
     )
+    save_generated_artifact("scoring_shadow_manifest", manifest_payload, compress=False)
     staged_timeline = stage_dir / "timeline.json"
     staged_manifest = stage_dir / "scoring_shadow_manifest.json"
     staged_frames = sorted(stage_dir.glob("frame_*.json"))

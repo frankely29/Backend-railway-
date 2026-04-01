@@ -35,6 +35,14 @@ from assistant_outlook_engine import build_assistant_outlook_index, get_assistan
 from hotspot_scoring import score_zones
 from artifact_freshness import evaluate_artifact_freshness
 from artifact_storage_service import cleanup_artifact_storage, get_artifact_storage_report
+from artifact_db_store import (
+    delete_generated_artifact,
+    ensure_generated_artifact_store_schema,
+    generated_artifact_present,
+    generated_artifact_report,
+    load_generated_artifact,
+    save_generated_artifact,
+)
 from avatar_assets import (
     AVATAR_THUMB_MIME,
     avatar_thumb_path,
@@ -442,6 +450,27 @@ def _json_cached_response(
 
 
 def _read_timeline_cached() -> Dict[str, Any]:
+    artifact = load_generated_artifact("timeline")
+    if artifact:
+        cache_token = f"{artifact.get('updated_at_unix')}:{artifact.get('content_sha256')}:{artifact.get('payload_bytes')}"
+        etag = f"\"sha256:{artifact.get('content_sha256')}\""
+        with _timeline_cache_lock:
+            cached = _timeline_cache_entry
+            if cached and cached.get("cache_token") == cache_token:
+                _record_perf_metric("timeline.cache_hit")
+                return cached
+            _record_perf_metric("timeline.cache_miss")
+            _timeline_cache_entry.clear()
+            _timeline_cache_entry.update(
+                {
+                    "data": artifact.get("payload") or {},
+                    "cache_token": cache_token,
+                    "size": int(artifact.get("payload_bytes") or 0),
+                    "etag": etag,
+                }
+            )
+            return dict(_timeline_cache_entry)
+
     stat_result = TIMELINE_PATH.stat()
     mtime = stat_result.st_mtime
     size = int(stat_result.st_size)
@@ -494,12 +523,35 @@ def _read_frame_cached(idx: int) -> Dict[str, Any]:
 
 def _has_assistant_outlook() -> bool:
     try:
+        if generated_artifact_present("assistant_outlook"):
+            return True
         return ASSISTANT_OUTLOOK_PATH.exists() and ASSISTANT_OUTLOOK_PATH.stat().st_size > 0
     except Exception:
         return False
 
 
 def _read_assistant_outlook_cached() -> Dict[str, Any]:
+    artifact = load_generated_artifact("assistant_outlook")
+    if artifact:
+        cache_token = f"{artifact.get('updated_at_unix')}:{artifact.get('content_sha256')}:{artifact.get('payload_bytes')}"
+        etag = f"\"sha256:{artifact.get('content_sha256')}\""
+        with _assistant_outlook_cache_lock:
+            cached = _assistant_outlook_cache_entry
+            if cached and cached.get("cache_token") == cache_token:
+                _record_perf_metric("assistant_outlook.cache_hit")
+                return cached
+            _record_perf_metric("assistant_outlook.cache_miss")
+            _assistant_outlook_cache_entry.clear()
+            _assistant_outlook_cache_entry.update(
+                {
+                    "data": artifact.get("payload") or {},
+                    "cache_token": cache_token,
+                    "size": int(artifact.get("payload_bytes") or 0),
+                    "etag": etag,
+                }
+            )
+            return dict(_assistant_outlook_cache_entry)
+
     stat_result = ASSISTANT_OUTLOOK_PATH.stat()
     mtime = stat_result.st_mtime
     size = int(stat_result.st_size)
@@ -518,12 +570,17 @@ def _read_assistant_outlook_cached() -> Dict[str, Any]:
 
 def _has_day_tendency_model() -> bool:
     try:
+        if generated_artifact_present("day_tendency_model"):
+            return True
         return DAY_TENDENCY_MODEL_PATH.exists() and DAY_TENDENCY_MODEL_PATH.stat().st_size > 0
     except Exception:
         return False
 
 
 def _read_day_tendency_model() -> Dict[str, Any]:
+    artifact = load_generated_artifact("day_tendency_model")
+    if artifact:
+        return artifact.get("payload") or {}
     return _read_json(DAY_TENDENCY_MODEL_PATH)
 
 
@@ -1404,29 +1461,38 @@ def _build_day_tendency_only(bin_minutes: int = DEFAULT_BIN_MINUTES) -> Dict[str
         raise RuntimeError("No .parquet files found in /data. Cannot build day tendency model.")
     zones_path = ensure_zones_geojson(DATA_DIR, force=False)
 
-    return build_day_tendency_model(
+    result = build_day_tendency_model(
         parquet_files=parquets,
         out_dir=DAY_TENDENCY_DIR,
         zones_geojson_path=zones_path,
         bin_minutes=bin_minutes,
     )
+    try:
+        model_payload = _read_json(DAY_TENDENCY_MODEL_PATH)
+        save_generated_artifact("day_tendency_model", model_payload, compress=False)
+    except Exception:
+        print("[warn] unable to persist day tendency model into generated_artifact_store")
+        print(traceback.format_exc())
+    return result
 
 
 def _build_assistant_outlook_only() -> Dict[str, Any]:
-    if not TIMELINE_PATH.exists() or TIMELINE_PATH.stat().st_size <= 0:
+    timeline_artifact = load_generated_artifact("timeline")
+    if not timeline_artifact and (not TIMELINE_PATH.exists() or TIMELINE_PATH.stat().st_size <= 0):
         raise RuntimeError("timeline.json missing. Cannot build assistant outlook index.")
 
     frame_paths = sorted(FRAMES_DIR.glob("frame_*.json"))
     if not frame_paths:
         raise RuntimeError("frame artifacts missing. Cannot build assistant outlook index.")
 
-    timeline_payload = _read_json(TIMELINE_PATH)
+    timeline_payload = (timeline_artifact or {}).get("payload") or _read_json(TIMELINE_PATH)
     timeline_bin_minutes = int((timeline_payload or {}).get("bin_minutes") or DEFAULT_BIN_MINUTES)
     assistant_outlook = build_assistant_outlook_index(
         timeline_payload=timeline_payload,
         frames_dir=FRAMES_DIR,
         bin_minutes=timeline_bin_minutes,
     )
+    save_generated_artifact("assistant_outlook", assistant_outlook, compress=True)
     ASSISTANT_OUTLOOK_PATH.write_text(json.dumps(assistant_outlook, ensure_ascii=False), encoding="utf-8")
     return assistant_outlook
 
@@ -1546,6 +1612,12 @@ def _generate_worker(bin_minutes: int, min_trips_per_window: int) -> None:
             zones_geojson_path=zones_path,
             bin_minutes=bin_minutes,
         )
+        try:
+            model_payload = _read_json(DAY_TENDENCY_MODEL_PATH)
+            save_generated_artifact("day_tendency_model", model_payload, compress=False)
+        except Exception:
+            print("[warn] unable to persist day tendency model into generated_artifact_store")
+            print(traceback.format_exc())
         result = {
             "frames": frames_result,
             "day_tendency": day_tendency_result,
@@ -2942,6 +3014,7 @@ def startup():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     FRAMES_DIR.mkdir(parents=True, exist_ok=True)
     _db_init()
+    ensure_generated_artifact_store_schema()
     init_leaderboard_schema()
     ensure_pickup_recording_schema()
     ensure_games_schema()
@@ -2957,6 +3030,10 @@ def startup():
         traceback.print_exc()
     try:
         _start_avatar_asset_backfill()
+    except Exception:
+        traceback.print_exc()
+    try:
+        cleanup_artifact_storage(DATA_DIR, FRAMES_DIR)
     except Exception:
         traceback.print_exc()
 
@@ -2999,7 +3076,7 @@ def startup():
                     print("[warn] startup day tendency backfill failed")
                     print(traceback.format_exc())
             try:
-                tl = _read_json(TIMELINE_PATH)
+                tl = (_read_timeline_cached() or {}).get("data") or {}
                 _set_state(
                     state="done",
                     bin_minutes=DEFAULT_BIN_MINUTES,
@@ -3069,8 +3146,12 @@ def status():
     parquets = [p.name for p in _list_parquets()]
     zones_path = DATA_DIR / "taxi_zones.geojson"
     manifest_path = FRAMES_DIR / "scoring_shadow_manifest.json"
-    timeline_present = TIMELINE_PATH.exists() and TIMELINE_PATH.stat().st_size > 0 if TIMELINE_PATH.exists() else False
-    manifest_present = manifest_path.exists() and manifest_path.stat().st_size > 0 if manifest_path.exists() else False
+    timeline_artifact_in_db = generated_artifact_present("timeline")
+    manifest_artifact_in_db = generated_artifact_present("scoring_shadow_manifest")
+    day_tendency_artifact_in_db = generated_artifact_present("day_tendency_model")
+    assistant_outlook_artifact_in_db = generated_artifact_present("assistant_outlook")
+    timeline_present = timeline_artifact_in_db or (TIMELINE_PATH.exists() and TIMELINE_PATH.stat().st_size > 0 if TIMELINE_PATH.exists() else False)
+    manifest_present = manifest_artifact_in_db or (manifest_path.exists() and manifest_path.stat().st_size > 0 if manifest_path.exists() else False)
     freshness = _artifact_freshness_snapshot()
     identity = _backend_identity_snapshot(freshness)
     return {
@@ -3087,6 +3168,11 @@ def status():
         "timeline_present": timeline_present,
         "has_timeline": _has_frames(),
         "assistant_outlook_present": _has_assistant_outlook(),
+        "timeline_artifact_in_db": timeline_artifact_in_db,
+        "manifest_artifact_in_db": manifest_artifact_in_db,
+        "day_tendency_artifact_in_db": day_tendency_artifact_in_db,
+        "assistant_outlook_artifact_in_db": assistant_outlook_artifact_in_db,
+        "generated_artifact_store_report": generated_artifact_report(),
         "generate_state": _get_state(),
         "generate_lock": _generate_lock_snapshot(),
         "artifact_freshness": freshness,
@@ -3377,7 +3463,7 @@ def day_tendency_frame_context(
 
 @app.get("/timeline")
 def timeline(request: Request):
-    if not _has_frames():
+    if not (generated_artifact_present("timeline") or _has_frames()):
         raise HTTPException(status_code=409, detail="timeline not ready. Call /generate first.")
     cached = _read_timeline_cached()
     return _json_cached_response(request, cached["data"], etag=cached.get("etag"))

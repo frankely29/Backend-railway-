@@ -32,19 +32,30 @@ def _safe_size(path: Path) -> int:
 
 def _legacy_candidates(data_dir: Path) -> List[Path]:
     candidates: List[Path] = []
-    candidates.extend(sorted(data_dir.glob("frame_*.json")))
-    for name in ("timeline.json", "scoring_shadow_manifest.json", "hotspots_20min.json"):
+    for name in ("timeline.json", "scoring_shadow_manifest.json", "assistant_outlook.json", "hotspots_20min.json"):
         p = data_dir / name
         if p.exists():
             candidates.append(p)
     return candidates
 
 
+def _stale_temp_build_dirs(data_dir: Path) -> List[Path]:
+    dirs: List[Path] = []
+    for pattern in ("build_*", "tmp_build_*", "frames.__building__*"):
+        for candidate in data_dir.glob(pattern):
+            if candidate.is_dir() and candidate.name != "frames.__building__":
+                dirs.append(candidate)
+    return sorted(dirs)
+
+
 def _cleanup_candidates(data_dir: Path, frames_dir: Path) -> List[Path]:
+    # Safety: parquet files are source-of-truth raw data and must never be auto-deleted.
+    # Safety: live frame_*.json and taxi_zones.geojson must never be cleanup targets.
     candidates: List[Path] = [
         data_dir / "duckdb_tmp",
         data_dir / "frames.__building__",
     ]
+    candidates.extend(_stale_temp_build_dirs(data_dir))
     if frames_dir.resolve() != data_dir.resolve():
         candidates.extend(_legacy_candidates(data_dir))
     return candidates
