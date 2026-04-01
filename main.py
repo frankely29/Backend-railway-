@@ -184,6 +184,9 @@ _cleanup_last_startup_removed_count = 0
 _cleanup_last_startup_freed_bytes_estimate = 0
 _cleanup_last_periodic_removed_count = 0
 _cleanup_last_periodic_freed_bytes_estimate = 0
+_cleanup_last_periodic_ran_at_unix = 0
+_reconcile_last_periodic_deleted_paths: List[str] = []
+_reconcile_last_periodic_ran_at_unix = 0
 _to_3857 = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
 _to_4326 = Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
 
@@ -654,19 +657,144 @@ def _prune_redundant_db_backed_artifact_files() -> Dict[str, Any]:
     }
 
 
+def _artifact_runtime_policy_snapshot() -> Dict[str, Any]:
+    return {
+        "volume_required": [
+            "*.parquet",
+            "taxi_zones.geojson",
+            "frames/frame_*.json",
+            "frames/timeline.json",
+        ],
+        "db_required": [
+            "assistant_outlook",
+            "day_tendency_model",
+            "scoring_shadow_manifest",
+        ],
+        "db_mirrored_optional": ["timeline"],
+        "must_not_remain_on_volume": [
+            "frames/assistant_outlook.json",
+            "day_tendency/model.json",
+            "frames/scoring_shadow_manifest.json",
+        ],
+    }
+
+
+def _artifact_runtime_integrity_report() -> Dict[str, Any]:
+    parquet_count = len(_list_parquets())
+    frame_count = len([p for p in FRAMES_DIR.glob("frame_*.json") if p.is_file()])
+    zones_present = DATA_DIR.joinpath("taxi_zones.geojson").exists()
+    timeline_present = TIMELINE_PATH.exists() and TIMELINE_PATH.is_file()
+    required_volume_ok = parquet_count > 0 and frame_count > 0 and zones_present and timeline_present
+
+    required_db_keys = ["assistant_outlook", "day_tendency_model", "scoring_shadow_manifest"]
+    missing_required_db_artifacts = [key for key in required_db_keys if not generated_artifact_present(key)]
+    required_db_ok = len(missing_required_db_artifacts) == 0
+
+    optional_db_mirror = {"timeline": generated_artifact_present("timeline")}
+
+    redundant_targets = [
+        ASSISTANT_OUTLOOK_PATH,
+        DAY_TENDENCY_MODEL_PATH,
+        FRAMES_DIR / "scoring_shadow_manifest.json",
+    ]
+    redundant_file_copies_present = [str(path) for path in redundant_targets if path.exists() and path.is_file()]
+
+    missing_required_volume: List[str] = []
+    if parquet_count <= 0:
+        missing_required_volume.append("*.parquet")
+    if not zones_present:
+        missing_required_volume.append("taxi_zones.geojson")
+    if frame_count <= 0:
+        missing_required_volume.append("frames/frame_*.json")
+    if not timeline_present:
+        missing_required_volume.append("frames/timeline.json")
+
+    ok = required_volume_ok and required_db_ok and not redundant_file_copies_present
+    return {
+        "ok": ok,
+        "required_volume_ok": required_volume_ok,
+        "required_db_ok": required_db_ok,
+        "optional_db_mirror": optional_db_mirror,
+        "redundant_file_copies_present": redundant_file_copies_present,
+        "missing_required_volume": missing_required_volume,
+        "missing_required_db_artifacts": missing_required_db_artifacts,
+        "unexpected_volume_files_present": list(redundant_file_copies_present),
+        "frame_count": frame_count,
+        "parquet_count": parquet_count,
+    }
+
+
+def _reconcile_artifact_runtime_state() -> Dict[str, Any]:
+    before_integrity = _artifact_runtime_integrity_report()
+    repaired_flags = {
+        "assistant_outlook_rebuilt": False,
+        "day_tendency_rebuilt": False,
+    }
+    deleted_paths: List[str] = []
+
+    assistant_outlook_missing = not generated_artifact_present("assistant_outlook")
+    if assistant_outlook_missing and _has_frames():
+        try:
+            _build_assistant_outlook_only()
+            repaired_flags["assistant_outlook_rebuilt"] = True
+        except Exception:
+            traceback.print_exc()
+
+    day_tendency_missing = not generated_artifact_present("day_tendency_model")
+    if day_tendency_missing and len(_list_parquets()) > 0 and (DATA_DIR / "taxi_zones.geojson").exists():
+        try:
+            _build_day_tendency_only(DEFAULT_BIN_MINUTES)
+            repaired_flags["day_tendency_rebuilt"] = True
+        except Exception:
+            traceback.print_exc()
+
+    guarded_delete_targets = [
+        (ASSISTANT_OUTLOOK_PATH, "assistant_outlook"),
+        (DAY_TENDENCY_MODEL_PATH, "day_tendency_model"),
+        (FRAMES_DIR / "scoring_shadow_manifest.json", "scoring_shadow_manifest"),
+    ]
+    # Safety: never delete parquet files, timeline, frame_*.json, or taxi_zones.geojson here.
+    for target_path, artifact_key in guarded_delete_targets:
+        try:
+            if not generated_artifact_present(artifact_key):
+                continue
+            if not target_path.exists() or not target_path.is_file():
+                continue
+            target_path.unlink(missing_ok=True)
+            if not target_path.exists():
+                deleted_paths.append(str(target_path))
+        except Exception:
+            continue
+
+    after_integrity = _artifact_runtime_integrity_report()
+    return {
+        "repaired_flags": repaired_flags,
+        "deleted_paths": deleted_paths,
+        "before_integrity": before_integrity,
+        "after_integrity": after_integrity,
+    }
+
+
 def _start_storage_cleanup_sweeper() -> None:
     def _worker() -> None:
         global _cleanup_last_periodic_removed_count, _cleanup_last_periodic_freed_bytes_estimate
+        global _cleanup_last_periodic_ran_at_unix, _reconcile_last_periodic_deleted_paths, _reconcile_last_periodic_ran_at_unix
         while True:
             try:
                 time.sleep(max(60, int(STORAGE_CLEANUP_INTERVAL_SECONDS)))
                 cleanup_result = cleanup_artifact_storage(DATA_DIR, FRAMES_DIR)
-                prune_result = _prune_redundant_db_backed_artifact_files()
-                removed_count = int(cleanup_result.get("removed_count") or 0) + int(prune_result.get("removed_count") or 0)
-                bytes_freed = int(cleanup_result.get("bytes_freed_estimate") or 0) + int(prune_result.get("bytes_freed_estimate") or 0)
+                reconcile_result = _reconcile_artifact_runtime_state()
+                removed_count = int(cleanup_result.get("removed_count") or 0)
+                bytes_freed = int(cleanup_result.get("bytes_freed_estimate") or 0)
                 _cleanup_last_periodic_removed_count = removed_count
                 _cleanup_last_periodic_freed_bytes_estimate = bytes_freed
-                print(f"[storage-cleanup-periodic] removed={removed_count} freed_bytes_estimate={bytes_freed}")
+                _cleanup_last_periodic_ran_at_unix = int(time.time())
+                _reconcile_last_periodic_deleted_paths = list(reconcile_result.get("deleted_paths") or [])
+                _reconcile_last_periodic_ran_at_unix = int(time.time())
+                print(
+                    f"[storage-cleanup-periodic] removed={removed_count} freed_bytes_estimate={bytes_freed} "
+                    f"reconcile_deleted={len(_reconcile_last_periodic_deleted_paths)}"
+                )
             except Exception:
                 traceback.print_exc()
 
@@ -3087,6 +3215,19 @@ app.include_router(work_battles_router)
 # =========================================================
 @app.on_event("startup")
 def startup():
+    def _log_runtime_integrity_summary() -> None:
+        try:
+            integrity_report = _artifact_runtime_integrity_report()
+            print(
+                f"[artifact-runtime] ok={integrity_report.get('ok')} "
+                f"frame_count={integrity_report.get('frame_count')} parquet_count={integrity_report.get('parquet_count')} "
+                f"redundant_files={integrity_report.get('redundant_file_copies_present')}"
+            )
+            if not integrity_report.get("ok"):
+                print(f"[warn] artifact runtime integrity issues: {integrity_report}")
+        except Exception:
+            traceback.print_exc()
+
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     FRAMES_DIR.mkdir(parents=True, exist_ok=True)
     _db_init()
@@ -3139,6 +3280,7 @@ def startup():
 
         if not zones_ok or not parquets_ok:
             _set_state(state="idle")
+            _log_runtime_integrity_summary()
             return
 
         freshness = evaluate_artifact_freshness(
@@ -3189,12 +3331,14 @@ def startup():
                         "day_tendency": {"ok": _has_day_tendency_model(), "built_at_startup": not day_tendency_ready},
                     },
                 )
+            _log_runtime_integrity_summary()
             return
 
         print(f"[artifact-freshness] stale -> regenerating reason_codes={reason_codes}")
         start_generate(DEFAULT_BIN_MINUTES, DEFAULT_MIN_TRIPS_PER_WINDOW)
     except Exception:
         _set_state(state="idle")
+    _log_runtime_integrity_summary()
 
 
 # =========================================================
@@ -3250,6 +3394,7 @@ def status():
     manifest_present = manifest_artifact_in_db
     freshness = _artifact_freshness_snapshot()
     identity = _backend_identity_snapshot(freshness)
+    artifact_runtime_integrity = _artifact_runtime_integrity_report()
     return {
         "status": "ok",
         "data_dir": str(DATA_DIR),
@@ -3268,6 +3413,9 @@ def status():
         "cleanup_last_startup_freed_bytes_estimate": _cleanup_last_startup_freed_bytes_estimate,
         "cleanup_last_periodic_removed_count": _cleanup_last_periodic_removed_count,
         "cleanup_last_periodic_freed_bytes_estimate": _cleanup_last_periodic_freed_bytes_estimate,
+        "cleanup_last_periodic_ran_at_unix": _cleanup_last_periodic_ran_at_unix,
+        "reconcile_last_periodic_deleted_paths": list(_reconcile_last_periodic_deleted_paths),
+        "reconcile_last_periodic_ran_at_unix": _reconcile_last_periodic_ran_at_unix,
         "timeline_artifact_in_db": timeline_artifact_in_db,
         "manifest_artifact_in_db": manifest_artifact_in_db,
         "day_tendency_artifact_in_db": day_tendency_artifact_in_db,
@@ -3278,6 +3426,8 @@ def status():
         "manifest_file_present": manifest_file_present,
         "timeline_file_present": timeline_file_present,
         "generated_artifact_store_report": generated_artifact_report(),
+        "artifact_runtime_policy": _artifact_runtime_policy_snapshot(),
+        "artifact_runtime_integrity": artifact_runtime_integrity,
         "generate_state": _get_state(),
         "generate_lock": _generate_lock_snapshot(),
         "artifact_freshness": freshness,
@@ -3288,6 +3438,18 @@ def status():
         "auth_enabled": bool(JWT_SECRET and len(JWT_SECRET) >= 24),
         "performance_metrics": _perf_metric_snapshot(),
     }
+
+
+@app.get("/admin/artifacts/runtime_integrity")
+def admin_artifact_runtime_integrity(admin: sqlite3.Row = Depends(require_admin)):
+    _ = admin
+    return _artifact_runtime_integrity_report()
+
+
+@app.post("/admin/artifacts/reconcile_runtime")
+def admin_reconcile_artifact_runtime(admin: sqlite3.Row = Depends(require_admin)):
+    _ = admin
+    return _reconcile_artifact_runtime_state()
 
 
 @app.get("/admin/performance/metrics")
