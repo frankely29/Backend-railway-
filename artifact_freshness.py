@@ -153,6 +153,15 @@ def build_expected_artifact_signature(
 
 
 def load_existing_artifact_manifest(frames_dir: Path) -> dict | None:
+    try:
+        from artifact_db_store import load_generated_artifact
+
+        artifact = load_generated_artifact("scoring_shadow_manifest")
+        if artifact and isinstance(artifact.get("payload"), dict):
+            return artifact.get("payload")
+    except Exception:
+        pass
+
     manifest_path = frames_dir / "scoring_shadow_manifest.json"
     try:
         if not manifest_path.exists() or not manifest_path.is_file():

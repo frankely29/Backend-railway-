@@ -748,23 +748,8 @@ def _reconcile_artifact_runtime_state() -> Dict[str, Any]:
         except Exception:
             traceback.print_exc()
 
-    guarded_delete_targets = [
-        (ASSISTANT_OUTLOOK_PATH, "assistant_outlook"),
-        (DAY_TENDENCY_MODEL_PATH, "day_tendency_model"),
-        (FRAMES_DIR / "scoring_shadow_manifest.json", "scoring_shadow_manifest"),
-    ]
-    # Safety: never delete parquet files, timeline, frame_*.json, or taxi_zones.geojson here.
-    for target_path, artifact_key in guarded_delete_targets:
-        try:
-            if not generated_artifact_present(artifact_key):
-                continue
-            if not target_path.exists() or not target_path.is_file():
-                continue
-            target_path.unlink(missing_ok=True)
-            if not target_path.exists():
-                deleted_paths.append(str(target_path))
-        except Exception:
-            continue
+    prune_result = _prune_redundant_db_backed_artifact_files()
+    deleted_paths = list(prune_result.get("removed_paths") or [])
 
     after_integrity = _artifact_runtime_integrity_report()
     return {
@@ -783,13 +768,13 @@ def _start_storage_cleanup_sweeper() -> None:
             try:
                 time.sleep(max(60, int(STORAGE_CLEANUP_INTERVAL_SECONDS)))
                 cleanup_result = cleanup_artifact_storage(DATA_DIR, FRAMES_DIR)
-                reconcile_result = _reconcile_artifact_runtime_state()
-                removed_count = int(cleanup_result.get("removed_count") or 0)
-                bytes_freed = int(cleanup_result.get("bytes_freed_estimate") or 0)
+                prune_result = _prune_redundant_db_backed_artifact_files()
+                removed_count = int(cleanup_result.get("removed_count") or 0) + int(prune_result.get("removed_count") or 0)
+                bytes_freed = int(cleanup_result.get("bytes_freed_estimate") or 0) + int(prune_result.get("bytes_freed_estimate") or 0)
                 _cleanup_last_periodic_removed_count = removed_count
                 _cleanup_last_periodic_freed_bytes_estimate = bytes_freed
                 _cleanup_last_periodic_ran_at_unix = int(time.time())
-                _reconcile_last_periodic_deleted_paths = list(reconcile_result.get("deleted_paths") or [])
+                _reconcile_last_periodic_deleted_paths = list(prune_result.get("removed_paths") or [])
                 _reconcile_last_periodic_ran_at_unix = int(time.time())
                 print(
                     f"[storage-cleanup-periodic] removed={removed_count} freed_bytes_estimate={bytes_freed} "
