@@ -3049,7 +3049,10 @@ def startup():
     try:
         # Cleanup is intentionally limited to temp/build leftovers.
         # Parquet inputs and frame_*.json artifacts remain protected source-of-truth files.
-        cleanup_artifact_storage(DATA_DIR, FRAMES_DIR)
+        cleanup_result = cleanup_artifact_storage(DATA_DIR, FRAMES_DIR)
+        removed_count = int(cleanup_result.get("removed_count") or 0)
+        bytes_freed = int(cleanup_result.get("bytes_freed_estimate") or 0)
+        print(f"[storage-cleanup] removed {removed_count} temp artifacts, freed ~{bytes_freed} bytes")
     except Exception:
         traceback.print_exc()
 
