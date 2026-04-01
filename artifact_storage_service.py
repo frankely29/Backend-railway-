@@ -9,6 +9,7 @@ from typing import Any, Dict, Iterable, List
 
 
 _MB = 1024 * 1024
+STALE_BUILD_DIR_SECONDS = int(os.environ.get("ARTIFACT_BUILD_STALE_SECONDS", str(6 * 3600)))
 
 
 def _safe_size(path: Path) -> int:
@@ -32,11 +33,18 @@ def _safe_size(path: Path) -> int:
 
 
 def _stale_temp_build_dirs(data_dir: Path) -> List[Path]:
+    cutoff_unix = time.time() - STALE_BUILD_DIR_SECONDS
     dirs: List[Path] = []
-    for pattern in ("build_*", "tmp_build_*", "frames.__building__*"):
+    for pattern in ("build_*", "tmp_build_*"):
         for candidate in data_dir.glob(pattern):
-            if candidate.is_dir() and candidate.name != "frames.__building__":
-                dirs.append(candidate)
+            if not candidate.is_dir():
+                continue
+            try:
+                if candidate.stat().st_mtime >= cutoff_unix:
+                    continue
+            except Exception:
+                continue
+            dirs.append(candidate)
     return sorted(dirs)
 
 
@@ -44,7 +52,7 @@ def _stale_temp_root_build_dirs() -> List[Path]:
     temp_root = Path(os.environ.get("ARTIFACT_BUILD_TMP_DIR", "/tmp/tlc_artifact_build"))
     if not temp_root.exists() or not temp_root.is_dir():
         return []
-    cutoff_unix = time.time() - (6 * 3600)
+    cutoff_unix = time.time() - STALE_BUILD_DIR_SECONDS
     stale: List[Path] = []
     for candidate in temp_root.glob("build_*"):
         if not candidate.is_dir():
@@ -60,8 +68,8 @@ def _stale_temp_root_build_dirs() -> List[Path]:
 
 def _cleanup_candidates(data_dir: Path, frames_dir: Path) -> List[Path]:
     # Safety: parquet files are source-of-truth raw data and must never be auto-deleted.
-    # Safety: live frame_*.json and taxi_zones.geojson must never be cleanup targets.
-    # Cleanup in this module is intentionally restricted to temp/build leftovers only.
+    # Safety: live frame_*.json, timeline/manifest/assistant_outlook files, and taxi_zones.geojson
+    # must never be cleanup targets. Cleanup is intentionally restricted to temp/build leftovers only.
     candidates: List[Path] = [
         data_dir / "duckdb_tmp",
         data_dir / "frames.__building__",
@@ -143,6 +151,7 @@ def cleanup_artifact_storage(data_dir: Path, frames_dir: Path) -> Dict[str, Any]
     bytes_freed_estimate = 0
 
     for candidate in _cleanup_candidates(data_dir, frames_dir):
+        # Candidate list is constrained to temp/build directories only; no parquet or live frame files.
         if not candidate.exists():
             continue
         size_before = _safe_size(candidate)

@@ -179,6 +179,8 @@ _presence_last_change_cursor_ms = 0
 _avatar_backfill_started = False
 _perf_metrics_lock = threading.Lock()
 _perf_metrics: Dict[str, int] = defaultdict(int)
+_cleanup_last_startup_removed_count = 0
+_cleanup_last_startup_freed_bytes_estimate = 0
 _to_3857 = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
 _to_4326 = Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
 
@@ -3046,14 +3048,19 @@ def startup():
         _start_avatar_asset_backfill()
     except Exception:
         traceback.print_exc()
+    global _cleanup_last_startup_removed_count, _cleanup_last_startup_freed_bytes_estimate
     try:
         # Cleanup is intentionally limited to temp/build leftovers.
-        # Parquet inputs and frame_*.json artifacts remain protected source-of-truth files.
+        # Safety guard: never auto-delete source parquet files, frame_*.json, or taxi_zones.geojson.
         cleanup_result = cleanup_artifact_storage(DATA_DIR, FRAMES_DIR)
         removed_count = int(cleanup_result.get("removed_count") or 0)
         bytes_freed = int(cleanup_result.get("bytes_freed_estimate") or 0)
-        print(f"[storage-cleanup] removed {removed_count} temp artifacts, freed ~{bytes_freed} bytes")
+        _cleanup_last_startup_removed_count = removed_count
+        _cleanup_last_startup_freed_bytes_estimate = bytes_freed
+        print(f"[storage-cleanup] removed={removed_count} freed_bytes_estimate={bytes_freed}")
     except Exception:
+        _cleanup_last_startup_removed_count = 0
+        _cleanup_last_startup_freed_bytes_estimate = 0
         traceback.print_exc()
 
     # Auto-fill generate state and self-heal stale artifacts/day tendency.
@@ -3187,6 +3194,8 @@ def status():
         "timeline_present": timeline_present,
         "has_timeline": _has_frames(),
         "assistant_outlook_present": _has_assistant_outlook(),
+        "cleanup_last_startup_removed_count": _cleanup_last_startup_removed_count,
+        "cleanup_last_startup_freed_bytes_estimate": _cleanup_last_startup_freed_bytes_estimate,
         "timeline_artifact_in_db": timeline_artifact_in_db,
         "manifest_artifact_in_db": manifest_artifact_in_db,
         "day_tendency_artifact_in_db": day_tendency_artifact_in_db,
