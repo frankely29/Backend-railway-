@@ -1622,12 +1622,13 @@ def build_hotspots_frames(
             stage_dir,
             bin_minutes=int(bin_minutes),
         )
-        # assistant_outlook is primary in DB; file copy is transitional compatibility.
+        # assistant_outlook is DB-first; do not keep a file copy on volume.
         save_generated_artifact("assistant_outlook", assistant_outlook_payload, compress=True)
-        (stage_dir / "assistant_outlook.json").write_text(
-            json.dumps(assistant_outlook_payload, separators=(",", ":")),
-            encoding="utf-8",
-        )
+        legacy_assistant_outlook_path = out_dir / "assistant_outlook.json"
+        try:
+            legacy_assistant_outlook_path.unlink(missing_ok=True)
+        except Exception:
+            pass
         live_shadow_profiles = [
             "citywide_v2",
             "citywide_v3",
@@ -1877,25 +1878,24 @@ def build_hotspots_frames(
                     "zones_geojson_signature": expected_freshness.get("source_inventory", {}).get("zones_geojson"),
                 }
 
-        (stage_dir / "scoring_shadow_manifest.json").write_text(
-            json.dumps(manifest_payload, separators=(",", ":")),
-            encoding="utf-8",
-        )
-        # Keep scoring_shadow_manifest.json on volume while mirroring to DB for status visibility.
+        # scoring_shadow_manifest is DB-first; do not keep a file copy on volume.
         save_generated_artifact("scoring_shadow_manifest", manifest_payload, compress=False)
         staged_timeline = stage_dir / "timeline.json"
-        staged_manifest = stage_dir / "scoring_shadow_manifest.json"
         staged_frames = sorted(stage_dir.glob("frame_*.json"))
-        staged_assistant_outlook = stage_dir / "assistant_outlook.json"
-        if not staged_timeline.exists() or not staged_manifest.exists() or not staged_assistant_outlook.exists() or not staged_frames:
+        if not staged_timeline.exists() or not staged_frames:
             raise RuntimeError("Staged artifact build did not produce required files.")
+        legacy_manifest_path = out_dir / "scoring_shadow_manifest.json"
+        try:
+            legacy_manifest_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
         for generated in out_dir.glob("frame_*.json"):
             try:
                 generated.unlink()
             except Exception:
                 pass
-        for generated_name in ("timeline.json", "scoring_shadow_manifest.json", "assistant_outlook.json"):
+        for generated_name in ("timeline.json",):
             generated_path = out_dir / generated_name
             try:
                 if generated_path.exists() and generated_path.is_file():
@@ -1912,7 +1912,7 @@ def build_hotspots_frames(
             "frames_dir": str(out_dir),
             "rows": total_rows,
             "assistant_outlook": {
-                "path": str(out_dir / "assistant_outlook.json"),
+                "path": None,
                 "version": 1,
                 "horizon_bins": 6,
             },

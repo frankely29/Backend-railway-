@@ -175,16 +175,19 @@ def build_day_tendency_model(
     out_dir: Path,
     zones_geojson_path: Path,
     bin_minutes: int = 20,
+    persist_file: bool = True,
 ) -> Dict[str, Any]:
     out_dir.mkdir(parents=True, exist_ok=True)
     model_path = out_dir / "model.json"
 
     if not parquet_files:
         payload = _insufficient_payload()
-        model_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        if persist_file:
+            model_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         return {
             "ok": True,
             "model_path": str(model_path),
+            "payload": payload,
             "usable_dates": 0,
             "borough_weekday_bin_cohorts": 0,
             "borough_bin_cohorts": 0,
@@ -284,10 +287,12 @@ def build_day_tendency_model(
 
     if not rows or not daily_rows:
         payload = _insufficient_payload(usable_dates=0)
-        model_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        if persist_file:
+            model_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         return {
             "ok": True,
             "model_path": str(model_path),
+            "payload": payload,
             "usable_dates": 0,
             "borough_weekday_bin_cohorts": 0,
             "borough_bin_cohorts": 0,
@@ -312,10 +317,12 @@ def build_day_tendency_model(
     if not usable_rows:
         payload = _insufficient_payload(first_date=first_date, last_date=last_date, usable_dates=0)
         payload["filters"]["dropped_low_sample_dates"] = int(dropped_low_sample_dates)
-        model_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        if persist_file:
+            model_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         return {
             "ok": True,
             "model_path": str(model_path),
+            "payload": payload,
             "usable_dates": 0,
             "borough_weekday_bin_cohorts": 0,
             "borough_bin_cohorts": 0,
@@ -561,11 +568,13 @@ def build_day_tendency_model(
         },
     }
 
-    model_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    if persist_file:
+        model_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     return {
         "ok": True,
         "model_path": str(model_path),
+        "payload": payload,
         "usable_dates": len(usable_dates),
         "borough_weekday_bin_cohorts": len(borough_weekday_bin),
         "borough_bin_cohorts": len(borough_bin),

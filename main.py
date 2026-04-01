@@ -131,6 +131,7 @@ PRESENCE_DELTA_MAX_LIMIT = int(os.environ.get("PRESENCE_DELTA_MAX_LIMIT", "500")
 PRESENCE_SNAPSHOT_MAX_LIMIT = int(os.environ.get("PRESENCE_SNAPSHOT_MAX_LIMIT", "1200"))
 AVATAR_THUMB_IMMUTABLE_CACHE_SECONDS = int(os.environ.get("AVATAR_THUMB_IMMUTABLE_CACHE_SECONDS", str(30 * 24 * 3600)))
 AVATAR_BACKFILL_BATCH_SIZE = int(os.environ.get("AVATAR_BACKFILL_BATCH_SIZE", "25"))
+STORAGE_CLEANUP_INTERVAL_SECONDS = int(os.environ.get("STORAGE_CLEANUP_INTERVAL_SECONDS", "21600"))
 
 PICKUP_ZONE_HOTSPOT_MIN_POINTS = 5  # Keep 5-dot minimum to avoid pickup noise.
 PICKUP_ZONE_HOTSPOT_MAX_POINTS = 100
@@ -181,6 +182,8 @@ _perf_metrics_lock = threading.Lock()
 _perf_metrics: Dict[str, int] = defaultdict(int)
 _cleanup_last_startup_removed_count = 0
 _cleanup_last_startup_freed_bytes_estimate = 0
+_cleanup_last_periodic_removed_count = 0
+_cleanup_last_periodic_freed_bytes_estimate = 0
 _to_3857 = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
 _to_4326 = Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
 
@@ -618,6 +621,56 @@ def _day_tendency_model_is_current() -> bool:
         return True
     except Exception:
         return False
+
+
+def _prune_redundant_db_backed_artifact_files() -> Dict[str, Any]:
+    removed_paths: List[str] = []
+    bytes_freed_estimate = 0
+    prune_targets = [
+        (ASSISTANT_OUTLOOK_PATH, "assistant_outlook"),
+        (DAY_TENDENCY_MODEL_PATH, "day_tendency_model"),
+        (FRAMES_DIR / "scoring_shadow_manifest.json", "scoring_shadow_manifest"),
+    ]
+    for target_path, artifact_key in prune_targets:
+        try:
+            if not generated_artifact_present(artifact_key):
+                continue
+            artifact = load_generated_artifact(artifact_key)
+            if not artifact:
+                continue
+            if not target_path.exists() or not target_path.is_file():
+                continue
+            size = int(target_path.stat().st_size)
+            target_path.unlink(missing_ok=True)
+            if not target_path.exists():
+                removed_paths.append(str(target_path))
+                bytes_freed_estimate += size
+        except Exception:
+            continue
+    return {
+        "removed_paths": removed_paths,
+        "removed_count": len(removed_paths),
+        "bytes_freed_estimate": int(bytes_freed_estimate),
+    }
+
+
+def _start_storage_cleanup_sweeper() -> None:
+    def _worker() -> None:
+        global _cleanup_last_periodic_removed_count, _cleanup_last_periodic_freed_bytes_estimate
+        while True:
+            try:
+                time.sleep(max(60, int(STORAGE_CLEANUP_INTERVAL_SECONDS)))
+                cleanup_result = cleanup_artifact_storage(DATA_DIR, FRAMES_DIR)
+                prune_result = _prune_redundant_db_backed_artifact_files()
+                removed_count = int(cleanup_result.get("removed_count") or 0) + int(prune_result.get("removed_count") or 0)
+                bytes_freed = int(cleanup_result.get("bytes_freed_estimate") or 0) + int(prune_result.get("bytes_freed_estimate") or 0)
+                _cleanup_last_periodic_removed_count = removed_count
+                _cleanup_last_periodic_freed_bytes_estimate = bytes_freed
+                print(f"[storage-cleanup-periodic] removed={removed_count} freed_bytes_estimate={bytes_freed}")
+            except Exception:
+                traceback.print_exc()
+
+    threading.Thread(target=_worker, daemon=True, name="storage-cleanup-sweeper").start()
 
 
 def _weekday_name_from_mon0(dow: int) -> str:
@@ -1480,10 +1533,13 @@ def _build_day_tendency_only(bin_minutes: int = DEFAULT_BIN_MINUTES) -> Dict[str
         out_dir=DAY_TENDENCY_DIR,
         zones_geojson_path=zones_path,
         bin_minutes=bin_minutes,
+        persist_file=False,
     )
     try:
-        model_payload = result if isinstance(result, dict) else _read_json(DAY_TENDENCY_MODEL_PATH)
+        model_payload = ((result or {}).get("payload") if isinstance(result, dict) else None) or _read_day_tendency_model()
         save_generated_artifact("day_tendency_model", model_payload, compress=False)
+        DAY_TENDENCY_MODEL_PATH.unlink(missing_ok=True)
+        _prune_redundant_db_backed_artifact_files()
     except Exception:
         print("[warn] unable to persist day tendency model into generated_artifact_store")
         print(traceback.format_exc())
@@ -1509,7 +1565,8 @@ def _build_assistant_outlook_only() -> Dict[str, Any]:
         bin_minutes=timeline_bin_minutes,
     )
     save_generated_artifact("assistant_outlook", assistant_outlook, compress=True)
-    ASSISTANT_OUTLOOK_PATH.write_text(json.dumps(assistant_outlook, ensure_ascii=False), encoding="utf-8")
+    ASSISTANT_OUTLOOK_PATH.unlink(missing_ok=True)
+    _prune_redundant_db_backed_artifact_files()
     return assistant_outlook
 
 
@@ -1627,10 +1684,13 @@ def _generate_worker(bin_minutes: int, min_trips_per_window: int) -> None:
             out_dir=DAY_TENDENCY_DIR,
             zones_geojson_path=zones_path,
             bin_minutes=bin_minutes,
+            persist_file=False,
         )
         try:
-            model_payload = day_tendency_result if isinstance(day_tendency_result, dict) else _read_json(DAY_TENDENCY_MODEL_PATH)
+            model_payload = ((day_tendency_result or {}).get("payload") if isinstance(day_tendency_result, dict) else None) or _read_day_tendency_model()
             save_generated_artifact("day_tendency_model", model_payload, compress=False)
+            DAY_TENDENCY_MODEL_PATH.unlink(missing_ok=True)
+            _prune_redundant_db_backed_artifact_files()
         except Exception:
             print("[warn] unable to persist day tendency model into generated_artifact_store")
             print(traceback.format_exc())
@@ -3031,6 +3091,7 @@ def startup():
     FRAMES_DIR.mkdir(parents=True, exist_ok=True)
     _db_init()
     ensure_generated_artifact_store_schema()
+    _prune_redundant_db_backed_artifact_files()
     init_leaderboard_schema()
     ensure_pickup_recording_schema()
     ensure_games_schema()
@@ -3053,14 +3114,19 @@ def startup():
         # Cleanup is intentionally limited to temp/build leftovers.
         # Safety guard: never auto-delete source parquet files, frame_*.json, or taxi_zones.geojson.
         cleanup_result = cleanup_artifact_storage(DATA_DIR, FRAMES_DIR)
-        removed_count = int(cleanup_result.get("removed_count") or 0)
-        bytes_freed = int(cleanup_result.get("bytes_freed_estimate") or 0)
+        prune_result = _prune_redundant_db_backed_artifact_files()
+        removed_count = int(cleanup_result.get("removed_count") or 0) + int(prune_result.get("removed_count") or 0)
+        bytes_freed = int(cleanup_result.get("bytes_freed_estimate") or 0) + int(prune_result.get("bytes_freed_estimate") or 0)
         _cleanup_last_startup_removed_count = removed_count
         _cleanup_last_startup_freed_bytes_estimate = bytes_freed
         print(f"[storage-cleanup] removed={removed_count} freed_bytes_estimate={bytes_freed}")
     except Exception:
         _cleanup_last_startup_removed_count = 0
         _cleanup_last_startup_freed_bytes_estimate = 0
+        traceback.print_exc()
+    try:
+        _start_storage_cleanup_sweeper()
+    except Exception:
         traceback.print_exc()
 
     # Auto-fill generate state and self-heal stale artifacts/day tendency.
@@ -3176,8 +3242,12 @@ def status():
     manifest_artifact_in_db = generated_artifact_present("scoring_shadow_manifest")
     day_tendency_artifact_in_db = generated_artifact_present("day_tendency_model")
     assistant_outlook_artifact_in_db = generated_artifact_present("assistant_outlook")
+    assistant_outlook_file_present = ASSISTANT_OUTLOOK_PATH.exists() and ASSISTANT_OUTLOOK_PATH.stat().st_size > 0 if ASSISTANT_OUTLOOK_PATH.exists() else False
+    day_tendency_file_present = DAY_TENDENCY_MODEL_PATH.exists() and DAY_TENDENCY_MODEL_PATH.stat().st_size > 0 if DAY_TENDENCY_MODEL_PATH.exists() else False
+    manifest_file_present = manifest_path.exists() and manifest_path.stat().st_size > 0 if manifest_path.exists() else False
+    timeline_file_present = TIMELINE_PATH.exists() and TIMELINE_PATH.stat().st_size > 0 if TIMELINE_PATH.exists() else False
     timeline_present = timeline_artifact_in_db or (TIMELINE_PATH.exists() and TIMELINE_PATH.stat().st_size > 0 if TIMELINE_PATH.exists() else False)
-    manifest_present = manifest_artifact_in_db or (manifest_path.exists() and manifest_path.stat().st_size > 0 if manifest_path.exists() else False)
+    manifest_present = manifest_artifact_in_db
     freshness = _artifact_freshness_snapshot()
     identity = _backend_identity_snapshot(freshness)
     return {
@@ -3196,11 +3266,17 @@ def status():
         "assistant_outlook_present": _has_assistant_outlook(),
         "cleanup_last_startup_removed_count": _cleanup_last_startup_removed_count,
         "cleanup_last_startup_freed_bytes_estimate": _cleanup_last_startup_freed_bytes_estimate,
+        "cleanup_last_periodic_removed_count": _cleanup_last_periodic_removed_count,
+        "cleanup_last_periodic_freed_bytes_estimate": _cleanup_last_periodic_freed_bytes_estimate,
         "timeline_artifact_in_db": timeline_artifact_in_db,
         "manifest_artifact_in_db": manifest_artifact_in_db,
         "day_tendency_artifact_in_db": day_tendency_artifact_in_db,
         "assistant_outlook_in_db": assistant_outlook_artifact_in_db,
         "assistant_outlook_artifact_in_db": assistant_outlook_artifact_in_db,
+        "assistant_outlook_file_present": assistant_outlook_file_present,
+        "day_tendency_file_present": day_tendency_file_present,
+        "manifest_file_present": manifest_file_present,
+        "timeline_file_present": timeline_file_present,
         "generated_artifact_store_report": generated_artifact_report(),
         "generate_state": _get_state(),
         "generate_lock": _generate_lock_snapshot(),
@@ -3533,7 +3609,7 @@ def assistant_outlook(
     if not _has_assistant_outlook():
         raise HTTPException(
             status_code=409,
-            detail="assistant outlook not ready. Call /generate first to build assistant_outlook.json.",
+            detail="assistant outlook not ready. Call /generate first to build assistant_outlook.",
         )
 
     # Assistant outlook is prebuilt from artifacts; this route only performs indexed lookup.
