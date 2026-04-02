@@ -14,6 +14,12 @@ class ZoneScoreResult:
     historical_component: float
     live_component: float
     same_timeslot_component: float
+    long_run_historical_component: float
+    recent_shape_component: float
+    outcome_modifier: float
+    quality_modifier: float
+    saturation_modifier: float
+    hotspot_limit_used: int
     weighted_trip_count: float
     unique_driver_count: int
     recommended: bool
