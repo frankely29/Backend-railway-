@@ -16,6 +16,7 @@ def _bool_db_value(flag: bool):
 def log_zone_bins(db_exec, *, bin_time: int, rows: Iterable[ZoneScoreResult]) -> None:
     ranked = sorted(list(rows), key=lambda r: r.final_score, reverse=True)[:MAX_ZONE_BIN_LOGS]
     for r in ranked:
+        hotspot_limit_used = int(getattr(r, "hotspot_limit_used", 0) or 0)
         db_exec(
             """
             INSERT INTO hotspot_experiment_bins(
@@ -32,7 +33,7 @@ def log_zone_bins(db_exec, *, bin_time: int, rows: Iterable[ZoneScoreResult]) ->
                 float(r.historical_component), float(r.live_component), float(r.same_timeslot_component),
                 float(r.long_run_historical_component), float(r.recent_shape_component),
                 float(r.outcome_modifier), float(r.quality_modifier), float(r.saturation_modifier),
-                int(r.hotspot_limit_used),
+                hotspot_limit_used,
                 float(r.density_penalty), float(r.weighted_trip_count), int(r.unique_driver_count),
                 _bool_db_value(bool(r.recommended)),
             ),

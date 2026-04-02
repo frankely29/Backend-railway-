@@ -44,6 +44,7 @@ from pickup_hotspot_intelligence import (
     determine_zone_hotspot_limit,
     get_zone_or_hotspot_outcome_modifier,
     sculpt_hotspot_shapes_from_recent_points,
+    build_cross_zone_merged_hotspots,
 )
 from artifact_freshness import evaluate_artifact_freshness
 from artifact_storage_service import cleanup_artifact_storage, get_artifact_storage_report
@@ -157,6 +158,7 @@ PICKUP_ZONE_SECOND_HOTSPOT_MIN_POINTS = 8
 PICKUP_ZONE_SECOND_COMPONENT_MIN_POINTS = 3
 PICKUP_ZONE_SECOND_COMPONENT_MIN_SCORE_RATIO = 0.45
 HOTSPOT_RECENT_LOOKBACK_SECONDS = 6 * 3600
+HOTSPOT_RECENT_SHAPE_LOOKBACK_SECONDS = 90 * 60
 HOTSPOT_TIMESLOT_BIN_MINUTES = 20
 
 _pickup_zone_geom_cache: Optional[Dict[int, Dict[str, Any]]] = None
@@ -4743,7 +4745,9 @@ def _load_pickup_zone_geometries() -> Dict[int, Dict[str, Any]]:
 
 
 def _pickup_zone_recent_points(
-    zone_ids: List[int], max_points_per_zone: int = PICKUP_ZONE_HOTSPOT_MAX_POINTS
+    zone_ids: List[int],
+    max_points_per_zone: int = PICKUP_ZONE_HOTSPOT_MAX_POINTS,
+    lookback_seconds: int = HOTSPOT_RECENT_SHAPE_LOOKBACK_SECONDS,
 ) -> Dict[int, List[Dict[str, Any]]]:
     clean_zone_ids: List[int] = []
     for z in zone_ids:
@@ -4755,6 +4759,7 @@ def _pickup_zone_recent_points(
         return {}
 
     cap = max(1, min(PICKUP_ZONE_HOTSPOT_MAX_POINTS, int(max_points_per_zone)))
+    cutoff_ts = int(time.time()) - max(60, int(lookback_seconds))
     clean_zone_ids = list(dict.fromkeys(clean_zone_ids))[:256]
     placeholders = ",".join(["?"] * len(clean_zone_ids))
 
@@ -4772,6 +4777,7 @@ def _pickup_zone_recent_points(
                 ROW_NUMBER() OVER (PARTITION BY pl.zone_id ORDER BY pl.created_at DESC, pl.id DESC) AS rn
             FROM pickup_logs pl
             WHERE pl.zone_id IN ({placeholders})
+              AND pl.created_at >= ?
               AND {pickup_log_not_voided_sql("pl")}
         )
         SELECT id, zone_id, zone_name, borough, user_id, lat, lng, created_at
@@ -4779,7 +4785,7 @@ def _pickup_zone_recent_points(
         WHERE rn <= ?
         ORDER BY zone_id ASC, created_at DESC, id DESC
     """
-    rows = _db_query_all(sql, tuple(clean_zone_ids + [cap]))
+    rows = _db_query_all(sql, tuple(clean_zone_ids + [cutoff_ts, cap]))
     grouped: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
     for row in rows:
         item = dict(row)
@@ -5127,6 +5133,13 @@ def _build_zone_hotspot_components(
                     "hotspot_index": hotspot_index,
                     "hotspot_id": hotspot_id,
                     "hotspot_method": "historical_anchor_sculpted",
+                    "covered_zone_ids": [zone_id],
+                    "covered_zone_names": [zone_name],
+                    "merged": False,
+                    "merged_zone_ids": [zone_id],
+                    "merged_zone_names": [zone_name],
+                    "merged_zone_count": 1,
+                    "primary_zone_id": zone_id,
                     "sample_size": len(point_rows),
                     "component_point_count": int(comp.get("point_count") or 0),
                     "latest_created_at": latest_created_at,
@@ -5135,6 +5148,7 @@ def _build_zone_hotspot_components(
                     "merged_from_count": 1,
                     "peak_score": float(comp.get("peak_score") or 0.0),
                     "component_score": float(comp.get("component_score") or 0.0),
+                    "weighted_support": float(comp.get("weighted_point_count") or 0.0),
                     "max_points_per_zone": PICKUP_ZONE_HOTSPOT_MAX_POINTS,
                     "min_points": PICKUP_ZONE_HOTSPOT_MIN_POINTS,
                     "micro_hotspots": [],
@@ -5649,7 +5663,11 @@ def _pickup_zone_hotspots_with_debug(
 
     zone_points: Dict[int, List[Dict[str, Any]]] = {}
     try:
-        zone_points = _pickup_zone_recent_points(clean_zone_ids, PICKUP_ZONE_HOTSPOT_MAX_POINTS)
+        zone_points = _pickup_zone_recent_points(
+            clean_zone_ids,
+            PICKUP_ZONE_HOTSPOT_MAX_POINTS,
+            HOTSPOT_RECENT_SHAPE_LOOKBACK_SECONDS,
+        )
     except Exception:
         if include_debug:
             debug["global_errors"].append("recent_points_load_failed")
@@ -5690,12 +5708,6 @@ def _pickup_zone_hotspots_with_debug(
                     "zone_scores": zone_scores,
                     "expires_at_monotonic": now_monotonic + PICKUP_SCORE_CACHE_TTL_SECONDS,
                 }
-            try:
-                log_zone_bins(_db_exec, bin_time=now_ts, rows=zone_scores.values())
-            except Exception:
-                if include_debug:
-                    debug["global_errors"].append("log_zone_bins_failed")
-                print("[warn] Failed to log pickup zone bins", traceback.format_exc())
         except Exception:
             if include_debug:
                 debug["global_errors"].append("score_zones_failed")
@@ -5710,6 +5722,9 @@ def _pickup_zone_hotspots_with_debug(
         print("[warn] Failed to prune pickup hotspot experiment tables", traceback.format_exc())
 
     features: List[Dict[str, Any]] = []
+    zone_features_map: Dict[int, List[Dict[str, Any]]] = {}
+    zone_debug_map: Dict[int, Dict[str, Any]] = {}
+    emitted_hotspot_ids: set[str] = set()
     for zone_id in clean_zone_ids:
         pts = zone_points.get(zone_id, [])
         zone_data = zone_geoms.get(zone_id)
@@ -5738,11 +5753,11 @@ def _pickup_zone_hotspots_with_debug(
             }
             if qualified:
                 debug["qualified_zone_ids"].append(zone_id)
+            zone_debug_map[zone_id] = zone_debug
 
         if not zone_data:
             if zone_debug is not None:
                 zone_debug["errors"].append("geometry_missing")
-                debug["zones"].append(zone_debug)
             continue
 
         zone_features: List[Dict[str, Any]] = []
@@ -5800,41 +5815,11 @@ def _pickup_zone_hotspots_with_debug(
         if not zone_features:
             with _pickup_zone_hotspot_cache_lock:
                 _pickup_zone_hotspot_feature_cache.pop(zone_id, None)
-            if zone_debug is not None:
-                debug["zones"].append(zone_debug)
             continue
 
-        if not cached_hit:
-            zone_micro_total = 0
-            for feature in zone_features:
-                props = feature.setdefault("properties", {})
-                props["signature"] = signature
-                try:
-                    micro_payload = _build_zone_micro_hotspots_payload(zone_id, zone_data, pts, feature)
-                except Exception:
-                    micro_payload = []
-                    if zone_debug is not None:
-                        zone_debug["errors"].append("micro_hotspot_build_failed")
-                    print(f"[warn] Failed to build pickup micro-hotspots for zone {zone_id}", traceback.format_exc())
-                props["micro_hotspots"] = [item for item in micro_payload if isinstance(item, dict)][:2]
-                zone_micro_total += len(props["micro_hotspots"])
-                feature.pop("_hotspot_proj", None)
-                feature.pop("_component_cells", None)
-            with _pickup_zone_hotspot_cache_lock:
-                _pickup_zone_hotspot_feature_cache[zone_id] = {
-                    "signature": signature,
-                    "features": copy.deepcopy(zone_features),
-                    "created_at_monotonic": now_monotonic,
-                    "last_access_monotonic": now_monotonic,
-                }
-            if zone_debug is not None:
-                zone_debug["micro_hotspot_count"] = zone_micro_total
-
-        zone_micro_total = 0
         for feature in zone_features:
             props = feature.setdefault("properties", {})
             props["signature"] = signature
-            zone_micro_total += len(props.get("micro_hotspots") or [])
             if score is not None:
                 _pickup_zone_score_cache[zone_id] = score.final_score
                 props["hotspot_score"] = score.final_score
@@ -5851,27 +5836,144 @@ def _pickup_zone_hotspots_with_debug(
                 props["quality_modifier"] = props.get("quality_modifier", score.quality_modifier)
                 props["saturation_modifier"] = props.get("saturation_modifier", score.saturation_modifier)
                 props["hotspot_limit_used"] = props.get("hotspot_limit_used", score.hotspot_limit_used)
-                if score.recommended and not score_bundle_fresh:
-                    try:
-                        log_recommendation_outcome(
-                            _db_exec,
-                            recommended_at=now_ts,
-                            zone_id=zone_id,
-                            score=score.final_score,
-                            confidence=score.confidence,
-                            cluster_id=None,
-                        )
-                    except Exception:
-                        if zone_debug is not None:
-                            zone_debug["errors"].append("log_recommendation_outcome_failed")
-                        print(f"[warn] Failed to log recommendation outcome for zone {zone_id}", traceback.format_exc())
-            features.append(feature)
+            zone_features_map.setdefault(zone_id, []).append(feature)
 
+    used_merge_zones: set[int] = set()
+    merged_candidates = build_cross_zone_merged_hotspots(
+        zone_feature_map=zone_features_map,
+        zone_meta_map=zone_geoms,
+        zone_recent_points=zone_points,
+    )
+    for merged in merged_candidates:
+        zone_a, zone_b = merged["zone_pair"]
+        if zone_a in used_merge_zones or zone_b in used_merge_zones:
+            continue
+        if not zone_features_map.get(zone_a) or not zone_features_map.get(zone_b):
+            continue
+        feature_a = zone_features_map[zone_a][0]
+        feature_b = zone_features_map[zone_b][0]
+        props_a = feature_a.get("properties") or {}
+        props_b = feature_b.get("properties") or {}
+        merged_zone_names = merged.get("merged_zone_names") or [props_a.get("zone_name") or "", props_b.get("zone_name") or ""]
+        merged_hotspot_id = f"merged:{zone_a}:{zone_b}:anchor:0"
+        merged_props = {
+            **props_a,
+            "zone_id": zone_a,
+            "zone_name": merged_zone_names[0],
+            "borough": merged.get("borough") or props_a.get("borough") or props_b.get("borough"),
+            "hotspot_id": merged_hotspot_id,
+            "hotspot_method": "cross_zone_merge",
+            "covered_zone_ids": [zone_a, zone_b],
+            "covered_zone_names": merged_zone_names,
+            "merged": True,
+            "merged_zone_ids": [zone_a, zone_b],
+            "merged_zone_names": merged_zone_names,
+            "merged_zone_count": 2,
+            "primary_zone_id": zone_a,
+            "merged_from_count": 2,
+            "component_score": float(props_a.get("component_score") or 0.0) + float(props_b.get("component_score") or 0.0),
+            "weighted_support": float(props_a.get("weighted_support") or 0.0) + float(props_b.get("weighted_support") or 0.0),
+            "intensity": max(float(props_a.get("intensity") or 0.0), float(props_b.get("intensity") or 0.0)),
+            "merge_evidence": merged.get("decision") or {},
+            "micro_hotspots": [],
+        }
+        merged_feature = {
+            "type": "Feature",
+            "geometry": mapping(merged.get("geometry")),
+            "properties": merged_props,
+            "_hotspot_proj": merged.get("merged_geometry_proj"),
+        }
+        zone_features_map[zone_a][0] = merged_feature
+        zone_features_map[zone_b] = [copy.deepcopy(merged_feature)]
+        used_merge_zones.update({zone_a, zone_b})
+
+    for zone_id in clean_zone_ids:
+        zone_features = zone_features_map.get(zone_id) or []
+        zone_data = zone_geoms.get(zone_id)
+        pts = zone_points.get(zone_id, [])
+        score = zone_scores.get(zone_id)
+        zone_debug = zone_debug_map.get(zone_id)
+        zone_micro_total = 0
+        for feature in zone_features:
+            props = feature.setdefault("properties", {})
+            covered_ids = [int(z) for z in (props.get("covered_zone_ids") or [zone_id])]
+            covered_names: List[str] = []
+            for zid in covered_ids:
+                covered_names.append((zone_geoms.get(zid) or {}).get("zone_name") or str(zid))
+            props["covered_zone_ids"] = covered_ids
+            props["covered_zone_names"] = covered_names
+            hotspot_limit_real = max(
+                [int((zone_scores.get(zid).hotspot_limit_used if zone_scores.get(zid) is not None else 2)) for zid in covered_ids] or [2]
+            )
+            props["hotspot_limit_used"] = max(int(props.get("hotspot_limit_used") or 0), hotspot_limit_real)
+            for zid in covered_ids:
+                if zone_scores.get(zid) is not None:
+                    zone_scores[zid].hotspot_limit_used = int(props["hotspot_limit_used"])
+            point_rows_for_micro = []
+            for zid in covered_ids:
+                point_rows_for_micro.extend(zone_points.get(zid, []))
+            micro_zone_meta = dict(zone_data or {})
+            if len(covered_ids) > 1:
+                try:
+                    geoms = [zone_geoms[zid]["geometry"] for zid in covered_ids if zone_geoms.get(zid)]
+                    if geoms:
+                        micro_zone_meta["geometry"] = unary_union(geoms)
+                except Exception:
+                    pass
+            try:
+                micro_payload = _build_zone_micro_hotspots_payload(zone_id, micro_zone_meta, point_rows_for_micro or pts, feature)
+            except Exception:
+                micro_payload = []
+                if zone_debug is not None:
+                    zone_debug["errors"].append("micro_hotspot_build_failed")
+            props["micro_hotspots"] = [item for item in micro_payload if isinstance(item, dict)][:2]
+            zone_micro_total += len(props["micro_hotspots"])
+            feature.pop("_hotspot_proj", None)
+            feature.pop("_component_cells", None)
+            if score is not None and score.recommended and not score_bundle_fresh:
+                try:
+                    log_recommendation_outcome(
+                        _db_exec,
+                        recommended_at=now_ts,
+                        zone_id=zone_id,
+                        score=score.final_score,
+                        confidence=score.confidence,
+                        cluster_id=str(props.get("hotspot_id")) if props.get("hotspot_id") else None,
+                    )
+                except Exception:
+                    if zone_debug is not None:
+                        zone_debug["errors"].append("log_recommendation_outcome_failed")
+            dedupe_key = str(props.get("hotspot_id") or f"{zone_id}:{len(features)}")
+            if dedupe_key not in emitted_hotspot_ids:
+                features.append(feature)
+                emitted_hotspot_ids.add(dedupe_key)
+
+        if zone_features:
+            with _pickup_zone_hotspot_cache_lock:
+                _pickup_zone_hotspot_feature_cache[zone_id] = {
+                    "signature": zone_signatures.get(zone_id) or _pickup_zone_signature([]),
+                    "features": copy.deepcopy(zone_features),
+                    "created_at_monotonic": now_monotonic,
+                    "last_access_monotonic": now_monotonic,
+                }
         if zone_debug is not None:
             zone_debug["feature_emitted"] = bool(zone_features)
             zone_debug["micro_hotspot_count"] = zone_micro_total
-            debug["rendered_zone_ids"].append(zone_id)
+            zone_debug["merged"] = any(bool((f.get("properties") or {}).get("merged")) for f in zone_features)
+            zone_debug["merged_zone_count"] = 2 if zone_debug["merged"] else 1
+            if zone_features:
+                zone_debug["hotspot_method"] = (zone_features[0].get("properties") or {}).get("hotspot_method", zone_debug["hotspot_method"])
+            if zone_features:
+                debug["rendered_zone_ids"].append(zone_id)
             debug["zones"].append(zone_debug)
+
+    if not score_bundle_fresh and zone_scores:
+        try:
+            log_zone_bins(_db_exec, bin_time=now_ts, rows=zone_scores.values())
+        except Exception:
+            if include_debug:
+                debug["global_errors"].append("log_zone_bins_failed")
+            print("[warn] Failed to log pickup zone bins", traceback.format_exc())
 
     _cleanup_pickup_zone_caches(now_monotonic)
     payload = {"type": "FeatureCollection", "features": features}
@@ -5918,6 +6020,7 @@ def _pickup_zone_stats(zone_ids: List[int], sample_limit: int = 100) -> List[Dic
                 ROW_NUMBER() OVER (PARTITION BY pl.zone_id ORDER BY pl.created_at DESC, pl.id DESC) AS rn
             FROM pickup_logs pl
             WHERE pl.zone_id IN ({placeholders})
+              AND pl.created_at >= ?
               AND {pickup_log_not_voided_sql("pl")}
         )
         SELECT

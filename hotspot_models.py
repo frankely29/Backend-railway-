@@ -23,6 +23,9 @@ class ZoneScoreResult:
     weighted_trip_count: float
     unique_driver_count: int
     recommended: bool
+    merged: bool = False
+    merged_zone_count: int = 1
+    hotspot_method: str = "historical_anchor_sculpted"
 
 
 @dataclass

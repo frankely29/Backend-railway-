@@ -5,7 +5,7 @@ import time
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 from pyproj import Transformer
-from shapely.geometry import Point
+from shapely.geometry import Point, shape
 from shapely.ops import transform, unary_union
 
 _TO_3857 = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
@@ -315,6 +315,193 @@ def sculpt_hotspot_shapes_from_recent_points(
             }
         )
     return sculpted
+
+
+def should_merge_adjacent_zone_hotspots(
+    zone_a_meta: Mapping[str, Any],
+    zone_b_meta: Mapping[str, Any],
+    comp_a: Mapping[str, Any],
+    comp_b: Mapping[str, Any],
+    recent_points_a: Sequence[Mapping[str, Any]],
+    recent_points_b: Sequence[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    borough_a = str(zone_a_meta.get("borough") or "").strip().lower()
+    borough_b = str(zone_b_meta.get("borough") or "").strip().lower()
+    if not borough_a or borough_a != borough_b:
+        return {"eligible": False, "reason": "borough_mismatch"}
+
+    zone_geom_a = zone_a_meta.get("geometry")
+    zone_geom_b = zone_b_meta.get("geometry")
+    if zone_geom_a is None or zone_geom_b is None or zone_geom_a.is_empty or zone_geom_b.is_empty:
+        return {"eligible": False, "reason": "zone_geometry_missing"}
+
+    zone_a_proj = transform(_TO_3857.transform, zone_geom_a)
+    zone_b_proj = transform(_TO_3857.transform, zone_geom_b)
+    boundary_distance_m = float(zone_a_proj.distance(zone_b_proj))
+    if boundary_distance_m > 60.0:
+        return {"eligible": False, "reason": "zone_boundary_too_far", "boundary_distance_m": boundary_distance_m}
+
+    poly_a = comp_a.get("polygon_proj")
+    poly_b = comp_b.get("polygon_proj")
+    if (poly_a is None or poly_a.is_empty) and comp_a.get("geometry") is not None:
+        try:
+            geom_a = comp_a.get("geometry")
+            if isinstance(geom_a, dict):
+                geom_a = shape(geom_a)
+            poly_a = transform(_TO_3857.transform, geom_a)
+        except Exception:
+            poly_a = None
+    if (poly_b is None or poly_b.is_empty) and comp_b.get("geometry") is not None:
+        try:
+            geom_b = comp_b.get("geometry")
+            if isinstance(geom_b, dict):
+                geom_b = shape(geom_b)
+            poly_b = transform(_TO_3857.transform, geom_b)
+        except Exception:
+            poly_b = None
+    if poly_a is None or poly_b is None or poly_a.is_empty or poly_b.is_empty:
+        return {"eligible": False, "reason": "component_geometry_missing"}
+
+    centroid_distance_miles = float(poly_a.centroid.distance(poly_b.centroid)) / 1609.344
+    if centroid_distance_miles > 0.40:
+        return {"eligible": False, "reason": "centroids_too_far", "centroid_distance_miles": centroid_distance_miles}
+
+    boundary_band = zone_a_proj.buffer(75.0).intersection(zone_b_proj.buffer(75.0))
+    boundary_recent_count = 0
+    for row in list(recent_points_a) + list(recent_points_b):
+        try:
+            x, y = _TO_3857.transform(float(row["lng"]), float(row["lat"]))
+        except Exception:
+            continue
+        if not boundary_band.is_empty and boundary_band.covers(Point(x, y)):
+            boundary_recent_count += 1
+
+    if boundary_recent_count < 3:
+        return {"eligible": False, "reason": "weak_boundary_activity", "boundary_recent_count": boundary_recent_count}
+
+    combined_recent_count = len(recent_points_a) + len(recent_points_b)
+    if combined_recent_count < 5:
+        return {"eligible": False, "reason": "insufficient_recent_points", "combined_recent_count": combined_recent_count}
+
+    support_a = float(comp_a.get("weighted_support") or comp_a.get("weighted_point_count") or 0.0)
+    support_b = float(comp_b.get("weighted_support") or comp_b.get("weighted_point_count") or 0.0)
+    combined_support = support_a + support_b
+    if combined_support < 14.0:
+        return {"eligible": False, "reason": "insufficient_historical_support", "combined_support": combined_support}
+
+    score_a = float(comp_a.get("component_score") or 0.0)
+    score_b = float(comp_b.get("component_score") or 0.0)
+    merged_score = score_a + score_b
+    if merged_score < (max(score_a, score_b) * 1.05):
+        return {"eligible": False, "reason": "merged_score_not_stronger", "merged_score": merged_score}
+
+    return {
+        "eligible": True,
+        "reason": "eligible",
+        "boundary_distance_m": boundary_distance_m,
+        "centroid_distance_miles": centroid_distance_miles,
+        "boundary_recent_count": boundary_recent_count,
+        "combined_recent_count": combined_recent_count,
+        "combined_support": combined_support,
+        "merged_score": merged_score,
+    }
+
+
+def make_cross_zone_merged_geometry(
+    comp_a: Mapping[str, Any],
+    comp_b: Mapping[str, Any],
+    zone_geom_a: Any,
+    zone_geom_b: Any,
+):
+    poly_a = comp_a.get("polygon_proj")
+    poly_b = comp_b.get("polygon_proj")
+    if (poly_a is None or poly_a.is_empty) and comp_a.get("geometry") is not None:
+        try:
+            geom_a = comp_a.get("geometry")
+            if isinstance(geom_a, dict):
+                geom_a = shape(geom_a)
+            poly_a = transform(_TO_3857.transform, geom_a)
+        except Exception:
+            poly_a = None
+    if (poly_b is None or poly_b.is_empty) and comp_b.get("geometry") is not None:
+        try:
+            geom_b = comp_b.get("geometry")
+            if isinstance(geom_b, dict):
+                geom_b = shape(geom_b)
+            poly_b = transform(_TO_3857.transform, geom_b)
+        except Exception:
+            poly_b = None
+    if poly_a is None or poly_b is None or poly_a.is_empty or poly_b.is_empty:
+        return None
+
+    zone_union_proj = unary_union(
+        [transform(_TO_3857.transform, zone_geom_a), transform(_TO_3857.transform, zone_geom_b)]
+    )
+    merged = unary_union([poly_a, poly_b]).intersection(zone_union_proj)
+    if merged.is_empty:
+        return None
+    simplified = merged.simplify(16.0, preserve_topology=True).intersection(zone_union_proj)
+    return simplified if not simplified.is_empty else merged
+
+
+def build_cross_zone_merged_hotspots(
+    *,
+    zone_feature_map: Mapping[int, Sequence[Mapping[str, Any]]],
+    zone_meta_map: Mapping[int, Mapping[str, Any]],
+    zone_recent_points: Mapping[int, Sequence[Mapping[str, Any]]],
+) -> List[Dict[str, Any]]:
+    zone_ids = sorted(int(z) for z in zone_feature_map.keys())
+    merged: List[Dict[str, Any]] = []
+    for i, zone_a in enumerate(zone_ids):
+        features_a = list(zone_feature_map.get(zone_a) or [])
+        if not features_a:
+            continue
+        for zone_b in zone_ids[i + 1 :]:
+            features_b = list(zone_feature_map.get(zone_b) or [])
+            if not features_b:
+                continue
+            meta_a = zone_meta_map.get(zone_a) or {}
+            meta_b = zone_meta_map.get(zone_b) or {}
+            comp_a = features_a[0]
+            comp_b = features_b[0]
+            decision = should_merge_adjacent_zone_hotspots(
+                meta_a,
+                meta_b,
+                comp_a,
+                comp_b,
+                zone_recent_points.get(zone_a) or [],
+                zone_recent_points.get(zone_b) or [],
+            )
+            if not decision.get("eligible"):
+                continue
+            merged_geom_proj = make_cross_zone_merged_geometry(
+                comp_a,
+                comp_b,
+                meta_a.get("geometry"),
+                meta_b.get("geometry"),
+            )
+            if merged_geom_proj is None or merged_geom_proj.is_empty:
+                continue
+            a, b = sorted([zone_a, zone_b])
+            merged.append(
+                {
+                    "zone_pair": (a, b),
+                    "merged_geometry_proj": merged_geom_proj,
+                    "geometry": transform(_TO_4326.transform, merged_geom_proj),
+                    "primary_zone_id": a,
+                    "merged_zone_ids": [a, b],
+                    "merged_zone_names": [
+                        str((meta_a if zone_a == a else meta_b).get("zone_name") or ""),
+                        str((meta_b if zone_b == b else meta_a).get("zone_name") or ""),
+                    ],
+                    "borough": str(meta_a.get("borough") or meta_b.get("borough") or ""),
+                    "component_a": comp_a,
+                    "component_b": comp_b,
+                    "decision": decision,
+                }
+            )
+    merged.sort(key=lambda r: float((r.get("decision") or {}).get("merged_score") or 0.0), reverse=True)
+    return merged
 
 
 def get_zone_or_hotspot_outcome_modifier(
