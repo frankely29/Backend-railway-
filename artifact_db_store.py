@@ -85,6 +85,21 @@ def _decode_record(record: Any) -> Optional[Dict[str, Any]]:
     }
 
 
+def _metadata_from_record(record: Any) -> Optional[Dict[str, Any]]:
+    if not record:
+        return None
+    artifact_key = str(_row_value(record, "artifact_key") or "")
+    if artifact_key not in ALLOWED_ARTIFACT_KEYS:
+        return None
+    return {
+        "artifact_key": artifact_key,
+        "content_encoding": str(_row_value(record, "content_encoding") or "json"),
+        "content_sha256": str(_row_value(record, "content_sha256") or ""),
+        "updated_at_unix": int(_row_value(record, "updated_at_unix") or 0),
+        "payload_uncompressed_bytes": int(_row_value(record, "payload_uncompressed_bytes") or 0),
+    }
+
+
 def ensure_generated_artifact_store_schema() -> None:
     payload_blob_type = "BYTEA" if DB_BACKEND == "postgres" else "BLOB"
     needs_recreate = False
@@ -192,11 +207,27 @@ def load_generated_artifact(artifact_key: str) -> Optional[Dict[str, Any]]:
     return _decode_record(row)
 
 
+def load_generated_artifact_metadata(artifact_key: str) -> Optional[Dict[str, Any]]:
+    if artifact_key not in ALLOWED_ARTIFACT_KEYS:
+        return None
+    row = _db_query_one(
+        """
+        SELECT artifact_key, content_encoding, updated_at_unix, content_sha256, payload_uncompressed_bytes
+        FROM generated_artifact_store
+        WHERE artifact_key = ?
+        """,
+        (artifact_key,),
+    )
+    return _metadata_from_record(row)
+
+
 def delete_generated_artifact(artifact_key: str) -> None:
     _db_exec("DELETE FROM generated_artifact_store WHERE artifact_key = ?", (artifact_key,))
 
 
 def generated_artifact_present(artifact_key: str) -> bool:
+    if artifact_key not in ALLOWED_ARTIFACT_KEYS:
+        return False
     row = _db_query_one(
         "SELECT artifact_key FROM generated_artifact_store WHERE artifact_key = ?",
         (artifact_key,),

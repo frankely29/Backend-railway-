@@ -631,9 +631,12 @@ def _build_assistant_outlook_frame_bucket_cached(
 ) -> Dict[str, Any]:
     timeline_payload = (timeline_cached or {}).get("data") or {}
     timeline_etag = str((timeline_cached or {}).get("etag") or "")
+    frame_key = str(frame_time or "").strip()
+    if not frame_key:
+        raise KeyError("frame_time is required")
     bin_minutes = int(timeline_payload.get("bin_minutes") or DEFAULT_BIN_MINUTES)
     key = _assistant_outlook_bucket_cache_key(
-        frame_time=frame_time,
+        frame_time=frame_key,
         horizon_bins=horizon_bins,
         timeline_etag=timeline_etag,
         bin_minutes=bin_minutes,
@@ -654,14 +657,14 @@ def _build_assistant_outlook_frame_bucket_cached(
     bucket_payload = build_assistant_outlook_frame_bucket(
         timeline_payload=timeline_payload,
         frames_dir=FRAMES_DIR,
-        frame_time=frame_time,
+        frame_time=frame_key,
         horizon_bins=horizon_bins,
     )
     frame_bucket = bucket_payload.get("bucket") or {}
     cached_entry = {
-        "frame_time": str(frame_time),
-        "horizon_bins": int(horizon_bins),
-        "bin_minutes": int(bin_minutes),
+        "frame_time": str(bucket_payload.get("frame_time") or frame_key),
+        "horizon_bins": int(bucket_payload.get("horizon_bins") or horizon_bins),
+        "bin_minutes": int(bucket_payload.get("bin_minutes") or bin_minutes),
         "timeline_etag": timeline_etag,
         "frame_bucket": frame_bucket,
         "cache_key": key,
@@ -3855,12 +3858,7 @@ def assistant_outlook(
     except Exception:
         raise HTTPException(status_code=503, detail="assistant outlook unavailable: timeline not ready")
 
-    timeline_payload = (timeline_cached or {}).get("data") or {}
-    timeline_items = [str(item) for item in (timeline_payload.get("timeline") or []) if str(item).strip()]
-    timeline_lookup = {item: idx for idx, item in enumerate(timeline_items)}
     frame_key = str(frame_time or "").strip()
-    if frame_key not in timeline_lookup:
-        raise HTTPException(status_code=404, detail=f"Unknown frame_time: {frame_key}")
 
     try:
         cached_bucket = _build_assistant_outlook_frame_bucket_cached(
@@ -3879,13 +3877,19 @@ def assistant_outlook(
         raise HTTPException(status_code=404, detail=f"Unknown frame_time: {frame_key}")
     except (FileNotFoundError, json.JSONDecodeError, OSError, UnicodeDecodeError, ValueError) as exc:
         print(f"[warn] assistant outlook frame bucket unavailable for frame_time={frame_key}: {exc}")
-        raise HTTPException(status_code=503, detail="assistant outlook temporarily unavailable")
+        raise HTTPException(
+            status_code=503,
+            detail={"error": "assistant_outlook_unavailable", "message": "assistant outlook temporarily unavailable"},
+        )
     except HTTPException:
         raise
     except Exception:
         print("[warn] assistant outlook frame bucket build failed")
         print(traceback.format_exc())
-        raise HTTPException(status_code=503, detail="assistant outlook temporarily unavailable")
+        raise HTTPException(
+            status_code=503,
+            detail={"error": "assistant_outlook_unavailable", "message": "assistant outlook temporarily unavailable"},
+        )
 
     response_etag = str((timeline_cached or {}).get("etag") or "")
     return _json_cached_response(request, payload, etag=response_etag)

@@ -254,6 +254,18 @@ def _timeline_items_and_index(timeline_payload: Dict[str, Any]) -> Tuple[List[st
     return timeline, by_frame_time
 
 
+def _normalize_requested_location_ids(location_ids: Iterable[Any]) -> List[str]:
+    requested: List[str] = []
+    seen: set[str] = set()
+    for raw_id in location_ids or []:
+        normalized = _to_location_id_str(raw_id)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        requested.append(normalized)
+    return requested
+
+
 def build_assistant_outlook_frame_bucket(
     timeline_payload: Dict[str, Any],
     frames_dir: Path,
@@ -278,6 +290,7 @@ def build_assistant_outlook_frame_bucket(
     return {
         "frame_time": frame_key,
         "frame_idx": int(frame_idx),
+        "bin_minutes": int((timeline_payload or {}).get("bin_minutes") or 20),
         "horizon_bins": int(horizon_bins),
         "bucket": frame_bucket,
     }
@@ -294,14 +307,7 @@ def get_assistant_outlook_payload(
     if frame_bucket is None:
         raise KeyError(f"frame_time not found: {frame_key}")
 
-    requested: List[str] = []
-    seen: set[str] = set()
-    for raw_id in location_ids or []:
-        normalized = _to_location_id_str(raw_id)
-        if not normalized or normalized in seen:
-            continue
-        seen.add(normalized)
-        requested.append(normalized)
+    requested = _normalize_requested_location_ids(location_ids)
 
     zones = [frame_bucket[zone_id] for zone_id in requested if zone_id in frame_bucket]
     zones_by_location_id = {zone.get("location_id"): zone for zone in zones if zone.get("location_id")}
@@ -331,14 +337,7 @@ def get_assistant_outlook_payload_from_frame_bucket(
     bin_minutes: int = 20,
     horizon_bins: int = HORIZON_BINS_DEFAULT,
 ) -> Dict[str, Any]:
-    requested: List[str] = []
-    seen: set[str] = set()
-    for raw_id in location_ids or []:
-        normalized = _to_location_id_str(raw_id)
-        if not normalized or normalized in seen:
-            continue
-        seen.add(normalized)
-        requested.append(normalized)
+    requested = _normalize_requested_location_ids(location_ids)
 
     zones = [frame_bucket[zone_id] for zone_id in requested if zone_id in frame_bucket]
     zones_by_location_id = {zone.get("location_id"): zone for zone in zones if zone.get("location_id")}
