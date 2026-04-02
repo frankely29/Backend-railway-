@@ -26,6 +26,24 @@ _PROGRESSION_BY_USER_CACHE: Dict[int, Dict[str, Any]] = {}
 _LEADERBOARD_RUNTIME_LOCK = threading.Lock()
 _CURRENT_BADGES_CACHE_TTL_SECONDS = 10
 _PROGRESSION_CACHE_TTL_SECONDS = 15
+_CURRENT_BADGES_CACHE_MAX_ENTRIES = 2000
+_PROGRESSION_CACHE_MAX_ENTRIES = 2000
+
+
+def _prune_user_ttl_cache(cache: Dict[int, Dict[str, Any]], now: int, ttl_seconds: int, max_entries: int) -> None:
+    expired_user_ids = [
+        uid for uid, entry in cache.items() if (now - int(entry.get("cached_at_unix") or 0)) > int(ttl_seconds)
+    ]
+    for uid in expired_user_ids:
+        cache.pop(uid, None)
+
+    if len(cache) <= int(max_entries):
+        return
+
+    over_limit = len(cache) - int(max_entries)
+    oldest_first = sorted(cache.items(), key=lambda item: int(item[1].get("cached_at_unix") or 0))
+    for uid, _ in oldest_first[:over_limit]:
+        cache.pop(uid, None)
 
 
 def _build_level_xp_thresholds() -> List[int]:
@@ -254,6 +272,12 @@ def get_progression_for_user(user_id: int) -> Dict[str, Any]:
     now = int(time.time())
     uid = int(user_id)
     with _LEADERBOARD_RUNTIME_LOCK:
+        _prune_user_ttl_cache(
+            _PROGRESSION_BY_USER_CACHE,
+            now=now,
+            ttl_seconds=_PROGRESSION_CACHE_TTL_SECONDS,
+            max_entries=_PROGRESSION_CACHE_MAX_ENTRIES,
+        )
         cached = _PROGRESSION_BY_USER_CACHE.get(uid)
         if cached and (now - int(cached.get("cached_at_unix") or 0)) <= _PROGRESSION_CACHE_TTL_SECONDS:
             return dict(cached.get("payload") or {})
@@ -570,6 +594,12 @@ def get_current_badges_for_user(user_id: int, refresh_if_needed: bool = True) ->
     now = int(time.time())
     uid = int(user_id)
     with _LEADERBOARD_RUNTIME_LOCK:
+        _prune_user_ttl_cache(
+            _CURRENT_BADGES_BY_USER_CACHE,
+            now=now,
+            ttl_seconds=_CURRENT_BADGES_CACHE_TTL_SECONDS,
+            max_entries=_CURRENT_BADGES_CACHE_MAX_ENTRIES,
+        )
         cached = _CURRENT_BADGES_BY_USER_CACHE.get(uid)
         if cached and (now - int(cached.get("cached_at_unix") or 0)) <= _CURRENT_BADGES_CACHE_TTL_SECONDS:
             return list(cached.get("payload") or [])
