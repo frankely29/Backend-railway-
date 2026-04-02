@@ -96,7 +96,7 @@ def score_zones(
             outcome_modifier=1.0,
             quality_modifier=1.0,
             saturation_modifier=1.0 - saturation_penalty,
-            hotspot_limit_used=2,
+            hotspot_limit_used=0,
             weighted_trip_count=adjusted_live,
             unique_driver_count=unique_driver_count,
             recommended=recommended,
