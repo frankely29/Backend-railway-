@@ -1,36 +1,25 @@
 from __future__ import annotations
 
-import math
-from typing import Any, Dict, Iterable, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 from hotspot_models import ZoneScoreResult
 
 
 def recency_decay_weight(age_seconds: float) -> float:
     age_minutes = max(0.0, age_seconds / 60.0)
-    if age_minutes <= 10:
+    if age_minutes <= 12:
         return 1.0
-    if age_minutes <= 20:
-        return 0.78
-    if age_minutes <= 40:
-        return 0.5
+    if age_minutes <= 30:
+        return 0.65
     if age_minutes <= 60:
-        return 0.3
+        return 0.34
     if age_minutes <= 120:
-        return 0.12
-    return 0.04
+        return 0.15
+    return 0.06
 
 
 def _clip(v: float, lo: float = 0.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, v))
-
-
-def _normalized_strength(weighted_trip_count: float, unique_driver_count: int, same_timeslot_support: float, active_driver_count: int) -> float:
-    trip_strength = _clip(weighted_trip_count / 14.0)
-    unique_strength = _clip(unique_driver_count / 7.0)
-    timeslot_strength = _clip(same_timeslot_support / 8.0)
-    network_strength = _clip(active_driver_count / 80.0)
-    return _clip(0.40 * trip_strength + 0.25 * unique_strength + 0.20 * timeslot_strength + 0.15 * network_strength)
 
 
 def score_zones(
@@ -47,13 +36,11 @@ def score_zones(
     out: Dict[int, ZoneScoreResult] = {}
 
     all_zone_ids = set(zone_points.keys()) | set(historical_by_zone.keys()) | set(same_timeslot_by_zone.keys())
-    adaptive_threshold = 1.6 + min(2.0, max(0.0, active_driver_count / 65.0))
 
     for zid in all_zone_ids:
         points = zone_points.get(zid, [])
         weighted_trip_count = 0.0
         unique_drivers: set[int] = set()
-
         for p in points:
             created_at = int(p.get("created_at") or now_ts)
             age = max(0, now_ts - created_at)
@@ -66,41 +53,50 @@ def score_zones(
                     pass
 
         unique_driver_count = len(unique_drivers)
-        diversity = 0.30 + 0.70 * _clip(unique_driver_count / max(1.0, weighted_trip_count)) if weighted_trip_count > 0 else 0.0
+        diversity = 0.32 + 0.68 * _clip(unique_driver_count / max(1.0, weighted_trip_count)) if weighted_trip_count > 0 else 0.0
         adjusted_live = weighted_trip_count * diversity
 
-        historical_norm = _clip((historical_by_zone.get(zid, 0.0) or 0.0) / 16.0)
-        live_norm = _clip(adjusted_live / 14.0)
-        same_timeslot_norm = _clip((same_timeslot_by_zone.get(zid, 0.0) or 0.0) / 10.0)
-        density_penalty = _clip((density_by_zone.get(zid, 0.0) or 0.0) / 6.0)
+        long_run_hist = float(historical_by_zone.get(zid, 0.0) or 0.0)
+        continuation = float(same_timeslot_by_zone.get(zid, 0.0) or 0.0)
+        saturation = _clip(float(density_by_zone.get(zid, 0.0) or 0.0) / 5.0)
+        active_network = _clip(active_driver_count / 90.0)
 
-        strength = _normalized_strength(adjusted_live, unique_driver_count, same_timeslot_by_zone.get(zid, 0.0) or 0.0, active_driver_count)
+        hist_norm = _clip(long_run_hist / 52.0)
+        live_norm = _clip(adjusted_live / 12.0)
+        continuation_norm = _clip(continuation / 28.0)
+        network_norm = _clip((active_network * 0.55) + (live_norm * 0.45))
 
-        hist_w = 0.58 - 0.18 * strength
-        live_w = 0.20 + 0.10 * strength
-        timeslot_w = 0.17 + 0.03 * strength
-        density_w = 0.08
+        long_run_component = 0.55 * hist_norm
+        live_component = 0.20 * live_norm
+        continuation_component = 0.15 * continuation_norm
+        network_component = 0.10 * network_norm
+        saturation_penalty = 0.18 * saturation
 
-        raw = (hist_w * historical_norm) + (live_w * live_norm) + (timeslot_w * same_timeslot_norm) - (density_w * density_penalty)
-
-        confidence = _clip(0.25 + 0.75 * strength)
+        raw = long_run_component + live_component + continuation_component + network_component - saturation_penalty
+        confidence = _clip(0.30 + (0.60 * hist_norm) + (0.20 * live_norm) - (0.10 * saturation))
         gated = max(0.0, raw) * confidence
 
         prev_score = float(previous_scores.get(zid, gated))
-        smoothed = (0.65 * prev_score) + (0.35 * gated)
+        smoothed = (0.72 * prev_score) + (0.28 * gated)
 
-        min_evidence = adjusted_live >= adaptive_threshold or historical_norm >= 0.25
-        recommended = bool(min_evidence and confidence >= 0.38 and smoothed >= 0.20)
+        min_evidence = (hist_norm >= 0.24) or (live_norm >= 0.15 and continuation_norm >= 0.12)
+        recommended = bool(min_evidence and confidence >= 0.36 and smoothed >= 0.18)
 
         out[zid] = ZoneScoreResult(
             zone_id=int(zid),
             final_score=_clip(smoothed),
             confidence=confidence,
-            live_strength=strength,
-            density_penalty=density_penalty,
-            historical_component=hist_w * historical_norm,
-            live_component=live_w * live_norm,
-            same_timeslot_component=timeslot_w * same_timeslot_norm,
+            live_strength=live_norm,
+            density_penalty=saturation,
+            historical_component=long_run_component,
+            live_component=live_component,
+            same_timeslot_component=continuation_component,
+            long_run_historical_component=long_run_component,
+            recent_shape_component=live_component,
+            outcome_modifier=1.0,
+            quality_modifier=1.0,
+            saturation_modifier=1.0 - saturation_penalty,
+            hotspot_limit_used=2,
             weighted_trip_count=adjusted_live,
             unique_driver_count=unique_driver_count,
             recommended=recommended,

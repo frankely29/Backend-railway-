@@ -21,12 +21,18 @@ def log_zone_bins(db_exec, *, bin_time: int, rows: Iterable[ZoneScoreResult]) ->
             INSERT INTO hotspot_experiment_bins(
                 bin_time, zone_id, final_score, confidence,
                 historical_component, live_component, same_timeslot_component,
+                long_run_historical_component, recent_shape_component,
+                outcome_modifier, quality_modifier, saturation_modifier,
+                hotspot_limit_used,
                 density_penalty, weighted_trip_count, unique_driver_count, recommended
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 int(bin_time), int(r.zone_id), float(r.final_score), float(r.confidence),
                 float(r.historical_component), float(r.live_component), float(r.same_timeslot_component),
+                float(r.long_run_historical_component), float(r.recent_shape_component),
+                float(r.outcome_modifier), float(r.quality_modifier), float(r.saturation_modifier),
+                int(r.hotspot_limit_used),
                 float(r.density_penalty), float(r.weighted_trip_count), int(r.unique_driver_count),
                 _bool_db_value(bool(r.recommended)),
             ),
