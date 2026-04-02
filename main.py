@@ -68,6 +68,8 @@ from core import (
     _hash_password,
     _sql,
     DB_BACKEND,
+    POSTGRES_POOL_MAX,
+    POSTGRES_POOL_MIN,
     _make_token,
     _user_block_state,
     _require_jwt_secret,
@@ -3243,6 +3245,7 @@ from leaderboard_routes import router as leaderboard_router
 from leaderboard_service import (
     get_best_current_badge_for_user,
     get_best_current_badges_for_users,
+    get_leaderboard_runtime_snapshot,
     get_progression_for_user,
     get_my_rank,
     get_overview_for_user,
@@ -3460,6 +3463,7 @@ def status():
     freshness = _artifact_freshness_snapshot()
     identity = _backend_identity_snapshot(freshness)
     artifact_runtime_integrity = _artifact_runtime_integrity_report()
+    leaderboard_runtime = get_leaderboard_runtime_snapshot()
     return {
         "status": "ok",
         "data_dir": str(DATA_DIR),
@@ -3505,6 +3509,13 @@ def status():
         "trial_enforced": ENFORCE_TRIAL,
         "auth_enabled": bool(JWT_SECRET and len(JWT_SECRET) >= 24),
         "performance_metrics": _perf_metric_snapshot(),
+        "postgres_pool_min": POSTGRES_POOL_MIN,
+        "postgres_pool_max": POSTGRES_POOL_MAX,
+        "current_badges_last_refresh_ts": leaderboard_runtime.get("current_badges_last_refresh_ts"),
+        "current_badges_refresh_interval_seconds": leaderboard_runtime.get("current_badges_refresh_interval_seconds"),
+        "current_badges_refresh_lock_active": leaderboard_runtime.get("current_badges_refresh_lock_active"),
+        "leaderboard_badges_cache_entries": leaderboard_runtime.get("leaderboard_badges_cache_entries"),
+        "leaderboard_progression_cache_entries": leaderboard_runtime.get("leaderboard_progression_cache_entries"),
     }
 
 

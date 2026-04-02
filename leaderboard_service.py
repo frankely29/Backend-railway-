@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import time
 import sqlite3
+import threading
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
-from core import DB_BACKEND, _db_exec, _db_query_all, _db_query_one
+from core import DB_BACKEND, _db_exec, _db_query_all, _db_query_one, _db_run_in_transaction, _sql
 from leaderboard_models import LeaderboardMetric, LeaderboardPeriod
 
 NYC_TZ = ZoneInfo("America/New_York")
@@ -17,6 +18,14 @@ PROGRESSION_XP_PER_HOUR = 30
 PROGRESSION_XP_PER_REPORTED_PICKUP = 20
 PROGRESSION_MAX_PICKUP_REPORTS_PER_DAY_FOR_XP = 25
 MAX_LEVEL = 1000
+_CURRENT_BADGES_REFRESH_LOCK = threading.Lock()
+_CURRENT_BADGES_LAST_REFRESH_TS = 0
+_CURRENT_BADGES_MIN_REFRESH_INTERVAL_SECONDS = 30
+_CURRENT_BADGES_BY_USER_CACHE: Dict[int, Dict[str, Any]] = {}
+_PROGRESSION_BY_USER_CACHE: Dict[int, Dict[str, Any]] = {}
+_LEADERBOARD_RUNTIME_LOCK = threading.Lock()
+_CURRENT_BADGES_CACHE_TTL_SECONDS = 10
+_PROGRESSION_CACHE_TTL_SECONDS = 15
 
 
 def _build_level_xp_thresholds() -> List[int]:
@@ -242,8 +251,17 @@ def get_lifetime_totals_for_user(user_id: int) -> Dict[str, float]:
 
 
 def get_progression_for_user(user_id: int) -> Dict[str, Any]:
+    now = int(time.time())
+    uid = int(user_id)
+    with _LEADERBOARD_RUNTIME_LOCK:
+        cached = _PROGRESSION_BY_USER_CACHE.get(uid)
+        if cached and (now - int(cached.get("cached_at_unix") or 0)) <= _PROGRESSION_CACHE_TTL_SECONDS:
+            return dict(cached.get("payload") or {})
     by_user = get_progression_for_users([int(user_id)])
-    return by_user.get(int(user_id), build_progression_from_daily_stats_rows([]))
+    progression = by_user.get(uid, build_progression_from_daily_stats_rows([]))
+    with _LEADERBOARD_RUNTIME_LOCK:
+        _PROGRESSION_BY_USER_CACHE[uid] = {"payload": dict(progression), "cached_at_unix": now}
+    return progression
 
 
 def get_progression_for_users(user_ids: List[int]) -> Dict[int, Dict[str, Any]]:
@@ -399,71 +417,108 @@ def get_my_rank(user_id: int, metric: LeaderboardMetric, period: LeaderboardPeri
 
 def refresh_current_badges() -> None:
     now = int(time.time())
+    daily_bounds = current_period_bounds(LeaderboardPeriod.daily)
+    weekly_bounds = current_period_bounds(LeaderboardPeriod.weekly)
+    monthly_bounds = current_period_bounds(LeaderboardPeriod.monthly)
+    yearly_bounds = current_period_bounds(LeaderboardPeriod.yearly)
 
-    # Current badges must be DAILY miles only.
-    _db_exec(
-        "DELETE FROM leaderboard_badges_current WHERE metric<>? OR period<>?",
-        (LeaderboardMetric.miles.value, LeaderboardPeriod.daily.value),
-    )
-
-    board = _aggregate_rows(LeaderboardMetric.miles, LeaderboardPeriod.daily)
-
-    _db_exec(
-        "DELETE FROM leaderboard_badges_current WHERE metric=? AND period=?",
-        (LeaderboardMetric.miles.value, LeaderboardPeriod.daily.value),
-    )
-
-    for row in board["rows"][:3]:
-        if not row["badge_code"]:
-            continue
-        _db_exec(
-            """
-            INSERT INTO leaderboard_badges_current(user_id, metric, period, period_key, rank_position, badge_code, awarded_at, is_current)
-            VALUES(?,?,?,?,?,?,?,?)
-            ON CONFLICT(user_id, metric, period, period_key) DO UPDATE SET
-              rank_position=excluded.rank_position,
-              badge_code=excluded.badge_code,
-              awarded_at=excluded.awarded_at,
-              is_current=excluded.is_current
-            """,
+    def _run(conn, cur):
+        cur.execute(
+            _sql("DELETE FROM leaderboard_badges_current WHERE metric<>? OR period<>?"),
+            (LeaderboardMetric.miles.value, LeaderboardPeriod.daily.value),
+        )
+        cur.execute(
+            _sql(
+                f"""
+                SELECT s.user_id,
+                       COALESCE(SUM(s.miles_worked), 0) AS metric_value
+                FROM driver_daily_stats s
+                JOIN users u ON u.id = s.user_id
+                WHERE s.nyc_date >= ? AND s.nyc_date <= ?
+                  AND {_leaderboard_active_user_where_sql("u")}
+                GROUP BY s.user_id
+                ORDER BY metric_value DESC, s.user_id ASC
+                """
+            ),
+            (daily_bounds.start_date.isoformat(), daily_bounds.end_date.isoformat()),
+        )
+        ranked_rows = list(cur.fetchall())
+        cur.execute(
+            _sql("DELETE FROM leaderboard_badges_current WHERE metric=? AND period=?"),
+            (LeaderboardMetric.miles.value, LeaderboardPeriod.daily.value),
+        )
+        for rank_position, row in enumerate(ranked_rows[:3], start=1):
+            normalized_badge_code = _normalized_badge_code(rank_position)
+            if not normalized_badge_code:
+                continue
+            cur.execute(
+                _sql(
+                    """
+                    INSERT INTO leaderboard_badges_current(user_id, metric, period, period_key, rank_position, badge_code, awarded_at, is_current)
+                    VALUES(?,?,?,?,?,?,?,?)
+                    ON CONFLICT(user_id, metric, period, period_key) DO UPDATE SET
+                      rank_position=excluded.rank_position,
+                      badge_code=excluded.badge_code,
+                      awarded_at=excluded.awarded_at,
+                      is_current=excluded.is_current
+                    """
+                ),
+                (
+                    int(row["user_id"]),
+                    LeaderboardMetric.miles.value,
+                    LeaderboardPeriod.daily.value,
+                    daily_bounds.period_key,
+                    rank_position,
+                    normalized_badge_code,
+                    now,
+                    _bool_db_value(True),
+                ),
+            )
+        cur.execute(_sql("SELECT COALESCE(MAX(updated_at), 0) AS max_updated_at FROM driver_daily_stats"))
+        source_row = cur.fetchone()
+        source_updated_at = int(source_row["max_updated_at"] or 0) if source_row else 0
+        cur.execute(
+            _sql(
+                """
+                INSERT INTO leaderboard_badges_refresh_state(id, daily_period_key, weekly_period_key, monthly_period_key, yearly_period_key, source_updated_at, refreshed_at)
+                VALUES(1,?,?,?,?,?,?)
+                ON CONFLICT(id) DO UPDATE SET
+                  daily_period_key=excluded.daily_period_key,
+                  weekly_period_key=excluded.weekly_period_key,
+                  monthly_period_key=excluded.monthly_period_key,
+                  yearly_period_key=excluded.yearly_period_key,
+                  source_updated_at=excluded.source_updated_at,
+                  refreshed_at=excluded.refreshed_at
+                """
+            ),
             (
-                int(row["user_id"]),
-                LeaderboardMetric.miles.value,
-                LeaderboardPeriod.daily.value,
-                board["period_key"],
-                int(row["rank_position"]),
-                _normalized_badge_code(int(row["rank_position"]), row.get("badge_code")),
+                daily_bounds.period_key,
+                weekly_bounds.period_key,
+                monthly_bounds.period_key,
+                yearly_bounds.period_key,
+                source_updated_at,
                 now,
-                _bool_db_value(True),
             ),
         )
 
-    source_row = _db_query_one("SELECT COALESCE(MAX(updated_at), 0) AS max_updated_at FROM driver_daily_stats")
-    _db_exec(
-        """
-        INSERT INTO leaderboard_badges_refresh_state(id, daily_period_key, weekly_period_key, monthly_period_key, yearly_period_key, source_updated_at, refreshed_at)
-        VALUES(1,?,?,?,?,?,?)
-        ON CONFLICT(id) DO UPDATE SET
-          daily_period_key=excluded.daily_period_key,
-          weekly_period_key=excluded.weekly_period_key,
-          monthly_period_key=excluded.monthly_period_key,
-          yearly_period_key=excluded.yearly_period_key,
-          source_updated_at=excluded.source_updated_at,
-          refreshed_at=excluded.refreshed_at
-        """,
-        (
-            current_period_bounds(LeaderboardPeriod.daily).period_key,
-            current_period_bounds(LeaderboardPeriod.weekly).period_key,
-            current_period_bounds(LeaderboardPeriod.monthly).period_key,
-            current_period_bounds(LeaderboardPeriod.yearly).period_key,
-            int(source_row["max_updated_at"] or 0) if source_row else 0,
-            now,
-        ),
-    )
+    _db_run_in_transaction(_run)
+    global _CURRENT_BADGES_LAST_REFRESH_TS
+    with _LEADERBOARD_RUNTIME_LOCK:
+        _CURRENT_BADGES_LAST_REFRESH_TS = now
+        _CURRENT_BADGES_BY_USER_CACHE.clear()
 
 
 def refresh_current_badges_if_needed(max_staleness_seconds: int = 30) -> None:
+    global _CURRENT_BADGES_LAST_REFRESH_TS
     now = int(time.time())
+    refresh_interval_seconds = max(
+        1,
+        int(max_staleness_seconds),
+        int(_CURRENT_BADGES_MIN_REFRESH_INTERVAL_SECONDS),
+    )
+    with _LEADERBOARD_RUNTIME_LOCK:
+        if now - int(_CURRENT_BADGES_LAST_REFRESH_TS) <= refresh_interval_seconds:
+            return
     expected_keys = {
         "daily_period_key": current_period_bounds(LeaderboardPeriod.daily).period_key,
         "weekly_period_key": current_period_bounds(LeaderboardPeriod.weekly).period_key,
@@ -482,14 +537,42 @@ def refresh_current_badges_if_needed(max_staleness_seconds: int = 30) -> None:
     if state:
         state_dict = dict(state)
         keys_match = all((state_dict.get(key) or "") == value for key, value in expected_keys.items())
-        recently_refreshed = now - int(state_dict.get("refreshed_at") or 0) <= max(1, int(max_staleness_seconds))
+        recently_refreshed = now - int(state_dict.get("refreshed_at") or 0) <= refresh_interval_seconds
         if keys_match and recently_refreshed:
+            with _LEADERBOARD_RUNTIME_LOCK:
+                _CURRENT_BADGES_LAST_REFRESH_TS = now
             return
-
-    refresh_current_badges()
+    with _CURRENT_BADGES_REFRESH_LOCK:
+        now_in_lock = int(time.time())
+        with _LEADERBOARD_RUNTIME_LOCK:
+            if now_in_lock - int(_CURRENT_BADGES_LAST_REFRESH_TS) <= refresh_interval_seconds:
+                return
+        state_in_lock = _db_query_one(
+            """
+            SELECT daily_period_key, weekly_period_key, monthly_period_key, yearly_period_key, source_updated_at, refreshed_at
+            FROM leaderboard_badges_refresh_state
+            WHERE id=1
+            LIMIT 1
+            """
+        )
+        if state_in_lock:
+            state_in_lock_dict = dict(state_in_lock)
+            keys_match = all((state_in_lock_dict.get(key) or "") == value for key, value in expected_keys.items())
+            recently_refreshed = now_in_lock - int(state_in_lock_dict.get("refreshed_at") or 0) <= refresh_interval_seconds
+            if keys_match and recently_refreshed:
+                with _LEADERBOARD_RUNTIME_LOCK:
+                    _CURRENT_BADGES_LAST_REFRESH_TS = now_in_lock
+                return
+        refresh_current_badges()
 
 
 def get_current_badges_for_user(user_id: int, refresh_if_needed: bool = True) -> List[Dict]:
+    now = int(time.time())
+    uid = int(user_id)
+    with _LEADERBOARD_RUNTIME_LOCK:
+        cached = _CURRENT_BADGES_BY_USER_CACHE.get(uid)
+        if cached and (now - int(cached.get("cached_at_unix") or 0)) <= _CURRENT_BADGES_CACHE_TTL_SECONDS:
+            return list(cached.get("payload") or [])
     if refresh_if_needed:
         refresh_current_badges_if_needed()
     rows = _db_query_all(
@@ -500,7 +583,7 @@ def get_current_badges_for_user(user_id: int, refresh_if_needed: bool = True) ->
         ORDER BY awarded_at DESC, rank_position ASC
         """,
         (
-            int(user_id),
+            uid,
             _bool_db_value(True),
             LeaderboardMetric.miles.value,
             LeaderboardPeriod.daily.value,
@@ -512,7 +595,23 @@ def get_current_badges_for_user(user_id: int, refresh_if_needed: bool = True) ->
         item["badge_code"] = _normalized_badge_code(int(item.get("rank_position") or 0), item.get("badge_code"))
         if item["badge_code"]:
             normalized_rows.append(item)
+    with _LEADERBOARD_RUNTIME_LOCK:
+        _CURRENT_BADGES_BY_USER_CACHE[uid] = {"payload": list(normalized_rows), "cached_at_unix": now}
     return normalized_rows
+
+
+def get_leaderboard_runtime_snapshot() -> Dict[str, Any]:
+    with _LEADERBOARD_RUNTIME_LOCK:
+        badges_cache_entries = len(_CURRENT_BADGES_BY_USER_CACHE)
+        progression_cache_entries = len(_PROGRESSION_BY_USER_CACHE)
+        last_refresh_ts = int(_CURRENT_BADGES_LAST_REFRESH_TS)
+    return {
+        "current_badges_last_refresh_ts": last_refresh_ts,
+        "current_badges_refresh_interval_seconds": int(_CURRENT_BADGES_MIN_REFRESH_INTERVAL_SECONDS),
+        "current_badges_refresh_lock_active": bool(_CURRENT_BADGES_REFRESH_LOCK.locked()),
+        "leaderboard_badges_cache_entries": badges_cache_entries,
+        "leaderboard_progression_cache_entries": progression_cache_entries,
+    }
 
 
 
