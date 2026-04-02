@@ -564,7 +564,7 @@ def refresh_current_badges_if_needed(max_staleness_seconds: int = 30) -> None:
         recently_refreshed = now - int(state_dict.get("refreshed_at") or 0) <= refresh_interval_seconds
         if keys_match and recently_refreshed:
             with _LEADERBOARD_RUNTIME_LOCK:
-                _CURRENT_BADGES_LAST_REFRESH_TS = now
+                _CURRENT_BADGES_LAST_REFRESH_TS = int(state_dict.get("refreshed_at") or now)
             return
     with _CURRENT_BADGES_REFRESH_LOCK:
         now_in_lock = int(time.time())
@@ -585,7 +585,7 @@ def refresh_current_badges_if_needed(max_staleness_seconds: int = 30) -> None:
             recently_refreshed = now_in_lock - int(state_in_lock_dict.get("refreshed_at") or 0) <= refresh_interval_seconds
             if keys_match and recently_refreshed:
                 with _LEADERBOARD_RUNTIME_LOCK:
-                    _CURRENT_BADGES_LAST_REFRESH_TS = now_in_lock
+                    _CURRENT_BADGES_LAST_REFRESH_TS = int(state_in_lock_dict.get("refreshed_at") or now_in_lock)
                 return
         refresh_current_badges()
 
