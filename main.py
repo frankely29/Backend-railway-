@@ -31,7 +31,11 @@ from hotspot_experiments import (
     log_zone_bins,
     prune_experiment_tables,
 )
-from assistant_outlook_engine import build_assistant_outlook_index, get_assistant_outlook_payload
+from assistant_outlook_engine import (
+    HORIZON_BINS_DEFAULT,
+    build_assistant_outlook_frame_bucket,
+    get_assistant_outlook_payload_from_frame_bucket,
+)
 from hotspot_scoring import score_zones
 from artifact_freshness import evaluate_artifact_freshness
 from artifact_storage_service import cleanup_artifact_storage, get_artifact_storage_report
@@ -156,8 +160,11 @@ _pickup_zone_score_cache: Dict[int, float] = {}
 _pickup_zone_hotspot_cache_lock = threading.Lock()
 _timeline_cache_entry: Dict[str, Any] = {}
 _timeline_cache_lock = threading.Lock()
-_assistant_outlook_cache_entry: Dict[str, Any] = {}
-_assistant_outlook_cache_lock = threading.Lock()
+_assistant_outlook_frame_bucket_cache: Dict[str, Dict[str, Any]] = {}
+_assistant_outlook_frame_bucket_order: deque[str] = deque()
+_assistant_outlook_frame_bucket_lock = threading.Lock()
+ASSISTANT_OUTLOOK_FRAME_BUCKET_CACHE_MAX = 6
+_assistant_outlook_legacy_artifact_pruned = False
 _frame_cache: Dict[int, Dict[str, Any]] = {}
 _frame_cache_order: deque[int] = deque()
 _frame_cache_lock = threading.Lock()
@@ -540,21 +547,12 @@ def _read_frame_cached(idx: int) -> Dict[str, Any]:
 
 def _has_assistant_outlook() -> bool:
     try:
-        if generated_artifact_present("assistant_outlook"):
-            _prune_assistant_outlook_file_if_db_ready()
-            return True
-        return _assistant_outlook_file_is_valid_json()
+        return _has_frames()
     except Exception:
         return False
 
 
 def _prune_assistant_outlook_file_if_db_ready() -> int:
-    try:
-        artifact = load_generated_artifact("assistant_outlook")
-        if not artifact:
-            return 0
-    except Exception:
-        return 0
     try:
         if not ASSISTANT_OUTLOOK_PATH.exists() or not ASSISTANT_OUTLOOK_PATH.is_file():
             return 0
@@ -601,63 +599,84 @@ def _prune_invalid_assistant_outlook_file_if_needed() -> int:
         return 0
 
 
-def _read_assistant_outlook_cached() -> Optional[Dict[str, Any]]:
-    artifact = load_generated_artifact("assistant_outlook")
-    if artifact:
-        _prune_assistant_outlook_file_if_db_ready()
-        metadata = artifact.get("metadata") or {}
-        cache_token = (
-            f"{metadata.get('updated_at_unix')}:"
-            f"{metadata.get('content_sha256')}:"
-            f"{metadata.get('payload_uncompressed_bytes')}"
-        )
-        etag = f"\"sha256:{metadata.get('content_sha256')}\""
-        with _assistant_outlook_cache_lock:
-            cached = _assistant_outlook_cache_entry
-            if cached and cached.get("cache_token") == cache_token:
-                _record_perf_metric("assistant_outlook.cache_hit")
-                return cached
-            _record_perf_metric("assistant_outlook.cache_miss")
-            _assistant_outlook_cache_entry.clear()
-            _assistant_outlook_cache_entry.update(
-                {
-                    "data": artifact.get("payload") or {},
-                    "cache_token": cache_token,
-                    "size": int(metadata.get("payload_uncompressed_bytes") or 0),
-                    "etag": etag,
-                    "source_mode": "db",
-                }
-            )
-            return dict(_assistant_outlook_cache_entry)
+def _assistant_outlook_bucket_cache_key(
+    *,
+    frame_time: str,
+    horizon_bins: int,
+    timeline_etag: str,
+    bin_minutes: int,
+) -> str:
+    return f"{str(frame_time).strip()}|{int(horizon_bins)}|{int(bin_minutes)}|{timeline_etag}"
 
+
+def _prune_legacy_assistant_outlook_artifact_if_present() -> bool:
+    global _assistant_outlook_legacy_artifact_pruned
     try:
-        stat_result = ASSISTANT_OUTLOOK_PATH.stat()
-        mtime = stat_result.st_mtime
-        size = int(stat_result.st_size)
-        etag = _etag_for_path(ASSISTANT_OUTLOOK_PATH, mtime, size)
+        if not generated_artifact_present("assistant_outlook"):
+            return False
+        delete_generated_artifact("assistant_outlook")
+        _assistant_outlook_legacy_artifact_pruned = True
+        print("[artifact-prune] deleted legacy assistant_outlook generated artifact row")
+        return True
     except Exception:
-        return None
-    with _assistant_outlook_cache_lock:
-        cached = _assistant_outlook_cache_entry
-        if cached and cached.get("mtime") == mtime and cached.get("size") == size:
-            _record_perf_metric("assistant_outlook.cache_hit")
-            return dict(cached)
-        _record_perf_metric("assistant_outlook.cache_miss")
+        traceback.print_exc()
+        return False
+
+
+def _build_assistant_outlook_frame_bucket_cached(
+    *,
+    timeline_cached: Dict[str, Any],
+    frame_time: str,
+    horizon_bins: int = HORIZON_BINS_DEFAULT,
+) -> Dict[str, Any]:
+    timeline_payload = (timeline_cached or {}).get("data") or {}
+    timeline_etag = str((timeline_cached or {}).get("etag") or "")
+    bin_minutes = int(timeline_payload.get("bin_minutes") or DEFAULT_BIN_MINUTES)
+    key = _assistant_outlook_bucket_cache_key(
+        frame_time=frame_time,
+        horizon_bins=horizon_bins,
+        timeline_etag=timeline_etag,
+        bin_minutes=bin_minutes,
+    )
+
+    with _assistant_outlook_frame_bucket_lock:
+        cached = _assistant_outlook_frame_bucket_cache.get(key)
+        if cached is not None:
+            _record_perf_metric("assistant_outlook.bucket_cache_hit")
+            try:
+                _assistant_outlook_frame_bucket_order.remove(key)
+            except ValueError:
+                pass
+            _assistant_outlook_frame_bucket_order.append(key)
+            return cached
+        _record_perf_metric("assistant_outlook.bucket_cache_miss")
+
+    bucket_payload = build_assistant_outlook_frame_bucket(
+        timeline_payload=timeline_payload,
+        frames_dir=FRAMES_DIR,
+        frame_time=frame_time,
+        horizon_bins=horizon_bins,
+    )
+    frame_bucket = bucket_payload.get("bucket") or {}
+    cached_entry = {
+        "frame_time": str(frame_time),
+        "horizon_bins": int(horizon_bins),
+        "bin_minutes": int(bin_minutes),
+        "timeline_etag": timeline_etag,
+        "frame_bucket": frame_bucket,
+        "cache_key": key,
+    }
+    with _assistant_outlook_frame_bucket_lock:
+        _assistant_outlook_frame_bucket_cache[key] = cached_entry
         try:
-            data = _read_json(ASSISTANT_OUTLOOK_PATH)
-            if not isinstance(data, dict):
-                raise ValueError("assistant_outlook file payload is not a JSON object")
-        except (json.JSONDecodeError, OSError, UnicodeDecodeError, ValueError):
-            print(f"[warn] assistant outlook file fallback invalid; ignoring: {ASSISTANT_OUTLOOK_PATH}")
-            return None
-        except Exception:
-            traceback.print_exc()
-            return None
-        _assistant_outlook_cache_entry.clear()
-        _assistant_outlook_cache_entry.update(
-            {"data": data, "mtime": mtime, "size": size, "etag": etag, "source_mode": "file_fallback"}
-        )
-        return dict(_assistant_outlook_cache_entry)
+            _assistant_outlook_frame_bucket_order.remove(key)
+        except ValueError:
+            pass
+        _assistant_outlook_frame_bucket_order.append(key)
+        while len(_assistant_outlook_frame_bucket_order) > ASSISTANT_OUTLOOK_FRAME_BUCKET_CACHE_MAX:
+            evicted_key = _assistant_outlook_frame_bucket_order.popleft()
+            _assistant_outlook_frame_bucket_cache.pop(evicted_key, None)
+    return cached_entry
 
 
 def _has_day_tendency_model() -> bool:
@@ -745,7 +764,6 @@ def _artifact_runtime_policy_snapshot() -> Dict[str, Any]:
             "frames/timeline.json",
         ],
         "db_required": [
-            "assistant_outlook",
             "day_tendency_model",
             "scoring_shadow_manifest",
         ],
@@ -765,7 +783,7 @@ def _artifact_runtime_integrity_report() -> Dict[str, Any]:
     timeline_present = TIMELINE_PATH.exists() and TIMELINE_PATH.is_file()
     required_volume_ok = parquet_count > 0 and frame_count > 0 and zones_present and timeline_present
 
-    required_db_keys = ["assistant_outlook", "day_tendency_model", "scoring_shadow_manifest"]
+    required_db_keys = ["day_tendency_model", "scoring_shadow_manifest"]
     missing_required_db_artifacts = [key for key in required_db_keys if not generated_artifact_present(key)]
     required_db_ok = len(missing_required_db_artifacts) == 0
 
@@ -806,18 +824,13 @@ def _artifact_runtime_integrity_report() -> Dict[str, Any]:
 def _reconcile_artifact_runtime_state() -> Dict[str, Any]:
     before_integrity = _artifact_runtime_integrity_report()
     repaired_flags = {
-        "assistant_outlook_rebuilt": False,
+        "assistant_outlook_legacy_pruned": False,
         "day_tendency_rebuilt": False,
     }
     deleted_paths: List[str] = []
 
-    assistant_outlook_missing = not generated_artifact_present("assistant_outlook")
-    if assistant_outlook_missing and _has_frames():
-        try:
-            _build_assistant_outlook_only()
-            repaired_flags["assistant_outlook_rebuilt"] = True
-        except Exception:
-            traceback.print_exc()
+    if _prune_legacy_assistant_outlook_artifact_if_present():
+        repaired_flags["assistant_outlook_legacy_pruned"] = True
 
     day_tendency_missing = not generated_artifact_present("day_tendency_model")
     if day_tendency_missing and len(_list_parquets()) > 0 and (DATA_DIR / "taxi_zones.geojson").exists():
@@ -1741,25 +1754,19 @@ def _build_day_tendency_only(bin_minutes: int = DEFAULT_BIN_MINUTES) -> Dict[str
 def _build_assistant_outlook_only() -> Dict[str, Any]:
     timeline_artifact = load_generated_artifact("timeline")
     if not timeline_artifact and (not TIMELINE_PATH.exists() or TIMELINE_PATH.stat().st_size <= 0):
-        raise RuntimeError("timeline.json missing. Cannot build assistant outlook index.")
-
+        raise RuntimeError("timeline.json missing. Cannot serve assistant outlook.")
     frame_paths = sorted(FRAMES_DIR.glob("frame_*.json"))
     if not frame_paths:
-        raise RuntimeError("frame artifacts missing. Cannot build assistant outlook index.")
-
-    timeline_payload = _read_json(TIMELINE_PATH)
-    if not timeline_payload and timeline_artifact:
-        timeline_payload = (timeline_artifact or {}).get("payload") or {}
-    timeline_bin_minutes = int((timeline_payload or {}).get("bin_minutes") or DEFAULT_BIN_MINUTES)
-    assistant_outlook = build_assistant_outlook_index(
-        timeline_payload=timeline_payload,
-        frames_dir=FRAMES_DIR,
-        bin_minutes=timeline_bin_minutes,
-    )
-    save_generated_artifact("assistant_outlook", assistant_outlook, compress=True)
+        raise RuntimeError("frame artifacts missing. Cannot serve assistant outlook.")
+    _prune_legacy_assistant_outlook_artifact_if_present()
     _prune_assistant_outlook_file_if_db_ready()
     _prune_redundant_db_backed_artifact_files()
-    return assistant_outlook
+    return {
+        "ok": True,
+        "mode": "on_demand_frame_bucket",
+        "timeline_present": True,
+        "frame_count": len(frame_paths),
+    }
 
 
 def _write_lock() -> None:
@@ -3359,14 +3366,8 @@ def startup():
 
         if frames_ready and freshness.get("fresh"):
             print(f"[artifact-freshness] fresh reason_codes={reason_codes}")
-            if not assistant_outlook_ready:
-                print("[warn] assistant outlook missing; rebuilding from existing frames")
-                try:
-                    _build_assistant_outlook_only()
-                    assistant_outlook_ready = _has_assistant_outlook()
-                except Exception:
-                    print("[warn] startup assistant outlook backfill failed")
-                    print(traceback.format_exc())
+            _ = assistant_outlook_ready
+            _prune_legacy_assistant_outlook_artifact_if_present()
             if not day_tendency_ready:
                 print("[warn] day tendency model missing or stale; rebuilding at startup")
                 try:
@@ -3454,7 +3455,7 @@ def status():
     assistant_outlook_file_present = ASSISTANT_OUTLOOK_PATH.exists() and ASSISTANT_OUTLOOK_PATH.stat().st_size > 0 if ASSISTANT_OUTLOOK_PATH.exists() else False
     assistant_outlook_file_bytes = int(ASSISTANT_OUTLOOK_PATH.stat().st_size) if ASSISTANT_OUTLOOK_PATH.exists() and ASSISTANT_OUTLOOK_PATH.is_file() else 0
     assistant_outlook_file_valid_json = _assistant_outlook_file_is_valid_json() if assistant_outlook_file_present else False
-    assistant_outlook_source_mode = "db" if assistant_outlook_artifact_in_db else ("file_fallback" if assistant_outlook_file_valid_json else "missing")
+    assistant_outlook_source_mode = "on_demand_frame_bucket" if _has_assistant_outlook() else "missing"
     day_tendency_file_present = DAY_TENDENCY_MODEL_PATH.exists() and DAY_TENDENCY_MODEL_PATH.stat().st_size > 0 if DAY_TENDENCY_MODEL_PATH.exists() else False
     manifest_file_present = manifest_path.exists() and manifest_path.stat().st_size > 0 if manifest_path.exists() else False
     timeline_file_present = TIMELINE_PATH.exists() and TIMELINE_PATH.stat().st_size > 0 if TIMELINE_PATH.exists() else False
@@ -3494,6 +3495,10 @@ def status():
         "assistant_outlook_file_bytes": assistant_outlook_file_bytes,
         "assistant_outlook_file_valid_json": assistant_outlook_file_valid_json,
         "assistant_outlook_source_mode": assistant_outlook_source_mode,
+        "assistant_outlook_mode": "on_demand_frame_bucket",
+        "assistant_outlook_frame_bucket_cache_entries": len(_assistant_outlook_frame_bucket_cache),
+        "assistant_outlook_legacy_artifact_present": assistant_outlook_artifact_in_db,
+        "assistant_outlook_legacy_artifact_pruned": _assistant_outlook_legacy_artifact_pruned,
         "day_tendency_file_present": day_tendency_file_present,
         "manifest_file_present": manifest_file_present,
         "timeline_file_present": timeline_file_present,
@@ -3841,36 +3846,48 @@ def assistant_outlook(
     frame_time: str,
     location_ids: str,
 ):
-    # Assistant outlook is prebuilt from artifacts; this route only performs indexed lookup.
     requested_location_ids = _parse_assistant_location_ids(location_ids)
     if not requested_location_ids:
         raise HTTPException(status_code=400, detail="location_ids is required and must include at least one id.")
 
-    cached = _read_assistant_outlook_cached()
-    if not cached:
-        if _has_frames():
-            try:
-                _build_assistant_outlook_only()
-            except Exception:
-                print("[warn] assistant outlook rebuild from existing frames failed")
-                print(traceback.format_exc())
-        cached = _read_assistant_outlook_cached()
-    if not cached:
-        raise HTTPException(
-            status_code=503,
-            detail="assistant outlook temporarily unavailable. Retry shortly or run /generate.",
-        )
-    data = cached.get("data") or {}
-    timeline = set((data.get("timeline") or []))
-    if frame_time not in timeline:
-        raise HTTPException(status_code=404, detail=f"Unknown frame_time: {frame_time}")
+    try:
+        timeline_cached = _read_timeline_cached()
+    except Exception:
+        raise HTTPException(status_code=503, detail="assistant outlook unavailable: timeline not ready")
+
+    timeline_payload = (timeline_cached or {}).get("data") or {}
+    timeline_items = [str(item) for item in (timeline_payload.get("timeline") or []) if str(item).strip()]
+    frame_key = str(frame_time or "").strip()
+    if frame_key not in set(timeline_items):
+        raise HTTPException(status_code=404, detail=f"Unknown frame_time: {frame_key}")
 
     try:
-        payload = get_assistant_outlook_payload(data, frame_time, requested_location_ids)
+        cached_bucket = _build_assistant_outlook_frame_bucket_cached(
+            timeline_cached=timeline_cached,
+            frame_time=frame_key,
+            horizon_bins=HORIZON_BINS_DEFAULT,
+        )
+        payload = get_assistant_outlook_payload_from_frame_bucket(
+            frame_bucket=cached_bucket.get("frame_bucket") or {},
+            frame_time=frame_key,
+            location_ids=requested_location_ids,
+            bin_minutes=int(cached_bucket.get("bin_minutes") or DEFAULT_BIN_MINUTES),
+            horizon_bins=int(cached_bucket.get("horizon_bins") or HORIZON_BINS_DEFAULT),
+        )
     except KeyError:
-        raise HTTPException(status_code=404, detail=f"Unknown frame_time: {frame_time}")
+        raise HTTPException(status_code=404, detail=f"Unknown frame_time: {frame_key}")
+    except (FileNotFoundError, json.JSONDecodeError, OSError, UnicodeDecodeError, ValueError) as exc:
+        print(f"[warn] assistant outlook frame bucket unavailable for frame_time={frame_key}: {exc}")
+        raise HTTPException(status_code=503, detail="assistant outlook temporarily unavailable")
+    except HTTPException:
+        raise
+    except Exception:
+        print("[warn] assistant outlook frame bucket build failed")
+        print(traceback.format_exc())
+        raise HTTPException(status_code=503, detail="assistant outlook temporarily unavailable")
 
-    return _json_cached_response(request, payload, etag=cached.get("etag"))
+    response_etag = str((timeline_cached or {}).get("etag") or "")
+    return _json_cached_response(request, payload, etag=response_etag)
 
 
 @app.get("/frame/{idx}")

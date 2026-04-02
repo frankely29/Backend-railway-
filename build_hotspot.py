@@ -16,7 +16,6 @@ from zone_earnings_engine import build_zone_earnings_shadow_sql
 from zone_geometry_metrics import build_zone_geometry_metrics_rows
 from zone_mode_profiles import ZONE_MODE_PROFILES, validate_zone_mode_profiles_for_live_engine
 from artifact_freshness import build_expected_artifact_signature
-from assistant_outlook_engine import build_assistant_outlook_index
 from artifact_db_store import save_generated_artifact
 
 logger = logging.getLogger(__name__)
@@ -1617,13 +1616,6 @@ def build_hotspots_frames(
         timeline_payload = {"timeline": timeline, "count": len(timeline)}
         # Keep timeline.json on volume for compatibility while mirroring metadata copy in DB.
         save_generated_artifact("timeline", timeline_payload, compress=False)
-        assistant_outlook_payload = build_assistant_outlook_index(
-            timeline_payload,
-            stage_dir,
-            bin_minutes=int(bin_minutes),
-        )
-        # assistant_outlook is DB-first; do not keep a file copy on volume.
-        save_generated_artifact("assistant_outlook", assistant_outlook_payload, compress=True)
         legacy_assistant_outlook_path = out_dir / "assistant_outlook.json"
         stage_assistant_outlook_path = stage_dir / "assistant_outlook.json"
         try:
@@ -1917,9 +1909,8 @@ def build_hotspots_frames(
             "frames_dir": str(out_dir),
             "rows": total_rows,
             "assistant_outlook": {
+                "mode": "on_demand_frame_bucket",
                 "path": None,
-                "version": 1,
-                "horizon_bins": 6,
             },
         }
     finally:

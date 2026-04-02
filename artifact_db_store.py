@@ -12,7 +12,6 @@ from core import DB_BACKEND, _db_exec, _db_query_all, _db_query_one
 # Do NOT store parquet files or frame_*.json blobs here (runtime serves those from volume).
 # Do NOT mix pickup_logs, leaderboard, miles/hours, or other runtime app tables here.
 ALLOWED_ARTIFACT_KEYS = {
-    "assistant_outlook",
     "day_tendency_model",
     "scoring_shadow_manifest",
     "timeline",
@@ -111,7 +110,7 @@ def ensure_generated_artifact_store_schema() -> None:
     _db_exec(
         """
         DELETE FROM generated_artifact_store
-        WHERE artifact_key NOT IN ('assistant_outlook','day_tendency_model','scoring_shadow_manifest','timeline')
+        WHERE artifact_key NOT IN ('day_tendency_model','scoring_shadow_manifest','timeline')
         """
     )
 
