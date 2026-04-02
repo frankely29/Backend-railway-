@@ -15,10 +15,11 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 try:
     import psycopg2
     from psycopg2.extras import RealDictCursor
-    from psycopg2.pool import ThreadedConnectionPool
+    from psycopg2.pool import PoolError, ThreadedConnectionPool
 except ImportError:  # pragma: no cover - exercised in runtime/test import permutations
     psycopg2 = None
     RealDictCursor = None
+    PoolError = None
     ThreadedConnectionPool = None
 from fastapi import HTTPException, Request
 
@@ -34,8 +35,8 @@ POSTGRES_URL = os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL")
 DB_BACKEND = "postgres" if POSTGRES_URL else "sqlite"
 TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "7"))
 ENFORCE_TRIAL = str(os.environ.get("ENFORCE_TRIAL", "0")).strip().lower() in ("1", "true", "yes", "on")
-POSTGRES_POOL_MIN = max(1, int(os.environ.get("POSTGRES_POOL_MIN", "1")))
-POSTGRES_POOL_MAX = max(POSTGRES_POOL_MIN, int(os.environ.get("POSTGRES_POOL_MAX", "12")))
+POSTGRES_POOL_MIN = max(1, int(os.environ.get("POSTGRES_POOL_MIN", "2")))
+POSTGRES_POOL_MAX = max(POSTGRES_POOL_MIN, int(os.environ.get("POSTGRES_POOL_MAX", "24")))
 LIVE_TOKEN_TTL_SECONDS = min(90, max(30, int(os.environ.get("LIVE_TOKEN_TTL_SECONDS", "60"))))
 
 
@@ -104,12 +105,27 @@ def _db():
     if DB_BACKEND == "postgres":
         _require_psycopg2_for_postgres()
         pool = _postgres_conn_pool()
-        conn = pool.getconn()
+        conn = _postgres_getconn_with_retry(pool)
         return _PooledPostgresConnection(conn, pool)
 
     conn = sqlite3.connect(str(COMMUNITY_DB_PATH), check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def _postgres_getconn_with_retry(pool: _ThreadedConnectionPool):
+    retry_delays_seconds = [0.0, 0.05, 0.10, 0.15, 0.20, 0.25]
+    last_pool_error = None
+    for delay in retry_delays_seconds:
+        if delay > 0:
+            time.sleep(delay)
+        try:
+            return pool.getconn()
+        except Exception as exc:
+            if PoolError is None or not isinstance(exc, PoolError):
+                raise
+            last_pool_error = exc
+    raise RuntimeError("Postgres connection pool exhausted after retries (~750ms).") from last_pool_error
 
 
 def _sql(sql: str) -> str:
@@ -149,6 +165,21 @@ def _db_query_all(sql: str, params: Tuple[Any, ...] = ()) -> List[sqlite3.Row]:
             cur = conn.cursor()
             cur.execute(_sql(sql), params)
             return list(cur.fetchall())
+        finally:
+            conn.close()
+
+
+def _db_run_in_transaction(fn):
+    with _db_lock:
+        conn = _db()
+        try:
+            cur = conn.cursor()
+            result = fn(conn, cur)
+            conn.commit()
+            return result
+        except Exception:
+            conn.rollback()
+            raise
         finally:
             conn.close()
 
