@@ -3857,8 +3857,9 @@ def assistant_outlook(
 
     timeline_payload = (timeline_cached or {}).get("data") or {}
     timeline_items = [str(item) for item in (timeline_payload.get("timeline") or []) if str(item).strip()]
+    timeline_lookup = {item: idx for idx, item in enumerate(timeline_items)}
     frame_key = str(frame_time or "").strip()
-    if frame_key not in set(timeline_items):
+    if frame_key not in timeline_lookup:
         raise HTTPException(status_code=404, detail=f"Unknown frame_time: {frame_key}")
 
     try:

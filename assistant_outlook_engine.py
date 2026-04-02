@@ -150,11 +150,13 @@ def extract_assistant_feature_payload(feature: Dict[str, Any]) -> Dict[str, Any]
 def _load_frame_features(frames_dir: Path, frame_idx: int) -> List[Dict[str, Any]]:
     frame_path = Path(frames_dir) / f"frame_{int(frame_idx):06d}.json"
     if not frame_path.exists():
-        return []
+        raise FileNotFoundError(f"missing frame artifact: {frame_path}")
     doc = json.loads(frame_path.read_text(encoding="utf-8"))
     polygons = doc.get("polygons") or {}
     features = polygons.get("features") or []
-    return features if isinstance(features, list) else []
+    if not isinstance(features, list):
+        raise ValueError(f"invalid frame artifact shape (features not a list): {frame_path}")
+    return features
 
 
 def build_zone_outlook_for_frame(
