@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Tuple
 import json
 
 # Assistant outlook contract:
@@ -242,6 +242,45 @@ def build_assistant_outlook_index(
     }
 
 
+def _timeline_items_and_index(timeline_payload: Dict[str, Any]) -> Tuple[List[str], Dict[str, int]]:
+    timeline = [str(item) for item in ((timeline_payload or {}).get("timeline") or []) if str(item).strip()]
+    by_frame_time: Dict[str, int] = {}
+    for idx, frame_time in enumerate(timeline):
+        key = str(frame_time)
+        if key and key not in by_frame_time:
+            by_frame_time[key] = idx
+    return timeline, by_frame_time
+
+
+def build_assistant_outlook_frame_bucket(
+    timeline_payload: Dict[str, Any],
+    frames_dir: Path,
+    frame_time: str,
+    *,
+    horizon_bins: int = HORIZON_BINS_DEFAULT,
+) -> Dict[str, Any]:
+    timeline, by_frame_time = _timeline_items_and_index(timeline_payload)
+    frame_key = str(frame_time or "").strip()
+    if not frame_key:
+        raise KeyError("frame_time is required")
+    frame_idx = by_frame_time.get(frame_key)
+    if frame_idx is None:
+        raise KeyError(f"frame_time not found: {frame_key}")
+
+    frame_bucket = build_zone_outlook_for_frame(
+        frame_idx=frame_idx,
+        timeline=timeline,
+        frames_dir=Path(frames_dir),
+        horizon_bins=horizon_bins,
+    )
+    return {
+        "frame_time": frame_key,
+        "frame_idx": int(frame_idx),
+        "horizon_bins": int(horizon_bins),
+        "bucket": frame_bucket,
+    }
+
+
 def get_assistant_outlook_payload(
     index: Dict[str, Any],
     frame_time: str,
@@ -280,3 +319,65 @@ def get_assistant_outlook_payload(
         "zones_by_location_id": zones_by_location_id,
         "by_location_id": by_location_id,
     }
+
+
+def get_assistant_outlook_payload_from_frame_bucket(
+    *,
+    frame_bucket: Dict[str, Dict[str, Any]],
+    frame_time: str,
+    location_ids: Iterable[Any],
+    bin_minutes: int = 20,
+    horizon_bins: int = HORIZON_BINS_DEFAULT,
+) -> Dict[str, Any]:
+    requested: List[str] = []
+    seen: set[str] = set()
+    for raw_id in location_ids or []:
+        normalized = _to_location_id_str(raw_id)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        requested.append(normalized)
+
+    zones = [frame_bucket[zone_id] for zone_id in requested if zone_id in frame_bucket]
+    zones_by_location_id = {zone.get("location_id"): zone for zone in zones if zone.get("location_id")}
+    by_location_id = {
+        location_id: (zone_payload.get("points") or [])
+        for location_id, zone_payload in zones_by_location_id.items()
+    }
+    return {
+        "frame_time": str(frame_time or "").strip(),
+        "location_ids": requested,
+        "bin_minutes": int(bin_minutes),
+        "horizon_bins": int(horizon_bins),
+        "requested_count": len(requested),
+        "returned_count": len(zones),
+        "zones": zones,
+        "items": zones,
+        "zones_by_location_id": zones_by_location_id,
+        "by_location_id": by_location_id,
+    }
+
+
+def get_assistant_outlook_payload_for_request(
+    timeline_payload: Dict[str, Any],
+    frames_dir: Path,
+    frame_time: str,
+    location_ids: Iterable[Any],
+    *,
+    bin_minutes: int = 20,
+    horizon_bins: int = HORIZON_BINS_DEFAULT,
+) -> Dict[str, Any]:
+    bucket_payload = build_assistant_outlook_frame_bucket(
+        timeline_payload=timeline_payload,
+        frames_dir=frames_dir,
+        frame_time=frame_time,
+        horizon_bins=horizon_bins,
+    )
+    frame_bucket = bucket_payload.get("bucket") or {}
+    return get_assistant_outlook_payload_from_frame_bucket(
+        frame_bucket=frame_bucket,
+        frame_time=frame_time,
+        location_ids=location_ids,
+        bin_minutes=bin_minutes,
+        horizon_bins=horizon_bins,
+    )
