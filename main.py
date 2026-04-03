@@ -6198,7 +6198,8 @@ def _recent_pickups_payload(
     except Exception:
         print("[warn] pickup zone stats helper failed", traceback.format_exc())
         zone_stats = []
-        hotspot_zone_ids = []
+        hotspot_zone_ids = list(dict.fromkeys(zone_ids_for_stats))
+        pickup_hotspot_debug["requested_zone_ids"] = hotspot_zone_ids
         hotspot_aux_errors.append("pickup_zone_stats_failed")
     try:
         zone_hotspots, pickup_hotspot_debug = _pickup_zone_hotspots_with_debug(
