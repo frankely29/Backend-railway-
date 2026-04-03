@@ -364,6 +364,40 @@ def convert_historical_components_to_emittable_shapes(
     return converted
 
 
+def _feature_or_component_metric(comp: Mapping[str, Any], *keys: str, default: float = 0.0) -> float:
+    props = comp.get("properties") if isinstance(comp, Mapping) else None
+    for key in keys:
+        value = None
+        if isinstance(comp, Mapping) and key in comp:
+            value = comp.get(key)
+        elif isinstance(props, Mapping) and key in props:
+            value = props.get(key)
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except Exception:
+            continue
+    return float(default)
+
+
+def _component_geometry_proj(comp: Mapping[str, Any]):
+    poly = comp.get("polygon_proj")
+    if poly is not None and not poly.is_empty:
+        return poly
+    geom_obj = comp.get("geometry")
+    if geom_obj is None and isinstance(comp.get("properties"), Mapping):
+        geom_obj = comp.get("properties", {}).get("geometry")
+    if geom_obj is None:
+        return None
+    try:
+        if isinstance(geom_obj, dict):
+            geom_obj = shape(geom_obj)
+        return transform(_TO_3857.transform, geom_obj)
+    except Exception:
+        return None
+
+
 def should_merge_adjacent_zone_hotspots(
     zone_a_meta: Mapping[str, Any],
     zone_b_meta: Mapping[str, Any],
@@ -388,24 +422,8 @@ def should_merge_adjacent_zone_hotspots(
     if boundary_distance_m > 60.0:
         return {"eligible": False, "reason": "zone_boundary_too_far", "boundary_distance_m": boundary_distance_m}
 
-    poly_a = comp_a.get("polygon_proj")
-    poly_b = comp_b.get("polygon_proj")
-    if (poly_a is None or poly_a.is_empty) and comp_a.get("geometry") is not None:
-        try:
-            geom_a = comp_a.get("geometry")
-            if isinstance(geom_a, dict):
-                geom_a = shape(geom_a)
-            poly_a = transform(_TO_3857.transform, geom_a)
-        except Exception:
-            poly_a = None
-    if (poly_b is None or poly_b.is_empty) and comp_b.get("geometry") is not None:
-        try:
-            geom_b = comp_b.get("geometry")
-            if isinstance(geom_b, dict):
-                geom_b = shape(geom_b)
-            poly_b = transform(_TO_3857.transform, geom_b)
-        except Exception:
-            poly_b = None
+    poly_a = _component_geometry_proj(comp_a)
+    poly_b = _component_geometry_proj(comp_b)
     if poly_a is None or poly_b is None or poly_a.is_empty or poly_b.is_empty:
         return {"eligible": False, "reason": "component_geometry_missing"}
 
@@ -430,14 +448,30 @@ def should_merge_adjacent_zone_hotspots(
     if combined_recent_count < 5:
         return {"eligible": False, "reason": "insufficient_recent_points", "combined_recent_count": combined_recent_count}
 
-    support_a = float(comp_a.get("weighted_support") or comp_a.get("weighted_point_count") or 0.0)
-    support_b = float(comp_b.get("weighted_support") or comp_b.get("weighted_point_count") or 0.0)
+    support_a = _feature_or_component_metric(
+        comp_a,
+        "weighted_support",
+        "weighted_point_count",
+        "historical_weighted_support",
+        "component_point_count",
+        "sample_size",
+        default=0.0,
+    )
+    support_b = _feature_or_component_metric(
+        comp_b,
+        "weighted_support",
+        "weighted_point_count",
+        "historical_weighted_support",
+        "component_point_count",
+        "sample_size",
+        default=0.0,
+    )
     combined_support = support_a + support_b
     if combined_support < 14.0:
         return {"eligible": False, "reason": "insufficient_historical_support", "combined_support": combined_support}
 
-    score_a = float(comp_a.get("component_score") or 0.0)
-    score_b = float(comp_b.get("component_score") or 0.0)
+    score_a = _feature_or_component_metric(comp_a, "component_score", "peak_score", "intensity", default=0.0)
+    score_b = _feature_or_component_metric(comp_b, "component_score", "peak_score", "intensity", default=0.0)
     merged_score = score_a + score_b
     if merged_score < (max(score_a, score_b) * 1.05):
         return {"eligible": False, "reason": "merged_score_not_stronger", "merged_score": merged_score}
@@ -460,24 +494,8 @@ def make_cross_zone_merged_geometry(
     zone_geom_a: Any,
     zone_geom_b: Any,
 ):
-    poly_a = comp_a.get("polygon_proj")
-    poly_b = comp_b.get("polygon_proj")
-    if (poly_a is None or poly_a.is_empty) and comp_a.get("geometry") is not None:
-        try:
-            geom_a = comp_a.get("geometry")
-            if isinstance(geom_a, dict):
-                geom_a = shape(geom_a)
-            poly_a = transform(_TO_3857.transform, geom_a)
-        except Exception:
-            poly_a = None
-    if (poly_b is None or poly_b.is_empty) and comp_b.get("geometry") is not None:
-        try:
-            geom_b = comp_b.get("geometry")
-            if isinstance(geom_b, dict):
-                geom_b = shape(geom_b)
-            poly_b = transform(_TO_3857.transform, geom_b)
-        except Exception:
-            poly_b = None
+    poly_a = _component_geometry_proj(comp_a)
+    poly_b = _component_geometry_proj(comp_b)
     if poly_a is None or poly_b is None or poly_a.is_empty or poly_b.is_empty:
         return None
 
