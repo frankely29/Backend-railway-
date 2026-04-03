@@ -5062,6 +5062,8 @@ def _build_zone_hotspot_components(
         "second_hotspot_qualified": False,
         "second_hotspot_rejected_reason": "",
         "hotspot_limit_used": 0,
+        "used_recent_sculpting": False,
+        "used_historical_fallback_shape": False,
     }
     zone_geom = zone_meta.get("geometry")
     if zone_geom is None or zone_geom.is_empty:
@@ -5096,6 +5098,13 @@ def _build_zone_hotspot_components(
         zone_geom,
         frame_time,
     )
+    used_recent_sculpting = bool(recent_components)
+    weak_recent_sculpting = False
+    if recent_components:
+        peak_recent_strength = max(float(c.get("recent_shape_component") or 0.0) for c in recent_components)
+        weak_recent_sculpting = peak_recent_strength < 0.12
+    if weak_recent_sculpting:
+        recent_components = []
     using_historical_fallback = False
     if not recent_components:
         recent_components = convert_historical_components_to_emittable_shapes(
@@ -5175,6 +5184,8 @@ def _build_zone_hotspot_components(
 
     debug["second_hotspot_qualified"] = len(emitted) > 1
     debug["emitted_hotspot_count"] = len(emitted)
+    debug["used_recent_sculpting"] = bool(used_recent_sculpting and not using_historical_fallback)
+    debug["used_historical_fallback_shape"] = bool(using_historical_fallback)
     debug["historical_only_fallback"] = bool(using_historical_fallback)
     return emitted, debug
 
@@ -5628,26 +5639,41 @@ def _pickup_zone_density_penalty(zone_ids: List[int]) -> Dict[int, float]:
 
 
 def should_emit_zone_hotspot(
-    zone_id: int,
     zone_score: Any,
     historical_anchor_points: List[Dict[str, Any]],
     historical_components: List[Dict[str, Any]],
-    recent_points: List[Dict[str, Any]],
-) -> Tuple[bool, str]:
-    _ = zone_id
-    _ = recent_points
+) -> bool:
     if zone_score is None:
-        return False, "missing_zone_score"
+        return False
     if not bool(getattr(zone_score, "recommended", False)):
-        return False, "zone_not_recommended"
+        return False
     if len(historical_anchor_points) >= PICKUP_ZONE_HOTSPOT_MIN_POINTS:
-        return True, "historical_anchor_points_threshold"
+        return True
     strongest_weighted = max(
         [float(c.get("weighted_point_count") or 0.0) for c in historical_components if isinstance(c, dict)] or [0.0]
     )
     if historical_components and strongest_weighted >= 5.0:
-        return True, "historical_component_support_threshold"
-    return False, "insufficient_historical_support"
+        return True
+    return False
+
+
+def _zone_hotspot_skip_reason(
+    zone_score: Any,
+    historical_anchor_points: List[Dict[str, Any]],
+    historical_components: List[Dict[str, Any]],
+) -> str:
+    if zone_score is None:
+        return "missing_zone_score"
+    if not bool(getattr(zone_score, "recommended", False)):
+        return "zone_not_recommended"
+    if len(historical_anchor_points) >= PICKUP_ZONE_HOTSPOT_MIN_POINTS:
+        return ""
+    strongest_weighted = max(
+        [float(c.get("weighted_point_count") or 0.0) for c in historical_components if isinstance(c, dict)] or [0.0]
+    )
+    if historical_components and strongest_weighted >= 5.0:
+        return ""
+    return "insufficient_historical_support"
 
 
 def _pickup_zone_hotspots_with_debug(
@@ -5779,12 +5805,15 @@ def _pickup_zone_hotspots_with_debug(
                 cell_size_m=float(PICKUP_ZONE_HOTSPOT_CELL_SIZE_M),
                 simplify_m=float(PICKUP_ZONE_HOTSPOT_SIMPLIFY_M),
             )
-        qualified, qualification_reason = should_emit_zone_hotspot(
-            zone_id=zone_id,
+        qualified = should_emit_zone_hotspot(
             zone_score=score,
             historical_anchor_points=historical_anchor_points,
             historical_components=historical_components,
-            recent_points=pts,
+        )
+        skipped_reason = _zone_hotspot_skip_reason(
+            zone_score=score,
+            historical_anchor_points=historical_anchor_points,
+            historical_components=historical_components,
         )
         hotspot_limit = determine_zone_hotspot_limit(
             zone_data.get("geometry") if zone_data else None,
@@ -5799,9 +5828,11 @@ def _pickup_zone_hotspots_with_debug(
                 "zone_name": (zone_data or {}).get("zone_name") or "",
                 "borough": (zone_data or {}).get("borough") or "",
                 "point_count": len(pts),
+                "recent_point_count": len(pts),
                 "historical_anchor_point_count": len(historical_anchor_points),
                 "historical_component_count": len(historical_components),
-                "qualification_reason": qualification_reason,
+                "qualified_by_historical_support": qualified,
+                "skipped_reason": skipped_reason,
                 "qualified": qualified,
                 "geometry_found": bool(zone_data),
                 "cached_hit": False,
@@ -5812,6 +5843,8 @@ def _pickup_zone_hotspots_with_debug(
                 "feature_emitted": False,
                 "micro_hotspot_count": 0,
                 "hotspot_method": "none",
+                "used_recent_sculpting": False,
+                "used_historical_fallback_shape": False,
                 "signature": signature,
                 "errors": [],
             }
@@ -5822,6 +5855,7 @@ def _pickup_zone_hotspots_with_debug(
         if not zone_data:
             if zone_debug is not None:
                 zone_debug["errors"].append("geometry_missing")
+                zone_debug["skipped_reason"] = zone_debug.get("skipped_reason") or "geometry_missing"
             continue
 
         zone_features: List[Dict[str, Any]] = []
@@ -5891,6 +5925,8 @@ def _pickup_zone_hotspots_with_debug(
 
         if zone_debug is not None and zone_component_debug:
             zone_debug.update(zone_component_debug)
+            if zone_debug.get("emitted_hotspot_count", 0) <= 0 and not zone_debug.get("skipped_reason"):
+                zone_debug["skipped_reason"] = zone_component_debug.get("second_hotspot_rejected_reason") or ""
 
         if not zone_features:
             with _pickup_zone_hotspot_cache_lock:
