@@ -100,5 +100,10 @@ def score_zones(
             weighted_trip_count=adjusted_live,
             unique_driver_count=unique_driver_count,
             recommended=recommended,
+            merged=False,
+            merged_zone_count=1,
+            hotspot_method="historical_anchor_sculpted",
+            merged_zone_ids=None,
+            covered_zone_ids=[int(zid)],
         )
     return out

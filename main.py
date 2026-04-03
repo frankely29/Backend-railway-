@@ -39,6 +39,7 @@ from assistant_outlook_engine import (
 from hotspot_scoring import score_zones
 from pickup_hotspot_intelligence import (
     build_hotspot_quality_modifier,
+    convert_historical_components_to_emittable_shapes,
     build_zone_historical_anchor_components,
     build_zone_historical_anchor_points,
     determine_zone_hotspot_limit,
@@ -2666,7 +2667,7 @@ def _db_init() -> None:
               outcome_modifier DOUBLE PRECISION NOT NULL DEFAULT 1,
               quality_modifier DOUBLE PRECISION NOT NULL DEFAULT 1,
               saturation_modifier DOUBLE PRECISION NOT NULL DEFAULT 1,
-              hotspot_limit_used INTEGER NOT NULL DEFAULT 2,
+              hotspot_limit_used INTEGER NOT NULL DEFAULT 0,
               density_penalty DOUBLE PRECISION NOT NULL,
               weighted_trip_count DOUBLE PRECISION NOT NULL,
               unique_driver_count INTEGER NOT NULL,
@@ -2681,7 +2682,7 @@ def _db_init() -> None:
         _try_alter("ALTER TABLE hotspot_experiment_bins ADD COLUMN outcome_modifier DOUBLE PRECISION NOT NULL DEFAULT 1;", "ALTER TABLE hotspot_experiment_bins ADD COLUMN IF NOT EXISTS outcome_modifier DOUBLE PRECISION NOT NULL DEFAULT 1;")
         _try_alter("ALTER TABLE hotspot_experiment_bins ADD COLUMN quality_modifier DOUBLE PRECISION NOT NULL DEFAULT 1;", "ALTER TABLE hotspot_experiment_bins ADD COLUMN IF NOT EXISTS quality_modifier DOUBLE PRECISION NOT NULL DEFAULT 1;")
         _try_alter("ALTER TABLE hotspot_experiment_bins ADD COLUMN saturation_modifier DOUBLE PRECISION NOT NULL DEFAULT 1;", "ALTER TABLE hotspot_experiment_bins ADD COLUMN IF NOT EXISTS saturation_modifier DOUBLE PRECISION NOT NULL DEFAULT 1;")
-        _try_alter("ALTER TABLE hotspot_experiment_bins ADD COLUMN hotspot_limit_used INTEGER NOT NULL DEFAULT 2;", "ALTER TABLE hotspot_experiment_bins ADD COLUMN IF NOT EXISTS hotspot_limit_used INTEGER NOT NULL DEFAULT 2;")
+        _try_alter("ALTER TABLE hotspot_experiment_bins ADD COLUMN hotspot_limit_used INTEGER NOT NULL DEFAULT 0;", "ALTER TABLE hotspot_experiment_bins ADD COLUMN IF NOT EXISTS hotspot_limit_used INTEGER NOT NULL DEFAULT 0;")
 
         _db_exec(
             """
@@ -2961,7 +2962,7 @@ def _db_init() -> None:
           outcome_modifier REAL NOT NULL DEFAULT 1,
           quality_modifier REAL NOT NULL DEFAULT 1,
           saturation_modifier REAL NOT NULL DEFAULT 1,
-          hotspot_limit_used INTEGER NOT NULL DEFAULT 2,
+          hotspot_limit_used INTEGER NOT NULL DEFAULT 0,
           density_penalty REAL NOT NULL,
           weighted_trip_count REAL NOT NULL,
           unique_driver_count INTEGER NOT NULL,
@@ -2976,7 +2977,7 @@ def _db_init() -> None:
     _try_alter("ALTER TABLE hotspot_experiment_bins ADD COLUMN outcome_modifier REAL NOT NULL DEFAULT 1;")
     _try_alter("ALTER TABLE hotspot_experiment_bins ADD COLUMN quality_modifier REAL NOT NULL DEFAULT 1;")
     _try_alter("ALTER TABLE hotspot_experiment_bins ADD COLUMN saturation_modifier REAL NOT NULL DEFAULT 1;")
-    _try_alter("ALTER TABLE hotspot_experiment_bins ADD COLUMN hotspot_limit_used INTEGER NOT NULL DEFAULT 2;")
+    _try_alter("ALTER TABLE hotspot_experiment_bins ADD COLUMN hotspot_limit_used INTEGER NOT NULL DEFAULT 0;")
 
     _db_exec(
         """
@@ -5046,6 +5047,10 @@ def _build_zone_hotspot_components(
     zone_meta: Dict[str, Any],
     point_rows: List[Dict[str, Any]],
     fallback: bool = False,
+    *,
+    frame_time: Optional[int] = None,
+    historical_anchor_points: Optional[List[Dict[str, Any]]] = None,
+    historical_components: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     debug: Dict[str, Any] = {
         "candidate_component_count": 0,
@@ -5056,7 +5061,7 @@ def _build_zone_hotspot_components(
         "component_point_counts": [],
         "second_hotspot_qualified": False,
         "second_hotspot_rejected_reason": "",
-        "hotspot_limit_used": 2,
+        "hotspot_limit_used": 0,
     }
     zone_geom = zone_meta.get("geometry")
     if zone_geom is None or zone_geom.is_empty:
@@ -5064,17 +5069,13 @@ def _build_zone_hotspot_components(
         return [], debug
 
     long_run_points = _pickup_zone_long_run_points(zone_id)
-    frame_time = int(time.time())
-    anchor_points = build_zone_historical_anchor_points(
+    frame_time = int(frame_time or time.time())
+    anchor_points = historical_anchor_points if historical_anchor_points is not None else build_zone_historical_anchor_points(
         pickup_rows=long_run_points,
         frame_time=frame_time,
         bin_minutes=HOTSPOT_TIMESLOT_BIN_MINUTES,
     )
-    if len(anchor_points) < PICKUP_ZONE_HOTSPOT_MIN_POINTS:
-        debug["second_hotspot_rejected_reason"] = "not_enough_historical_anchor_points"
-        return [], debug
-
-    historical_components = build_zone_historical_anchor_components(
+    historical_components = historical_components if historical_components is not None else build_zone_historical_anchor_components(
         zone_id=zone_id,
         zone_geom=zone_geom,
         weighted_points=anchor_points,
@@ -5095,8 +5096,15 @@ def _build_zone_hotspot_components(
         zone_geom,
         frame_time,
     )
+    using_historical_fallback = False
     if not recent_components:
-        debug["second_hotspot_rejected_reason"] = "recent_shape_sculpt_failed"
+        recent_components = convert_historical_components_to_emittable_shapes(
+            historical_components[: max(3, hotspot_limit)],
+            zone_geom,
+        )
+        using_historical_fallback = bool(recent_components)
+    if not recent_components:
+        debug["second_hotspot_rejected_reason"] = "historical_shape_fallback_failed"
         return [], debug
 
     debug["candidate_component_count"] = len(recent_components)
@@ -5132,7 +5140,7 @@ def _build_zone_hotspot_components(
                     "borough": borough,
                     "hotspot_index": hotspot_index,
                     "hotspot_id": hotspot_id,
-                    "hotspot_method": "historical_anchor_sculpted",
+                    "hotspot_method": "historical_anchor_only" if using_historical_fallback else "historical_anchor_sculpted",
                     "covered_zone_ids": [zone_id],
                     "covered_zone_names": [zone_name],
                     "merged": False,
@@ -5153,6 +5161,7 @@ def _build_zone_hotspot_components(
                     "min_points": PICKUP_ZONE_HOTSPOT_MIN_POINTS,
                     "micro_hotspots": [],
                     "recent_shape_component": float(comp.get("recent_shape_component") or 0.0),
+                    "historical_only_fallback": bool(using_historical_fallback),
                     "outcome_modifier": float(outcome["modifier"]),
                     "quality_modifier": float(quality["quality_modifier"]),
                     "saturation_modifier": max(0.5, 1.0 - float(quality["saturation_penalty"])),
@@ -5166,6 +5175,7 @@ def _build_zone_hotspot_components(
 
     debug["second_hotspot_qualified"] = len(emitted) > 1
     debug["emitted_hotspot_count"] = len(emitted)
+    debug["historical_only_fallback"] = bool(using_historical_fallback)
     return emitted, debug
 
 
@@ -5617,6 +5627,29 @@ def _pickup_zone_density_penalty(zone_ids: List[int]) -> Dict[int, float]:
     return out
 
 
+def should_emit_zone_hotspot(
+    zone_id: int,
+    zone_score: Any,
+    historical_anchor_points: List[Dict[str, Any]],
+    historical_components: List[Dict[str, Any]],
+    recent_points: List[Dict[str, Any]],
+) -> Tuple[bool, str]:
+    _ = zone_id
+    _ = recent_points
+    if zone_score is None:
+        return False, "missing_zone_score"
+    if not bool(getattr(zone_score, "recommended", False)):
+        return False, "zone_not_recommended"
+    if len(historical_anchor_points) >= PICKUP_ZONE_HOTSPOT_MIN_POINTS:
+        return True, "historical_anchor_points_threshold"
+    strongest_weighted = max(
+        [float(c.get("weighted_point_count") or 0.0) for c in historical_components if isinstance(c, dict)] or [0.0]
+    )
+    if historical_components and strongest_weighted >= 5.0:
+        return True, "historical_component_support_threshold"
+    return False, "insufficient_historical_support"
+
+
 def _pickup_zone_hotspots_with_debug(
     zone_ids: List[int],
     include_debug: bool = False,
@@ -5730,7 +5763,35 @@ def _pickup_zone_hotspots_with_debug(
         zone_data = zone_geoms.get(zone_id)
         signature = zone_signatures.get(zone_id) or _pickup_zone_signature([])
         score = zone_scores.get(zone_id)
-        qualified = len(pts) >= PICKUP_ZONE_HOTSPOT_MIN_POINTS and bool(score and score.recommended)
+        frame_time = now_ts
+        long_run_points = _pickup_zone_long_run_points(zone_id)
+        historical_anchor_points = build_zone_historical_anchor_points(
+            pickup_rows=long_run_points,
+            frame_time=frame_time,
+            bin_minutes=HOTSPOT_TIMESLOT_BIN_MINUTES,
+        )
+        historical_components: List[Dict[str, Any]] = []
+        if zone_data and zone_data.get("geometry") is not None:
+            historical_components = build_zone_historical_anchor_components(
+                zone_id=zone_id,
+                zone_geom=zone_data.get("geometry"),
+                weighted_points=historical_anchor_points,
+                cell_size_m=float(PICKUP_ZONE_HOTSPOT_CELL_SIZE_M),
+                simplify_m=float(PICKUP_ZONE_HOTSPOT_SIMPLIFY_M),
+            )
+        qualified, qualification_reason = should_emit_zone_hotspot(
+            zone_id=zone_id,
+            zone_score=score,
+            historical_anchor_points=historical_anchor_points,
+            historical_components=historical_components,
+            recent_points=pts,
+        )
+        hotspot_limit = determine_zone_hotspot_limit(
+            zone_data.get("geometry") if zone_data else None,
+            historical_components,
+        )
+        if score is not None:
+            score.hotspot_limit_used = int(hotspot_limit)
         zone_debug: Optional[Dict[str, Any]] = None
         if include_debug:
             zone_debug = {
@@ -5738,6 +5799,9 @@ def _pickup_zone_hotspots_with_debug(
                 "zone_name": (zone_data or {}).get("zone_name") or "",
                 "borough": (zone_data or {}).get("borough") or "",
                 "point_count": len(pts),
+                "historical_anchor_point_count": len(historical_anchor_points),
+                "historical_component_count": len(historical_components),
+                "qualification_reason": qualification_reason,
                 "qualified": qualified,
                 "geometry_found": bool(zone_data),
                 "cached_hit": False,
@@ -5785,7 +5849,15 @@ def _pickup_zone_hotspots_with_debug(
             if zone_debug is not None:
                 zone_debug["primary_attempted"] = True
             try:
-                zone_features, zone_component_debug = _build_zone_hotspot_components(zone_id, zone_data, pts, fallback=False)
+                zone_features, zone_component_debug = _build_zone_hotspot_components(
+                    zone_id,
+                    zone_data,
+                    pts,
+                    fallback=False,
+                    frame_time=frame_time,
+                    historical_anchor_points=historical_anchor_points,
+                    historical_components=historical_components,
+                )
                 if zone_debug is not None:
                     zone_debug["primary_ok"] = bool(zone_features)
                     if zone_features:
@@ -5799,7 +5871,15 @@ def _pickup_zone_hotspots_with_debug(
             if zone_debug is not None:
                 zone_debug["fallback_attempted"] = True
             try:
-                zone_features, zone_component_debug = _build_zone_hotspot_components(zone_id, zone_data, pts, fallback=True)
+                zone_features, zone_component_debug = _build_zone_hotspot_components(
+                    zone_id,
+                    zone_data,
+                    pts,
+                    fallback=True,
+                    frame_time=frame_time,
+                    historical_anchor_points=historical_anchor_points,
+                    historical_components=historical_components,
+                )
                 if zone_debug is not None:
                     zone_debug["fallback_ok"] = bool(zone_features)
                     if zone_features:
@@ -5883,7 +5963,7 @@ def _pickup_zone_hotspots_with_debug(
             "properties": merged_props,
             "_hotspot_proj": merged.get("merged_geometry_proj"),
         }
-        zone_features_map[zone_a][0] = merged_feature
+        zone_features_map[zone_a] = [merged_feature]
         zone_features_map[zone_b] = [copy.deepcopy(merged_feature)]
         used_merge_zones.update({zone_a, zone_b})
 
@@ -5962,7 +6042,14 @@ def _pickup_zone_hotspots_with_debug(
             zone_debug["merged"] = any(bool((f.get("properties") or {}).get("merged")) for f in zone_features)
             zone_debug["merged_zone_count"] = 2 if zone_debug["merged"] else 1
             if zone_features:
-                zone_debug["hotspot_method"] = (zone_features[0].get("properties") or {}).get("hotspot_method", zone_debug["hotspot_method"])
+                first_props = zone_features[0].get("properties") or {}
+                zone_debug["hotspot_method"] = first_props.get("hotspot_method", zone_debug["hotspot_method"])
+                zone_debug["merged_zone_ids"] = first_props.get("merged_zone_ids") or [zone_id]
+                zone_debug["covered_zone_ids"] = first_props.get("covered_zone_ids") or [zone_id]
+                zone_debug["outcome_modifier"] = first_props.get("outcome_modifier")
+                zone_debug["quality_modifier"] = first_props.get("quality_modifier")
+                zone_debug["saturation_modifier"] = first_props.get("saturation_modifier")
+                zone_debug["hotspot_limit_used"] = first_props.get("hotspot_limit_used")
             if zone_features:
                 debug["rendered_zone_ids"].append(zone_id)
             debug["zones"].append(zone_debug)
