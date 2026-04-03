@@ -4836,7 +4836,6 @@ def _normalize_pickup_zone_point_entries(point_rows: List[Dict[str, Any]]) -> Li
         )
     return point_entries
 
-
 def _build_density_components(
     zone_proj: Any,
     point_entries: List[Dict[str, Any]],
@@ -4968,7 +4967,6 @@ def _build_density_components(
         "cell_size": cell_size,
     }
 
-
 def _shape_hotspot_component(component: Dict[str, Any], zone_proj: Any) -> Optional[Any]:
     base_geom = component.get("geometry")
     if base_geom is None or base_geom.is_empty:
@@ -5000,7 +4998,6 @@ def _shape_hotspot_component(component: Dict[str, Any], zone_proj: Any) -> Optio
         if not clipped2.is_empty:
             clipped = clipped2
     return clipped
-
 
 def _hotspot_merge_decision(candidate_components: List[Dict[str, Any]], selected_cells: set[Tuple[int, int]]) -> Tuple[bool, str]:
     if len(candidate_components) < 2:
@@ -5040,171 +5037,207 @@ def _hotspot_merge_decision(candidate_components: List[Dict[str, Any]], selected
                                 return True, "density_bridge"
     return False, "separate"
 
-
 def _build_zone_hotspot_components(
     zone_id: int,
     zone_meta: Dict[str, Any],
     point_rows: List[Dict[str, Any]],
     fallback: bool = False,
-    *,
-    frame_time: Optional[int] = None,
-    historical_anchor_points: Optional[List[Dict[str, Any]]] = None,
-    historical_components: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     debug: Dict[str, Any] = {
         "candidate_component_count": 0,
         "emitted_hotspot_count": 0,
         "merged": False,
-        "merge_reason": "historical_anchor_model",
+        "merge_reason": "none",
         "hotspot_ids": [],
         "component_point_counts": [],
         "second_hotspot_qualified": False,
         "second_hotspot_rejected_reason": "",
-        "hotspot_limit_used": 0,
-        "used_recent_sculpting": False,
-        "used_historical_fallback_shape": False,
     }
+    if len(point_rows) < PICKUP_ZONE_HOTSPOT_MIN_POINTS:
+        debug["second_hotspot_rejected_reason"] = "zone_below_min_points"
+        return [], debug
+
     zone_geom = zone_meta.get("geometry")
     if zone_geom is None or zone_geom.is_empty:
         debug["second_hotspot_rejected_reason"] = "zone_geometry_missing"
         return [], debug
 
-    long_run_points = _pickup_zone_long_run_points(zone_id)
-    frame_time = int(frame_time or time.time())
-    anchor_points = historical_anchor_points if historical_anchor_points is not None else build_zone_historical_anchor_points(
-        pickup_rows=long_run_points,
-        frame_time=frame_time,
-        bin_minutes=HOTSPOT_TIMESLOT_BIN_MINUTES,
-    )
-    historical_components = historical_components if historical_components is not None else build_zone_historical_anchor_components(
-        zone_id=zone_id,
-        zone_geom=zone_geom,
-        weighted_points=anchor_points,
-        cell_size_m=float(PICKUP_ZONE_HOTSPOT_CELL_SIZE_M),
-        simplify_m=float(PICKUP_ZONE_HOTSPOT_SIMPLIFY_M),
-    )
-    hotspot_limit = determine_zone_hotspot_limit(zone_geom, historical_components)
-    debug["hotspot_limit_used"] = hotspot_limit
-
-    recent_rows = point_rows[:]
-    recent_components: List[Dict[str, Any]] = []
-    if historical_components:
-        recent_components = sculpt_hotspot_shapes_from_recent_points(
-            historical_components[: max(3, hotspot_limit)],
-            recent_rows,
-            zone_geom,
-            frame_time,
-        )
-    used_recent_sculpting = bool(recent_components)
-    weak_recent_sculpting = False
-    if recent_components:
-        peak_recent_strength = max(float(c.get("recent_shape_component") or 0.0) for c in recent_components)
-        weak_recent_sculpting = peak_recent_strength < 0.12
-    if weak_recent_sculpting:
-        recent_components = []
-    using_historical_fallback = False
-    if not recent_components and historical_components:
-        recent_components = convert_historical_components_to_emittable_shapes(
-            historical_components[: max(3, hotspot_limit)],
-            zone_geom,
-        )
-        using_historical_fallback = bool(recent_components)
-    used_recent_cluster_fallback = False
-    if not recent_components:
-        recent_components = _build_recent_cluster_components_for_zone(zone_id, zone_meta, recent_rows)
-        used_recent_cluster_fallback = bool(recent_components)
-    if not recent_components:
-        debug["second_hotspot_rejected_reason"] = "no_emittable_historical_or_recent_clusters"
+    try:
+        zone_proj = transform(_to_3857.transform, zone_geom)
+    except Exception:
+        debug["second_hotspot_rejected_reason"] = "zone_projection_failed"
+        return [], debug
+    if zone_proj.is_empty:
+        debug["second_hotspot_rejected_reason"] = "zone_projection_empty"
         return [], debug
 
-    debug["candidate_component_count"] = len(recent_components)
-    debug["component_point_counts"] = [int(c.get("point_count") or 0) for c in recent_components[:3]]
+    point_entries = _normalize_pickup_zone_point_entries(point_rows)
+    if len(point_entries) < PICKUP_ZONE_HOTSPOT_MIN_POINTS:
+        debug["second_hotspot_rejected_reason"] = "not_enough_valid_points"
+        return [], debug
 
+    build = _build_density_components(zone_proj, point_entries, threshold_ratio=0.48)
+    components = build.get("components") or []
+    selected_cells = build.get("selected") or set()
+    if fallback or not components:
+        fallback_groups: List[Dict[str, Any]] = []
+        by_cell: Dict[Tuple[int, int], List[Dict[str, Any]]] = defaultdict(list)
+        cell_size = max(90.0, float(PICKUP_ZONE_HOTSPOT_CELL_SIZE_M))
+        minx, miny, _, _ = zone_proj.bounds
+        for pe in point_entries:
+            gx = int(math.floor((pe["x"] - minx) / cell_size))
+            gy = int(math.floor((pe["y"] - miny) / cell_size))
+            by_cell[(gx, gy)].append(pe)
+        if by_cell:
+            seeds = sorted(by_cell.items(), key=lambda kv: len(kv[1]), reverse=True)[:2]
+            for _, seed_points in seeds:
+                sx = sum(p["x"] for p in seed_points) / len(seed_points)
+                sy = sum(p["y"] for p in seed_points) / len(seed_points)
+                members: List[Dict[str, Any]] = []
+                for pe in point_entries:
+                    if Point(pe["x"], pe["y"]).distance(Point(sx, sy)) <= 320.0:
+                        members.append(pe)
+                if not members:
+                    continue
+                geom = unary_union([Point(p["x"], p["y"]).buffer(max(115.0, 75.0 + 12.0 * len(members))) for p in members]).intersection(zone_proj)
+                if geom.is_empty:
+                    continue
+                fallback_groups.append(
+                    {
+                        "cells": set(),
+                        "component_score": float(sum(p["weight"] for p in members)),
+                        "peak_score": float(max((p["weight"] for p in members), default=0.0)),
+                        "point_count": len(members),
+                        "geometry": geom,
+                    }
+                )
+        components = sorted(
+            fallback_groups,
+            key=lambda c: (float(c.get("component_score") or 0.0), int(c.get("point_count") or 0)),
+            reverse=True,
+        )
+        selected_cells = set()
+
+    if not components:
+        debug["second_hotspot_rejected_reason"] = "no_components"
+        return [], debug
+
+    debug["candidate_component_count"] = len(components)
+    debug["component_point_counts"] = [int(c.get("point_count") or 0) for c in components[:2]]
+
+    strongest = components[0]
+    top_components: List[Dict[str, Any]] = [strongest]
+    if len(components) > 1:
+        second = components[1]
+        second_ok = True
+        second_reason = ""
+        if len(point_entries) < PICKUP_ZONE_SECOND_HOTSPOT_MIN_POINTS:
+            second_ok = False
+            second_reason = "zone_points_below_second_threshold"
+        elif int(second.get("point_count") or 0) < PICKUP_ZONE_SECOND_COMPONENT_MIN_POINTS:
+            second_ok = False
+            second_reason = "second_component_low_point_count"
+        else:
+            s0 = max(0.0001, float(strongest.get("component_score") or 0.0001))
+            s1 = float(second.get("component_score") or 0.0)
+            if (s1 / s0) < PICKUP_ZONE_SECOND_COMPONENT_MIN_SCORE_RATIO:
+                second_ok = False
+                second_reason = "second_component_low_strength"
+        if second_ok:
+            debug["second_hotspot_qualified"] = True
+            top_components.append(second)
+        else:
+            debug["second_hotspot_rejected_reason"] = second_reason
+
+    shaped_candidates: List[Dict[str, Any]] = []
+    for rank, comp in enumerate(top_components):
+        shaped = _shape_hotspot_component(comp, zone_proj)
+        if shaped is None or shaped.is_empty:
+            continue
+        shaped_candidates.append({**comp, "polygon": shaped, "component_rank": rank})
+
+    if not shaped_candidates:
+        debug["second_hotspot_rejected_reason"] = "component_shaping_failed"
+        return [], debug
+
+    merged, merge_reason = _hotspot_merge_decision(shaped_candidates, selected_cells)
+    debug["merged"] = merged
+    debug["merge_reason"] = merge_reason
+
+    final_components: List[Dict[str, Any]] = []
+    if merged and len(shaped_candidates) > 1:
+        merged_geom = unary_union([c["polygon"] for c in shaped_candidates]).intersection(zone_proj)
+        if not merged_geom.is_empty:
+            merged_component = {
+                "polygon": merged_geom,
+                "component_score": sum(float(c.get("component_score") or 0.0) for c in shaped_candidates),
+                "peak_score": max(float(c.get("peak_score") or 0.0) for c in shaped_candidates),
+                "point_count": sum(int(c.get("point_count") or 0) for c in shaped_candidates),
+                "component_rank": 0,
+                "merged_from_count": len(shaped_candidates),
+                "cells": set().union(*[c.get("cells") or set() for c in shaped_candidates]),
+            }
+            final_components = [merged_component]
+    if not final_components:
+        for c in shaped_candidates[:2]:
+            final_components.append({**c, "merged_from_count": 1})
+
+    latest_created_at = max((int(p.get("created_at") or 0) for p in point_entries), default=0)
+    sample_size = len(point_entries)
     zone_name = zone_meta.get("zone_name") or ((point_rows[0].get("zone_name") if point_rows else "") or "")
     borough = zone_meta.get("borough") or ((point_rows[0].get("borough") if point_rows else "") or "")
-    latest_created_at = max((int(p.get("created_at") or 0) for p in point_rows), default=0)
+    signature = _pickup_zone_signature(point_rows)
 
     emitted: List[Dict[str, Any]] = []
-    for hotspot_index, comp in enumerate(recent_components[:hotspot_limit]):
-        hotspot_geom = comp.get("geometry")
-        if hotspot_geom is None or hotspot_geom.is_empty:
+    for hotspot_index, comp in enumerate(final_components[:2]):
+        polygon = comp.get("polygon")
+        if polygon is None or polygon.is_empty:
             continue
-        hotspot_id = str(comp.get("anchor_id") or f"zone:{zone_id}:anchor:{hotspot_index}")
-        outcome = get_zone_or_hotspot_outcome_modifier(_recent_recommendation_outcomes(zone_id, hotspot_id), min_samples=6)
-        quality = build_hotspot_quality_modifier(
-            short_trip_share=0.0,
-            continuation_score=min(1.0, float(comp.get("recent_shape_component") or 0.0)),
-            saturation=min(1.0, len(point_rows) / 40.0),
-            borough=borough,
-        )
-
-        base_intensity = float(comp.get("intensity") or 0.25)
-        final_intensity = max(0.18, min(1.0, base_intensity * float(outcome["modifier"]) * float(quality["quality_modifier"])))
-        base_confidence = float(comp.get("confidence") or 0.35)
-        final_confidence = max(0.25, min(1.0, base_confidence * float(outcome["modifier"])))
+        hotspot_ll = transform(_to_4326.transform, polygon)
+        if hotspot_ll.is_empty:
+            continue
+        component_score = float(comp.get("component_score") or 0.0)
+        peak_score = max(0.0001, float(comp.get("peak_score") or 0.0001))
+        intensity = min(1.0, max(0.22, peak_score / max(0.75, 0.45 * sample_size)))
+        hotspot_id = f"{zone_id}:{signature[:12]}:{hotspot_index}"
         emitted.append(
             {
                 "type": "Feature",
-                "geometry": mapping(hotspot_geom),
+                "geometry": mapping(hotspot_ll),
                 "properties": {
                     "zone_id": zone_id,
                     "zone_name": zone_name,
                     "borough": borough,
                     "hotspot_index": hotspot_index,
                     "hotspot_id": hotspot_id,
-                    "hotspot_method": (
-                        "recent_cluster_only"
-                        if used_recent_cluster_fallback
-                        else ("historical_anchor_only" if using_historical_fallback else "historical_anchor_sculpted")
-                    ),
-                    "covered_zone_ids": [zone_id],
-                    "covered_zone_names": [zone_name],
-                    "merged": False,
-                    "merged_zone_ids": [zone_id],
-                    "merged_zone_names": [zone_name],
-                    "merged_zone_count": 1,
-                    "primary_zone_id": zone_id,
-                    "sample_size": len(point_rows),
+                    "hotspot_method": "fallback_multi_cluster" if fallback else "recency_weighted_density_components",
+                    "sample_size": sample_size,
                     "component_point_count": int(comp.get("point_count") or 0),
                     "latest_created_at": latest_created_at,
-                    "intensity": final_intensity,
-                    "confidence": final_confidence,
-                    "component_rank": int(comp.get("anchor_rank") or hotspot_index),
-                    "merged_from_count": 1,
-                    "peak_score": float(comp.get("peak_score") or 0.0),
-                    "component_score": float(comp.get("component_score") or 0.0),
-                    "weighted_support": float(comp.get("weighted_point_count") or 0.0),
+                    "intensity": intensity,
+                    "signature": signature,
+                    "component_rank": int(comp.get("component_rank") or 0),
+                    "merged_from_count": int(comp.get("merged_from_count") or 1),
+                    "peak_score": peak_score,
+                    "component_score": component_score,
                     "max_points_per_zone": PICKUP_ZONE_HOTSPOT_MAX_POINTS,
                     "min_points": PICKUP_ZONE_HOTSPOT_MIN_POINTS,
                     "micro_hotspots": [],
-                    "recent_shape_component": float(comp.get("recent_shape_component") or 0.0),
-                    "historical_only_fallback": bool(using_historical_fallback),
-                    "outcome_modifier": float(outcome["modifier"]),
-                    "quality_modifier": float(quality["quality_modifier"]),
-                    "saturation_modifier": max(0.5, 1.0 - float(quality["saturation_penalty"])),
-                    "hotspot_limit_used": hotspot_limit,
                 },
-                "_hotspot_proj": comp.get("polygon_proj"),
+                "_hotspot_proj": polygon,
                 "_component_cells": comp.get("cells") or set(),
             }
         )
         debug["hotspot_ids"].append(hotspot_id)
 
-    debug["second_hotspot_qualified"] = len(emitted) > 1
     debug["emitted_hotspot_count"] = len(emitted)
-    debug["used_recent_sculpting"] = bool(used_recent_sculpting and not using_historical_fallback and not used_recent_cluster_fallback)
-    debug["used_historical_fallback_shape"] = bool(using_historical_fallback)
-    debug["used_recent_cluster_fallback_shape"] = bool(used_recent_cluster_fallback)
-    debug["historical_only_fallback"] = bool(using_historical_fallback)
     return emitted, debug
-
 
 def _build_pickup_zone_hotspot_feature(
     zone_id: int, zone_meta: Dict[str, Any], point_rows: List[Dict[str, Any]]
 ) -> List[Dict[str, Any]]:
     components, _ = _build_zone_hotspot_components(zone_id, zone_meta, point_rows, fallback=False)
     return components
-
 
 def _build_fallback_pickup_zone_hotspot_feature(
     zone_id: int,
@@ -5213,7 +5246,6 @@ def _build_fallback_pickup_zone_hotspot_feature(
 ) -> List[Dict[str, Any]]:
     components, _ = _build_zone_hotspot_components(zone_id, zone_meta, point_rows, fallback=True)
     return components
-
 
 def _build_zone_micro_hotspots_payload(
     zone_id: int,
@@ -5274,39 +5306,35 @@ def _build_zone_micro_hotspots_payload(
     if not weighted_buckets:
         return []
 
+    best_cell = max(weighted_buckets.items(), key=lambda kv: kv[1])[0]
+    gx, gy = best_cell
+    center_x = minx + ((gx + 0.5) * cell_size_m)
+    center_y = miny + ((gy + 0.5) * cell_size_m)
+    center_lng, center_lat = _to_4326.transform(center_x, center_y)
+    event_count = int(raw_counts.get(best_cell, 0))
+    intensity = round(min(1.0, max(0.2, weighted_buckets[best_cell] / 7.5)), 3)
+    confidence = round(min(0.98, 0.5 + (weighted_buckets[best_cell] / 12.0)), 3)
+
     zone_name = zone_meta.get("zone_name") or ((point_rows[0].get("zone_name") if point_rows else "") or "")
     borough = zone_meta.get("borough") or ((point_rows[0].get("borough") if point_rows else "") or "")
 
-    max_micro = 2 if float(hotspot_proj.area) >= 220000.0 else 1
-    ranked_cells = sorted(weighted_buckets.items(), key=lambda kv: kv[1], reverse=True)[:max_micro]
-    micros: List[Dict[str, Any]] = []
-    for (gx, gy), w in ranked_cells:
-        center_x = minx + ((gx + 0.5) * cell_size_m)
-        center_y = miny + ((gy + 0.5) * cell_size_m)
-        center_lng, center_lat = _to_4326.transform(center_x, center_y)
-        event_count = int(raw_counts.get((gx, gy), 0))
-        intensity = round(min(1.0, max(0.2, w / 7.5)), 3)
-        confidence = round(min(0.98, 0.5 + (w / 12.0)), 3)
-        micros.append(
-            {
-                "cluster_id": f"{hotspot_id}:{gx}:{gy}",
-                "zone_id": zone_id,
-                "hotspot_id": hotspot_id,
-                "hotspot_index": int(hotspot_index),
-                "center_lat": center_lat,
-                "center_lng": center_lng,
-                "radius_m": 42,
-                "intensity": intensity,
-                "confidence": confidence,
-                "event_count": event_count,
-                "recommended": True,
-                "zone_name": zone_name,
-                "borough": borough,
-                "micro_method": "densest_cells_inside_hotspot",
-            }
-        )
-    return micros
-
+    micro = {
+        "cluster_id": f"{hotspot_id}:{gx}:{gy}",
+        "zone_id": zone_id,
+        "hotspot_id": hotspot_id,
+        "hotspot_index": int(hotspot_index),
+        "center_lat": center_lat,
+        "center_lng": center_lng,
+        "radius_m": 42,
+        "intensity": intensity,
+        "confidence": confidence,
+        "event_count": event_count,
+        "recommended": True,
+        "zone_name": zone_name,
+        "borough": borough,
+        "micro_method": "densest_cell_inside_hotspot",
+    }
+    return [micro]
 
 def _current_timeslot_bin(now_ts: int, bin_minutes: int = HOTSPOT_TIMESLOT_BIN_MINUTES) -> int:
     dt = time.gmtime(now_ts)
@@ -5801,11 +5829,7 @@ def _pickup_zone_hotspots_with_debug(
 
     zone_points: Dict[int, List[Dict[str, Any]]] = {}
     try:
-        zone_points = _pickup_zone_recent_points(
-            clean_zone_ids,
-            PICKUP_ZONE_HOTSPOT_MAX_POINTS,
-            HOTSPOT_RECENT_SHAPE_LOOKBACK_SECONDS,
-        )
+        zone_points = _pickup_zone_recent_points(clean_zone_ids, PICKUP_ZONE_HOTSPOT_MAX_POINTS)
     except Exception:
         if include_debug:
             debug["global_errors"].append("recent_points_load_failed")
@@ -5846,6 +5870,12 @@ def _pickup_zone_hotspots_with_debug(
                     "zone_scores": zone_scores,
                     "expires_at_monotonic": now_monotonic + PICKUP_SCORE_CACHE_TTL_SECONDS,
                 }
+            try:
+                log_zone_bins(_db_exec, bin_time=now_ts, rows=zone_scores.values())
+            except Exception:
+                if include_debug:
+                    debug["global_errors"].append("log_zone_bins_failed")
+                print("[warn] Failed to log pickup zone bins", traceback.format_exc())
         except Exception:
             if include_debug:
                 debug["global_errors"].append("score_zones_failed")
@@ -5860,71 +5890,11 @@ def _pickup_zone_hotspots_with_debug(
         print("[warn] Failed to prune pickup hotspot experiment tables", traceback.format_exc())
 
     features: List[Dict[str, Any]] = []
-    zone_features_map: Dict[int, List[Dict[str, Any]]] = {}
-    zone_debug_map: Dict[int, Dict[str, Any]] = {}
-    emitted_hotspot_ids: set[str] = set()
     for zone_id in clean_zone_ids:
         pts = zone_points.get(zone_id, [])
         zone_data = zone_geoms.get(zone_id)
         signature = zone_signatures.get(zone_id) or _pickup_zone_signature([])
-        score = zone_scores.get(zone_id)
-        frame_time = now_ts
-        long_run_points = _pickup_zone_long_run_points(zone_id)
-        historical_anchor_points = build_zone_historical_anchor_points(
-            pickup_rows=long_run_points,
-            frame_time=frame_time,
-            bin_minutes=HOTSPOT_TIMESLOT_BIN_MINUTES,
-        )
-        historical_components: List[Dict[str, Any]] = []
-        if zone_data and zone_data.get("geometry") is not None:
-            historical_components = build_zone_historical_anchor_components(
-                zone_id=zone_id,
-                zone_geom=zone_data.get("geometry"),
-                weighted_points=historical_anchor_points,
-                cell_size_m=float(PICKUP_ZONE_HOTSPOT_CELL_SIZE_M),
-                simplify_m=float(PICKUP_ZONE_HOTSPOT_SIMPLIFY_M),
-            )
-        recent_components_for_qualification: List[Dict[str, Any]] = []
-        if zone_data and zone_data.get("geometry") is not None:
-            if historical_components:
-                try:
-                    recent_components_for_qualification = sculpt_hotspot_shapes_from_recent_points(
-                        historical_components[:3],
-                        pts,
-                        zone_data.get("geometry"),
-                        frame_time,
-                    )
-                except Exception:
-                    recent_components_for_qualification = []
-            if not recent_components_for_qualification:
-                recent_components_for_qualification = _build_recent_cluster_components_for_zone(zone_id, zone_data, pts)
-        qualified_by_historical_support = len(historical_anchor_points) >= PICKUP_ZONE_HOTSPOT_MIN_POINTS
-        strongest_historical_weighted = max(
-            [float(c.get("weighted_point_count") or 0.0) for c in historical_components if isinstance(c, dict)] or [0.0]
-        )
-        qualified_by_historical_component = bool(historical_components) and strongest_historical_weighted >= 5.0
-        qualified_by_recent_support = len(pts) >= PICKUP_ZONE_HOTSPOT_MIN_POINTS and _valid_recent_cluster_components(
-            recent_components_for_qualification
-        )
-        qualified = should_emit_zone_hotspot_from_cluster_evidence(
-            zone_score=score,
-            historical_anchor_points=historical_anchor_points,
-            historical_components=historical_components,
-            recent_points=pts,
-            recent_components=recent_components_for_qualification,
-        )
-        skipped_reason = _zone_hotspot_skip_reason(
-            historical_anchor_points=historical_anchor_points,
-            historical_components=historical_components,
-            recent_points=pts,
-            recent_components=recent_components_for_qualification,
-        )
-        hotspot_limit = determine_zone_hotspot_limit(
-            zone_data.get("geometry") if zone_data else None,
-            historical_components,
-        )
-        if score is not None:
-            score.hotspot_limit_used = int(hotspot_limit)
+        qualified = len(pts) >= PICKUP_ZONE_HOTSPOT_MIN_POINTS
         zone_debug: Optional[Dict[str, Any]] = None
         if include_debug:
             zone_debug = {
@@ -5933,14 +5903,6 @@ def _pickup_zone_hotspots_with_debug(
                 "borough": (zone_data or {}).get("borough") or "",
                 "point_count": len(pts),
                 "recent_point_count": len(pts),
-                "historical_anchor_point_count": len(historical_anchor_points),
-                "historical_component_count": len(historical_components),
-                "qualified_by_cluster_evidence": qualified,
-                "qualified_by_historical_support": bool(qualified_by_historical_support),
-                "qualified_by_historical_component_support": bool(qualified_by_historical_component),
-                "qualified_by_recent_support": bool(qualified_by_recent_support),
-                "suppressed_by_zone_score": False,
-                "skipped_reason": skipped_reason,
                 "qualified": qualified,
                 "geometry_found": bool(zone_data),
                 "cached_hit": False,
@@ -5951,20 +5913,24 @@ def _pickup_zone_hotspots_with_debug(
                 "feature_emitted": False,
                 "micro_hotspot_count": 0,
                 "hotspot_method": "none",
-                "used_recent_sculpting": False,
-                "used_historical_fallback_shape": False,
-                "used_recent_cluster_fallback_shape": False,
                 "signature": signature,
+                "candidate_component_count": 0,
+                "emitted_hotspot_count": 0,
+                "merged": False,
+                "merge_reason": "none",
+                "hotspot_ids": [],
+                "component_point_counts": [],
+                "second_hotspot_qualified": False,
+                "second_hotspot_rejected_reason": "",
                 "errors": [],
             }
             if qualified:
                 debug["qualified_zone_ids"].append(zone_id)
-            zone_debug_map[zone_id] = zone_debug
 
         if not zone_data:
             if zone_debug is not None:
                 zone_debug["errors"].append("geometry_missing")
-                zone_debug["skipped_reason"] = zone_debug.get("skipped_reason") or "geometry_missing"
+                debug["zones"].append(zone_debug)
             continue
 
         zone_features: List[Dict[str, Any]] = []
@@ -5992,15 +5958,7 @@ def _pickup_zone_hotspots_with_debug(
             if zone_debug is not None:
                 zone_debug["primary_attempted"] = True
             try:
-                zone_features, zone_component_debug = _build_zone_hotspot_components(
-                    zone_id,
-                    zone_data,
-                    pts,
-                    fallback=False,
-                    frame_time=frame_time,
-                    historical_anchor_points=historical_anchor_points,
-                    historical_components=historical_components,
-                )
+                zone_features, zone_component_debug = _build_zone_hotspot_components(zone_id, zone_data, pts, fallback=False)
                 if zone_debug is not None:
                     zone_debug["primary_ok"] = bool(zone_features)
                     if zone_features:
@@ -6014,15 +5972,7 @@ def _pickup_zone_hotspots_with_debug(
             if zone_debug is not None:
                 zone_debug["fallback_attempted"] = True
             try:
-                zone_features, zone_component_debug = _build_zone_hotspot_components(
-                    zone_id,
-                    zone_data,
-                    pts,
-                    fallback=True,
-                    frame_time=frame_time,
-                    historical_anchor_points=historical_anchor_points,
-                    historical_components=historical_components,
-                )
+                zone_features, zone_component_debug = _build_zone_hotspot_components(zone_id, zone_data, pts, fallback=True)
                 if zone_debug is not None:
                     zone_debug["fallback_ok"] = bool(zone_features)
                     if zone_features:
@@ -6034,17 +5984,46 @@ def _pickup_zone_hotspots_with_debug(
 
         if zone_debug is not None and zone_component_debug:
             zone_debug.update(zone_component_debug)
-            if zone_debug.get("emitted_hotspot_count", 0) <= 0 and not zone_debug.get("skipped_reason"):
-                zone_debug["skipped_reason"] = zone_component_debug.get("second_hotspot_rejected_reason") or ""
 
         if not zone_features:
             with _pickup_zone_hotspot_cache_lock:
                 _pickup_zone_hotspot_feature_cache.pop(zone_id, None)
+            if zone_debug is not None:
+                debug["zones"].append(zone_debug)
             continue
 
+        if not cached_hit:
+            zone_micro_total = 0
+            for feature in zone_features:
+                props = feature.setdefault("properties", {})
+                props["signature"] = signature
+                try:
+                    micro_payload = _build_zone_micro_hotspots_payload(zone_id, zone_data, pts, feature)
+                except Exception:
+                    micro_payload = []
+                    if zone_debug is not None:
+                        zone_debug["errors"].append("micro_hotspot_build_failed")
+                    print(f"[warn] Failed to build pickup micro-hotspots for zone {zone_id}", traceback.format_exc())
+                props["micro_hotspots"] = [item for item in micro_payload if isinstance(item, dict)][:1]
+                zone_micro_total += len(props["micro_hotspots"])
+                feature.pop("_hotspot_proj", None)
+                feature.pop("_component_cells", None)
+            with _pickup_zone_hotspot_cache_lock:
+                _pickup_zone_hotspot_feature_cache[zone_id] = {
+                    "signature": signature,
+                    "features": copy.deepcopy(zone_features),
+                    "created_at_monotonic": now_monotonic,
+                    "last_access_monotonic": now_monotonic,
+                }
+            if zone_debug is not None:
+                zone_debug["micro_hotspot_count"] = zone_micro_total
+
+        score = zone_scores.get(zone_id)
+        zone_micro_total = 0
         for feature in zone_features:
             props = feature.setdefault("properties", {})
             props["signature"] = signature
+            zone_micro_total += len(props.get("micro_hotspots") or [])
             if score is not None:
                 _pickup_zone_score_cache[zone_id] = score.final_score
                 props["hotspot_score"] = score.final_score
@@ -6055,117 +6034,27 @@ def _pickup_zone_hotspots_with_debug(
                 props["weighted_trip_count"] = score.weighted_trip_count
                 props["unique_driver_count"] = score.unique_driver_count
                 props["recommended"] = score.recommended
-                props["long_run_historical_component"] = score.long_run_historical_component
-                props["recent_shape_component"] = props.get("recent_shape_component", score.recent_shape_component)
-                props["outcome_modifier"] = props.get("outcome_modifier", score.outcome_modifier)
-                props["quality_modifier"] = props.get("quality_modifier", score.quality_modifier)
-                props["saturation_modifier"] = props.get("saturation_modifier", score.saturation_modifier)
-                props["hotspot_limit_used"] = props.get("hotspot_limit_used", score.hotspot_limit_used)
-                score_visibility_modifier = 1.0
-                if not bool(score.recommended):
-                    score_visibility_modifier *= 0.84
-                score_visibility_modifier *= max(0.72, min(1.08, float(score.confidence)))
-                props["zone_score_visibility_modifier"] = float(score_visibility_modifier)
-                props["intensity"] = max(
-                    0.14,
-                    min(1.0, float(props.get("intensity") or 0.0) * float(score_visibility_modifier)),
-                )
-            zone_features_map.setdefault(zone_id, []).append(feature)
+                if score.recommended and not score_bundle_fresh:
+                    try:
+                        log_recommendation_outcome(
+                            _db_exec,
+                            recommended_at=now_ts,
+                            zone_id=zone_id,
+                            score=score.final_score,
+                            confidence=score.confidence,
+                            cluster_id=None,
+                        )
+                    except Exception:
+                        if zone_debug is not None:
+                            zone_debug["errors"].append("log_recommendation_outcome_failed")
+                        print(f"[warn] Failed to log recommendation outcome for zone {zone_id}", traceback.format_exc())
+            features.append(feature)
 
-    for zone_id in clean_zone_ids:
-        zone_features = zone_features_map.get(zone_id) or []
-        zone_data = zone_geoms.get(zone_id)
-        pts = zone_points.get(zone_id, [])
-        score = zone_scores.get(zone_id)
-        zone_debug = zone_debug_map.get(zone_id)
-        zone_micro_total = 0
-        for feature in zone_features:
-            props = feature.setdefault("properties", {})
-            covered_ids = [int(z) for z in (props.get("covered_zone_ids") or [zone_id])]
-            covered_names: List[str] = []
-            for zid in covered_ids:
-                covered_names.append((zone_geoms.get(zid) or {}).get("zone_name") or str(zid))
-            props["covered_zone_ids"] = covered_ids
-            props["covered_zone_names"] = covered_names
-            hotspot_limit_real = max(
-                [int((zone_scores.get(zid).hotspot_limit_used if zone_scores.get(zid) is not None else 2)) for zid in covered_ids] or [2]
-            )
-            props["hotspot_limit_used"] = max(int(props.get("hotspot_limit_used") or 0), hotspot_limit_real)
-            for zid in covered_ids:
-                if zone_scores.get(zid) is not None:
-                    zone_scores[zid].hotspot_limit_used = int(props["hotspot_limit_used"])
-            point_rows_for_micro = []
-            for zid in covered_ids:
-                point_rows_for_micro.extend(zone_points.get(zid, []))
-            micro_zone_meta = dict(zone_data or {})
-            if len(covered_ids) > 1:
-                try:
-                    geoms = [zone_geoms[zid]["geometry"] for zid in covered_ids if zone_geoms.get(zid)]
-                    if geoms:
-                        micro_zone_meta["geometry"] = unary_union(geoms)
-                except Exception:
-                    pass
-            try:
-                micro_payload = _build_zone_micro_hotspots_payload(zone_id, micro_zone_meta, point_rows_for_micro or pts, feature)
-            except Exception:
-                micro_payload = []
-                if zone_debug is not None:
-                    zone_debug["errors"].append("micro_hotspot_build_failed")
-            props["micro_hotspots"] = [item for item in micro_payload if isinstance(item, dict)][:2]
-            zone_micro_total += len(props["micro_hotspots"])
-            feature.pop("_hotspot_proj", None)
-            feature.pop("_component_cells", None)
-            if score is not None and score.recommended and not score_bundle_fresh:
-                try:
-                    log_recommendation_outcome(
-                        _db_exec,
-                        recommended_at=now_ts,
-                        zone_id=zone_id,
-                        score=score.final_score,
-                        confidence=score.confidence,
-                        cluster_id=str(props.get("hotspot_id")) if props.get("hotspot_id") else None,
-                    )
-                except Exception:
-                    if zone_debug is not None:
-                        zone_debug["errors"].append("log_recommendation_outcome_failed")
-            dedupe_key = str(props.get("hotspot_id") or f"{zone_id}:{len(features)}")
-            if dedupe_key not in emitted_hotspot_ids:
-                features.append(feature)
-                emitted_hotspot_ids.add(dedupe_key)
-
-        if zone_features:
-            with _pickup_zone_hotspot_cache_lock:
-                _pickup_zone_hotspot_feature_cache[zone_id] = {
-                    "signature": zone_signatures.get(zone_id) or _pickup_zone_signature([]),
-                    "features": copy.deepcopy(zone_features),
-                    "created_at_monotonic": now_monotonic,
-                    "last_access_monotonic": now_monotonic,
-                }
         if zone_debug is not None:
             zone_debug["feature_emitted"] = bool(zone_features)
             zone_debug["micro_hotspot_count"] = zone_micro_total
-            zone_debug["merged"] = any(bool((f.get("properties") or {}).get("merged")) for f in zone_features)
-            zone_debug["merged_zone_count"] = 2 if zone_debug["merged"] else 1
-            if zone_features:
-                first_props = zone_features[0].get("properties") or {}
-                zone_debug["hotspot_method"] = first_props.get("hotspot_method", zone_debug["hotspot_method"])
-                zone_debug["merged_zone_ids"] = first_props.get("merged_zone_ids") or [zone_id]
-                zone_debug["covered_zone_ids"] = first_props.get("covered_zone_ids") or [zone_id]
-                zone_debug["outcome_modifier"] = first_props.get("outcome_modifier")
-                zone_debug["quality_modifier"] = first_props.get("quality_modifier")
-                zone_debug["saturation_modifier"] = first_props.get("saturation_modifier")
-                zone_debug["hotspot_limit_used"] = first_props.get("hotspot_limit_used")
-            if zone_features:
-                debug["rendered_zone_ids"].append(zone_id)
+            debug["rendered_zone_ids"].append(zone_id)
             debug["zones"].append(zone_debug)
-
-    if not score_bundle_fresh and zone_scores:
-        try:
-            log_zone_bins(_db_exec, bin_time=now_ts, rows=zone_scores.values())
-        except Exception:
-            if include_debug:
-                debug["global_errors"].append("log_zone_bins_failed")
-            print("[warn] Failed to log pickup zone bins", traceback.format_exc())
 
     _cleanup_pickup_zone_caches(now_monotonic)
     payload = {"type": "FeatureCollection", "features": features}
@@ -6173,7 +6062,6 @@ def _pickup_zone_hotspots_with_debug(
     debug["orphan_micro_hotspot_count"] = 0
     debug["top_level_micro_hotspot_count"] = len(_flatten_zone_micro_hotspots(payload))
     return payload, debug
-
 
 def _pickup_zone_hotspots(zone_ids: List[int]) -> Dict[str, Any]:
     try:
