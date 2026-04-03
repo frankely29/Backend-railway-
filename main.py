@@ -4827,6 +4827,7 @@ def _normalize_pickup_zone_point_entries(point_rows: List[Dict[str, Any]]) -> Li
         )
     return point_entries
 
+
 def _build_density_components(
     zone_proj: Any,
     point_entries: List[Dict[str, Any]],
@@ -4958,6 +4959,7 @@ def _build_density_components(
         "cell_size": cell_size,
     }
 
+
 def _shape_hotspot_component(component: Dict[str, Any], zone_proj: Any) -> Optional[Any]:
     base_geom = component.get("geometry")
     if base_geom is None or base_geom.is_empty:
@@ -4989,6 +4991,7 @@ def _shape_hotspot_component(component: Dict[str, Any], zone_proj: Any) -> Optio
         if not clipped2.is_empty:
             clipped = clipped2
     return clipped
+
 
 def _hotspot_merge_decision(candidate_components: List[Dict[str, Any]], selected_cells: set[Tuple[int, int]]) -> Tuple[bool, str]:
     if len(candidate_components) < 2:
@@ -5027,6 +5030,7 @@ def _hotspot_merge_decision(candidate_components: List[Dict[str, Any]], selected
                             if (bx, by) in cells_b:
                                 return True, "density_bridge"
     return False, "separate"
+
 
 def _build_zone_hotspot_components(
     zone_id: int,
@@ -5224,11 +5228,13 @@ def _build_zone_hotspot_components(
     debug["emitted_hotspot_count"] = len(emitted)
     return emitted, debug
 
+
 def _build_pickup_zone_hotspot_feature(
     zone_id: int, zone_meta: Dict[str, Any], point_rows: List[Dict[str, Any]]
 ) -> List[Dict[str, Any]]:
     components, _ = _build_zone_hotspot_components(zone_id, zone_meta, point_rows, fallback=False)
     return components
+
 
 def _build_fallback_pickup_zone_hotspot_feature(
     zone_id: int,
@@ -5237,6 +5243,7 @@ def _build_fallback_pickup_zone_hotspot_feature(
 ) -> List[Dict[str, Any]]:
     components, _ = _build_zone_hotspot_components(zone_id, zone_meta, point_rows, fallback=True)
     return components
+
 
 def _build_zone_micro_hotspots_payload(
     zone_id: int,
@@ -5326,6 +5333,7 @@ def _build_zone_micro_hotspots_payload(
         "micro_method": "densest_cell_inside_hotspot",
     }
     return [micro]
+
 
 def _current_timeslot_bin(now_ts: int, bin_minutes: int = HOTSPOT_TIMESLOT_BIN_MINUTES) -> int:
     dt = time.gmtime(now_ts)
