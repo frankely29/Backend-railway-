@@ -5777,6 +5777,8 @@ def _pickup_zone_hotspots_with_debug(
         pts = zone_points.get(zone_id, [])
         zone_data = zone_geoms.get(zone_id)
         signature = zone_signatures.get(zone_id) or _pickup_zone_signature([])
+        # Hotspot polygon emission is cluster-driven; recommendation scoring metadata
+        # must not gate whether a zone can emit a hotspot bubble.
         qualified = len(pts) >= PICKUP_ZONE_HOTSPOT_MIN_POINTS
         zone_debug: Optional[Dict[str, Any]] = None
         if include_debug:
