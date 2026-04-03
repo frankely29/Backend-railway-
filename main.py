@@ -5688,6 +5688,7 @@ def _pickup_zone_hotspots_with_debug(
 
     debug: Dict[str, Any] = {
         "min_points_threshold": PICKUP_ZONE_HOTSPOT_MIN_POINTS,
+        "qualification_rule": "point_count>=min_points_threshold",
         "requested_zone_ids": clean_zone_ids,
         "zone_hotspot_count": 0,
         "orphan_micro_hotspot_count": 0,
