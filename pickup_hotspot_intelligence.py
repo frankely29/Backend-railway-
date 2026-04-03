@@ -343,8 +343,10 @@ def convert_historical_components_to_emittable_shapes(
         ll = transform(_TO_4326.transform, shaped)
         support = float(comp.get("weighted_point_count") or 0.0)
         comp_score = float(comp.get("component_score") or 0.0)
-        normalized = _clip((comp_score / 10.0) * 0.7 + (support / 16.0) * 0.3)
-        intensity = _clip(0.22 + (0.56 * normalized), 0.18, 0.92)
+        support_norm = _clip(support / 14.0)
+        score_norm = _clip(comp_score / 9.0)
+        normalized = (score_norm * 0.62) + (support_norm * 0.38)
+        intensity = _clip(0.24 + (0.52 * normalized), 0.20, 0.90)
         converted.append(
             {
                 **comp,
