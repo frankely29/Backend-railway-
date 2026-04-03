@@ -5138,6 +5138,8 @@ def _build_zone_hotspot_components(
 
         base_intensity = float(comp.get("intensity") or 0.25)
         final_intensity = max(0.18, min(1.0, base_intensity * float(outcome["modifier"]) * float(quality["quality_modifier"])))
+        base_confidence = float(comp.get("confidence") or 0.35)
+        final_confidence = max(0.25, min(1.0, base_confidence * float(outcome["modifier"])))
         emitted.append(
             {
                 "type": "Feature",
@@ -5160,6 +5162,7 @@ def _build_zone_hotspot_components(
                     "component_point_count": int(comp.get("point_count") or 0),
                     "latest_created_at": latest_created_at,
                     "intensity": final_intensity,
+                    "confidence": final_confidence,
                     "component_rank": int(comp.get("anchor_rank") or hotspot_index),
                     "merged_from_count": 1,
                     "peak_score": float(comp.get("peak_score") or 0.0),
@@ -5637,42 +5640,54 @@ def _pickup_zone_density_penalty(zone_ids: List[int]) -> Dict[int, float]:
     return out
 
 
-def should_emit_zone_hotspot(
-    zone_score: Any,
-    historical_anchor_points: List[Dict[str, Any]],
-    historical_components: List[Dict[str, Any]],
-) -> bool:
-    if zone_score is None:
-        return False
-    if not bool(getattr(zone_score, "recommended", False)):
-        return False
-    if len(historical_anchor_points) >= PICKUP_ZONE_HOTSPOT_MIN_POINTS:
-        return True
-    strongest_weighted = max(
-        [float(c.get("weighted_point_count") or 0.0) for c in historical_components if isinstance(c, dict)] or [0.0]
-    )
-    if historical_components and strongest_weighted >= 5.0:
-        return True
+def _valid_recent_cluster_components(recent_components: List[Dict[str, Any]]) -> bool:
+    for comp in recent_components:
+        geom = comp.get("geometry")
+        if geom is not None and not getattr(geom, "is_empty", True):
+            return True
     return False
 
 
-def _zone_hotspot_skip_reason(
+def should_emit_zone_hotspot_from_cluster_evidence(
     zone_score: Any,
     historical_anchor_points: List[Dict[str, Any]],
     historical_components: List[Dict[str, Any]],
-) -> str:
-    if zone_score is None:
-        return "missing_zone_score"
-    if not bool(getattr(zone_score, "recommended", False)):
-        return "zone_not_recommended"
-    if len(historical_anchor_points) >= PICKUP_ZONE_HOTSPOT_MIN_POINTS:
-        return ""
+    recent_points: List[Dict[str, Any]],
+    recent_components: List[Dict[str, Any]],
+) -> bool:
+    del zone_score  # Zone score is a modifier, not a kill switch.
+    qualified_by_historical_support = len(historical_anchor_points) >= PICKUP_ZONE_HOTSPOT_MIN_POINTS
     strongest_weighted = max(
         [float(c.get("weighted_point_count") or 0.0) for c in historical_components if isinstance(c, dict)] or [0.0]
     )
-    if historical_components and strongest_weighted >= 5.0:
+    qualified_by_historical_component = bool(historical_components) and strongest_weighted >= 5.0
+    qualified_by_recent_support = len(recent_points) >= PICKUP_ZONE_HOTSPOT_MIN_POINTS and _valid_recent_cluster_components(
+        recent_components
+    )
+    return bool(qualified_by_historical_support or qualified_by_historical_component or qualified_by_recent_support)
+
+
+def _zone_hotspot_skip_reason(
+    historical_anchor_points: List[Dict[str, Any]],
+    historical_components: List[Dict[str, Any]],
+    recent_points: List[Dict[str, Any]],
+    recent_components: List[Dict[str, Any]],
+) -> str:
+    qualified_by_historical_support = len(historical_anchor_points) >= PICKUP_ZONE_HOTSPOT_MIN_POINTS
+    strongest_weighted = max(
+        [float(c.get("weighted_point_count") or 0.0) for c in historical_components if isinstance(c, dict)] or [0.0]
+    )
+    qualified_by_historical_component = bool(historical_components) and strongest_weighted >= 5.0
+    qualified_by_recent_support = len(recent_points) >= PICKUP_ZONE_HOTSPOT_MIN_POINTS and _valid_recent_cluster_components(
+        recent_components
+    )
+    if qualified_by_historical_support or qualified_by_historical_component or qualified_by_recent_support:
         return ""
-    return "insufficient_historical_support"
+    if not historical_components and not recent_components:
+        return "no_historical_or_recent_cluster_components"
+    if len(recent_points) >= PICKUP_ZONE_HOTSPOT_MIN_POINTS and not recent_components:
+        return "recent_points_not_clustered"
+    return "insufficient_cluster_evidence"
 
 
 def _pickup_zone_hotspots_with_debug(
@@ -5804,15 +5819,37 @@ def _pickup_zone_hotspots_with_debug(
                 cell_size_m=float(PICKUP_ZONE_HOTSPOT_CELL_SIZE_M),
                 simplify_m=float(PICKUP_ZONE_HOTSPOT_SIMPLIFY_M),
             )
-        qualified = should_emit_zone_hotspot(
+        recent_components_for_qualification: List[Dict[str, Any]] = []
+        if zone_data and zone_data.get("geometry") is not None and historical_components:
+            try:
+                recent_components_for_qualification = sculpt_hotspot_shapes_from_recent_points(
+                    historical_components[:3],
+                    pts,
+                    zone_data.get("geometry"),
+                    frame_time,
+                )
+            except Exception:
+                recent_components_for_qualification = []
+        qualified_by_historical_support = len(historical_anchor_points) >= PICKUP_ZONE_HOTSPOT_MIN_POINTS
+        strongest_historical_weighted = max(
+            [float(c.get("weighted_point_count") or 0.0) for c in historical_components if isinstance(c, dict)] or [0.0]
+        )
+        qualified_by_historical_component = bool(historical_components) and strongest_historical_weighted >= 5.0
+        qualified_by_recent_support = len(pts) >= PICKUP_ZONE_HOTSPOT_MIN_POINTS and _valid_recent_cluster_components(
+            recent_components_for_qualification
+        )
+        qualified = should_emit_zone_hotspot_from_cluster_evidence(
             zone_score=score,
             historical_anchor_points=historical_anchor_points,
             historical_components=historical_components,
+            recent_points=pts,
+            recent_components=recent_components_for_qualification,
         )
         skipped_reason = _zone_hotspot_skip_reason(
-            zone_score=score,
             historical_anchor_points=historical_anchor_points,
             historical_components=historical_components,
+            recent_points=pts,
+            recent_components=recent_components_for_qualification,
         )
         hotspot_limit = determine_zone_hotspot_limit(
             zone_data.get("geometry") if zone_data else None,
@@ -5830,7 +5867,10 @@ def _pickup_zone_hotspots_with_debug(
                 "recent_point_count": len(pts),
                 "historical_anchor_point_count": len(historical_anchor_points),
                 "historical_component_count": len(historical_components),
-                "qualified_by_historical_support": qualified,
+                "qualified_by_cluster_evidence": qualified,
+                "qualified_by_historical_support": bool(qualified_by_historical_support or qualified_by_historical_component),
+                "qualified_by_recent_support": bool(qualified_by_recent_support),
+                "suppressed_by_zone_score": False,
                 "skipped_reason": skipped_reason,
                 "qualified": qualified,
                 "geometry_found": bool(zone_data),
@@ -5951,6 +5991,15 @@ def _pickup_zone_hotspots_with_debug(
                 props["quality_modifier"] = props.get("quality_modifier", score.quality_modifier)
                 props["saturation_modifier"] = props.get("saturation_modifier", score.saturation_modifier)
                 props["hotspot_limit_used"] = props.get("hotspot_limit_used", score.hotspot_limit_used)
+                score_visibility_modifier = 1.0
+                if not bool(score.recommended):
+                    score_visibility_modifier *= 0.84
+                score_visibility_modifier *= max(0.72, min(1.08, float(score.confidence)))
+                props["zone_score_visibility_modifier"] = float(score_visibility_modifier)
+                props["intensity"] = max(
+                    0.14,
+                    min(1.0, float(props.get("intensity") or 0.0) * float(score_visibility_modifier)),
+                )
             zone_features_map.setdefault(zone_id, []).append(feature)
 
     for zone_id in clean_zone_ids:
