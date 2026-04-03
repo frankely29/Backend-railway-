@@ -45,7 +45,6 @@ from pickup_hotspot_intelligence import (
     determine_zone_hotspot_limit,
     get_zone_or_hotspot_outcome_modifier,
     sculpt_hotspot_shapes_from_recent_points,
-    build_cross_zone_merged_hotspots,
 )
 from artifact_freshness import evaluate_artifact_freshness
 from artifact_storage_service import cleanup_artifact_storage, get_artifact_storage_report
@@ -5954,55 +5953,6 @@ def _pickup_zone_hotspots_with_debug(
                 props["hotspot_limit_used"] = props.get("hotspot_limit_used", score.hotspot_limit_used)
             zone_features_map.setdefault(zone_id, []).append(feature)
 
-    used_merge_zones: set[int] = set()
-    merged_candidates = build_cross_zone_merged_hotspots(
-        zone_feature_map=zone_features_map,
-        zone_meta_map=zone_geoms,
-        zone_recent_points=zone_points,
-    )
-    for merged in merged_candidates:
-        zone_a, zone_b = merged["zone_pair"]
-        if zone_a in used_merge_zones or zone_b in used_merge_zones:
-            continue
-        if not zone_features_map.get(zone_a) or not zone_features_map.get(zone_b):
-            continue
-        feature_a = zone_features_map[zone_a][0]
-        feature_b = zone_features_map[zone_b][0]
-        props_a = feature_a.get("properties") or {}
-        props_b = feature_b.get("properties") or {}
-        merged_zone_names = merged.get("merged_zone_names") or [props_a.get("zone_name") or "", props_b.get("zone_name") or ""]
-        merged_hotspot_id = f"merged:{zone_a}:{zone_b}:anchor:0"
-        merged_props = {
-            **props_a,
-            "zone_id": zone_a,
-            "zone_name": merged_zone_names[0],
-            "borough": merged.get("borough") or props_a.get("borough") or props_b.get("borough"),
-            "hotspot_id": merged_hotspot_id,
-            "hotspot_method": "cross_zone_merge",
-            "covered_zone_ids": [zone_a, zone_b],
-            "covered_zone_names": merged_zone_names,
-            "merged": True,
-            "merged_zone_ids": [zone_a, zone_b],
-            "merged_zone_names": merged_zone_names,
-            "merged_zone_count": 2,
-            "primary_zone_id": zone_a,
-            "merged_from_count": 2,
-            "component_score": float(props_a.get("component_score") or 0.0) + float(props_b.get("component_score") or 0.0),
-            "weighted_support": float(props_a.get("weighted_support") or 0.0) + float(props_b.get("weighted_support") or 0.0),
-            "intensity": max(float(props_a.get("intensity") or 0.0), float(props_b.get("intensity") or 0.0)),
-            "merge_evidence": merged.get("decision") or {},
-            "micro_hotspots": [],
-        }
-        merged_feature = {
-            "type": "Feature",
-            "geometry": mapping(merged.get("geometry")),
-            "properties": merged_props,
-            "_hotspot_proj": merged.get("merged_geometry_proj"),
-        }
-        zone_features_map[zone_a] = [merged_feature]
-        zone_features_map[zone_b] = [copy.deepcopy(merged_feature)]
-        used_merge_zones.update({zone_a, zone_b})
-
     for zone_id in clean_zone_ids:
         zone_features = zone_features_map.get(zone_id) or []
         zone_data = zone_geoms.get(zone_id)
@@ -6339,6 +6289,7 @@ def _recent_pickups_payload(
     hotspot_zone_ids: List[int] = []
     zone_hotspots: Dict[str, Any] = {"type": "FeatureCollection", "features": []}
     micro_hotspots: List[Dict[str, Any]] = []
+    hotspot_aux_errors: List[str] = []
     pickup_hotspot_debug: Dict[str, Any] = {
         "min_points_threshold": PICKUP_ZONE_HOTSPOT_MIN_POINTS,
         "requested_zone_ids": [],
@@ -6354,28 +6305,41 @@ def _recent_pickups_payload(
         zone_stats = _pickup_zone_stats(zone_ids_for_stats, sample_limit=safe_zone_sample_limit)
         hotspot_zone_ids = [int(z.get("zone_id")) for z in zone_stats if z.get("zone_id") is not None]
         pickup_hotspot_debug["requested_zone_ids"] = hotspot_zone_ids
+    except Exception:
+        print("[warn] pickup zone stats helper failed", traceback.format_exc())
+        zone_stats = []
+        hotspot_zone_ids = []
+        hotspot_aux_errors.append("pickup_zone_stats_failed")
+    try:
         zone_hotspots, pickup_hotspot_debug = _pickup_zone_hotspots_with_debug(
             hotspot_zone_ids,
             include_debug=include_debug,
         )
         micro_hotspots = _flatten_zone_micro_hotspots(zone_hotspots)
     except Exception:
-        print("[warn] pickup hotspot auxiliary path failed", traceback.format_exc())
-        zone_stats = []
+        print("[warn] pickup hotspot geometry helper failed", traceback.format_exc())
         zone_hotspots = {"type": "FeatureCollection", "features": []}
         micro_hotspots = []
-        hotspot_zone_ids = []
+        hotspot_aux_errors.append("pickup_hotspot_geometry_failed")
         pickup_hotspot_debug = {
             "min_points_threshold": PICKUP_ZONE_HOTSPOT_MIN_POINTS,
-            "requested_zone_ids": [],
+            "requested_zone_ids": hotspot_zone_ids,
             "zone_hotspot_count": 0,
             "orphan_micro_hotspot_count": 0,
             "top_level_micro_hotspot_count": 0,
             "qualified_zone_ids": [],
             "rendered_zone_ids": [],
-            "global_errors": ["pickup_hotspot_auxiliary_path_failed"] if include_debug else [],
+            "global_errors": hotspot_aux_errors[:] if include_debug else [],
             "zones": [],
         }
+    if include_debug and hotspot_aux_errors:
+        existing_errors = pickup_hotspot_debug.get("global_errors")
+        if not isinstance(existing_errors, list):
+            existing_errors = []
+        for err in hotspot_aux_errors:
+            if err not in existing_errors:
+                existing_errors.append(err)
+        pickup_hotspot_debug["global_errors"] = existing_errors
 
     if not isinstance(zone_hotspots, dict):
         zone_hotspots = {"type": "FeatureCollection", "features": []}
