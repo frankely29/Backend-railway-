@@ -149,7 +149,6 @@ PICKUP_ZONE_SECOND_HOTSPOT_MIN_POINTS = 8
 PICKUP_ZONE_SECOND_COMPONENT_MIN_POINTS = 3
 PICKUP_ZONE_SECOND_COMPONENT_MIN_SCORE_RATIO = 0.45
 HOTSPOT_RECENT_LOOKBACK_SECONDS = 6 * 3600
-HOTSPOT_RECENT_SHAPE_LOOKBACK_SECONDS = 90 * 60
 HOTSPOT_TIMESLOT_BIN_MINUTES = 20
 
 _pickup_zone_geom_cache: Optional[Dict[int, Dict[str, Any]]] = None
@@ -4736,9 +4735,7 @@ def _load_pickup_zone_geometries() -> Dict[int, Dict[str, Any]]:
 
 
 def _pickup_zone_recent_points(
-    zone_ids: List[int],
-    max_points_per_zone: int = PICKUP_ZONE_HOTSPOT_MAX_POINTS,
-    lookback_seconds: int = HOTSPOT_RECENT_SHAPE_LOOKBACK_SECONDS,
+    zone_ids: List[int], max_points_per_zone: int = PICKUP_ZONE_HOTSPOT_MAX_POINTS
 ) -> Dict[int, List[Dict[str, Any]]]:
     clean_zone_ids: List[int] = []
     for z in zone_ids:
@@ -4750,7 +4747,6 @@ def _pickup_zone_recent_points(
         return {}
 
     cap = max(1, min(PICKUP_ZONE_HOTSPOT_MAX_POINTS, int(max_points_per_zone)))
-    cutoff_ts = int(time.time()) - max(60, int(lookback_seconds))
     clean_zone_ids = list(dict.fromkeys(clean_zone_ids))[:256]
     placeholders = ",".join(["?"] * len(clean_zone_ids))
 
@@ -4768,7 +4764,6 @@ def _pickup_zone_recent_points(
                 ROW_NUMBER() OVER (PARTITION BY pl.zone_id ORDER BY pl.created_at DESC, pl.id DESC) AS rn
             FROM pickup_logs pl
             WHERE pl.zone_id IN ({placeholders})
-              AND pl.created_at >= ?
               AND {pickup_log_not_voided_sql("pl")}
         )
         SELECT id, zone_id, zone_name, borough, user_id, lat, lng, created_at
@@ -4776,7 +4771,7 @@ def _pickup_zone_recent_points(
         WHERE rn <= ?
         ORDER BY zone_id ASC, created_at DESC, id DESC
     """
-    rows = _db_query_all(sql, tuple(clean_zone_ids + [cutoff_ts, cap]))
+    rows = _db_query_all(sql, tuple(clean_zone_ids + [cap]))
     grouped: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
     for row in rows:
         item = dict(row)
