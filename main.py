@@ -38,6 +38,7 @@ from pickup_hotspot_intelligence import (
     build_zone_historical_anchor_points,
     determine_zone_hotspot_limit,
     get_zone_or_hotspot_outcome_modifier,
+    sculpt_hotspot_shapes_from_recent_points,
 )
 from assistant_outlook_engine import (
     HORIZON_BINS_DEFAULT,
@@ -5839,6 +5840,199 @@ def _enrich_emitted_zone_hotspot_features(
     }
 
 
+def _refine_emitted_zone_hotspot_geometries(
+    zone_id: int,
+    zone_data: Dict[str, Any],
+    zone_features: List[Dict[str, Any]],
+    pts: List[Dict[str, Any]],
+    now_ts: int,
+) -> Dict[str, Any]:
+    reason_counts: Dict[str, int] = defaultdict(int)
+    debug_out: Dict[str, Any] = {
+        "geometry_refinement_attempted": False,
+        "geometry_refinement_applied_count": 0,
+        "geometry_refinement_rejected_count": 0,
+        "refinement_rejected_reason_counts": {},
+        "historical_component_count_for_refinement": 0,
+        "refined_hotspot_ids": [],
+        "rejected_refinement_hotspot_ids": [],
+    }
+    if not zone_features:
+        return debug_out
+
+    for feature in zone_features:
+        props = feature.setdefault("properties", {})
+        props["geometry_refinement_version"] = "recent_shape_v1"
+        props["geometry_refined"] = False
+        props["geometry_refinement_method"] = "recent_shape_sculpt"
+        props["recent_shape_component"] = 0.0
+        props["geometry_refinement_overlap_ratio"] = 0.0
+        props["geometry_refinement_centroid_shift_miles"] = 0.0
+        props["geometry_refinement_area_ratio"] = 0.0
+
+    debug_out["geometry_refinement_attempted"] = True
+    zone_geom = (zone_data or {}).get("geometry")
+    if zone_geom is None or getattr(zone_geom, "is_empty", True):
+        for feature in zone_features:
+            hotspot_id = str((feature.get("properties") or {}).get("hotspot_id") or "")
+            if hotspot_id:
+                debug_out["rejected_refinement_hotspot_ids"].append(hotspot_id)
+        reason_counts["zone_geometry_missing"] += len(zone_features)
+        debug_out["geometry_refinement_rejected_count"] = len(zone_features)
+        debug_out["refinement_rejected_reason_counts"] = dict(reason_counts)
+        return debug_out
+
+    try:
+        zone_proj = transform(_to_3857.transform, zone_geom)
+    except Exception:
+        zone_proj = None
+    if zone_proj is None or getattr(zone_proj, "is_empty", True):
+        for feature in zone_features:
+            hotspot_id = str((feature.get("properties") or {}).get("hotspot_id") or "")
+            if hotspot_id:
+                debug_out["rejected_refinement_hotspot_ids"].append(hotspot_id)
+        reason_counts["zone_projection_failed"] += len(zone_features)
+        debug_out["geometry_refinement_rejected_count"] = len(zone_features)
+        debug_out["refinement_rejected_reason_counts"] = dict(reason_counts)
+        return debug_out
+
+    sculpted_candidates: List[Dict[str, Any]] = []
+    try:
+        long_run_rows = _pickup_zone_long_run_points(zone_id, limit=2400)
+        historical_anchor_points = build_zone_historical_anchor_points(
+            pickup_rows=long_run_rows,
+            frame_time=now_ts,
+        )
+        historical_components = build_zone_historical_anchor_components(
+            zone_id=zone_id,
+            zone_geom=zone_geom,
+            weighted_points=historical_anchor_points,
+        )
+        debug_out["historical_component_count_for_refinement"] = len(historical_components)
+        sculpted_candidates = sculpt_hotspot_shapes_from_recent_points(
+            historical_components=historical_components,
+            recent_points=pts,
+            zone_geom=zone_geom,
+            frame_time=now_ts,
+        )
+    except Exception:
+        reason_counts["sculpt_generation_failed"] += len(zone_features)
+        for feature in zone_features:
+            hotspot_id = str((feature.get("properties") or {}).get("hotspot_id") or "")
+            if hotspot_id:
+                debug_out["rejected_refinement_hotspot_ids"].append(hotspot_id)
+        debug_out["geometry_refinement_rejected_count"] = len(zone_features)
+        debug_out["refinement_rejected_reason_counts"] = dict(reason_counts)
+        print(f"[warn] Failed hotspot geometry refinement for zone {zone_id}", traceback.format_exc())
+        return debug_out
+
+    applied_count = 0
+    rejected_count = 0
+    for fallback_idx, feature in enumerate(zone_features):
+        props = feature.setdefault("properties", {})
+        hotspot_id = str(props.get("hotspot_id") or "")
+        hotspot_index = props.get("hotspot_index")
+        try:
+            idx = int(hotspot_index)
+        except Exception:
+            idx = int(fallback_idx)
+
+        if idx < 0 or idx >= len(sculpted_candidates):
+            rejected_count += 1
+            reason_counts["missing_sculpted_candidate"] += 1
+            if hotspot_id:
+                debug_out["rejected_refinement_hotspot_ids"].append(hotspot_id)
+            continue
+
+        candidate = sculpted_candidates[idx]
+        sculpted_proj = candidate.get("polygon_proj")
+        if sculpted_proj is None or getattr(sculpted_proj, "is_empty", True):
+            rejected_count += 1
+            reason_counts["sculpted_geometry_empty"] += 1
+            if hotspot_id:
+                debug_out["rejected_refinement_hotspot_ids"].append(hotspot_id)
+            continue
+
+        try:
+            original_geom = shape(feature.get("geometry"))
+            original_proj = transform(_to_3857.transform, original_geom).intersection(zone_proj)
+        except Exception:
+            original_proj = None
+        if original_proj is None or getattr(original_proj, "is_empty", True):
+            rejected_count += 1
+            reason_counts["original_geometry_empty"] += 1
+            if hotspot_id:
+                debug_out["rejected_refinement_hotspot_ids"].append(hotspot_id)
+            continue
+
+        sculpted_proj = sculpted_proj.intersection(zone_proj)
+        if sculpted_proj.is_empty:
+            rejected_count += 1
+            reason_counts["sculpted_outside_zone"] += 1
+            if hotspot_id:
+                debug_out["rejected_refinement_hotspot_ids"].append(hotspot_id)
+            continue
+        if not zone_proj.buffer(0.75).covers(sculpted_proj):
+            rejected_count += 1
+            reason_counts["sculpted_not_inside_zone"] += 1
+            if hotspot_id:
+                debug_out["rejected_refinement_hotspot_ids"].append(hotspot_id)
+            continue
+
+        centroid_shift_miles = float(original_proj.centroid.distance(sculpted_proj.centroid)) / 1609.344
+        if centroid_shift_miles > 0.28:
+            rejected_count += 1
+            reason_counts["centroid_shift_too_far"] += 1
+            if hotspot_id:
+                debug_out["rejected_refinement_hotspot_ids"].append(hotspot_id)
+            continue
+
+        original_area = max(1.0, float(original_proj.area))
+        sculpted_area = max(1.0, float(sculpted_proj.area))
+        area_ratio = sculpted_area / original_area
+        if area_ratio < 0.40 or area_ratio > 2.50:
+            rejected_count += 1
+            reason_counts["area_ratio_out_of_range"] += 1
+            if hotspot_id:
+                debug_out["rejected_refinement_hotspot_ids"].append(hotspot_id)
+            continue
+
+        inter = original_proj.intersection(sculpted_proj)
+        union = original_proj.union(sculpted_proj)
+        overlap_ratio = 0.0
+        if not union.is_empty and union.area > 0:
+            overlap_ratio = float(inter.area) / float(union.area)
+        if overlap_ratio < 0.18:
+            rejected_count += 1
+            reason_counts["overlap_ratio_too_low"] += 1
+            if hotspot_id:
+                debug_out["rejected_refinement_hotspot_ids"].append(hotspot_id)
+            continue
+
+        refined_ll = transform(_to_4326.transform, sculpted_proj)
+        if refined_ll.is_empty:
+            rejected_count += 1
+            reason_counts["refined_projection_empty"] += 1
+            if hotspot_id:
+                debug_out["rejected_refinement_hotspot_ids"].append(hotspot_id)
+            continue
+
+        feature["geometry"] = mapping(refined_ll)
+        props["geometry_refined"] = True
+        props["recent_shape_component"] = round(float(candidate.get("recent_shape_component") or 0.0), 4)
+        props["geometry_refinement_overlap_ratio"] = round(overlap_ratio, 4)
+        props["geometry_refinement_centroid_shift_miles"] = round(centroid_shift_miles, 4)
+        props["geometry_refinement_area_ratio"] = round(area_ratio, 4)
+        applied_count += 1
+        if hotspot_id:
+            debug_out["refined_hotspot_ids"].append(hotspot_id)
+
+    debug_out["geometry_refinement_applied_count"] = applied_count
+    debug_out["geometry_refinement_rejected_count"] = rejected_count
+    debug_out["refinement_rejected_reason_counts"] = dict(reason_counts)
+    return debug_out
+
+
 def _metric_from_feature_props(feature: Dict[str, Any], *keys: str, default: float = 0.0) -> float:
     props = (feature or {}).get("properties") or {}
     for key in keys:
@@ -6113,6 +6307,13 @@ def _pickup_zone_hotspots_with_debug(
                 "hotspot_limit_used": 2,
                 "third_hotspot_qualified": False,
                 "third_hotspot_rejected_reason": "",
+                "geometry_refinement_attempted": False,
+                "geometry_refinement_applied_count": 0,
+                "geometry_refinement_rejected_count": 0,
+                "refinement_rejected_reason_counts": {},
+                "historical_component_count_for_refinement": 0,
+                "refined_hotspot_ids": [],
+                "rejected_refinement_hotspot_ids": [],
                 "errors": [],
             }
             if qualified:
@@ -6248,6 +6449,19 @@ def _pickup_zone_hotspots_with_debug(
                         if zone_debug is not None:
                             zone_debug["errors"].append("log_recommendation_outcome_failed")
                         print(f"[warn] Failed to log recommendation outcome for zone {zone_id}", traceback.format_exc())
+        refinement_debug: Dict[str, Any] = {}
+        try:
+            refinement_debug = _refine_emitted_zone_hotspot_geometries(
+                zone_id=zone_id,
+                zone_data=zone_data,
+                zone_features=zone_features,
+                pts=pts,
+                now_ts=now_ts,
+            )
+        except Exception:
+            if zone_debug is not None:
+                zone_debug["errors"].append("hotspot_geometry_refinement_failed")
+            print(f"[warn] Failed to refine pickup zone hotspot geometries for zone {zone_id}", traceback.format_exc())
         enrichment_debug: Dict[str, Any] = {}
         try:
             enrichment_debug = _enrich_emitted_zone_hotspot_features(
@@ -6267,6 +6481,16 @@ def _pickup_zone_hotspots_with_debug(
         if zone_debug is not None:
             zone_debug["feature_emitted"] = bool(zone_features)
             zone_debug["micro_hotspot_count"] = zone_micro_total
+            for key, default in (
+                ("geometry_refinement_attempted", False),
+                ("geometry_refinement_applied_count", 0),
+                ("geometry_refinement_rejected_count", 0),
+                ("refinement_rejected_reason_counts", {}),
+                ("historical_component_count_for_refinement", 0),
+                ("refined_hotspot_ids", []),
+                ("rejected_refinement_hotspot_ids", []),
+            ):
+                zone_debug[key] = refinement_debug.get(key, default)
             for key, default in (
                 ("historical_anchor_point_count", 0),
                 ("historical_component_count", 0),
