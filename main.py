@@ -31,6 +31,12 @@ from hotspot_experiments import (
     log_zone_bins,
     prune_experiment_tables,
 )
+from pickup_hotspot_intelligence import (
+    build_hotspot_quality_modifier,
+    build_zone_historical_anchor_components,
+    build_zone_historical_anchor_points,
+    get_zone_or_hotspot_outcome_modifier,
+)
 from assistant_outlook_engine import (
     HORIZON_BINS_DEFAULT,
     build_assistant_outlook_frame_bucket,
@@ -5669,6 +5675,105 @@ def _pickup_zone_density_penalty(zone_ids: List[int]) -> Dict[int, float]:
     return out
 
 
+def _enrich_emitted_zone_hotspot_features(
+    zone_id: int,
+    zone_data: Dict[str, Any],
+    zone_features: List[Dict[str, Any]],
+    pts: List[Dict[str, Any]],
+    score: Any,
+    now_ts: int,
+) -> Dict[str, Any]:
+    if not zone_features:
+        return {}
+
+    zone_geom = (zone_data or {}).get("geometry")
+    long_run_rows: List[Dict[str, Any]] = []
+    historical_anchor_points: List[Dict[str, Any]] = []
+    historical_components: List[Dict[str, Any]] = []
+    try:
+        long_run_rows = _pickup_zone_long_run_points(zone_id, limit=2400)
+        historical_anchor_points = build_zone_historical_anchor_points(
+            pickup_rows=long_run_rows,
+            frame_time=now_ts,
+        )
+        historical_components = build_zone_historical_anchor_components(
+            zone_id=zone_id,
+            zone_geom=zone_geom,
+            weighted_points=historical_anchor_points,
+        )
+    except Exception:
+        print(f"[warn] Failed hotspot historical enrichment for zone {zone_id}", traceback.format_exc())
+
+    historical_weighted_support = max(
+        [float(c.get("weighted_point_count") or 0.0) for c in historical_components] or [0.0]
+    )
+    historical_component_score = max(
+        [float(c.get("component_score") or 0.0) for c in historical_components] or [0.0]
+    )
+    historical_component_count = len(historical_components)
+    historical_anchor_point_count = len(historical_anchor_points)
+    historical_strength = max(0.0, min(1.0, historical_weighted_support / 12.0))
+
+    score_short_trip_share = 0.0
+    score_continuation = 0.0
+    score_saturation = 0.0
+    if score is not None:
+        score_short_trip_share = float(getattr(score, "short_trip_share", 0.0) or 0.0)
+        score_continuation = float(getattr(score, "continuation_score", getattr(score, "same_timeslot_component", 0.0)) or 0.0)
+        score_saturation = float(getattr(score, "saturation", getattr(score, "density_penalty", 0.0)) or 0.0)
+    borough = str((zone_data or {}).get("borough") or "")
+
+    for feature in zone_features:
+        props = feature.setdefault("properties", {})
+        hotspot_id = str(props.get("hotspot_id") or "")
+        outcome_rows = _recent_recommendation_outcomes(zone_id, hotspot_id if hotspot_id else None)
+        outcome = get_zone_or_hotspot_outcome_modifier(outcome_rows)
+        outcome_modifier = float(outcome.get("modifier") or 1.0)
+
+        quality = build_hotspot_quality_modifier(
+            short_trip_share=score_short_trip_share,
+            continuation_score=score_continuation,
+            saturation=score_saturation,
+            borough=borough,
+        )
+        quality_modifier = float(quality.get("quality_modifier") or 1.0)
+
+        base_intensity = float(props.get("intensity") or 0.55)
+        base_confidence = float(props.get("confidence") or getattr(score, "confidence", 0.55) or 0.55)
+        hist_boost = 0.85 + (0.25 * historical_strength)
+        live_combined_modifier = hist_boost * outcome_modifier * quality_modifier
+        final_intensity = max(0.20, min(1.00, base_intensity * live_combined_modifier))
+        final_confidence = max(0.20, min(0.98, base_confidence * live_combined_modifier))
+
+        props["historical_anchor_point_count"] = historical_anchor_point_count
+        props["historical_component_count"] = historical_component_count
+        props["historical_weighted_support"] = round(historical_weighted_support, 4)
+        props["historical_component_score"] = round(historical_component_score, 4)
+        props["historical_strength"] = round(historical_strength, 4)
+
+        props["outcome_modifier"] = round(outcome_modifier, 4)
+        props["outcome_sample_count"] = int(float(outcome.get("sample_count") or 0.0))
+        props["outcome_conversion_rate"] = round(float(outcome.get("conversion_rate") or 0.0), 4)
+        props["outcome_median_minutes_to_trip"] = round(float(outcome.get("median_minutes_to_trip") or 0.0), 4)
+
+        props["quality_modifier"] = round(quality_modifier, 4)
+        props["short_trip_trap_penalty"] = round(float(quality.get("short_trip_trap_penalty") or 0.0), 4)
+        props["trap_penalty"] = props["short_trip_trap_penalty"]
+        props["continuation_bonus"] = round(float(quality.get("continuation_bonus") or 0.0), 4)
+        props["saturation_penalty"] = round(float(quality.get("saturation_penalty") or 0.0), 4)
+
+        props["live_modifier_version"] = "hybrid_v1"
+        props["live_combined_modifier"] = round(live_combined_modifier, 4)
+        props["intensity"] = round(final_intensity, 4)
+        props["confidence"] = round(final_confidence, 4)
+
+    return {
+        "historical_anchor_point_count": historical_anchor_point_count,
+        "historical_component_count": historical_component_count,
+        "historical_strength": round(historical_strength, 4),
+    }
+
+
 def _pickup_zone_hotspots_with_debug(
     zone_ids: List[int],
     include_debug: bool = False,
@@ -5938,11 +6043,54 @@ def _pickup_zone_hotspots_with_debug(
                         if zone_debug is not None:
                             zone_debug["errors"].append("log_recommendation_outcome_failed")
                         print(f"[warn] Failed to log recommendation outcome for zone {zone_id}", traceback.format_exc())
+        enrichment_debug: Dict[str, Any] = {}
+        try:
+            enrichment_debug = _enrich_emitted_zone_hotspot_features(
+                zone_id=zone_id,
+                zone_data=zone_data,
+                zone_features=zone_features,
+                pts=pts,
+                score=score,
+                now_ts=now_ts,
+            )
+        except Exception:
+            if zone_debug is not None:
+                zone_debug["errors"].append("hotspot_enrichment_failed")
+            print(f"[warn] Failed to enrich pickup zone hotspots for zone {zone_id}", traceback.format_exc())
+        for feature in zone_features:
             features.append(feature)
 
         if zone_debug is not None:
             zone_debug["feature_emitted"] = bool(zone_features)
             zone_debug["micro_hotspot_count"] = zone_micro_total
+            for key, default in (
+                ("historical_anchor_point_count", 0),
+                ("historical_component_count", 0),
+                ("historical_strength", 0.0),
+                ("outcome_modifier", 1.0),
+                ("outcome_sample_count", 0),
+                ("quality_modifier", 1.0),
+                ("short_trip_trap_penalty", 0.0),
+                ("continuation_bonus", 0.0),
+                ("saturation_penalty", 0.0),
+                ("live_combined_modifier", 1.0),
+                ("live_modifier_version", "hybrid_v1"),
+            ):
+                zone_debug[key] = enrichment_debug.get(key, default)
+            if zone_features:
+                top_props = zone_features[0].get("properties") or {}
+                for key in (
+                    "outcome_modifier",
+                    "outcome_sample_count",
+                    "quality_modifier",
+                    "short_trip_trap_penalty",
+                    "continuation_bonus",
+                    "saturation_penalty",
+                    "live_combined_modifier",
+                    "live_modifier_version",
+                ):
+                    if key in top_props:
+                        zone_debug[key] = top_props.get(key)
             debug["rendered_zone_ids"].append(zone_id)
             debug["zones"].append(zone_debug)
 
