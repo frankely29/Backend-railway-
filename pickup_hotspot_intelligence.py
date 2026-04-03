@@ -340,6 +340,9 @@ def convert_historical_components_to_emittable_shapes(
             shaped = clipped
         if shaped.is_empty:
             continue
+        simplified = shaped.simplify(14.0, preserve_topology=True).intersection(zone_proj)
+        if not simplified.is_empty:
+            shaped = simplified
         ll = transform(_TO_4326.transform, shaped)
         support = float(comp.get("weighted_point_count") or 0.0)
         comp_score = float(comp.get("component_score") or 0.0)

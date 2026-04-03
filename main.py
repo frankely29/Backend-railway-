@@ -5083,20 +5083,18 @@ def _build_zone_hotspot_components(
         cell_size_m=float(PICKUP_ZONE_HOTSPOT_CELL_SIZE_M),
         simplify_m=float(PICKUP_ZONE_HOTSPOT_SIMPLIFY_M),
     )
-    if not historical_components:
-        debug["second_hotspot_rejected_reason"] = "no_historical_components"
-        return [], debug
-
     hotspot_limit = determine_zone_hotspot_limit(zone_geom, historical_components)
     debug["hotspot_limit_used"] = hotspot_limit
 
     recent_rows = point_rows[:]
-    recent_components = sculpt_hotspot_shapes_from_recent_points(
-        historical_components[: max(3, hotspot_limit)],
-        recent_rows,
-        zone_geom,
-        frame_time,
-    )
+    recent_components: List[Dict[str, Any]] = []
+    if historical_components:
+        recent_components = sculpt_hotspot_shapes_from_recent_points(
+            historical_components[: max(3, hotspot_limit)],
+            recent_rows,
+            zone_geom,
+            frame_time,
+        )
     used_recent_sculpting = bool(recent_components)
     weak_recent_sculpting = False
     if recent_components:
@@ -5105,14 +5103,18 @@ def _build_zone_hotspot_components(
     if weak_recent_sculpting:
         recent_components = []
     using_historical_fallback = False
-    if not recent_components:
+    if not recent_components and historical_components:
         recent_components = convert_historical_components_to_emittable_shapes(
             historical_components[: max(3, hotspot_limit)],
             zone_geom,
         )
         using_historical_fallback = bool(recent_components)
+    used_recent_cluster_fallback = False
     if not recent_components:
-        debug["second_hotspot_rejected_reason"] = "historical_shape_fallback_failed"
+        recent_components = _build_recent_cluster_components_for_zone(zone_id, zone_meta, recent_rows)
+        used_recent_cluster_fallback = bool(recent_components)
+    if not recent_components:
+        debug["second_hotspot_rejected_reason"] = "no_emittable_historical_or_recent_clusters"
         return [], debug
 
     debug["candidate_component_count"] = len(recent_components)
@@ -5150,7 +5152,11 @@ def _build_zone_hotspot_components(
                     "borough": borough,
                     "hotspot_index": hotspot_index,
                     "hotspot_id": hotspot_id,
-                    "hotspot_method": "historical_anchor_only" if using_historical_fallback else "historical_anchor_sculpted",
+                    "hotspot_method": (
+                        "recent_cluster_only"
+                        if used_recent_cluster_fallback
+                        else ("historical_anchor_only" if using_historical_fallback else "historical_anchor_sculpted")
+                    ),
                     "covered_zone_ids": [zone_id],
                     "covered_zone_names": [zone_name],
                     "merged": False,
@@ -5186,8 +5192,9 @@ def _build_zone_hotspot_components(
 
     debug["second_hotspot_qualified"] = len(emitted) > 1
     debug["emitted_hotspot_count"] = len(emitted)
-    debug["used_recent_sculpting"] = bool(used_recent_sculpting and not using_historical_fallback)
+    debug["used_recent_sculpting"] = bool(used_recent_sculpting and not using_historical_fallback and not used_recent_cluster_fallback)
     debug["used_historical_fallback_shape"] = bool(using_historical_fallback)
+    debug["used_recent_cluster_fallback_shape"] = bool(used_recent_cluster_fallback)
     debug["historical_only_fallback"] = bool(using_historical_fallback)
     return emitted, debug
 
@@ -5648,6 +5655,64 @@ def _valid_recent_cluster_components(recent_components: List[Dict[str, Any]]) ->
     return False
 
 
+def _build_recent_cluster_components_for_zone(
+    zone_id: int,
+    zone_meta: Dict[str, Any],
+    recent_points: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    zone_geom = zone_meta.get("geometry")
+    if zone_geom is None or zone_geom.is_empty or len(recent_points) < PICKUP_ZONE_HOTSPOT_MIN_POINTS:
+        return []
+    try:
+        zone_proj = transform(_to_3857.transform, zone_geom)
+    except Exception:
+        return []
+    if zone_proj.is_empty:
+        return []
+    point_entries = _normalize_pickup_zone_point_entries(recent_points)
+    if len(point_entries) < PICKUP_ZONE_HOTSPOT_MIN_POINTS:
+        return []
+    density = _build_density_components(zone_proj, point_entries, threshold_ratio=0.52)
+    raw_components = density.get("components") or []
+    if not raw_components:
+        return []
+
+    converted: List[Dict[str, Any]] = []
+    for idx, component in enumerate(raw_components[:3]):
+        support_points = int(component.get("point_count") or 0)
+        if support_points < PICKUP_ZONE_HOTSPOT_MIN_POINTS:
+            continue
+        shaped = _shape_hotspot_component(component, zone_proj)
+        if shaped is None or shaped.is_empty:
+            continue
+        geometry_ll = transform(_to_4326.transform, shaped)
+        if geometry_ll is None or getattr(geometry_ll, "is_empty", True):
+            continue
+        comp_score = float(component.get("component_score") or 0.0)
+        peak_score = float(component.get("peak_score") or 0.0)
+        score_norm = max(0.0, min(1.0, comp_score / 7.5))
+        peak_norm = max(0.0, min(1.0, peak_score / 2.6))
+        support_norm = max(0.0, min(1.0, support_points / 10.0))
+        normalized = (score_norm * 0.45) + (peak_norm * 0.25) + (support_norm * 0.30)
+        converted.append(
+            {
+                "anchor_rank": idx,
+                "anchor_id": f"zone:{zone_id}:recent:{idx}",
+                "cells": component.get("cells") or set(),
+                "polygon_proj": shaped,
+                "geometry": geometry_ll,
+                "component_score": comp_score,
+                "peak_score": peak_score,
+                "weighted_point_count": float(support_points),
+                "point_count": support_points,
+                "recent_shape_component": max(0.35, min(1.0, normalized)),
+                "intensity": max(0.22, min(0.76, 0.24 + (0.44 * normalized))),
+                "confidence": max(0.30, min(0.85, 0.34 + (0.44 * normalized))),
+            }
+        )
+    return converted
+
+
 def should_emit_zone_hotspot_from_cluster_evidence(
     zone_score: Any,
     historical_anchor_points: List[Dict[str, Any]],
@@ -5820,16 +5885,19 @@ def _pickup_zone_hotspots_with_debug(
                 simplify_m=float(PICKUP_ZONE_HOTSPOT_SIMPLIFY_M),
             )
         recent_components_for_qualification: List[Dict[str, Any]] = []
-        if zone_data and zone_data.get("geometry") is not None and historical_components:
-            try:
-                recent_components_for_qualification = sculpt_hotspot_shapes_from_recent_points(
-                    historical_components[:3],
-                    pts,
-                    zone_data.get("geometry"),
-                    frame_time,
-                )
-            except Exception:
-                recent_components_for_qualification = []
+        if zone_data and zone_data.get("geometry") is not None:
+            if historical_components:
+                try:
+                    recent_components_for_qualification = sculpt_hotspot_shapes_from_recent_points(
+                        historical_components[:3],
+                        pts,
+                        zone_data.get("geometry"),
+                        frame_time,
+                    )
+                except Exception:
+                    recent_components_for_qualification = []
+            if not recent_components_for_qualification:
+                recent_components_for_qualification = _build_recent_cluster_components_for_zone(zone_id, zone_data, pts)
         qualified_by_historical_support = len(historical_anchor_points) >= PICKUP_ZONE_HOTSPOT_MIN_POINTS
         strongest_historical_weighted = max(
             [float(c.get("weighted_point_count") or 0.0) for c in historical_components if isinstance(c, dict)] or [0.0]
@@ -5868,7 +5936,8 @@ def _pickup_zone_hotspots_with_debug(
                 "historical_anchor_point_count": len(historical_anchor_points),
                 "historical_component_count": len(historical_components),
                 "qualified_by_cluster_evidence": qualified,
-                "qualified_by_historical_support": bool(qualified_by_historical_support or qualified_by_historical_component),
+                "qualified_by_historical_support": bool(qualified_by_historical_support),
+                "qualified_by_historical_component_support": bool(qualified_by_historical_component),
                 "qualified_by_recent_support": bool(qualified_by_recent_support),
                 "suppressed_by_zone_score": False,
                 "skipped_reason": skipped_reason,
@@ -5884,6 +5953,7 @@ def _pickup_zone_hotspots_with_debug(
                 "hotspot_method": "none",
                 "used_recent_sculpting": False,
                 "used_historical_fallback_shape": False,
+                "used_recent_cluster_fallback_shape": False,
                 "signature": signature,
                 "errors": [],
             }
