@@ -5839,9 +5839,15 @@ def _build_cross_zone_merged_hotspot_feature(
             break
 
     zone_label = merged_zone_names[0] if merged_zone_names else f"Merged {small_zone_id}/{large_zone_id}"
+    merged_geometry = merge_result.get("geometry")
+    if isinstance(merged_geometry, dict):
+        merged_geometry_payload = merged_geometry
+    else:
+        merged_geometry_payload = mapping(merged_geometry)
+
     merged_feature = {
         "type": "Feature",
-        "geometry": mapping(merge_result.get("geometry")),
+        "geometry": merged_geometry_payload,
         "properties": {
             "zone_id": primary_zone_id,
             "zone_name": zone_label,

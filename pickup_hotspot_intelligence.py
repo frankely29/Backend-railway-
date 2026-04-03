@@ -454,6 +454,7 @@ def should_merge_adjacent_zone_hotspots(
         "weighted_point_count",
         "historical_weighted_support",
         "component_point_count",
+        "point_count",
         "sample_size",
         default=0.0,
     )
@@ -463,6 +464,7 @@ def should_merge_adjacent_zone_hotspots(
         "weighted_point_count",
         "historical_weighted_support",
         "component_point_count",
+        "point_count",
         "sample_size",
         default=0.0,
     )
