@@ -347,6 +347,7 @@ def convert_historical_components_to_emittable_shapes(
         score_norm = _clip(comp_score / 9.0)
         normalized = (score_norm * 0.62) + (support_norm * 0.38)
         intensity = _clip(0.24 + (0.52 * normalized), 0.20, 0.90)
+        confidence = _clip(0.34 + (0.56 * normalized), 0.28, 0.95)
         converted.append(
             {
                 **comp,
@@ -354,6 +355,7 @@ def convert_historical_components_to_emittable_shapes(
                 "geometry": ll,
                 "recent_shape_component": 0.0,
                 "intensity": float(intensity),
+                "confidence": float(confidence),
             }
         )
     return converted
