@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import List, Optional
 
 
 @dataclass
@@ -26,6 +26,8 @@ class ZoneScoreResult:
     merged: bool = False
     merged_zone_count: int = 1
     hotspot_method: str = "historical_anchor_sculpted"
+    merged_zone_ids: Optional[List[int]] = None
+    covered_zone_ids: Optional[List[int]] = None
 
 
 @dataclass

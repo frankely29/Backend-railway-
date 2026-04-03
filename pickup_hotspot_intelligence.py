@@ -317,6 +317,46 @@ def sculpt_hotspot_shapes_from_recent_points(
     return sculpted
 
 
+def convert_historical_components_to_emittable_shapes(
+    historical_components: Sequence[Mapping[str, Any]],
+    zone_geom: Any,
+) -> List[Dict[str, Any]]:
+    if not historical_components or zone_geom is None or getattr(zone_geom, "is_empty", True):
+        return []
+    zone_proj = transform(_TO_3857.transform, zone_geom)
+    if zone_proj.is_empty:
+        return []
+
+    converted: List[Dict[str, Any]] = []
+    for comp in historical_components:
+        poly = comp.get("polygon_proj")
+        if poly is None or poly.is_empty:
+            continue
+        clipped = poly.intersection(zone_proj)
+        if clipped.is_empty:
+            continue
+        shaped = clipped.buffer(18.0).buffer(-8.0).intersection(zone_proj)
+        if shaped.is_empty:
+            shaped = clipped
+        if shaped.is_empty:
+            continue
+        ll = transform(_TO_4326.transform, shaped)
+        support = float(comp.get("weighted_point_count") or 0.0)
+        comp_score = float(comp.get("component_score") or 0.0)
+        normalized = _clip((comp_score / 10.0) * 0.7 + (support / 16.0) * 0.3)
+        intensity = _clip(0.22 + (0.56 * normalized), 0.18, 0.92)
+        converted.append(
+            {
+                **comp,
+                "polygon_proj": shaped,
+                "geometry": ll,
+                "recent_shape_component": 0.0,
+                "intensity": float(intensity),
+            }
+        )
+    return converted
+
+
 def should_merge_adjacent_zone_hotspots(
     zone_a_meta: Mapping[str, Any],
     zone_b_meta: Mapping[str, Any],

@@ -69,6 +69,9 @@ def log_recommendation_outcome(
     converted_to_trip: Optional[bool] = None,
     minutes_to_trip: Optional[float] = None,
 ) -> None:
+    cluster_value = str(cluster_id).strip() if cluster_id is not None else None
+    if cluster_value == "":
+        cluster_value = None
     db_exec(
         """
         INSERT INTO recommendation_outcomes(
@@ -79,7 +82,7 @@ def log_recommendation_outcome(
             int(user_id) if user_id is not None else None,
             int(recommended_at),
             int(zone_id),
-            cluster_id,
+            cluster_value,
             float(score),
             float(confidence),
             None if converted_to_trip is None else _bool_db_value(bool(converted_to_trip)),
