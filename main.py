@@ -36,6 +36,7 @@ from pickup_hotspot_intelligence import (
     build_hotspot_quality_modifier,
     build_zone_historical_anchor_components,
     build_zone_historical_anchor_points,
+    determine_zone_hotspot_limit,
     get_zone_or_hotspot_outcome_modifier,
 )
 from assistant_outlook_engine import (
@@ -5034,11 +5035,39 @@ def _hotspot_merge_decision(candidate_components: List[Dict[str, Any]], selected
     return False, "separate"
 
 
+def _determine_live_zone_hotspot_limit(
+    zone_id: int,
+    zone_data: Dict[str, Any],
+    now_ts: int,
+) -> int:
+    try:
+        zone_geom = (zone_data or {}).get("geometry")
+        if zone_geom is None or getattr(zone_geom, "is_empty", True):
+            return 2
+
+        long_run_rows = _pickup_zone_long_run_points(zone_id, limit=2400)
+        historical_anchor_points = build_zone_historical_anchor_points(
+            pickup_rows=long_run_rows,
+            frame_time=now_ts,
+        )
+        historical_components = build_zone_historical_anchor_components(
+            zone_id=zone_id,
+            zone_geom=zone_geom,
+            weighted_points=historical_anchor_points,
+        )
+        limit = determine_zone_hotspot_limit(zone_geom, historical_components)
+        return 3 if int(limit) == 3 else 2
+    except Exception:
+        print(f"[warn] Failed to determine hotspot limit for zone {zone_id}", traceback.format_exc())
+        return 2
+
+
 def _build_zone_hotspot_components(
     zone_id: int,
     zone_meta: Dict[str, Any],
     point_rows: List[Dict[str, Any]],
     fallback: bool = False,
+    hotspot_limit: int = 2,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     debug: Dict[str, Any] = {
         "candidate_component_count": 0,
@@ -5049,7 +5078,13 @@ def _build_zone_hotspot_components(
         "component_point_counts": [],
         "second_hotspot_qualified": False,
         "second_hotspot_rejected_reason": "",
+        "hotspot_limit_used": 2,
+        "third_hotspot_qualified": False,
+        "third_hotspot_rejected_reason": "",
     }
+    hotspot_limit = 3 if int(hotspot_limit) >= 3 else 2
+    debug["hotspot_limit_used"] = hotspot_limit
+
     if len(point_rows) < PICKUP_ZONE_HOTSPOT_MIN_POINTS:
         debug["second_hotspot_rejected_reason"] = "zone_below_min_points"
         return [], debug
@@ -5120,7 +5155,7 @@ def _build_zone_hotspot_components(
         return [], debug
 
     debug["candidate_component_count"] = len(components)
-    debug["component_point_counts"] = [int(c.get("point_count") or 0) for c in components[:2]]
+    debug["component_point_counts"] = [int(c.get("point_count") or 0) for c in components[:hotspot_limit]]
 
     strongest = components[0]
     top_components: List[Dict[str, Any]] = [strongest]
@@ -5146,6 +5181,32 @@ def _build_zone_hotspot_components(
         else:
             debug["second_hotspot_rejected_reason"] = second_reason
 
+    if hotspot_limit >= 3 and len(components) > 2:
+        third = components[2]
+        third_ok = True
+        third_reason = ""
+        if len(point_entries) < 12:
+            third_ok = False
+            third_reason = "zone_points_below_third_threshold"
+        elif int(third.get("point_count") or 0) < 4:
+            third_ok = False
+            third_reason = "third_component_low_point_count"
+        else:
+            s0 = max(0.0001, float(strongest.get("component_score") or 0.0001))
+            s2 = float(third.get("component_score") or 0.0)
+            if (s2 / s0) < 0.35:
+                third_ok = False
+                third_reason = "third_component_low_strength"
+        if third_ok:
+            debug["third_hotspot_qualified"] = True
+            top_components.append(third)
+        else:
+            debug["third_hotspot_rejected_reason"] = third_reason
+    elif hotspot_limit < 3:
+        debug["third_hotspot_rejected_reason"] = "hotspot_limit_below_3"
+    elif len(components) <= 2:
+        debug["third_hotspot_rejected_reason"] = "no_third_component"
+
     shaped_candidates: List[Dict[str, Any]] = []
     for rank, comp in enumerate(top_components):
         shaped = _shape_hotspot_component(comp, zone_proj)
@@ -5157,26 +5218,29 @@ def _build_zone_hotspot_components(
         debug["second_hotspot_rejected_reason"] = "component_shaping_failed"
         return [], debug
 
-    merged, merge_reason = _hotspot_merge_decision(shaped_candidates, selected_cells)
+    merge_candidates = shaped_candidates[:2]
+    merged, merge_reason = _hotspot_merge_decision(merge_candidates, selected_cells)
     debug["merged"] = merged
     debug["merge_reason"] = merge_reason
 
     final_components: List[Dict[str, Any]] = []
-    if merged and len(shaped_candidates) > 1:
-        merged_geom = unary_union([c["polygon"] for c in shaped_candidates]).intersection(zone_proj)
+    if merged and len(merge_candidates) > 1:
+        merged_geom = unary_union([c["polygon"] for c in merge_candidates]).intersection(zone_proj)
         if not merged_geom.is_empty:
             merged_component = {
                 "polygon": merged_geom,
-                "component_score": sum(float(c.get("component_score") or 0.0) for c in shaped_candidates),
-                "peak_score": max(float(c.get("peak_score") or 0.0) for c in shaped_candidates),
-                "point_count": sum(int(c.get("point_count") or 0) for c in shaped_candidates),
+                "component_score": sum(float(c.get("component_score") or 0.0) for c in merge_candidates),
+                "peak_score": max(float(c.get("peak_score") or 0.0) for c in merge_candidates),
+                "point_count": sum(int(c.get("point_count") or 0) for c in merge_candidates),
                 "component_rank": 0,
-                "merged_from_count": len(shaped_candidates),
-                "cells": set().union(*[c.get("cells") or set() for c in shaped_candidates]),
+                "merged_from_count": len(merge_candidates),
+                "cells": set().union(*[c.get("cells") or set() for c in merge_candidates]),
             }
             final_components = [merged_component]
+            if hotspot_limit >= 3 and len(shaped_candidates) > 2:
+                final_components.append({**shaped_candidates[2], "merged_from_count": 1})
     if not final_components:
-        for c in shaped_candidates[:2]:
+        for c in shaped_candidates[:hotspot_limit]:
             final_components.append({**c, "merged_from_count": 1})
 
     latest_created_at = max((int(p.get("created_at") or 0) for p in point_entries), default=0)
@@ -5186,7 +5250,7 @@ def _build_zone_hotspot_components(
     signature = _pickup_zone_signature(point_rows)
 
     emitted: List[Dict[str, Any]] = []
-    for hotspot_index, comp in enumerate(final_components[:2]):
+    for hotspot_index, comp in enumerate(final_components[:hotspot_limit]):
         polygon = comp.get("polygon")
         if polygon is None or polygon.is_empty:
             continue
@@ -6046,6 +6110,9 @@ def _pickup_zone_hotspots_with_debug(
                 "component_point_counts": [],
                 "second_hotspot_qualified": False,
                 "second_hotspot_rejected_reason": "",
+                "hotspot_limit_used": 2,
+                "third_hotspot_qualified": False,
+                "third_hotspot_rejected_reason": "",
                 "errors": [],
             }
             if qualified:
@@ -6056,6 +6123,10 @@ def _pickup_zone_hotspots_with_debug(
                 zone_debug["errors"].append("geometry_missing")
                 zone_debug_map[zone_id] = zone_debug
             continue
+
+        hotspot_limit = _determine_live_zone_hotspot_limit(zone_id, zone_data, now_ts)
+        if zone_debug is not None:
+            zone_debug["hotspot_limit_used"] = hotspot_limit
 
         zone_recent_points_map[zone_id] = pts
         zone_meta_map[zone_id] = zone_data
@@ -6068,6 +6139,7 @@ def _pickup_zone_hotspots_with_debug(
                 cached
                 and cached.get("signature") == signature
                 and cached.get("features")
+                and int(cached.get("hotspot_limit_used") or 2) == hotspot_limit
                 and (now_monotonic - float(cached.get("created_at_monotonic") or 0.0)) <= PICKUP_HOTSPOT_CACHE_TTL_SECONDS
             ):
                 cached["last_access_monotonic"] = now_monotonic
@@ -6085,7 +6157,7 @@ def _pickup_zone_hotspots_with_debug(
             if zone_debug is not None:
                 zone_debug["primary_attempted"] = True
             try:
-                zone_features, zone_component_debug = _build_zone_hotspot_components(zone_id, zone_data, pts, fallback=False)
+                zone_features, zone_component_debug = _build_zone_hotspot_components(zone_id, zone_data, pts, fallback=False, hotspot_limit=hotspot_limit)
                 if zone_debug is not None:
                     zone_debug["primary_ok"] = bool(zone_features)
                     if zone_features:
@@ -6099,7 +6171,7 @@ def _pickup_zone_hotspots_with_debug(
             if zone_debug is not None:
                 zone_debug["fallback_attempted"] = True
             try:
-                zone_features, zone_component_debug = _build_zone_hotspot_components(zone_id, zone_data, pts, fallback=True)
+                zone_features, zone_component_debug = _build_zone_hotspot_components(zone_id, zone_data, pts, fallback=True, hotspot_limit=hotspot_limit)
                 if zone_debug is not None:
                     zone_debug["fallback_ok"] = bool(zone_features)
                     if zone_features:
@@ -6139,6 +6211,7 @@ def _pickup_zone_hotspots_with_debug(
                 _pickup_zone_hotspot_feature_cache[zone_id] = {
                     "signature": signature,
                     "features": copy.deepcopy(zone_features),
+                    "hotspot_limit_used": hotspot_limit,
                     "created_at_monotonic": now_monotonic,
                     "last_access_monotonic": now_monotonic,
                 }
