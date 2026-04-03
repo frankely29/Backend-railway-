@@ -32,6 +32,7 @@ from hotspot_experiments import (
     prune_experiment_tables,
 )
 from pickup_hotspot_intelligence import (
+    build_cross_zone_merged_hotspots,
     build_hotspot_quality_modifier,
     build_zone_historical_anchor_components,
     build_zone_historical_anchor_points,
@@ -5774,6 +5775,122 @@ def _enrich_emitted_zone_hotspot_features(
     }
 
 
+def _metric_from_feature_props(feature: Dict[str, Any], *keys: str, default: float = 0.0) -> float:
+    props = (feature or {}).get("properties") or {}
+    for key in keys:
+        if key not in props:
+            continue
+        try:
+            return float(props.get(key))
+        except Exception:
+            continue
+    return float(default)
+
+
+def _build_cross_zone_merged_hotspot_feature(
+    merge_result: Dict[str, Any],
+    feature_a: Dict[str, Any],
+    feature_b: Dict[str, Any],
+) -> Dict[str, Any]:
+    props_a = (feature_a or {}).get("properties") or {}
+    props_b = (feature_b or {}).get("properties") or {}
+    merged_zone_ids = list(merge_result.get("merged_zone_ids") or [])
+    merged_zone_names = [str(name or "") for name in (merge_result.get("merged_zone_names") or [])]
+    primary_zone_id = int(merge_result.get("primary_zone_id") or (merged_zone_ids[0] if merged_zone_ids else 0))
+    if len(merged_zone_ids) >= 2:
+        small_zone_id, large_zone_id = sorted(merged_zone_ids[:2])
+    else:
+        small_zone_id = primary_zone_id
+        large_zone_id = primary_zone_id
+    hotspot_id_a = str(props_a.get("hotspot_id") or "a")
+    hotspot_id_b = str(props_b.get("hotspot_id") or "b")
+    merged_hotspot_id = f"merged:{small_zone_id}:{large_zone_id}:{hotspot_id_a}:{hotspot_id_b}"
+
+    sample_size = int(_metric_from_feature_props(feature_a, "sample_size", default=0.0) + _metric_from_feature_props(feature_b, "sample_size", default=0.0))
+    component_point_count = int(
+        _metric_from_feature_props(feature_a, "component_point_count", default=0.0)
+        + _metric_from_feature_props(feature_b, "component_point_count", default=0.0)
+    )
+    latest_created_at = int(
+        max(
+            _metric_from_feature_props(feature_a, "latest_created_at", default=0.0),
+            _metric_from_feature_props(feature_b, "latest_created_at", default=0.0),
+        )
+    )
+
+    signature_a = str(props_a.get("signature") or "")
+    signature_b = str(props_b.get("signature") or "")
+    combined_signature = f"merge:{small_zone_id}:{large_zone_id}:{signature_a}:{signature_b}"
+
+    merged_micro: List[Dict[str, Any]] = []
+    for source in (props_a.get("micro_hotspots") or [], props_b.get("micro_hotspots") or []):
+        if not isinstance(source, list):
+            continue
+        for item in source:
+            if not isinstance(item, dict):
+                continue
+            micro = copy.deepcopy(item)
+            micro["hotspot_id"] = merged_hotspot_id
+            micro["hotspot_index"] = 0
+            merged_micro.append(micro)
+            if len(merged_micro) >= 2:
+                break
+        if len(merged_micro) >= 2:
+            break
+
+    zone_label = merged_zone_names[0] if merged_zone_names else f"Merged {small_zone_id}/{large_zone_id}"
+    merged_feature = {
+        "type": "Feature",
+        "geometry": mapping(merge_result.get("geometry")),
+        "properties": {
+            "zone_id": primary_zone_id,
+            "zone_name": zone_label,
+            "borough": str(merge_result.get("borough") or props_a.get("borough") or props_b.get("borough") or ""),
+            "hotspot_index": 0,
+            "hotspot_id": merged_hotspot_id,
+            "hotspot_method": "cross_zone_merge",
+            "merged": True,
+            "merged_zone_count": 2,
+            "merged_zone_ids": merged_zone_ids,
+            "merged_zone_names": merged_zone_names,
+            "covered_zone_ids": merged_zone_ids,
+            "covered_zone_names": merged_zone_names,
+            "sample_size": sample_size,
+            "component_point_count": component_point_count,
+            "latest_created_at": latest_created_at,
+            "signature": combined_signature,
+            "merged_from_count": 2,
+            "intensity": max(_metric_from_feature_props(feature_a, "intensity"), _metric_from_feature_props(feature_b, "intensity")),
+            "confidence": max(_metric_from_feature_props(feature_a, "confidence"), _metric_from_feature_props(feature_b, "confidence")),
+            "historical_strength": max(
+                _metric_from_feature_props(feature_a, "historical_strength"),
+                _metric_from_feature_props(feature_b, "historical_strength"),
+            ),
+            "outcome_modifier": max(
+                _metric_from_feature_props(feature_a, "outcome_modifier", default=1.0),
+                _metric_from_feature_props(feature_b, "outcome_modifier", default=1.0),
+            ),
+            "quality_modifier": (
+                _metric_from_feature_props(feature_a, "quality_modifier", default=1.0)
+                + _metric_from_feature_props(feature_b, "quality_modifier", default=1.0)
+            )
+            / 2.0,
+            "live_combined_modifier": max(
+                _metric_from_feature_props(feature_a, "live_combined_modifier", default=1.0),
+                _metric_from_feature_props(feature_b, "live_combined_modifier", default=1.0),
+            ),
+            "recommended": bool(props_a.get("recommended")) or bool(props_b.get("recommended")),
+            "micro_hotspots": merged_micro,
+        },
+    }
+    for key in ("final_score", "hotspot_score"):
+        merged_feature["properties"][key] = max(
+            _metric_from_feature_props(feature_a, key),
+            _metric_from_feature_props(feature_b, key),
+        )
+    return merged_feature
+
+
 def _pickup_zone_hotspots_with_debug(
     zone_ids: List[int],
     include_debug: bool = False,
@@ -5793,6 +5910,9 @@ def _pickup_zone_hotspots_with_debug(
         "zone_hotspot_count": 0,
         "orphan_micro_hotspot_count": 0,
         "top_level_micro_hotspot_count": 0,
+        "cross_zone_merge_candidates": 0,
+        "cross_zone_merge_applied_count": 0,
+        "merged_zone_pairs": [],
     }
     if include_debug:
         debug.update(
@@ -5881,7 +6001,10 @@ def _pickup_zone_hotspots_with_debug(
             debug["global_errors"].append("prune_experiment_tables_failed")
         print("[warn] Failed to prune pickup hotspot experiment tables", traceback.format_exc())
 
-    features: List[Dict[str, Any]] = []
+    zone_feature_map: Dict[int, List[Dict[str, Any]]] = {}
+    zone_debug_map: Dict[int, Dict[str, Any]] = {}
+    zone_recent_points_map: Dict[int, List[Dict[str, Any]]] = {}
+    zone_meta_map: Dict[int, Dict[str, Any]] = {}
     for zone_id in clean_zone_ids:
         pts = zone_points.get(zone_id, [])
         zone_data = zone_geoms.get(zone_id)
@@ -5925,8 +6048,11 @@ def _pickup_zone_hotspots_with_debug(
         if not zone_data:
             if zone_debug is not None:
                 zone_debug["errors"].append("geometry_missing")
-                debug["zones"].append(zone_debug)
+                zone_debug_map[zone_id] = zone_debug
             continue
+
+        zone_recent_points_map[zone_id] = pts
+        zone_meta_map[zone_id] = zone_data
 
         zone_features: List[Dict[str, Any]] = []
         cached_hit = False
@@ -5984,7 +6110,7 @@ def _pickup_zone_hotspots_with_debug(
             with _pickup_zone_hotspot_cache_lock:
                 _pickup_zone_hotspot_feature_cache.pop(zone_id, None)
             if zone_debug is not None:
-                debug["zones"].append(zone_debug)
+                zone_debug_map[zone_id] = zone_debug
             continue
 
         if not cached_hit:
@@ -6057,8 +6183,7 @@ def _pickup_zone_hotspots_with_debug(
             if zone_debug is not None:
                 zone_debug["errors"].append("hotspot_enrichment_failed")
             print(f"[warn] Failed to enrich pickup zone hotspots for zone {zone_id}", traceback.format_exc())
-        for feature in zone_features:
-            features.append(feature)
+        zone_feature_map[zone_id] = zone_features
 
         if zone_debug is not None:
             zone_debug["feature_emitted"] = bool(zone_features)
@@ -6091,8 +6216,93 @@ def _pickup_zone_hotspots_with_debug(
                 ):
                     if key in top_props:
                         zone_debug[key] = top_props.get(key)
-            debug["rendered_zone_ids"].append(zone_id)
-            debug["zones"].append(zone_debug)
+            zone_debug_map[zone_id] = zone_debug
+
+    merge_candidate_map: Dict[int, List[Dict[str, Any]]] = {}
+    for zone_id, zone_features in zone_feature_map.items():
+        zone_meta = zone_meta_map.get(zone_id) or {}
+        if len(zone_features) != 1:
+            continue
+        if zone_meta.get("geometry") is None or getattr(zone_meta.get("geometry"), "is_empty", True):
+            continue
+        borough = str(zone_meta.get("borough") or "").strip()
+        if not borough:
+            continue
+        merge_candidate_map[zone_id] = [zone_features[0]]
+
+    merge_results: List[Dict[str, Any]] = []
+    if len(merge_candidate_map) >= 2:
+        try:
+            merge_results = build_cross_zone_merged_hotspots(
+                zone_feature_map=merge_candidate_map,
+                zone_meta_map=zone_meta_map,
+                zone_recent_points=zone_recent_points_map,
+            )
+        except Exception:
+            if include_debug:
+                debug["global_errors"].append("cross_zone_merge_build_failed")
+            print("[warn] Failed to build cross-zone merged hotspots", traceback.format_exc())
+            merge_results = []
+
+    consumed_zones: set[int] = set()
+    merged_features: List[Dict[str, Any]] = []
+    merged_zone_pairs: List[List[int]] = []
+    for merge_result in sorted(
+        merge_results,
+        key=lambda m: tuple(int(z) for z in (m.get("zone_pair") or ())),
+    ):
+        zone_pair = tuple(int(z) for z in (merge_result.get("zone_pair") or ()))
+        if len(zone_pair) != 2:
+            continue
+        zone_a, zone_b = zone_pair
+        if zone_a in consumed_zones or zone_b in consumed_zones:
+            continue
+        features_a = zone_feature_map.get(zone_a) or []
+        features_b = zone_feature_map.get(zone_b) or []
+        if len(features_a) != 1 or len(features_b) != 1:
+            continue
+        meta_a = zone_meta_map.get(zone_a) or {}
+        meta_b = zone_meta_map.get(zone_b) or {}
+        borough_a = str(meta_a.get("borough") or "").strip().lower()
+        borough_b = str(meta_b.get("borough") or "").strip().lower()
+        if not borough_a or borough_a != borough_b:
+            continue
+        merged_feature = _build_cross_zone_merged_hotspot_feature(merge_result, features_a[0], features_b[0])
+        merged_features.append(merged_feature)
+        consumed_zones.add(zone_a)
+        consumed_zones.add(zone_b)
+        merged_zone_pairs.append([zone_a, zone_b])
+        merged_hotspot_id = str((merged_feature.get("properties") or {}).get("hotspot_id") or "")
+        for zid, partner in ((zone_a, zone_b), (zone_b, zone_a)):
+            zone_debug = zone_debug_map.get(zid)
+            if zone_debug is None:
+                continue
+            zone_debug["merged"] = True
+            zone_debug["merge_reason"] = "cross_zone_merge"
+            zone_debug["merged_into_cross_zone_hotspot"] = True
+            zone_debug["merged_partner_zone_id"] = partner
+            zone_debug["merged_hotspot_id"] = merged_hotspot_id
+
+    features: List[Dict[str, Any]] = []
+    features.extend(merged_features)
+    for zone_id in clean_zone_ids:
+        if zone_id in consumed_zones:
+            continue
+        features.extend(zone_feature_map.get(zone_id) or [])
+
+    if include_debug:
+        debug["cross_zone_merge_candidates"] = len(merge_results)
+        debug["cross_zone_merge_applied_count"] = len(merged_features)
+        debug["merged_zone_pairs"] = merged_zone_pairs
+        rendered_zone_ids: List[int] = []
+        for zone_id in clean_zone_ids:
+            zdebug = zone_debug_map.get(zone_id)
+            if zdebug is None:
+                continue
+            if zdebug.get("feature_emitted"):
+                rendered_zone_ids.append(zone_id)
+            debug["zones"].append(zdebug)
+        debug["rendered_zone_ids"] = rendered_zone_ids
 
     _cleanup_pickup_zone_caches(now_monotonic)
     payload = {"type": "FeatureCollection", "features": features}
