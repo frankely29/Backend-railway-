@@ -37,15 +37,6 @@ from assistant_outlook_engine import (
     get_assistant_outlook_payload_from_frame_bucket,
 )
 from hotspot_scoring import score_zones
-from pickup_hotspot_intelligence import (
-    build_hotspot_quality_modifier,
-    convert_historical_components_to_emittable_shapes,
-    build_zone_historical_anchor_components,
-    build_zone_historical_anchor_points,
-    determine_zone_hotspot_limit,
-    get_zone_or_hotspot_outcome_modifier,
-    sculpt_hotspot_shapes_from_recent_points,
-)
 from artifact_freshness import evaluate_artifact_freshness
 from artifact_storage_service import cleanup_artifact_storage, get_artifact_storage_report
 from artifact_db_store import (
@@ -5673,114 +5664,6 @@ def _pickup_zone_density_penalty(zone_ids: List[int]) -> Dict[int, float]:
     for r in rows:
         out[int(r["zone_id"])] = float(r["c"])
     return out
-
-
-def _valid_recent_cluster_components(recent_components: List[Dict[str, Any]]) -> bool:
-    for comp in recent_components:
-        geom = comp.get("geometry")
-        if geom is not None and not getattr(geom, "is_empty", True):
-            return True
-    return False
-
-
-def _build_recent_cluster_components_for_zone(
-    zone_id: int,
-    zone_meta: Dict[str, Any],
-    recent_points: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
-    zone_geom = zone_meta.get("geometry")
-    if zone_geom is None or zone_geom.is_empty or len(recent_points) < PICKUP_ZONE_HOTSPOT_MIN_POINTS:
-        return []
-    try:
-        zone_proj = transform(_to_3857.transform, zone_geom)
-    except Exception:
-        return []
-    if zone_proj.is_empty:
-        return []
-    point_entries = _normalize_pickup_zone_point_entries(recent_points)
-    if len(point_entries) < PICKUP_ZONE_HOTSPOT_MIN_POINTS:
-        return []
-    density = _build_density_components(zone_proj, point_entries, threshold_ratio=0.52)
-    raw_components = density.get("components") or []
-    if not raw_components:
-        return []
-
-    converted: List[Dict[str, Any]] = []
-    for idx, component in enumerate(raw_components[:3]):
-        support_points = int(component.get("point_count") or 0)
-        if support_points < PICKUP_ZONE_HOTSPOT_MIN_POINTS:
-            continue
-        shaped = _shape_hotspot_component(component, zone_proj)
-        if shaped is None or shaped.is_empty:
-            continue
-        geometry_ll = transform(_to_4326.transform, shaped)
-        if geometry_ll is None or getattr(geometry_ll, "is_empty", True):
-            continue
-        comp_score = float(component.get("component_score") or 0.0)
-        peak_score = float(component.get("peak_score") or 0.0)
-        score_norm = max(0.0, min(1.0, comp_score / 7.5))
-        peak_norm = max(0.0, min(1.0, peak_score / 2.6))
-        support_norm = max(0.0, min(1.0, support_points / 10.0))
-        normalized = (score_norm * 0.45) + (peak_norm * 0.25) + (support_norm * 0.30)
-        converted.append(
-            {
-                "anchor_rank": idx,
-                "anchor_id": f"zone:{zone_id}:recent:{idx}",
-                "cells": component.get("cells") or set(),
-                "polygon_proj": shaped,
-                "geometry": geometry_ll,
-                "component_score": comp_score,
-                "peak_score": peak_score,
-                "weighted_point_count": float(support_points),
-                "point_count": support_points,
-                "recent_shape_component": max(0.35, min(1.0, normalized)),
-                "intensity": max(0.22, min(0.76, 0.24 + (0.44 * normalized))),
-                "confidence": max(0.30, min(0.85, 0.34 + (0.44 * normalized))),
-            }
-        )
-    return converted
-
-
-def should_emit_zone_hotspot_from_cluster_evidence(
-    zone_score: Any,
-    historical_anchor_points: List[Dict[str, Any]],
-    historical_components: List[Dict[str, Any]],
-    recent_points: List[Dict[str, Any]],
-    recent_components: List[Dict[str, Any]],
-) -> bool:
-    del zone_score  # Zone score is a modifier, not a kill switch.
-    qualified_by_historical_support = len(historical_anchor_points) >= PICKUP_ZONE_HOTSPOT_MIN_POINTS
-    strongest_weighted = max(
-        [float(c.get("weighted_point_count") or 0.0) for c in historical_components if isinstance(c, dict)] or [0.0]
-    )
-    qualified_by_historical_component = bool(historical_components) and strongest_weighted >= 5.0
-    qualified_by_recent_support = len(recent_points) >= PICKUP_ZONE_HOTSPOT_MIN_POINTS and _valid_recent_cluster_components(
-        recent_components
-    )
-    return bool(qualified_by_historical_support or qualified_by_historical_component or qualified_by_recent_support)
-
-
-def _zone_hotspot_skip_reason(
-    historical_anchor_points: List[Dict[str, Any]],
-    historical_components: List[Dict[str, Any]],
-    recent_points: List[Dict[str, Any]],
-    recent_components: List[Dict[str, Any]],
-) -> str:
-    qualified_by_historical_support = len(historical_anchor_points) >= PICKUP_ZONE_HOTSPOT_MIN_POINTS
-    strongest_weighted = max(
-        [float(c.get("weighted_point_count") or 0.0) for c in historical_components if isinstance(c, dict)] or [0.0]
-    )
-    qualified_by_historical_component = bool(historical_components) and strongest_weighted >= 5.0
-    qualified_by_recent_support = len(recent_points) >= PICKUP_ZONE_HOTSPOT_MIN_POINTS and _valid_recent_cluster_components(
-        recent_components
-    )
-    if qualified_by_historical_support or qualified_by_historical_component or qualified_by_recent_support:
-        return ""
-    if not historical_components and not recent_components:
-        return "no_historical_or_recent_cluster_components"
-    if len(recent_points) >= PICKUP_ZONE_HOTSPOT_MIN_POINTS and not recent_components:
-        return "recent_points_not_clustered"
-    return "insufficient_cluster_evidence"
 
 
 def _pickup_zone_hotspots_with_debug(
