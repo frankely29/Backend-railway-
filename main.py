@@ -6132,7 +6132,11 @@ def _pickup_zone_stats(zone_ids: List[int], sample_limit: int = 100) -> List[Dic
         clean_zone_ids,
         max_points_per_zone=safe_sample_limit,
     )
-    zone_geoms = _load_pickup_zone_geometries()
+    try:
+        zone_geoms = _load_pickup_zone_geometries()
+    except Exception:
+        print("[warn] pickup zone geometry metadata load failed", traceback.format_exc())
+        zone_geoms = {}
     stats: List[Dict[str, Any]] = []
     for zid in clean_zone_ids:
         rows = zone_rows.get(zid) or []
@@ -6334,6 +6338,7 @@ def _recent_pickups_payload(
     zone_stats: List[Dict[str, Any]] = []
     hotspot_zone_ids: List[int] = []
     zone_hotspots: Dict[str, Any] = {"type": "FeatureCollection", "features": []}
+    micro_hotspots: List[Dict[str, Any]] = []
     pickup_hotspot_debug: Dict[str, Any] = {
         "min_points_threshold": PICKUP_ZONE_HOTSPOT_MIN_POINTS,
         "requested_zone_ids": [],
@@ -6347,49 +6352,35 @@ def _recent_pickups_payload(
     }
     try:
         zone_stats = _pickup_zone_stats(zone_ids_for_stats, sample_limit=safe_zone_sample_limit)
-    except Exception:
-        print("[warn] pickup zone stats failed", traceback.format_exc())
-        if include_debug:
-            pickup_hotspot_debug["global_errors"].append("pickup_zone_stats_failed")
-
-    try:
         hotspot_zone_ids = [int(z.get("zone_id")) for z in zone_stats if z.get("zone_id") is not None]
         pickup_hotspot_debug["requested_zone_ids"] = hotspot_zone_ids
-    except Exception:
-        hotspot_zone_ids = []
-        if include_debug:
-            pickup_hotspot_debug["global_errors"].append("pickup_zone_ids_failed")
-
-    try:
         zone_hotspots, pickup_hotspot_debug = _pickup_zone_hotspots_with_debug(
             hotspot_zone_ids,
             include_debug=include_debug,
         )
+        micro_hotspots = _flatten_zone_micro_hotspots(zone_hotspots)
     except Exception:
-        print("[warn] pickup hotspot generation failed", traceback.format_exc())
+        print("[warn] pickup hotspot auxiliary path failed", traceback.format_exc())
+        zone_stats = []
         zone_hotspots = {"type": "FeatureCollection", "features": []}
+        micro_hotspots = []
+        hotspot_zone_ids = []
         pickup_hotspot_debug = {
             "min_points_threshold": PICKUP_ZONE_HOTSPOT_MIN_POINTS,
-            "requested_zone_ids": hotspot_zone_ids,
+            "requested_zone_ids": [],
             "zone_hotspot_count": 0,
             "orphan_micro_hotspot_count": 0,
             "top_level_micro_hotspot_count": 0,
             "qualified_zone_ids": [],
             "rendered_zone_ids": [],
-            "global_errors": ["pickup_zone_hotspots_with_debug_failed"] if include_debug else [],
+            "global_errors": ["pickup_hotspot_auxiliary_path_failed"] if include_debug else [],
             "zones": [],
         }
 
-    # Return top-level micro-hotspots so frontend can render compact clusters directly.
-    try:
-        micro_hotspots = _flatten_zone_micro_hotspots(zone_hotspots)
-    except Exception:
-        print("[warn] pickup hotspot generation failed", traceback.format_exc())
-        micro_hotspots = []
+    if not isinstance(zone_hotspots, dict):
         zone_hotspots = {"type": "FeatureCollection", "features": []}
-        if include_debug:
-            pickup_hotspot_debug.setdefault("global_errors", [])
-            pickup_hotspot_debug["global_errors"].append("pickup_zone_micro_hotspots_failed")
+    if not isinstance(micro_hotspots, list):
+        micro_hotspots = []
     zone_features = zone_hotspots.get("features") if isinstance(zone_hotspots, dict) else []
     zone_hotspot_count = len(zone_features) if isinstance(zone_features, list) else 0
     response = {
