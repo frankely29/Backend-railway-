@@ -96,3 +96,4 @@ def prune_experiment_tables(db_exec, *, now_ts: int) -> None:
     db_exec("DELETE FROM hotspot_experiment_bins WHERE bin_time < ?", (cutoff,))
     db_exec("DELETE FROM micro_hotspot_experiment_bins WHERE bin_time < ?", (cutoff,))
     db_exec("DELETE FROM recommendation_outcomes WHERE recommended_at < ?", (cutoff,))
+    db_exec("DELETE FROM micro_recommendation_outcomes WHERE recommended_at < ?", (cutoff,))
