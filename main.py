@@ -6570,7 +6570,8 @@ def _pickup_zone_hotspots_with_debug(
                 if zone_debug is not None:
                     zone_debug.update(historical_debug)
                     if zone_features:
-                        zone_debug["hotspot_method"] = "historical_anchor_fallback"
+                        zone_debug["hotspot_method"] = "historical_fallback"
+                        zone_debug["historical_fallback_reason"] = "normal_build_empty_then_historical_fallback"
             except Exception:
                 if zone_debug is not None:
                     zone_debug["historical_fallback_attempted"] = True
