@@ -47,12 +47,19 @@ def log_micro_bins(db_exec, *, bin_time: int, rows: Iterable[MicroHotspotScoreRe
             """
             INSERT INTO micro_hotspot_experiment_bins(
                 bin_time, zone_id, cluster_id, final_score, confidence,
-                weighted_trip_count, unique_driver_count, crowding_penalty, recommended
-            ) VALUES(?,?,?,?,?,?,?,?,?)
+                weighted_trip_count, unique_driver_count, crowding_penalty,
+                center_lat, center_lng, radius_m, intensity,
+                baseline_component, live_component, same_timeslot_component, eta_alignment,
+                recommended
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 int(bin_time), int(r.zone_id), str(r.cluster_id), float(r.final_score), float(r.confidence),
-                float(r.weighted_trip_count), int(r.unique_driver_count), float(r.crowding_penalty), _bool_db_value(bool(r.recommended)),
+                float(r.weighted_trip_count), int(r.unique_driver_count), float(r.crowding_penalty),
+                float(r.center_lat), float(r.center_lng), float(r.radius_m), float(r.intensity),
+                float(r.baseline_component), float(r.live_component), float(r.same_timeslot_component),
+                None if r.eta_alignment is None else float(r.eta_alignment),
+                _bool_db_value(bool(r.recommended)),
             ),
         )
 

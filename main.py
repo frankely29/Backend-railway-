@@ -2700,11 +2700,52 @@ def _db_init() -> None:
               weighted_trip_count DOUBLE PRECISION NOT NULL,
               unique_driver_count INTEGER NOT NULL,
               crowding_penalty DOUBLE PRECISION NOT NULL,
+              center_lat DOUBLE PRECISION,
+              center_lng DOUBLE PRECISION,
+              radius_m DOUBLE PRECISION,
+              intensity DOUBLE PRECISION,
+              baseline_component DOUBLE PRECISION,
+              live_component DOUBLE PRECISION,
+              same_timeslot_component DOUBLE PRECISION,
+              eta_alignment DOUBLE PRECISION,
               recommended BOOLEAN NOT NULL DEFAULT FALSE
             );
             """
         )
         _db_exec("CREATE INDEX IF NOT EXISTS idx_micro_hotspot_experiment_bins_time ON micro_hotspot_experiment_bins(bin_time DESC);")
+        _db_exec("CREATE INDEX IF NOT EXISTS idx_micro_hotspot_experiment_bins_zone_time ON micro_hotspot_experiment_bins(zone_id, bin_time DESC);")
+        _try_alter(
+            "ALTER TABLE micro_hotspot_experiment_bins ADD COLUMN center_lat DOUBLE PRECISION;",
+            "ALTER TABLE micro_hotspot_experiment_bins ADD COLUMN IF NOT EXISTS center_lat DOUBLE PRECISION;",
+        )
+        _try_alter(
+            "ALTER TABLE micro_hotspot_experiment_bins ADD COLUMN center_lng DOUBLE PRECISION;",
+            "ALTER TABLE micro_hotspot_experiment_bins ADD COLUMN IF NOT EXISTS center_lng DOUBLE PRECISION;",
+        )
+        _try_alter(
+            "ALTER TABLE micro_hotspot_experiment_bins ADD COLUMN radius_m DOUBLE PRECISION;",
+            "ALTER TABLE micro_hotspot_experiment_bins ADD COLUMN IF NOT EXISTS radius_m DOUBLE PRECISION;",
+        )
+        _try_alter(
+            "ALTER TABLE micro_hotspot_experiment_bins ADD COLUMN intensity DOUBLE PRECISION;",
+            "ALTER TABLE micro_hotspot_experiment_bins ADD COLUMN IF NOT EXISTS intensity DOUBLE PRECISION;",
+        )
+        _try_alter(
+            "ALTER TABLE micro_hotspot_experiment_bins ADD COLUMN baseline_component DOUBLE PRECISION;",
+            "ALTER TABLE micro_hotspot_experiment_bins ADD COLUMN IF NOT EXISTS baseline_component DOUBLE PRECISION;",
+        )
+        _try_alter(
+            "ALTER TABLE micro_hotspot_experiment_bins ADD COLUMN live_component DOUBLE PRECISION;",
+            "ALTER TABLE micro_hotspot_experiment_bins ADD COLUMN IF NOT EXISTS live_component DOUBLE PRECISION;",
+        )
+        _try_alter(
+            "ALTER TABLE micro_hotspot_experiment_bins ADD COLUMN same_timeslot_component DOUBLE PRECISION;",
+            "ALTER TABLE micro_hotspot_experiment_bins ADD COLUMN IF NOT EXISTS same_timeslot_component DOUBLE PRECISION;",
+        )
+        _try_alter(
+            "ALTER TABLE micro_hotspot_experiment_bins ADD COLUMN eta_alignment DOUBLE PRECISION;",
+            "ALTER TABLE micro_hotspot_experiment_bins ADD COLUMN IF NOT EXISTS eta_alignment DOUBLE PRECISION;",
+        )
 
         _db_exec(
             """
@@ -3052,11 +3093,28 @@ def _db_init() -> None:
           weighted_trip_count REAL NOT NULL,
           unique_driver_count INTEGER NOT NULL,
           crowding_penalty REAL NOT NULL,
+          center_lat REAL,
+          center_lng REAL,
+          radius_m REAL,
+          intensity REAL,
+          baseline_component REAL,
+          live_component REAL,
+          same_timeslot_component REAL,
+          eta_alignment REAL,
           recommended INTEGER NOT NULL DEFAULT 0
         );
         """
     )
     _db_exec("CREATE INDEX IF NOT EXISTS idx_micro_hotspot_experiment_bins_time ON micro_hotspot_experiment_bins(bin_time DESC);")
+    _db_exec("CREATE INDEX IF NOT EXISTS idx_micro_hotspot_experiment_bins_zone_time ON micro_hotspot_experiment_bins(zone_id, bin_time DESC);")
+    _try_alter("ALTER TABLE micro_hotspot_experiment_bins ADD COLUMN center_lat REAL;")
+    _try_alter("ALTER TABLE micro_hotspot_experiment_bins ADD COLUMN center_lng REAL;")
+    _try_alter("ALTER TABLE micro_hotspot_experiment_bins ADD COLUMN radius_m REAL;")
+    _try_alter("ALTER TABLE micro_hotspot_experiment_bins ADD COLUMN intensity REAL;")
+    _try_alter("ALTER TABLE micro_hotspot_experiment_bins ADD COLUMN baseline_component REAL;")
+    _try_alter("ALTER TABLE micro_hotspot_experiment_bins ADD COLUMN live_component REAL;")
+    _try_alter("ALTER TABLE micro_hotspot_experiment_bins ADD COLUMN same_timeslot_component REAL;")
+    _try_alter("ALTER TABLE micro_hotspot_experiment_bins ADD COLUMN eta_alignment REAL;")
 
     _db_exec(
         """
