@@ -1012,6 +1012,176 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
         {clip01('shadow_score_raw_citywide_v3 * citywide_manhattan_saturation_discount_factor_n')} AS earnings_shadow_score_citywide_v3_anchor_shadow,
         {clip01(f"shadow_score_raw_citywide_v3 * {clip01('0.85 * earnings_shadow_confidence_citywide_v2 + 0.15 * demand_support_n')} * citywide_manhattan_saturation_discount_factor_n")} AS earnings_shadow_score_citywide_v3
       FROM scored
+    ),
+    candidate_trap_adjusted AS (
+      SELECT
+        candidate_scores.*,
+        CAST(ROUND(1 + 99 * earnings_shadow_score_citywide_v3_trap_candidate) AS INTEGER) AS earnings_shadow_rating_citywide_v3_trap_candidate,
+        CAST(ROUND(1 + 99 * earnings_shadow_score_manhattan_v3_trap_candidate) AS INTEGER) AS earnings_shadow_rating_manhattan_v3_trap_candidate,
+        CAST(ROUND(1 + 99 * earnings_shadow_score_bronx_wash_heights_v3_trap_candidate) AS INTEGER) AS earnings_shadow_rating_bronx_wash_heights_v3_trap_candidate,
+        CAST(ROUND(1 + 99 * earnings_shadow_score_queens_v3_trap_candidate) AS INTEGER) AS earnings_shadow_rating_queens_v3_trap_candidate,
+        CAST(ROUND(1 + 99 * earnings_shadow_score_brooklyn_v3_trap_candidate) AS INTEGER) AS earnings_shadow_rating_brooklyn_v3_trap_candidate,
+        CAST(ROUND(1 + 99 * earnings_shadow_score_staten_island_v3_trap_candidate) AS INTEGER) AS earnings_shadow_rating_staten_island_v3_trap_candidate,
+        CASE
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_citywide_v3_trap_candidate) AS INTEGER) >= 87 THEN 'green'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_citywide_v3_trap_candidate) AS INTEGER) >= 73 THEN 'purple'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_citywide_v3_trap_candidate) AS INTEGER) >= 60 THEN 'indigo'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_citywide_v3_trap_candidate) AS INTEGER) >= 48 THEN 'blue'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_citywide_v3_trap_candidate) AS INTEGER) >= 40 THEN 'sky'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_citywide_v3_trap_candidate) AS INTEGER) >= 33 THEN 'yellow'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_citywide_v3_trap_candidate) AS INTEGER) >= 25 THEN 'orange'
+          ELSE 'red'
+        END AS earnings_shadow_bucket_citywide_v3_trap_candidate,
+        CASE
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_citywide_v3_trap_candidate) AS INTEGER) >= 87 THEN '#00b050'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_citywide_v3_trap_candidate) AS INTEGER) >= 73 THEN '#8000ff'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_citywide_v3_trap_candidate) AS INTEGER) >= 60 THEN '#4b3cff'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_citywide_v3_trap_candidate) AS INTEGER) >= 48 THEN '#0066ff'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_citywide_v3_trap_candidate) AS INTEGER) >= 40 THEN '#66ccff'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_citywide_v3_trap_candidate) AS INTEGER) >= 33 THEN '#ffd400'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_citywide_v3_trap_candidate) AS INTEGER) >= 25 THEN '#ff8c00'
+          ELSE '#e60000'
+        END AS earnings_shadow_color_citywide_v3_trap_candidate,
+        CASE
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_manhattan_v3_trap_candidate) AS INTEGER) >= 87 THEN 'green'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_manhattan_v3_trap_candidate) AS INTEGER) >= 73 THEN 'purple'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_manhattan_v3_trap_candidate) AS INTEGER) >= 60 THEN 'indigo'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_manhattan_v3_trap_candidate) AS INTEGER) >= 48 THEN 'blue'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_manhattan_v3_trap_candidate) AS INTEGER) >= 40 THEN 'sky'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_manhattan_v3_trap_candidate) AS INTEGER) >= 33 THEN 'yellow'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_manhattan_v3_trap_candidate) AS INTEGER) >= 25 THEN 'orange'
+          ELSE 'red'
+        END AS earnings_shadow_bucket_manhattan_v3_trap_candidate,
+        CASE
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_manhattan_v3_trap_candidate) AS INTEGER) >= 87 THEN '#00b050'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_manhattan_v3_trap_candidate) AS INTEGER) >= 73 THEN '#8000ff'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_manhattan_v3_trap_candidate) AS INTEGER) >= 60 THEN '#4b3cff'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_manhattan_v3_trap_candidate) AS INTEGER) >= 48 THEN '#0066ff'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_manhattan_v3_trap_candidate) AS INTEGER) >= 40 THEN '#66ccff'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_manhattan_v3_trap_candidate) AS INTEGER) >= 33 THEN '#ffd400'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_manhattan_v3_trap_candidate) AS INTEGER) >= 25 THEN '#ff8c00'
+          ELSE '#e60000'
+        END AS earnings_shadow_color_manhattan_v3_trap_candidate,
+        CASE
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_bronx_wash_heights_v3_trap_candidate) AS INTEGER) >= 87 THEN 'green'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_bronx_wash_heights_v3_trap_candidate) AS INTEGER) >= 73 THEN 'purple'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_bronx_wash_heights_v3_trap_candidate) AS INTEGER) >= 60 THEN 'indigo'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_bronx_wash_heights_v3_trap_candidate) AS INTEGER) >= 48 THEN 'blue'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_bronx_wash_heights_v3_trap_candidate) AS INTEGER) >= 40 THEN 'sky'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_bronx_wash_heights_v3_trap_candidate) AS INTEGER) >= 33 THEN 'yellow'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_bronx_wash_heights_v3_trap_candidate) AS INTEGER) >= 25 THEN 'orange'
+          ELSE 'red'
+        END AS earnings_shadow_bucket_bronx_wash_heights_v3_trap_candidate,
+        CASE
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_bronx_wash_heights_v3_trap_candidate) AS INTEGER) >= 87 THEN '#00b050'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_bronx_wash_heights_v3_trap_candidate) AS INTEGER) >= 73 THEN '#8000ff'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_bronx_wash_heights_v3_trap_candidate) AS INTEGER) >= 60 THEN '#4b3cff'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_bronx_wash_heights_v3_trap_candidate) AS INTEGER) >= 48 THEN '#0066ff'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_bronx_wash_heights_v3_trap_candidate) AS INTEGER) >= 40 THEN '#66ccff'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_bronx_wash_heights_v3_trap_candidate) AS INTEGER) >= 33 THEN '#ffd400'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_bronx_wash_heights_v3_trap_candidate) AS INTEGER) >= 25 THEN '#ff8c00'
+          ELSE '#e60000'
+        END AS earnings_shadow_color_bronx_wash_heights_v3_trap_candidate,
+        CASE
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_queens_v3_trap_candidate) AS INTEGER) >= 87 THEN 'green'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_queens_v3_trap_candidate) AS INTEGER) >= 73 THEN 'purple'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_queens_v3_trap_candidate) AS INTEGER) >= 60 THEN 'indigo'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_queens_v3_trap_candidate) AS INTEGER) >= 48 THEN 'blue'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_queens_v3_trap_candidate) AS INTEGER) >= 40 THEN 'sky'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_queens_v3_trap_candidate) AS INTEGER) >= 33 THEN 'yellow'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_queens_v3_trap_candidate) AS INTEGER) >= 25 THEN 'orange'
+          ELSE 'red'
+        END AS earnings_shadow_bucket_queens_v3_trap_candidate,
+        CASE
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_queens_v3_trap_candidate) AS INTEGER) >= 87 THEN '#00b050'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_queens_v3_trap_candidate) AS INTEGER) >= 73 THEN '#8000ff'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_queens_v3_trap_candidate) AS INTEGER) >= 60 THEN '#4b3cff'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_queens_v3_trap_candidate) AS INTEGER) >= 48 THEN '#0066ff'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_queens_v3_trap_candidate) AS INTEGER) >= 40 THEN '#66ccff'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_queens_v3_trap_candidate) AS INTEGER) >= 33 THEN '#ffd400'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_queens_v3_trap_candidate) AS INTEGER) >= 25 THEN '#ff8c00'
+          ELSE '#e60000'
+        END AS earnings_shadow_color_queens_v3_trap_candidate,
+        CASE
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_brooklyn_v3_trap_candidate) AS INTEGER) >= 87 THEN 'green'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_brooklyn_v3_trap_candidate) AS INTEGER) >= 73 THEN 'purple'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_brooklyn_v3_trap_candidate) AS INTEGER) >= 60 THEN 'indigo'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_brooklyn_v3_trap_candidate) AS INTEGER) >= 48 THEN 'blue'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_brooklyn_v3_trap_candidate) AS INTEGER) >= 40 THEN 'sky'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_brooklyn_v3_trap_candidate) AS INTEGER) >= 33 THEN 'yellow'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_brooklyn_v3_trap_candidate) AS INTEGER) >= 25 THEN 'orange'
+          ELSE 'red'
+        END AS earnings_shadow_bucket_brooklyn_v3_trap_candidate,
+        CASE
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_brooklyn_v3_trap_candidate) AS INTEGER) >= 87 THEN '#00b050'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_brooklyn_v3_trap_candidate) AS INTEGER) >= 73 THEN '#8000ff'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_brooklyn_v3_trap_candidate) AS INTEGER) >= 60 THEN '#4b3cff'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_brooklyn_v3_trap_candidate) AS INTEGER) >= 48 THEN '#0066ff'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_brooklyn_v3_trap_candidate) AS INTEGER) >= 40 THEN '#66ccff'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_brooklyn_v3_trap_candidate) AS INTEGER) >= 33 THEN '#ffd400'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_brooklyn_v3_trap_candidate) AS INTEGER) >= 25 THEN '#ff8c00'
+          ELSE '#e60000'
+        END AS earnings_shadow_color_brooklyn_v3_trap_candidate,
+        CASE
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_staten_island_v3_trap_candidate) AS INTEGER) >= 87 THEN 'green'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_staten_island_v3_trap_candidate) AS INTEGER) >= 73 THEN 'purple'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_staten_island_v3_trap_candidate) AS INTEGER) >= 60 THEN 'indigo'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_staten_island_v3_trap_candidate) AS INTEGER) >= 48 THEN 'blue'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_staten_island_v3_trap_candidate) AS INTEGER) >= 40 THEN 'sky'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_staten_island_v3_trap_candidate) AS INTEGER) >= 33 THEN 'yellow'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_staten_island_v3_trap_candidate) AS INTEGER) >= 25 THEN 'orange'
+          ELSE 'red'
+        END AS earnings_shadow_bucket_staten_island_v3_trap_candidate,
+        CASE
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_staten_island_v3_trap_candidate) AS INTEGER) >= 87 THEN '#00b050'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_staten_island_v3_trap_candidate) AS INTEGER) >= 73 THEN '#8000ff'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_staten_island_v3_trap_candidate) AS INTEGER) >= 60 THEN '#4b3cff'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_staten_island_v3_trap_candidate) AS INTEGER) >= 48 THEN '#0066ff'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_staten_island_v3_trap_candidate) AS INTEGER) >= 40 THEN '#66ccff'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_staten_island_v3_trap_candidate) AS INTEGER) >= 33 THEN '#ffd400'
+          WHEN CAST(ROUND(1 + 99 * earnings_shadow_score_staten_island_v3_trap_candidate) AS INTEGER) >= 25 THEN '#ff8c00'
+          ELSE '#e60000'
+        END AS earnings_shadow_color_staten_island_v3_trap_candidate
+      FROM (
+        SELECT
+          factorized.*,
+          {clip01('earnings_shadow_score_citywide_v3 * citywide_trap_adjustment_factor')} AS earnings_shadow_score_citywide_v3_trap_candidate,
+          {clip01('earnings_shadow_score_manhattan_v3 * manhattan_trap_adjustment_factor')} AS earnings_shadow_score_manhattan_v3_trap_candidate,
+          {clip01('earnings_shadow_score_bronx_wash_heights_v3 * bronx_wash_heights_trap_adjustment_factor')} AS earnings_shadow_score_bronx_wash_heights_v3_trap_candidate,
+          {clip01('earnings_shadow_score_queens_v3 * queens_trap_adjustment_factor')} AS earnings_shadow_score_queens_v3_trap_candidate,
+          {clip01('earnings_shadow_score_brooklyn_v3 * brooklyn_trap_adjustment_factor')} AS earnings_shadow_score_brooklyn_v3_trap_candidate,
+          {clip01('earnings_shadow_score_staten_island_v3 * staten_island_trap_adjustment_factor')} AS earnings_shadow_score_staten_island_v3_trap_candidate,
+          {clip01('0.82 * earnings_shadow_confidence_citywide_v3 + 0.18 * (1.0 - safe_return_risk + safe_escape_quality) / 2.0')} AS earnings_shadow_confidence_citywide_v3_trap_candidate,
+          {clip01('0.82 * earnings_shadow_confidence_manhattan_v3 + 0.18 * (1.0 - safe_return_risk + safe_escape_quality) / 2.0')} AS earnings_shadow_confidence_manhattan_v3_trap_candidate,
+          {clip01('0.82 * earnings_shadow_confidence_bronx_wash_heights_v3 + 0.18 * (1.0 - safe_return_risk + safe_escape_quality) / 2.0')} AS earnings_shadow_confidence_bronx_wash_heights_v3_trap_candidate,
+          {clip01('0.82 * earnings_shadow_confidence_queens_v3 + 0.18 * (1.0 - safe_return_risk + safe_escape_quality) / 2.0')} AS earnings_shadow_confidence_queens_v3_trap_candidate,
+          {clip01('0.82 * earnings_shadow_confidence_brooklyn_v3 + 0.18 * (1.0 - safe_return_risk + safe_escape_quality) / 2.0')} AS earnings_shadow_confidence_brooklyn_v3_trap_candidate,
+          {clip01('0.82 * earnings_shadow_confidence_staten_island_v3 + 0.18 * (1.0 - safe_return_risk + safe_escape_quality) / 2.0')} AS earnings_shadow_confidence_staten_island_v3_trap_candidate,
+          ({clip01('earnings_shadow_score_citywide_v3 * citywide_trap_adjustment_factor')} - earnings_shadow_score_citywide_v3) AS earnings_shadow_delta_citywide_v3_trap_candidate,
+          ({clip01('earnings_shadow_score_manhattan_v3 * manhattan_trap_adjustment_factor')} - earnings_shadow_score_manhattan_v3) AS earnings_shadow_delta_manhattan_v3_trap_candidate,
+          ({clip01('earnings_shadow_score_bronx_wash_heights_v3 * bronx_wash_heights_trap_adjustment_factor')} - earnings_shadow_score_bronx_wash_heights_v3) AS earnings_shadow_delta_bronx_wash_heights_v3_trap_candidate,
+          ({clip01('earnings_shadow_score_queens_v3 * queens_trap_adjustment_factor')} - earnings_shadow_score_queens_v3) AS earnings_shadow_delta_queens_v3_trap_candidate,
+          ({clip01('earnings_shadow_score_brooklyn_v3 * brooklyn_trap_adjustment_factor')} - earnings_shadow_score_brooklyn_v3) AS earnings_shadow_delta_brooklyn_v3_trap_candidate,
+          ({clip01('earnings_shadow_score_staten_island_v3 * staten_island_trap_adjustment_factor')} - earnings_shadow_score_staten_island_v3) AS earnings_shadow_delta_staten_island_v3_trap_candidate
+        FROM (
+          SELECT
+            final.*,
+            COALESCE(return_risk_shadow, 0.0) AS safe_return_risk,
+            COALESCE(escape_quality_shadow, 0.0) AS safe_escape_quality,
+            COALESCE(airport_exit_share_n, 0.0) AS safe_airport_exit,
+            COALESCE(out_of_scored_network_exit_share_n, 0.0) AS safe_external_exit,
+            COALESCE(short_external_exit_share_8mi_40min_n, 0.0) AS safe_short_external,
+            COALESCE(good_long_external_exit_share_n, 0.0) AS safe_good_long_external,
+            COALESCE(downstream_value_n, 0.0) AS safe_downstream,
+            LEAST(GREATEST(1.0 - (0.16 * COALESCE(return_risk_shadow, 0.0)) - (0.05 * COALESCE(airport_exit_share_n, 0.0)) - (0.05 * COALESCE(short_external_exit_share_8mi_40min_n, 0.0)) + (0.07 * COALESCE(escape_quality_shadow, 0.0)) + (0.03 * COALESCE(good_long_external_exit_share_n, 0.0)), 0.76), 1.12) AS citywide_trap_adjustment_factor,
+            LEAST(GREATEST(1.0 - (0.18 * COALESCE(return_risk_shadow, 0.0)) - (0.05 * COALESCE(airport_exit_share_n, 0.0)) - (0.06 * COALESCE(short_external_exit_share_8mi_40min_n, 0.0)) + (0.06 * COALESCE(escape_quality_shadow, 0.0)) + (0.03 * COALESCE(good_long_external_exit_share_n, 0.0)), 0.72), 1.12) AS queens_trap_adjustment_factor,
+            LEAST(GREATEST(1.0 - (0.15 * COALESCE(return_risk_shadow, 0.0)) - (0.04 * COALESCE(short_external_exit_share_8mi_40min_n, 0.0)) + (0.06 * COALESCE(escape_quality_shadow, 0.0)) + (0.03 * COALESCE(good_long_external_exit_share_n, 0.0)), 0.76), 1.12) AS bronx_wash_heights_trap_adjustment_factor,
+            LEAST(GREATEST(1.0 - (0.15 * COALESCE(return_risk_shadow, 0.0)) - (0.04 * COALESCE(short_external_exit_share_8mi_40min_n, 0.0)) + (0.06 * COALESCE(escape_quality_shadow, 0.0)) + (0.03 * COALESCE(good_long_external_exit_share_n, 0.0)), 0.76), 1.12) AS brooklyn_trap_adjustment_factor,
+            LEAST(GREATEST(1.0 - (0.11 * COALESCE(return_risk_shadow, 0.0)) - (0.03 * COALESCE(short_external_exit_share_8mi_40min_n, 0.0)) + (0.08 * COALESCE(escape_quality_shadow, 0.0)) + (0.05 * COALESCE(good_long_external_exit_share_n, 0.0)), 0.80), 1.15) AS staten_island_trap_adjustment_factor,
+            LEAST(GREATEST(1.0 - (0.13 * COALESCE(return_risk_shadow, 0.0)) - (0.04 * COALESCE(airport_exit_share_n, 0.0)) - (0.04 * COALESCE(short_external_exit_share_8mi_40min_n, 0.0)) + (0.07 * COALESCE(escape_quality_shadow, 0.0)) + (0.03 * COALESCE(good_long_external_exit_share_n, 0.0)), 0.78), 1.10) AS manhattan_trap_adjustment_factor
+          FROM final
+        ) factorized
+      ) candidate_scores
     )
     SELECT
       PULocationID,
@@ -1427,7 +1597,56 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
       short_external_exit_share_8mi_40min_n,
       good_long_external_exit_share_n,
       return_risk_shadow,
-      escape_quality_shadow
-    FROM final
+      escape_quality_shadow,
+      safe_return_risk,
+      safe_escape_quality,
+      safe_airport_exit,
+      safe_external_exit,
+      safe_short_external,
+      safe_good_long_external,
+      safe_downstream,
+      citywide_trap_adjustment_factor,
+      queens_trap_adjustment_factor,
+      bronx_wash_heights_trap_adjustment_factor,
+      brooklyn_trap_adjustment_factor,
+      staten_island_trap_adjustment_factor,
+      manhattan_trap_adjustment_factor,
+      earnings_shadow_score_citywide_v3_trap_candidate,
+      earnings_shadow_score_manhattan_v3_trap_candidate,
+      earnings_shadow_score_bronx_wash_heights_v3_trap_candidate,
+      earnings_shadow_score_queens_v3_trap_candidate,
+      earnings_shadow_score_brooklyn_v3_trap_candidate,
+      earnings_shadow_score_staten_island_v3_trap_candidate,
+      earnings_shadow_confidence_citywide_v3_trap_candidate,
+      earnings_shadow_confidence_manhattan_v3_trap_candidate,
+      earnings_shadow_confidence_bronx_wash_heights_v3_trap_candidate,
+      earnings_shadow_confidence_queens_v3_trap_candidate,
+      earnings_shadow_confidence_brooklyn_v3_trap_candidate,
+      earnings_shadow_confidence_staten_island_v3_trap_candidate,
+      earnings_shadow_rating_citywide_v3_trap_candidate,
+      earnings_shadow_bucket_citywide_v3_trap_candidate,
+      earnings_shadow_color_citywide_v3_trap_candidate,
+      earnings_shadow_rating_manhattan_v3_trap_candidate,
+      earnings_shadow_bucket_manhattan_v3_trap_candidate,
+      earnings_shadow_color_manhattan_v3_trap_candidate,
+      earnings_shadow_rating_bronx_wash_heights_v3_trap_candidate,
+      earnings_shadow_bucket_bronx_wash_heights_v3_trap_candidate,
+      earnings_shadow_color_bronx_wash_heights_v3_trap_candidate,
+      earnings_shadow_rating_queens_v3_trap_candidate,
+      earnings_shadow_bucket_queens_v3_trap_candidate,
+      earnings_shadow_color_queens_v3_trap_candidate,
+      earnings_shadow_rating_brooklyn_v3_trap_candidate,
+      earnings_shadow_bucket_brooklyn_v3_trap_candidate,
+      earnings_shadow_color_brooklyn_v3_trap_candidate,
+      earnings_shadow_rating_staten_island_v3_trap_candidate,
+      earnings_shadow_bucket_staten_island_v3_trap_candidate,
+      earnings_shadow_color_staten_island_v3_trap_candidate,
+      earnings_shadow_delta_citywide_v3_trap_candidate,
+      earnings_shadow_delta_manhattan_v3_trap_candidate,
+      earnings_shadow_delta_bronx_wash_heights_v3_trap_candidate,
+      earnings_shadow_delta_queens_v3_trap_candidate,
+      earnings_shadow_delta_brooklyn_v3_trap_candidate,
+      earnings_shadow_delta_staten_island_v3_trap_candidate
+    FROM candidate_trap_adjusted
     ORDER BY dow_m, bin_start_min, PULocationID
     """
