@@ -17,6 +17,22 @@ def _flag_to_bool(value: Any) -> bool:
     return int(value) == 1
 
 
+def _flag_to_optional_bool(value: Any) -> Optional[bool]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    return int(value) == 1
+
+
+def _outcome_status(converted_to_trip: Optional[bool]) -> str:
+    if converted_to_trip is True:
+        return "converted"
+    if converted_to_trip is False:
+        return "not_converted"
+    return "pending"
+
+
 def _to_iso(ts: Any) -> Optional[str]:
     if ts is None:
         return None
@@ -437,7 +453,8 @@ def get_admin_recommendation_outcomes(limit: int = 200) -> List[Dict[str, Any]]:
             "hotspot_center_lng": float(dict(r)["hotspot_center_lng"]) if dict(r).get("hotspot_center_lng") is not None else None,
             "score": float(dict(r)["score"]) if dict(r).get("score") is not None else None,
             "confidence": float(dict(r)["confidence"]) if dict(r).get("confidence") is not None else None,
-            "converted_to_trip": _flag_to_bool(dict(r).get("converted_to_trip")),
+            "converted_to_trip": (converted := _flag_to_optional_bool(dict(r).get("converted_to_trip"))),
+            "outcome_status": _outcome_status(converted),
             "minutes_to_trip": float(dict(r)["minutes_to_trip"]) if dict(r).get("minutes_to_trip") is not None else None,
             "distance_to_recommendation_miles": float(dict(r)["distance_to_recommendation_miles"]) if dict(r).get("distance_to_recommendation_miles") is not None else None,
         }
@@ -466,13 +483,14 @@ def get_admin_micro_recommendation_outcomes(limit: int = 200) -> List[Dict[str, 
             "recommended_at": dict(r).get("recommended_at"),
             "recommended_at_iso": _to_iso(dict(r).get("recommended_at")),
             "zone_id": int(dict(r)["zone_id"]) if dict(r).get("zone_id") is not None else None,
-            "parent_hotspot_id": int(dict(r)["parent_hotspot_id"]) if dict(r).get("parent_hotspot_id") is not None else None,
+            "parent_hotspot_id": dict(r).get("parent_hotspot_id"),
             "micro_cluster_id": dict(r).get("micro_cluster_id"),
             "micro_center_lat": float(dict(r)["micro_center_lat"]) if dict(r).get("micro_center_lat") is not None else None,
             "micro_center_lng": float(dict(r)["micro_center_lng"]) if dict(r).get("micro_center_lng") is not None else None,
             "score": float(dict(r)["score"]) if dict(r).get("score") is not None else None,
             "confidence": float(dict(r)["confidence"]) if dict(r).get("confidence") is not None else None,
-            "converted_to_trip": _flag_to_bool(dict(r).get("converted_to_trip")),
+            "converted_to_trip": (converted := _flag_to_optional_bool(dict(r).get("converted_to_trip"))),
+            "outcome_status": _outcome_status(converted),
             "minutes_to_trip": float(dict(r)["minutes_to_trip"]) if dict(r).get("minutes_to_trip") is not None else None,
             "distance_to_recommendation_miles": float(dict(r)["distance_to_recommendation_miles"]) if dict(r).get("distance_to_recommendation_miles") is not None else None,
         }
