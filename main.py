@@ -5965,7 +5965,7 @@ def _recent_recommendation_outcomes_with_scope(
     if hotspot_id:
         hotspot_rows = _db_query_all(
             """
-            SELECT converted_to_trip, minutes_to_trip
+            SELECT converted_to_trip, minutes_to_trip, recommended_at
             FROM recommendation_outcomes
             WHERE zone_id = ?
               AND cluster_id = ?
@@ -5981,7 +5981,7 @@ def _recent_recommendation_outcomes_with_scope(
             return [dict(r) for r in hotspot_rows], "hotspot_specific", hotspot_count, 0
         zone_fallback_rows = _db_query_all(
             """
-            SELECT converted_to_trip, minutes_to_trip
+            SELECT converted_to_trip, minutes_to_trip, recommended_at
             FROM recommendation_outcomes
             WHERE zone_id = ?
               AND converted_to_trip IS NOT NULL
@@ -5995,7 +5995,7 @@ def _recent_recommendation_outcomes_with_scope(
 
     zone_fallback_rows = _db_query_all(
         """
-        SELECT converted_to_trip, minutes_to_trip
+        SELECT converted_to_trip, minutes_to_trip, recommended_at
         FROM recommendation_outcomes
         WHERE zone_id = ?
           AND converted_to_trip IS NOT NULL
@@ -6042,7 +6042,7 @@ def _recent_recommendation_outcomes_for_merged_hotspot(
     placeholders = ",".join(["?"] * len(normalized_zone_ids))
     rows = _db_query_all(
         f"""
-        SELECT converted_to_trip, minutes_to_trip
+        SELECT converted_to_trip, minutes_to_trip, recommended_at
         FROM recommendation_outcomes
         WHERE cluster_id = ?
           AND zone_id IN ({placeholders})
@@ -6081,13 +6081,21 @@ def _compute_merged_hotspot_learning_payload(
             "quality_modifier": quality_modifier,
             "live_combined_modifier": max(0.20, outcome_modifier * quality_modifier),
             "outcome_sample_count": int(float(outcome.get("sample_count") or 0.0)),
+            "outcome_effective_sample_count": float(outcome.get("effective_sample_count") or 0.0),
             "outcome_scope_used": merged_scope_used,
             "outcome_conversion_rate": float(outcome.get("conversion_rate") or 0.0),
+            "outcome_raw_conversion_rate": float(outcome.get("raw_conversion_rate") or 0.0),
             "outcome_median_minutes_to_trip": float(outcome.get("median_minutes_to_trip") or 0.0),
+            "outcome_representative_minutes_to_trip": float(outcome.get("representative_minutes_to_trip") or 0.0),
+            "outcome_recency_weight_version": str(outcome.get("recency_weight_version") or ""),
             "merged_outcome_scope_used": merged_scope_used,
             "merged_outcome_sample_count": int(float(outcome.get("sample_count") or 0.0)),
+            "merged_outcome_effective_sample_count": float(outcome.get("effective_sample_count") or 0.0),
             "merged_outcome_conversion_rate": float(outcome.get("conversion_rate") or 0.0),
+            "merged_outcome_raw_conversion_rate": float(outcome.get("raw_conversion_rate") or 0.0),
             "merged_outcome_median_minutes_to_trip": float(outcome.get("median_minutes_to_trip") or 0.0),
+            "merged_outcome_representative_minutes_to_trip": float(outcome.get("representative_minutes_to_trip") or 0.0),
+            "merged_outcome_recency_weight_version": str(outcome.get("recency_weight_version") or ""),
             "used_merged_hotspot_specific": True,
         }
 
@@ -6108,13 +6116,21 @@ def _compute_merged_hotspot_learning_payload(
         "quality_modifier": fallback_quality_modifier,
         "live_combined_modifier": fallback_live_combined_modifier,
         "outcome_sample_count": int(merged_sample_count),
+        "outcome_effective_sample_count": 0.0,
         "outcome_scope_used": "merged_fallback_from_children",
         "outcome_conversion_rate": 0.0,
+        "outcome_raw_conversion_rate": 0.0,
         "outcome_median_minutes_to_trip": 0.0,
+        "outcome_representative_minutes_to_trip": 0.0,
+        "outcome_recency_weight_version": "",
         "merged_outcome_scope_used": "merged_fallback_from_children",
         "merged_outcome_sample_count": int(merged_sample_count),
+        "merged_outcome_effective_sample_count": 0.0,
         "merged_outcome_conversion_rate": 0.0,
+        "merged_outcome_raw_conversion_rate": 0.0,
         "merged_outcome_median_minutes_to_trip": 0.0,
+        "merged_outcome_representative_minutes_to_trip": 0.0,
+        "merged_outcome_recency_weight_version": "",
         "used_merged_hotspot_specific": False,
     }
 
@@ -6228,6 +6244,10 @@ def _enrich_emitted_zone_hotspot_features(
         props["zone_fallback_outcome_sample_count"] = zone_fallback_count
         props["outcome_conversion_rate"] = round(float(outcome.get("conversion_rate") or 0.0), 4)
         props["outcome_median_minutes_to_trip"] = round(float(outcome.get("median_minutes_to_trip") or 0.0), 4)
+        props["outcome_effective_sample_count"] = round(float(outcome.get("effective_sample_count") or 0.0), 4)
+        props["outcome_raw_conversion_rate"] = round(float(outcome.get("raw_conversion_rate") or 0.0), 4)
+        props["outcome_representative_minutes_to_trip"] = round(float(outcome.get("representative_minutes_to_trip") or 0.0), 4)
+        props["outcome_recency_weight_version"] = str(outcome.get("recency_weight_version") or "")
 
         props["quality_modifier"] = round(quality_modifier, 4)
         props["short_trip_trap_penalty"] = round(float(quality.get("short_trip_trap_penalty") or 0.0), 4)
@@ -6570,6 +6590,10 @@ def _build_cross_zone_merged_hotspot_feature(
     merged_props["outcome_scope_used"] = str(merged_learning_payload.get("outcome_scope_used") or "merged_fallback_from_children")
     merged_props["outcome_conversion_rate"] = round(float(merged_learning_payload.get("outcome_conversion_rate") or 0.0), 4)
     merged_props["outcome_median_minutes_to_trip"] = round(float(merged_learning_payload.get("outcome_median_minutes_to_trip") or 0.0), 4)
+    merged_props["outcome_effective_sample_count"] = round(float(merged_learning_payload.get("outcome_effective_sample_count") or 0.0), 4)
+    merged_props["outcome_raw_conversion_rate"] = round(float(merged_learning_payload.get("outcome_raw_conversion_rate") or 0.0), 4)
+    merged_props["outcome_representative_minutes_to_trip"] = round(float(merged_learning_payload.get("outcome_representative_minutes_to_trip") or 0.0), 4)
+    merged_props["outcome_recency_weight_version"] = str(merged_learning_payload.get("outcome_recency_weight_version") or "")
     merged_props["live_combined_modifier"] = round(float(merged_learning_payload.get("live_combined_modifier") or 1.0), 4)
     merged_props["quality_modifier"] = round(float(merged_learning_payload.get("quality_modifier") or 1.0), 4)
 
@@ -6577,6 +6601,10 @@ def _build_cross_zone_merged_hotspot_feature(
     merged_props["merged_outcome_sample_count"] = int(merged_learning_payload.get("merged_outcome_sample_count") or 0)
     merged_props["merged_outcome_conversion_rate"] = round(float(merged_learning_payload.get("merged_outcome_conversion_rate") or 0.0), 4)
     merged_props["merged_outcome_median_minutes_to_trip"] = round(float(merged_learning_payload.get("merged_outcome_median_minutes_to_trip") or 0.0), 4)
+    merged_props["merged_outcome_effective_sample_count"] = round(float(merged_learning_payload.get("merged_outcome_effective_sample_count") or 0.0), 4)
+    merged_props["merged_outcome_raw_conversion_rate"] = round(float(merged_learning_payload.get("merged_outcome_raw_conversion_rate") or 0.0), 4)
+    merged_props["merged_outcome_representative_minutes_to_trip"] = round(float(merged_learning_payload.get("merged_outcome_representative_minutes_to_trip") or 0.0), 4)
+    merged_props["merged_outcome_recency_weight_version"] = str(merged_learning_payload.get("merged_outcome_recency_weight_version") or "")
 
     if bool(merged_learning_payload.get("used_merged_hotspot_specific")):
         merged_outcome_modifier = float(merged_learning_payload.get("outcome_modifier") or 1.0)
@@ -6845,7 +6873,7 @@ def _recent_micro_recommendation_outcomes(zone_id: int, micro_cluster_id: str, m
     cutoff = int(time.time()) - (30 * 24 * 3600)
     rows = _db_query_all(
         """
-        SELECT converted_to_trip, minutes_to_trip
+        SELECT converted_to_trip, minutes_to_trip, recommended_at
         FROM micro_recommendation_outcomes
         WHERE zone_id = ?
           AND micro_cluster_id = ?
@@ -7035,6 +7063,10 @@ def _apply_micro_hotspot_learning(
             micro["micro_learning_version"] = "micro_hotspot_v1"
             micro["micro_outcome_conversion_rate"] = 0.0
             micro["micro_outcome_median_minutes_to_trip"] = 0.0
+            micro["micro_outcome_effective_sample_count"] = 0.0
+            micro["micro_outcome_raw_conversion_rate"] = 0.0
+            micro["micro_outcome_representative_minutes_to_trip"] = 0.0
+            micro["micro_outcome_recency_weight_version"] = ""
             if not bool(micro.get("recommended_micro_hotspot")):
                 micro["micro_outcome_modifier"] = round(parent_outcome_modifier, 4)
                 micro["micro_outcome_sample_count"] = 0
@@ -7051,6 +7083,10 @@ def _apply_micro_hotspot_learning(
                 micro["micro_outcome_sample_count"] = int(float(outcome.get("sample_count") or 0.0))
                 micro["micro_outcome_conversion_rate"] = round(float(outcome.get("conversion_rate") or 0.0), 4)
                 micro["micro_outcome_median_minutes_to_trip"] = round(float(outcome.get("median_minutes_to_trip") or 0.0), 4)
+                micro["micro_outcome_effective_sample_count"] = round(float(outcome.get("effective_sample_count") or 0.0), 4)
+                micro["micro_outcome_raw_conversion_rate"] = round(float(outcome.get("raw_conversion_rate") or 0.0), 4)
+                micro["micro_outcome_representative_minutes_to_trip"] = round(float(outcome.get("representative_minutes_to_trip") or 0.0), 4)
+                micro["micro_outcome_recency_weight_version"] = str(outcome.get("recency_weight_version") or "")
                 micro["micro_outcome_scope_used"] = "micro_hotspot_specific"
                 micro["intensity"] = round(max(0.20, min(1.00, base_intensity * micro_modifier)), 4)
                 micro["confidence"] = round(max(0.20, min(0.98, base_confidence * micro_modifier)), 4)
@@ -7110,6 +7146,8 @@ def _pickup_zone_hotspots_with_debug(
         "settled_stale_hotspot_outcomes": 0,
         "settled_stale_micro_outcomes": 0,
         "outcome_learning_resolved_only": True,
+        "outcome_learning_recency_weighted": True,
+        "outcome_recency_weight_version": "resolved_recency_v1",
     }
     if include_debug:
         debug.update(
