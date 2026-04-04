@@ -151,6 +151,75 @@ AVATAR_THUMB_IMMUTABLE_CACHE_SECONDS = int(os.environ.get("AVATAR_THUMB_IMMUTABL
 AVATAR_BACKFILL_BATCH_SIZE = int(os.environ.get("AVATAR_BACKFILL_BATCH_SIZE", "25"))
 STORAGE_CLEANUP_INTERVAL_SECONDS = int(os.environ.get("STORAGE_CLEANUP_INTERVAL_SECONDS", "21600"))
 
+TRAP_CANDIDATE_PROMOTION_READINESS_CONFIG: Dict[str, Dict[str, Any]] = {
+    "citywide_v3_trap_candidate": {
+        "min_observations": 500,
+        "min_recurring_demotions": 8,
+        "max_abs_average_delta": 0.08,
+        "target_average_delta_low": -0.06,
+        "target_average_delta_high": -0.002,
+        "max_positive_extreme": 0.16,
+        "max_negative_extreme": -0.30,
+        "require_demotions_gt_promotions": True,
+        "recommended_next_phase": "limited_citywide_live_promotion",
+    },
+    "manhattan_v3_trap_candidate": {
+        "min_observations": 250,
+        "min_recurring_demotions": 5,
+        "max_abs_average_delta": 0.09,
+        "target_average_delta_low": -0.07,
+        "target_average_delta_high": -0.002,
+        "max_positive_extreme": 0.18,
+        "max_negative_extreme": -0.32,
+        "require_demotions_gt_promotions": True,
+        "recommended_next_phase": "hold_for_manual_review",
+    },
+    "bronx_wash_heights_v3_trap_candidate": {
+        "min_observations": 180,
+        "min_recurring_demotions": 4,
+        "max_abs_average_delta": 0.10,
+        "target_average_delta_low": -0.08,
+        "target_average_delta_high": -0.002,
+        "max_positive_extreme": 0.18,
+        "max_negative_extreme": -0.34,
+        "require_demotions_gt_promotions": True,
+        "recommended_next_phase": "hold_for_manual_review",
+    },
+    "queens_v3_trap_candidate": {
+        "min_observations": 220,
+        "min_recurring_demotions": 5,
+        "max_abs_average_delta": 0.10,
+        "target_average_delta_low": -0.08,
+        "target_average_delta_high": -0.002,
+        "max_positive_extreme": 0.18,
+        "max_negative_extreme": -0.34,
+        "require_demotions_gt_promotions": True,
+        "recommended_next_phase": "hold_for_manual_review",
+    },
+    "brooklyn_v3_trap_candidate": {
+        "min_observations": 220,
+        "min_recurring_demotions": 5,
+        "max_abs_average_delta": 0.10,
+        "target_average_delta_low": -0.08,
+        "target_average_delta_high": -0.002,
+        "max_positive_extreme": 0.18,
+        "max_negative_extreme": -0.34,
+        "require_demotions_gt_promotions": True,
+        "recommended_next_phase": "hold_for_manual_review",
+    },
+    "staten_island_v3_trap_candidate": {
+        "min_observations": 80,
+        "min_recurring_demotions": 2,
+        "max_abs_average_delta": 0.12,
+        "target_average_delta_low": -0.09,
+        "target_average_delta_high": 0.01,
+        "max_positive_extreme": 0.20,
+        "max_negative_extreme": -0.35,
+        "require_demotions_gt_promotions": False,
+        "recommended_next_phase": "hold_for_manual_review",
+    },
+}
+
 PICKUP_ZONE_HOTSPOT_MIN_POINTS = 5  # Keep 5-dot minimum to avoid pickup noise.
 PICKUP_ZONE_HOTSPOT_MAX_POINTS = 100
 PICKUP_ZONE_HOTSPOT_CELL_SIZE_M = 135
@@ -3636,6 +3705,11 @@ def root():
             "/admin/users",
             "/admin/users/disable",
             "/admin/users/reset_password",
+            "/admin/artifacts/trap_candidate_review",
+            "/admin/artifacts/trap_candidate_review/metadata",
+            "/admin/artifacts/trap_candidate_review/readiness",
+            "/admin/artifacts/trap_candidate_review/readiness/citywide",
+            "/admin/artifacts/summary",
         ],
     }
 
@@ -3688,6 +3762,7 @@ def status():
         "manifest_artifact_in_db": manifest_artifact_in_db,
         "day_tendency_artifact_in_db": day_tendency_artifact_in_db,
         "trap_candidate_review_artifact_in_db": trap_candidate_review_artifact_in_db,
+        "trap_candidate_review_readiness_available": trap_candidate_review_artifact_in_db,
         "assistant_outlook_in_db": assistant_outlook_artifact_in_db,
         "assistant_outlook_artifact_in_db": assistant_outlook_artifact_in_db,
         "assistant_outlook_file_present": assistant_outlook_file_present,
@@ -3723,6 +3798,147 @@ def status():
     }
 
 
+def _safe_profile_review_dict(payload: dict, profile_name: str) -> dict | None:
+    if not isinstance(payload, dict):
+        return None
+    profile_reviews = payload.get("profile_reviews")
+    if not isinstance(profile_reviews, dict):
+        return None
+    profile_review = profile_reviews.get(profile_name)
+    if not isinstance(profile_review, dict):
+        return None
+    return profile_review
+
+
+def _count_recurring_rows(rows: Any) -> int:
+    if not isinstance(rows, list):
+        return 0
+    count = 0
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        location_id = row.get("LocationID")
+        if isinstance(location_id, int):
+            count += 1
+            continue
+        if isinstance(location_id, str) and location_id.strip():
+            count += 1
+    return count
+
+
+def _evaluate_trap_candidate_readiness(profile_name: str, review: dict) -> dict:
+    config = TRAP_CANDIDATE_PROMOTION_READINESS_CONFIG.get(profile_name) or {}
+
+    def _as_int(name: str) -> int:
+        value = review.get(name, 0)
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, (int, float)):
+            return int(value)
+        return 0
+
+    def _as_float(name: str) -> float | None:
+        value = review.get(name)
+        if isinstance(value, bool):
+            return float(value)
+        if isinstance(value, (int, float)):
+            return float(value)
+        return None
+
+    eligible_zone_observations = _as_int("eligible_zone_observations")
+    promoted_observations = _as_int("promoted_observations")
+    demoted_observations = _as_int("demoted_observations")
+    average_delta_overall = _as_float("average_delta_overall")
+    min_delta_seen = _as_float("min_delta_seen")
+    max_delta_seen = _as_float("max_delta_seen")
+    recurring_top_demotions_count = _count_recurring_rows(review.get("top_recurring_demotions"))
+    recurring_top_promotions_count = _count_recurring_rows(review.get("top_recurring_promotions"))
+
+    avg_delta_value = average_delta_overall if average_delta_overall is not None else 0.0
+    observation_floor_ok = eligible_zone_observations >= int(config.get("min_observations", 0))
+    recurring_demotions_ok = recurring_top_demotions_count >= int(config.get("min_recurring_demotions", 0))
+    average_delta_in_target_band = (
+        float(config.get("target_average_delta_low", float("-inf")))
+        <= avg_delta_value
+        <= float(config.get("target_average_delta_high", float("inf")))
+    )
+    average_delta_not_too_large = abs(avg_delta_value) <= float(config.get("max_abs_average_delta", float("inf")))
+    positive_extreme_ok = max_delta_seen is None or max_delta_seen <= float(config.get("max_positive_extreme", float("inf")))
+    negative_extreme_ok = min_delta_seen is None or min_delta_seen >= float(config.get("max_negative_extreme", float("-inf")))
+    require_demotions_gt_promotions = bool(config.get("require_demotions_gt_promotions"))
+    demotion_balance_ok = (demoted_observations > promoted_observations) if require_demotions_gt_promotions else True
+
+    checks = {
+        "observation_floor_ok": observation_floor_ok,
+        "recurring_demotions_ok": recurring_demotions_ok,
+        "average_delta_in_target_band": average_delta_in_target_band,
+        "average_delta_not_too_large": average_delta_not_too_large,
+        "positive_extreme_ok": positive_extreme_ok,
+        "negative_extreme_ok": negative_extreme_ok,
+        "demotion_balance_ok": demotion_balance_ok,
+    }
+    secondary_true_count = sum(
+        1
+        for value in [
+            recurring_demotions_ok,
+            average_delta_in_target_band,
+            average_delta_not_too_large,
+            positive_extreme_ok,
+            negative_extreme_ok,
+            demotion_balance_ok,
+        ]
+        if value
+    )
+    if all(checks.values()):
+        status_value = "ready"
+    elif observation_floor_ok and secondary_true_count >= 4:
+        status_value = "borderline"
+    else:
+        status_value = "not_ready"
+
+    reasons: List[str] = []
+    if status_value == "ready":
+        reasons.append("all readiness checks passed")
+    else:
+        if not observation_floor_ok:
+            reasons.append("insufficient eligible observations")
+        if not recurring_demotions_ok:
+            reasons.append("not enough recurring demotion zones")
+        if not average_delta_in_target_band:
+            reasons.append("average delta outside target band")
+        if not average_delta_not_too_large:
+            reasons.append("average delta magnitude too large")
+        if not positive_extreme_ok:
+            reasons.append("positive delta spike exceeds threshold")
+        if not negative_extreme_ok:
+            reasons.append("negative delta spike exceeds threshold")
+        if not demotion_balance_ok:
+            reasons.append("demotions do not exceed promotions")
+        if status_value == "borderline":
+            reasons.append("meets observation floor with partial signal alignment")
+
+    metrics = {
+        "eligible_zone_observations": eligible_zone_observations,
+        "promoted_observations": promoted_observations,
+        "demoted_observations": demoted_observations,
+        "average_delta_overall": average_delta_overall,
+        "min_delta_seen": min_delta_seen,
+        "max_delta_seen": max_delta_seen,
+        "recurring_top_demotions_count": recurring_top_demotions_count,
+        "recurring_top_promotions_count": recurring_top_promotions_count,
+    }
+    return {
+        "profile_name": profile_name,
+        "status": status_value,
+        "recommended_next_phase": (
+            config.get("recommended_next_phase", "keep_shadow_only") if status_value == "ready" else "keep_shadow_only"
+        ),
+        "checks": checks,
+        "metrics": metrics,
+        "reasons": reasons,
+    }
+
+
 @app.get("/admin/artifacts/trap_candidate_review")
 def admin_trap_candidate_review_artifact(admin: sqlite3.Row = Depends(require_admin)):
     _ = admin
@@ -3747,6 +3963,58 @@ def admin_trap_candidate_review_artifact_metadata(admin: sqlite3.Row = Depends(r
         "ok": True,
         "artifact_key": "trap_candidate_review",
         "metadata": metadata,
+    }
+
+
+@app.get("/admin/artifacts/trap_candidate_review/readiness")
+def admin_trap_candidate_review_readiness(
+    profile: Optional[str] = None,
+    admin: sqlite3.Row = Depends(require_admin),
+):
+    _ = admin
+    artifact = load_generated_artifact("trap_candidate_review")
+    if not artifact:
+        raise HTTPException(status_code=404, detail="trap_candidate_review not found")
+    payload = artifact.get("payload") or {}
+    if not isinstance(payload, dict):
+        payload = {}
+
+    target_profiles = list(TRAP_CANDIDATE_PROMOTION_READINESS_CONFIG.keys())
+    if profile is not None:
+        if profile not in TRAP_CANDIDATE_PROMOTION_READINESS_CONFIG:
+            raise HTTPException(status_code=400, detail="unknown trap candidate profile")
+        target_profiles = [profile]
+
+    profiles_payload: Dict[str, Any] = {}
+    for profile_name in target_profiles:
+        review = _safe_profile_review_dict(payload, profile_name) or {}
+        profiles_payload[profile_name] = _evaluate_trap_candidate_readiness(profile_name, review)
+
+    metadata = artifact.get("metadata") or {}
+    return {
+        "ok": True,
+        "artifact_key": "trap_candidate_review",
+        "artifact_updated_at_unix": metadata.get("updated_at_unix"),
+        "profiles": profiles_payload,
+    }
+
+
+@app.get("/admin/artifacts/trap_candidate_review/readiness/citywide")
+def admin_trap_candidate_review_readiness_citywide(admin: sqlite3.Row = Depends(require_admin)):
+    _ = admin
+    artifact = load_generated_artifact("trap_candidate_review")
+    if not artifact:
+        raise HTTPException(status_code=404, detail="trap_candidate_review not found")
+    payload = artifact.get("payload") or {}
+    if not isinstance(payload, dict):
+        payload = {}
+    profile_name = "citywide_v3_trap_candidate"
+    review = _safe_profile_review_dict(payload, profile_name) or {}
+    readiness = _evaluate_trap_candidate_readiness(profile_name, review)
+    return {
+        "ok": True,
+        "profile_name": profile_name,
+        "readiness": readiness,
     }
 
 
