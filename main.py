@@ -5871,6 +5871,107 @@ def _recent_recommendation_outcomes(zone_id: int, hotspot_id: Optional[str] = No
     return rows
 
 
+def _recent_recommendation_outcomes_for_merged_hotspot(
+    covered_zone_ids: Any,
+    hotspot_id: Optional[str],
+    max_rows: int = 80,
+) -> Tuple[List[Dict[str, Any]], str, int]:
+    normalized_zone_ids: List[int] = []
+    seen_zone_ids: set[int] = set()
+    for raw_zone_id in (covered_zone_ids or []):
+        try:
+            zone_id = int(raw_zone_id)
+        except Exception:
+            continue
+        if zone_id in seen_zone_ids:
+            continue
+        seen_zone_ids.add(zone_id)
+        normalized_zone_ids.append(zone_id)
+
+    hotspot_key = str(hotspot_id or "").strip()
+    if not normalized_zone_ids or not hotspot_key:
+        return [], "merged_hotspot_specific", 0
+
+    cutoff = int(time.time()) - (30 * 24 * 3600)
+    placeholders = ",".join(["?"] * len(normalized_zone_ids))
+    rows = _db_query_all(
+        f"""
+        SELECT converted_to_trip, minutes_to_trip
+        FROM recommendation_outcomes
+        WHERE cluster_id = ?
+          AND zone_id IN ({placeholders})
+          AND recommended_at >= ?
+        ORDER BY recommended_at DESC, id DESC
+        LIMIT ?
+        """,
+        tuple([hotspot_key] + normalized_zone_ids + [int(cutoff), int(max_rows)]),
+    )
+    normalized_rows = [dict(r) for r in rows]
+    return normalized_rows, "merged_hotspot_specific", len(normalized_rows)
+
+
+def _compute_merged_hotspot_learning_payload(
+    merged_feature: Dict[str, Any],
+    feature_a: Dict[str, Any],
+    feature_b: Dict[str, Any],
+) -> Dict[str, Any]:
+    props = (merged_feature or {}).get("properties") or {}
+    merged_hotspot_id = str(props.get("hotspot_id") or "").strip()
+    covered_zone_ids = props.get("covered_zone_ids") or props.get("merged_zone_ids") or []
+    merged_rows, merged_scope_used, merged_sample_count = _recent_recommendation_outcomes_for_merged_hotspot(
+        covered_zone_ids=covered_zone_ids,
+        hotspot_id=merged_hotspot_id if merged_hotspot_id else None,
+    )
+    if merged_sample_count >= 6:
+        outcome = get_zone_or_hotspot_outcome_modifier(merged_rows)
+        outcome_modifier = float(outcome.get("modifier") or 1.0)
+        quality_modifier = (
+            _metric_from_feature_props(feature_a, "quality_modifier", default=1.0)
+            + _metric_from_feature_props(feature_b, "quality_modifier", default=1.0)
+        ) / 2.0
+        return {
+            "outcome_modifier": outcome_modifier,
+            "quality_modifier": quality_modifier,
+            "live_combined_modifier": max(0.20, outcome_modifier * quality_modifier),
+            "outcome_sample_count": int(float(outcome.get("sample_count") or 0.0)),
+            "outcome_scope_used": merged_scope_used,
+            "outcome_conversion_rate": float(outcome.get("conversion_rate") or 0.0),
+            "outcome_median_minutes_to_trip": float(outcome.get("median_minutes_to_trip") or 0.0),
+            "merged_outcome_scope_used": merged_scope_used,
+            "merged_outcome_sample_count": int(float(outcome.get("sample_count") or 0.0)),
+            "merged_outcome_conversion_rate": float(outcome.get("conversion_rate") or 0.0),
+            "merged_outcome_median_minutes_to_trip": float(outcome.get("median_minutes_to_trip") or 0.0),
+            "used_merged_hotspot_specific": True,
+        }
+
+    fallback_outcome_modifier = max(
+        _metric_from_feature_props(feature_a, "outcome_modifier", default=1.0),
+        _metric_from_feature_props(feature_b, "outcome_modifier", default=1.0),
+    )
+    fallback_quality_modifier = (
+        _metric_from_feature_props(feature_a, "quality_modifier", default=1.0)
+        + _metric_from_feature_props(feature_b, "quality_modifier", default=1.0)
+    ) / 2.0
+    fallback_live_combined_modifier = max(
+        _metric_from_feature_props(feature_a, "live_combined_modifier", default=1.0),
+        _metric_from_feature_props(feature_b, "live_combined_modifier", default=1.0),
+    )
+    return {
+        "outcome_modifier": fallback_outcome_modifier,
+        "quality_modifier": fallback_quality_modifier,
+        "live_combined_modifier": fallback_live_combined_modifier,
+        "outcome_sample_count": int(merged_sample_count),
+        "outcome_scope_used": "merged_fallback_from_children",
+        "outcome_conversion_rate": 0.0,
+        "outcome_median_minutes_to_trip": 0.0,
+        "merged_outcome_scope_used": "merged_fallback_from_children",
+        "merged_outcome_sample_count": int(merged_sample_count),
+        "merged_outcome_conversion_rate": 0.0,
+        "merged_outcome_median_minutes_to_trip": 0.0,
+        "used_merged_hotspot_specific": False,
+    }
+
+
 def _pickup_zone_density_penalty(zone_ids: List[int]) -> Dict[int, float]:
     if not zone_ids:
         return {}
@@ -6309,8 +6410,32 @@ def _build_cross_zone_merged_hotspot_feature(
             ),
             "recommended": bool(props_a.get("recommended")) or bool(props_b.get("recommended")),
             "micro_hotspots": merged_micro,
+            "merged_learning_version": "merged_hotspot_v1",
         },
     }
+    merged_props = merged_feature.setdefault("properties", {})
+    merged_base_intensity = float(merged_props.get("intensity") or 0.55)
+    merged_base_confidence = float(merged_props.get("confidence") or 0.55)
+    merged_learning_payload = _compute_merged_hotspot_learning_payload(merged_feature, feature_a, feature_b)
+
+    merged_props["outcome_modifier"] = round(float(merged_learning_payload.get("outcome_modifier") or 1.0), 4)
+    merged_props["outcome_sample_count"] = int(merged_learning_payload.get("outcome_sample_count") or 0)
+    merged_props["outcome_scope_used"] = str(merged_learning_payload.get("outcome_scope_used") or "merged_fallback_from_children")
+    merged_props["outcome_conversion_rate"] = round(float(merged_learning_payload.get("outcome_conversion_rate") or 0.0), 4)
+    merged_props["outcome_median_minutes_to_trip"] = round(float(merged_learning_payload.get("outcome_median_minutes_to_trip") or 0.0), 4)
+    merged_props["live_combined_modifier"] = round(float(merged_learning_payload.get("live_combined_modifier") or 1.0), 4)
+    merged_props["quality_modifier"] = round(float(merged_learning_payload.get("quality_modifier") or 1.0), 4)
+
+    merged_props["merged_outcome_scope_used"] = str(merged_learning_payload.get("merged_outcome_scope_used") or "merged_fallback_from_children")
+    merged_props["merged_outcome_sample_count"] = int(merged_learning_payload.get("merged_outcome_sample_count") or 0)
+    merged_props["merged_outcome_conversion_rate"] = round(float(merged_learning_payload.get("merged_outcome_conversion_rate") or 0.0), 4)
+    merged_props["merged_outcome_median_minutes_to_trip"] = round(float(merged_learning_payload.get("merged_outcome_median_minutes_to_trip") or 0.0), 4)
+
+    if bool(merged_learning_payload.get("used_merged_hotspot_specific")):
+        merged_outcome_modifier = float(merged_learning_payload.get("outcome_modifier") or 1.0)
+        merged_props["intensity"] = round(max(0.20, min(1.00, merged_base_intensity * merged_outcome_modifier)), 4)
+        merged_props["confidence"] = round(max(0.20, min(0.98, merged_base_confidence * merged_outcome_modifier)), 4)
+
     for key in ("final_score", "hotspot_score"):
         if key in props_a or key in props_b:
             merged_feature["properties"][key] = max(
@@ -6462,6 +6587,8 @@ def _pickup_zone_hotspots_with_debug(
         "merged_zone_pairs": [],
         "post_merge_recommendation_assignment_count": 0,
         "post_merge_logged_outcome_count": 0,
+        "merged_hotspot_specific_learning_count": 0,
+        "merged_hotspot_fallback_learning_count": 0,
     }
     if include_debug:
         debug.update(
@@ -6924,6 +7051,18 @@ def _pickup_zone_hotspots_with_debug(
         debug["cross_zone_merge_candidates"] = len(merge_results)
         debug["cross_zone_merge_applied_count"] = len(merged_features)
         debug["merged_zone_pairs"] = merged_zone_pairs
+        debug["merged_hotspot_specific_learning_count"] = sum(
+            1
+            for feature in merged_features
+            if str(((feature.get("properties") or {}).get("merged_outcome_scope_used") or "")).strip()
+            == "merged_hotspot_specific"
+        )
+        debug["merged_hotspot_fallback_learning_count"] = sum(
+            1
+            for feature in merged_features
+            if str(((feature.get("properties") or {}).get("merged_outcome_scope_used") or "")).strip()
+            == "merged_fallback_from_children"
+        )
         rendered_zone_ids: List[int] = []
         for zone_id in clean_zone_ids:
             zdebug = zone_debug_map.get(zone_id)
