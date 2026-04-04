@@ -56,6 +56,7 @@ from artifact_db_store import (
     generated_artifact_present,
     generated_artifact_report,
     load_generated_artifact,
+    load_generated_artifact_metadata,
     save_generated_artifact,
 )
 from avatar_assets import (
@@ -3647,6 +3648,7 @@ def status():
     timeline_artifact_in_db = generated_artifact_present("timeline")
     manifest_artifact_in_db = generated_artifact_present("scoring_shadow_manifest")
     day_tendency_artifact_in_db = generated_artifact_present("day_tendency_model")
+    trap_candidate_review_artifact_in_db = generated_artifact_present("trap_candidate_review")
     assistant_outlook_artifact_in_db = generated_artifact_present("assistant_outlook")
     assistant_outlook_file_present = ASSISTANT_OUTLOOK_PATH.exists() and ASSISTANT_OUTLOOK_PATH.stat().st_size > 0 if ASSISTANT_OUTLOOK_PATH.exists() else False
     assistant_outlook_file_bytes = int(ASSISTANT_OUTLOOK_PATH.stat().st_size) if ASSISTANT_OUTLOOK_PATH.exists() and ASSISTANT_OUTLOOK_PATH.is_file() else 0
@@ -3685,6 +3687,7 @@ def status():
         "timeline_artifact_in_db": timeline_artifact_in_db,
         "manifest_artifact_in_db": manifest_artifact_in_db,
         "day_tendency_artifact_in_db": day_tendency_artifact_in_db,
+        "trap_candidate_review_artifact_in_db": trap_candidate_review_artifact_in_db,
         "assistant_outlook_in_db": assistant_outlook_artifact_in_db,
         "assistant_outlook_artifact_in_db": assistant_outlook_artifact_in_db,
         "assistant_outlook_file_present": assistant_outlook_file_present,
@@ -3717,6 +3720,46 @@ def status():
         "current_badges_refresh_lock_active": leaderboard_runtime.get("current_badges_refresh_lock_active"),
         "leaderboard_badges_cache_entries": leaderboard_runtime.get("leaderboard_badges_cache_entries"),
         "leaderboard_progression_cache_entries": leaderboard_runtime.get("leaderboard_progression_cache_entries"),
+    }
+
+
+@app.get("/admin/artifacts/trap_candidate_review")
+def admin_trap_candidate_review_artifact(admin: sqlite3.Row = Depends(require_admin)):
+    _ = admin
+    artifact = load_generated_artifact("trap_candidate_review")
+    if not artifact:
+        raise HTTPException(status_code=404, detail="trap_candidate_review not found")
+    return {
+        "ok": True,
+        "artifact_key": "trap_candidate_review",
+        "metadata": artifact.get("metadata"),
+        "payload": artifact.get("payload"),
+    }
+
+
+@app.get("/admin/artifacts/trap_candidate_review/metadata")
+def admin_trap_candidate_review_artifact_metadata(admin: sqlite3.Row = Depends(require_admin)):
+    _ = admin
+    metadata = load_generated_artifact_metadata("trap_candidate_review")
+    if not metadata:
+        raise HTTPException(status_code=404, detail="trap_candidate_review not found")
+    return {
+        "ok": True,
+        "artifact_key": "trap_candidate_review",
+        "metadata": metadata,
+    }
+
+
+@app.get("/admin/artifacts/summary")
+def admin_artifacts_summary(admin: sqlite3.Row = Depends(require_admin)):
+    _ = admin
+    return {
+        "ok": True,
+        "generated_artifact_store_report": generated_artifact_report(),
+        "trap_candidate_review_present": generated_artifact_present("trap_candidate_review"),
+        "scoring_shadow_manifest_present": generated_artifact_present("scoring_shadow_manifest"),
+        "timeline_present": generated_artifact_present("timeline"),
+        "day_tendency_model_present": generated_artifact_present("day_tendency_model"),
     }
 
 
