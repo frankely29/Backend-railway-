@@ -27,6 +27,7 @@ from shapely.ops import transform, unary_union
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from hotspot_experiments import (
+    log_micro_bins,
     log_zone_bins,
     prune_experiment_tables,
 )
@@ -45,6 +46,7 @@ from assistant_outlook_engine import (
     build_assistant_outlook_frame_bucket,
     get_assistant_outlook_payload_from_frame_bucket,
 )
+from hotspot_models import MicroHotspotScoreResult
 from hotspot_scoring import score_zones
 from artifact_freshness import evaluate_artifact_freshness
 from artifact_storage_service import cleanup_artifact_storage, get_artifact_storage_report
@@ -7383,6 +7385,72 @@ def _apply_micro_hotspot_learning(
     }
 
 
+def _build_micro_experiment_rows_from_features(features: List[Dict[str, Any]]) -> List[MicroHotspotScoreResult]:
+    deduped_rows: Dict[str, MicroHotspotScoreResult] = {}
+    for feature in features:
+        if not isinstance(feature, dict):
+            continue
+        props = feature.get("properties") or {}
+        parent_zone_id_raw = props.get("zone_id")
+        baseline_component = float(props.get("final_score") or props.get("hotspot_score") or 0.0)
+        same_timeslot_component = float(props.get("outcome_conversion_rate") or 0.0)
+        micro_hotspots = props.get("micro_hotspots")
+        if not isinstance(micro_hotspots, list):
+            continue
+        for micro in micro_hotspots:
+            if not isinstance(micro, dict):
+                continue
+            cluster_id = str(micro.get("cluster_id") or "").strip()
+            if not cluster_id:
+                continue
+            try:
+                zone_id = int(micro.get("zone_id") if micro.get("zone_id") is not None else parent_zone_id_raw)
+            except Exception:
+                continue
+            try:
+                center_lat = float(micro.get("center_lat"))
+                center_lng = float(micro.get("center_lng"))
+            except Exception:
+                continue
+            if (
+                not math.isfinite(center_lat)
+                or not math.isfinite(center_lng)
+                or center_lat < -90.0
+                or center_lat > 90.0
+                or center_lng < -180.0
+                or center_lng > 180.0
+            ):
+                continue
+            radius_m = float(micro.get("radius_m") or 42.0)
+            intensity = float(micro.get("intensity") or 0.0)
+            confidence = float(micro.get("confidence") or 0.0)
+            weighted_trip_count = float(micro.get("event_count") or 0.0)
+            unique_driver_count = int(micro.get("event_count") or 0)
+            live_component = intensity
+            final_score = max(0.0, min(1.0, (0.55 * live_component) + (0.35 * confidence) + (0.10 * baseline_component)))
+            row = MicroHotspotScoreResult(
+                cluster_id=cluster_id,
+                zone_id=zone_id,
+                center_lat=center_lat,
+                center_lng=center_lng,
+                radius_m=radius_m,
+                intensity=intensity,
+                confidence=confidence,
+                weighted_trip_count=weighted_trip_count,
+                unique_driver_count=unique_driver_count,
+                crowding_penalty=0.0,
+                baseline_component=baseline_component,
+                live_component=live_component,
+                same_timeslot_component=same_timeslot_component,
+                final_score=float(final_score),
+                recommended=bool(micro.get("recommended_micro_hotspot", micro.get("recommended"))),
+            )
+            existing = deduped_rows.get(cluster_id)
+            if existing is None or (row.final_score, row.confidence) > (existing.final_score, existing.confidence):
+                deduped_rows[cluster_id] = row
+    return list(deduped_rows.values())
+
+
 def _pickup_zone_hotspots_with_debug(
     zone_ids: List[int],
     include_debug: bool = False,
@@ -7418,6 +7486,9 @@ def _pickup_zone_hotspots_with_debug(
         "logged_primary_micro_outcome_count": 0,
         "micro_hotspot_specific_learning_count": 0,
         "micro_hotspot_parent_fallback_learning_count": 0,
+        "micro_experiment_rows_built": 0,
+        "micro_experiment_rows_logged": 0,
+        "micro_experiment_logging_failed": False,
         "settled_stale_hotspot_outcomes": 0,
         "settled_stale_micro_outcomes": 0,
         "outcome_learning_resolved_only": True,
@@ -7949,6 +8020,18 @@ def _pickup_zone_hotspots_with_debug(
         for micro in (((feature.get("properties") or {}).get("micro_hotspots")) or [])
         if isinstance(micro, dict) and str((micro.get("micro_outcome_precision_profile") or "")).strip()
     )
+    if not score_bundle_fresh:
+        micro_rows = _build_micro_experiment_rows_from_features(features)
+        debug["micro_experiment_rows_built"] = len(micro_rows)
+        if micro_rows:
+            try:
+                log_micro_bins(_db_exec, bin_time=now_ts, rows=micro_rows)
+                debug["micro_experiment_rows_logged"] = len(micro_rows)
+            except Exception:
+                debug["micro_experiment_logging_failed"] = True
+                if include_debug:
+                    debug["global_errors"].append("log_micro_bins_failed")
+                print("[warn] Failed to log pickup micro bins", traceback.format_exc())
 
     for zone_id, zdebug in zone_debug_map.items():
         zone_recommended_micro_count = 0
