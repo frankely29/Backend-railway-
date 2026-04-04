@@ -7125,6 +7125,7 @@ def _pickup_zone_hotspots_with_debug(
                 parent_hotspot_id = micro.get("parent_hotspot_id")
                 zone_sync_ok = zone_sync_ok and (str(parent_hotspot_id or "") == str(props.get("hotspot_id") or ""))
         zdebug["recommended_micro_hotspot_count"] = zone_recommended_micro_count
+        zdebug["nonrecommended_micro_hotspot_count"] = zone_nonrecommended_micro_count
         zdebug["micro_hotspot_parent_sync_ok"] = bool(zone_sync_ok)
 
     if include_debug:
