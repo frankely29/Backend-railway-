@@ -5504,7 +5504,7 @@ def _build_zone_micro_hotspots_payload(
         "intensity": intensity,
         "confidence": confidence,
         "event_count": event_count,
-        "recommended": True,
+        "recommended": False,
         "zone_name": zone_name,
         "borough": borough,
         "micro_method": "densest_cell_inside_hotspot",
@@ -6563,6 +6563,54 @@ def _apply_final_recommended_hotspot_ownership(
     }
 
 
+def _apply_micro_hotspot_parent_recommendation_state(features: List[Dict[str, Any]]) -> Dict[str, int]:
+    recommended_micro_hotspot_count = 0
+    nonrecommended_micro_hotspot_count = 0
+
+    for feature in features:
+        if not isinstance(feature, dict):
+            continue
+        props = feature.get("properties") or {}
+        hotspot_id = props.get("hotspot_id")
+        hotspot_index = props.get("hotspot_index")
+        hotspot_method = props.get("hotspot_method")
+        parent_recommended = bool(props.get("recommended_hotspot"))
+        parent_recommendation_scope = props.get("recommendation_scope")
+        parent_merged = bool(props.get("merged"))
+        parent_covered_zone_ids = copy.deepcopy(props.get("covered_zone_ids") or [])
+        parent_covered_zone_names = copy.deepcopy(props.get("covered_zone_names") or [])
+
+        micro_hotspots = props.get("micro_hotspots")
+        if not isinstance(micro_hotspots, list):
+            continue
+
+        for micro_rank, micro in enumerate(micro_hotspots):
+            if not isinstance(micro, dict):
+                continue
+            micro["hotspot_id"] = hotspot_id
+            micro["hotspot_index"] = hotspot_index
+            micro["recommended"] = parent_recommended
+            micro["recommendation_scope"] = "micro_hotspot" if parent_recommended else "micro_secondary"
+            micro["parent_hotspot_id"] = hotspot_id
+            micro["parent_hotspot_method"] = hotspot_method
+            micro["parent_recommendation_scope"] = parent_recommendation_scope
+            micro["parent_merged"] = parent_merged
+            micro["parent_covered_zone_ids"] = copy.deepcopy(parent_covered_zone_ids)
+            micro["parent_covered_zone_names"] = copy.deepcopy(parent_covered_zone_names)
+            micro["micro_rank"] = int(micro_rank)
+            micro["micro_parent_feature_kind"] = "hotspot"
+            micro["micro_owner_version"] = "parent_recommendation_v1"
+            if parent_recommended:
+                recommended_micro_hotspot_count += 1
+            else:
+                nonrecommended_micro_hotspot_count += 1
+
+    return {
+        "recommended_micro_hotspot_count": recommended_micro_hotspot_count,
+        "nonrecommended_micro_hotspot_count": nonrecommended_micro_hotspot_count,
+    }
+
+
 def _pickup_zone_hotspots_with_debug(
     zone_ids: List[int],
     include_debug: bool = False,
@@ -6589,6 +6637,8 @@ def _pickup_zone_hotspots_with_debug(
         "post_merge_logged_outcome_count": 0,
         "merged_hotspot_specific_learning_count": 0,
         "merged_hotspot_fallback_learning_count": 0,
+        "recommended_micro_hotspot_count": 0,
+        "nonrecommended_micro_hotspot_count": 0,
     }
     if include_debug:
         debug.update(
@@ -6737,6 +6787,8 @@ def _pickup_zone_hotspots_with_debug(
                 "final_recommendation_scope": None,
                 "recommendation_logged_post_merge": False,
                 "recommendation_logged_cluster_id": None,
+                "recommended_micro_hotspot_count": 0,
+                "micro_hotspot_parent_sync_ok": True,
                 "outcome_scope_used": "zone_fallback",
                 "hotspot_specific_outcome_sample_count": 0,
                 "zone_fallback_outcome_sample_count": 0,
@@ -7046,6 +7098,34 @@ def _pickup_zone_hotspots_with_debug(
         zone_debug_map=zone_debug_map,
     )
     debug.update(post_merge_recommendation_debug)
+    debug.update(_apply_micro_hotspot_parent_recommendation_state(features))
+
+    for zone_id, zdebug in zone_debug_map.items():
+        zone_recommended_micro_count = 0
+        zone_nonrecommended_micro_count = 0
+        zone_sync_ok = True
+        for feature in features:
+            props = (feature or {}).get("properties") or {}
+            covered_zone_ids = props.get("covered_zone_ids") or [props.get("zone_id")]
+            normalized_zone_ids: set[int] = set()
+            for raw_zone_id in covered_zone_ids:
+                try:
+                    normalized_zone_ids.add(int(raw_zone_id))
+                except Exception:
+                    continue
+            if zone_id not in normalized_zone_ids:
+                continue
+            for micro in (props.get("micro_hotspots") or []):
+                if not isinstance(micro, dict):
+                    continue
+                if bool(micro.get("recommended")):
+                    zone_recommended_micro_count += 1
+                else:
+                    zone_nonrecommended_micro_count += 1
+                parent_hotspot_id = micro.get("parent_hotspot_id")
+                zone_sync_ok = zone_sync_ok and (str(parent_hotspot_id or "") == str(props.get("hotspot_id") or ""))
+        zdebug["recommended_micro_hotspot_count"] = zone_recommended_micro_count
+        zdebug["micro_hotspot_parent_sync_ok"] = bool(zone_sync_ok)
 
     if include_debug:
         debug["cross_zone_merge_candidates"] = len(merge_results)
