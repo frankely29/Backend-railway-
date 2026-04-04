@@ -24,6 +24,7 @@ PICKUP_SAVE_SESSION_BREAK_SECONDS = 480
 PICKUP_SAVE_MOTION_STALE_SECONDS = 180
 PICKUP_SAVE_RELOCATION_MIN_MILES = 0.25
 PICKUP_SAVE_SAME_POSITION_MAX_MILES = 0.08
+PICKUP_MICRO_RECOMMENDATION_ATTRIBUTION_MAX_MILES = 0.20
 
 
 def _noop_pickup_cache_invalidator() -> None:
@@ -179,6 +180,97 @@ def _format_wait_short(wait_seconds: int) -> str:
     if minutes > 0:
         return f"{minutes}m"
     return f"{seconds}s"
+
+
+def _settle_latest_hotspot_recommendation_outcome_tx(
+    cur,
+    user_id: int,
+    zone_id: int,
+    now_ts: int,
+) -> bool:
+    row = _query_one_cur(
+        cur,
+        """
+        SELECT id, recommended_at
+        FROM recommendation_outcomes
+        WHERE user_id = ?
+          AND zone_id = ?
+          AND converted_to_trip IS NULL
+          AND recommended_at <= ?
+          AND recommended_at >= ?
+        ORDER BY recommended_at DESC, id DESC
+        LIMIT 1
+        """,
+        (int(user_id), int(zone_id), int(now_ts), int(now_ts) - 5400),
+    )
+    if not row:
+        return False
+    recommended_at = int(row.get("recommended_at") or now_ts)
+    minutes_to_trip = max(0.0, (float(now_ts) - float(recommended_at)) / 60.0)
+    _exec_cur(
+        cur,
+        "UPDATE recommendation_outcomes SET converted_to_trip=?, minutes_to_trip=? WHERE id=?",
+        (_bool_db_value(True), float(minutes_to_trip), int(row["id"])),
+    )
+    return True
+
+
+def _settle_latest_micro_recommendation_outcome_tx(
+    cur,
+    user_id: int,
+    zone_id: int,
+    pickup_lat: float,
+    pickup_lng: float,
+    now_ts: int,
+) -> bool:
+    rows = _query_all_cur(
+        cur,
+        """
+        SELECT id, recommended_at, micro_center_lat, micro_center_lng
+        FROM micro_recommendation_outcomes
+        WHERE user_id = ?
+          AND zone_id = ?
+          AND converted_to_trip IS NULL
+          AND recommended_at <= ?
+          AND recommended_at >= ?
+          AND micro_center_lat IS NOT NULL
+          AND micro_center_lng IS NOT NULL
+        """,
+        (int(user_id), int(zone_id), int(now_ts), int(now_ts) - 5400),
+    )
+    best: Optional[Dict[str, Any]] = None
+    for row in rows:
+        distance_miles = _safe_haversine_miles(
+            float(pickup_lat),
+            float(pickup_lng),
+            float(row.get("micro_center_lat")),
+            float(row.get("micro_center_lng")),
+        )
+        if distance_miles > PICKUP_MICRO_RECOMMENDATION_ATTRIBUTION_MAX_MILES:
+            continue
+        candidate = dict(row)
+        candidate["_distance_miles"] = float(distance_miles)
+        if best is None:
+            best = candidate
+            continue
+        if candidate["_distance_miles"] < best["_distance_miles"]:
+            best = candidate
+            continue
+        if (
+            math.isclose(candidate["_distance_miles"], best["_distance_miles"], rel_tol=0.0, abs_tol=1e-9)
+            and int(candidate.get("recommended_at") or 0) > int(best.get("recommended_at") or 0)
+        ):
+            best = candidate
+    if best is None:
+        return False
+    recommended_at = int(best.get("recommended_at") or now_ts)
+    minutes_to_trip = max(0.0, (float(now_ts) - float(recommended_at)) / 60.0)
+    _exec_cur(
+        cur,
+        "UPDATE micro_recommendation_outcomes SET converted_to_trip=?, minutes_to_trip=? WHERE id=?",
+        (_bool_db_value(True), float(minutes_to_trip), int(best["id"])),
+    )
+    return True
 
 
 def record_pickup_presence_heartbeat(user_id: int, lat: float, lng: float, now_ts: int) -> None:
@@ -497,6 +589,8 @@ def create_pickup_record(payload: PickupRecordingPayload, user: Any) -> Dict[str
     frame_time = (payload.frame_time or "").strip() or None
     now = int(time.time())
     expires = now + 24 * 3600
+    settled_hotspot_recommendation = False
+    settled_micro_recommendation = False
 
     with _db_lock:
         conn = _db()
@@ -540,6 +634,27 @@ def create_pickup_record(payload: PickupRecordingPayload, user: Any) -> Dict[str
                 ("pickup", int(user["id"]), float(payload.lat), float(payload.lng), "", payload.zone_id, now, expires),
             )
             _increment_pickup_count_tx(cur, int(user["id"]), now, 1)
+            if payload.zone_id is not None:
+                try:
+                    settled_hotspot_recommendation = _settle_latest_hotspot_recommendation_outcome_tx(
+                        cur,
+                        user_id=int(user["id"]),
+                        zone_id=int(payload.zone_id),
+                        now_ts=now,
+                    )
+                except Exception:
+                    settled_hotspot_recommendation = False
+                try:
+                    settled_micro_recommendation = _settle_latest_micro_recommendation_outcome_tx(
+                        cur,
+                        user_id=int(user["id"]),
+                        zone_id=int(payload.zone_id),
+                        pickup_lat=float(payload.lat),
+                        pickup_lng=float(payload.lng),
+                        now_ts=now,
+                    )
+                except Exception:
+                    settled_micro_recommendation = False
             progression_after = get_pickup_progression_for_user(int(user["id"]), cur=cur)
             conn.commit()
             _invalidate_pickup_write_caches()
@@ -561,6 +676,8 @@ def create_pickup_record(payload: PickupRecordingPayload, user: Any) -> Dict[str
         "progression": progression_after,
         "cooldown_until_unix": int(guard.get("cooldown_until_unix") or (now + PICKUP_SAVE_COOLDOWN_SECONDS)),
         "accepted_guard_reason": str(guard.get("accepted_guard_reason") or ""),
+        "settled_hotspot_recommendation": bool(settled_hotspot_recommendation),
+        "settled_micro_recommendation": bool(settled_micro_recommendation),
     }
 
 

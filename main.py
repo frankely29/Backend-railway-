@@ -2726,12 +2726,22 @@ def _db_init() -> None:
               zone_id INTEGER NOT NULL,
               parent_hotspot_id TEXT,
               micro_cluster_id TEXT NOT NULL,
+              micro_center_lat DOUBLE PRECISION,
+              micro_center_lng DOUBLE PRECISION,
               score DOUBLE PRECISION NOT NULL,
               confidence DOUBLE PRECISION NOT NULL,
               converted_to_trip BOOLEAN,
               minutes_to_trip DOUBLE PRECISION
             );
             """
+        )
+        _try_alter(
+            "ALTER TABLE micro_recommendation_outcomes ADD COLUMN micro_center_lat DOUBLE PRECISION;",
+            "ALTER TABLE micro_recommendation_outcomes ADD COLUMN IF NOT EXISTS micro_center_lat DOUBLE PRECISION;",
+        )
+        _try_alter(
+            "ALTER TABLE micro_recommendation_outcomes ADD COLUMN micro_center_lng DOUBLE PRECISION;",
+            "ALTER TABLE micro_recommendation_outcomes ADD COLUMN IF NOT EXISTS micro_center_lng DOUBLE PRECISION;",
         )
         _db_exec("CREATE INDEX IF NOT EXISTS idx_micro_recommendation_outcomes_time ON micro_recommendation_outcomes(recommended_at DESC);")
         _db_exec(
@@ -3046,6 +3056,8 @@ def _db_init() -> None:
           zone_id INTEGER NOT NULL,
           parent_hotspot_id TEXT,
           micro_cluster_id TEXT NOT NULL,
+          micro_center_lat REAL,
+          micro_center_lng REAL,
           score REAL NOT NULL,
           confidence REAL NOT NULL,
           converted_to_trip INTEGER,
@@ -3053,6 +3065,8 @@ def _db_init() -> None:
         );
         """
     )
+    _try_alter("ALTER TABLE micro_recommendation_outcomes ADD COLUMN micro_center_lat REAL;")
+    _try_alter("ALTER TABLE micro_recommendation_outcomes ADD COLUMN micro_center_lng REAL;")
     _db_exec("CREATE INDEX IF NOT EXISTS idx_micro_recommendation_outcomes_time ON micro_recommendation_outcomes(recommended_at DESC);")
     _db_exec(
         "CREATE INDEX IF NOT EXISTS idx_micro_recommendation_outcomes_zone_cluster_time "
@@ -6524,7 +6538,6 @@ def _apply_final_recommended_hotspot_ownership(
         final_zone_feature_map[zone_id] = _choose_primary_recommended_hotspot_feature(zone_features)
 
     assignment_count = 0
-    logged_outcome_count = 0
     for zone_id in clean_zone_ids:
         zone_features = zone_feature_map.get(zone_id) or []
         for feature in zone_features:
@@ -6588,28 +6601,9 @@ def _apply_final_recommended_hotspot_ownership(
             zone_debug["final_recommended_hotspot_id"] = final_hotspot_id
             zone_debug["final_recommendation_scope"] = target_scope
 
-        if not score_bundle_fresh:
-            try:
-                log_recommendation_outcome(
-                    _db_exec,
-                    recommended_at=now_ts,
-                    zone_id=zone_id,
-                    score=score.final_score,
-                    confidence=score.confidence,
-                    cluster_id=final_hotspot_id,
-                )
-                logged_outcome_count += 1
-                if zone_debug is not None:
-                    zone_debug["recommendation_logged_post_merge"] = True
-                    zone_debug["recommendation_logged_cluster_id"] = final_hotspot_id
-            except Exception:
-                if zone_debug is not None:
-                    zone_debug["errors"].append("log_recommendation_outcome_failed")
-                print(f"[warn] Failed to log recommendation outcome for zone {zone_id}", traceback.format_exc())
-
     return {
         "post_merge_recommendation_assignment_count": assignment_count,
-        "post_merge_logged_outcome_count": logged_outcome_count,
+        "post_merge_logged_outcome_count": 0,
     }
 
 
@@ -6678,12 +6672,15 @@ def _choose_primary_recommended_micro_hotspot(micro_hotspots: Any) -> Optional[D
 
 def _log_micro_recommendation_outcome(
     *,
+    user_id: Optional[int],
     zone_id: int,
     parent_hotspot_id: Optional[str],
     micro_cluster_id: Optional[str],
     score: float,
     confidence: float,
     recommended_at: int,
+    micro_center_lat: Optional[float] = None,
+    micro_center_lng: Optional[float] = None,
 ) -> None:
     cluster_key = str(micro_cluster_id or "").strip()
     if not cluster_key:
@@ -6691,16 +6688,18 @@ def _log_micro_recommendation_outcome(
     _db_exec(
         """
         INSERT INTO micro_recommendation_outcomes(
-          user_id, recommended_at, zone_id, parent_hotspot_id, micro_cluster_id, score, confidence, converted_to_trip, minutes_to_trip
+          user_id, recommended_at, zone_id, parent_hotspot_id, micro_cluster_id, micro_center_lat, micro_center_lng, score, confidence, converted_to_trip, minutes_to_trip
         )
-        VALUES(?, ?, ?, ?, ?, ?, ?, NULL, NULL)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
         """,
         (
-            None,
+            int(user_id) if user_id is not None else None,
             int(recommended_at),
             int(zone_id),
             str(parent_hotspot_id or "").strip() or None,
             cluster_key,
+            float(micro_center_lat) if micro_center_lat is not None else None,
+            float(micro_center_lng) if micro_center_lng is not None else None,
             float(score),
             float(confidence),
         ),
@@ -6714,7 +6713,6 @@ def _apply_final_recommended_micro_hotspot_ownership(
     zone_debug_map: Dict[int, Dict[str, Any]],
 ) -> Dict[str, int]:
     recommended_primary_micro_hotspot_count = 0
-    logged_micro_outcome_count = 0
     for feature in features:
         if not isinstance(feature, dict):
             continue
@@ -6754,25 +6752,9 @@ def _apply_final_recommended_micro_hotspot_ownership(
                 continue
             zone_debug["recommended_primary_micro_hotspot_count"] = int(zone_debug.get("recommended_primary_micro_hotspot_count") or 0) + 1
 
-        if score_bundle_fresh:
-            continue
-        try:
-            zone_id = int(primary_micro.get("zone_id") or props.get("zone_id") or 0)
-            _log_micro_recommendation_outcome(
-                zone_id=zone_id,
-                parent_hotspot_id=parent_hotspot_id,
-                micro_cluster_id=str(primary_micro.get("cluster_id") or "").strip() or None,
-                score=float(props.get("final_score") or props.get("hotspot_score") or 0.0),
-                confidence=float(props.get("confidence") or 0.0),
-                recommended_at=now_ts,
-            )
-            logged_micro_outcome_count += 1
-        except Exception:
-            print("[warn] Failed to log micro recommendation outcome", traceback.format_exc())
-
     return {
         "recommended_primary_micro_hotspot_count": recommended_primary_micro_hotspot_count,
-        "logged_primary_micro_outcome_count": logged_micro_outcome_count,
+        "logged_primary_micro_outcome_count": 0,
     }
 
 
@@ -6791,6 +6773,158 @@ def _recent_micro_recommendation_outcomes(zone_id: int, micro_cluster_id: str, m
         (int(zone_id), str(micro_cluster_id), int(cutoff), int(max_rows)),
     )
     return [dict(r) for r in rows]
+
+
+def _viewer_recent_hotspot_impression_exists(
+    user_id: int,
+    zone_id: int,
+    hotspot_id: Optional[str],
+    now_ts: int,
+    cooldown_sec: int = 480,
+) -> bool:
+    cluster_key = str(hotspot_id or "").strip() or None
+    if not cluster_key:
+        return False
+    cutoff = int(now_ts) - max(1, int(cooldown_sec))
+    row = _db_query_one(
+        """
+        SELECT id
+        FROM recommendation_outcomes
+        WHERE user_id = ?
+          AND zone_id = ?
+          AND cluster_id = ?
+          AND recommended_at >= ?
+        ORDER BY recommended_at DESC, id DESC
+        LIMIT 1
+        """,
+        (int(user_id), int(zone_id), cluster_key, cutoff),
+    )
+    return row is not None
+
+
+def _viewer_recent_micro_impression_exists(
+    user_id: int,
+    zone_id: int,
+    micro_cluster_id: Optional[str],
+    now_ts: int,
+    cooldown_sec: int = 480,
+) -> bool:
+    cluster_key = str(micro_cluster_id or "").strip() or None
+    if not cluster_key:
+        return False
+    cutoff = int(now_ts) - max(1, int(cooldown_sec))
+    row = _db_query_one(
+        """
+        SELECT id
+        FROM micro_recommendation_outcomes
+        WHERE user_id = ?
+          AND zone_id = ?
+          AND micro_cluster_id = ?
+          AND recommended_at >= ?
+        ORDER BY recommended_at DESC, id DESC
+        LIMIT 1
+        """,
+        (int(user_id), int(zone_id), cluster_key, cutoff),
+    )
+    return row is not None
+
+
+def _log_viewer_recommendation_impressions_from_pickup_payload(
+    payload: Dict[str, Any],
+    viewer_user_id: int,
+    now_ts: int,
+) -> Dict[str, int]:
+    counts = {
+        "viewer_logged_hotspot_impressions": 0,
+        "viewer_logged_micro_impressions": 0,
+        "viewer_deduped_hotspot_impressions": 0,
+        "viewer_deduped_micro_impressions": 0,
+    }
+    features = (((payload or {}).get("zone_hotspots") or {}).get("features") or [])
+    if not isinstance(features, list):
+        return counts
+
+    for feature in features:
+        if not isinstance(feature, dict):
+            continue
+        props = feature.get("properties") or {}
+        if not bool(props.get("recommended_hotspot")):
+            continue
+        hotspot_id = str(props.get("hotspot_id") or "").strip() or None
+        if not hotspot_id:
+            continue
+
+        zone_candidates = props.get("recommended_zone_ids")
+        if not isinstance(zone_candidates, list) or not zone_candidates:
+            zone_candidates = [props.get("zone_id")]
+        zone_ids: List[int] = []
+        for raw_zone_id in zone_candidates:
+            try:
+                zone_id = int(raw_zone_id)
+            except Exception:
+                continue
+            if zone_id not in zone_ids:
+                zone_ids.append(zone_id)
+        if not zone_ids:
+            continue
+
+        score_val = float(props.get("final_score") or props.get("hotspot_score") or 0.0)
+        confidence_val = float(props.get("confidence") or 0.0)
+        micro_hotspots = props.get("micro_hotspots") or []
+        for zone_id in zone_ids:
+            try:
+                if _viewer_recent_hotspot_impression_exists(
+                    user_id=viewer_user_id,
+                    zone_id=zone_id,
+                    hotspot_id=hotspot_id,
+                    now_ts=now_ts,
+                ):
+                    counts["viewer_deduped_hotspot_impressions"] += 1
+                else:
+                    log_recommendation_outcome(
+                        _db_exec,
+                        recommended_at=now_ts,
+                        user_id=viewer_user_id,
+                        zone_id=zone_id,
+                        cluster_id=hotspot_id,
+                        score=score_val,
+                        confidence=confidence_val,
+                    )
+                    counts["viewer_logged_hotspot_impressions"] += 1
+            except Exception:
+                print(f"[warn] Failed viewer hotspot impression logging for zone={zone_id}", traceback.format_exc())
+
+            for micro in micro_hotspots:
+                if not isinstance(micro, dict) or not bool(micro.get("recommended_micro_hotspot")):
+                    continue
+                micro_cluster_id = str(micro.get("cluster_id") or "").strip() or None
+                if not micro_cluster_id:
+                    continue
+                center = micro.get("center") if isinstance(micro.get("center"), dict) else {}
+                try:
+                    if _viewer_recent_micro_impression_exists(
+                        user_id=viewer_user_id,
+                        zone_id=zone_id,
+                        micro_cluster_id=micro_cluster_id,
+                        now_ts=now_ts,
+                    ):
+                        counts["viewer_deduped_micro_impressions"] += 1
+                        continue
+                    _log_micro_recommendation_outcome(
+                        user_id=viewer_user_id,
+                        zone_id=zone_id,
+                        parent_hotspot_id=hotspot_id,
+                        micro_cluster_id=micro_cluster_id,
+                        score=score_val,
+                        confidence=float(micro.get("confidence") or confidence_val),
+                        recommended_at=now_ts,
+                        micro_center_lat=float(center.get("lat")) if center.get("lat") is not None else None,
+                        micro_center_lng=float(center.get("lng")) if center.get("lng") is not None else None,
+                    )
+                    counts["viewer_logged_micro_impressions"] += 1
+                except Exception:
+                    print(f"[warn] Failed viewer micro impression logging for zone={zone_id}", traceback.format_exc())
+    return counts
 
 
 def _apply_micro_hotspot_learning(
@@ -7588,6 +7722,12 @@ def _recent_pickups_payload(
     viewer: Optional[sqlite3.Row] = None,
 ) -> Dict[str, Any]:
     viewer_is_admin = bool(viewer is not None and _flag_to_int(viewer["is_admin"]) == 1)
+    viewer_user_id: Optional[int] = None
+    if viewer is not None:
+        try:
+            viewer_user_id = int(viewer["id"])
+        except Exception:
+            viewer_user_id = None
     safe_limit = max(1, min(200, int(limit)))
     safe_zone_sample_limit = max(1, min(100, int(zone_sample_limit)))
     include_debug = int(debug) == 1 and viewer_is_admin
@@ -7614,7 +7754,16 @@ def _recent_pickups_payload(
             if cached and float(cached.get("expires_at_monotonic") or 0.0) > now_monotonic:
                 cached["last_access_monotonic"] = now_monotonic
                 _record_perf_metric("pickup_recent.cache_hit")
-                return copy.deepcopy(cached["payload"])
+                response = copy.deepcopy(cached["payload"])
+                if viewer_user_id is not None:
+                    impression_counts = _log_viewer_recommendation_impressions_from_pickup_payload(
+                        payload=response,
+                        viewer_user_id=viewer_user_id,
+                        now_ts=int(time.time()),
+                    )
+                    if include_debug:
+                        response.setdefault("pickup_hotspot_debug", {}).update(impression_counts)
+                return response
     _record_perf_metric("pickup_recent.cache_miss")
 
     sql = f"""
@@ -7729,6 +7878,18 @@ def _recent_pickups_payload(
     }
     if include_debug:
         response["pickup_hotspot_debug"] = pickup_hotspot_debug
+        response["pickup_hotspot_debug"].setdefault("viewer_logged_hotspot_impressions", 0)
+        response["pickup_hotspot_debug"].setdefault("viewer_logged_micro_impressions", 0)
+        response["pickup_hotspot_debug"].setdefault("viewer_deduped_hotspot_impressions", 0)
+        response["pickup_hotspot_debug"].setdefault("viewer_deduped_micro_impressions", 0)
+    if viewer_user_id is not None:
+        impression_counts = _log_viewer_recommendation_impressions_from_pickup_payload(
+            payload=response,
+            viewer_user_id=viewer_user_id,
+            now_ts=int(time.time()),
+        )
+        if include_debug:
+            response.setdefault("pickup_hotspot_debug", {}).update(impression_counts)
     if not include_debug:
         with _pickup_recent_cache_lock:
             _pickup_recent_cache[cache_key] = {
