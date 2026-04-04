@@ -27,7 +27,6 @@ from shapely.ops import transform, unary_union
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from hotspot_experiments import (
-    log_recommendation_outcome,
     log_zone_bins,
     prune_experiment_tables,
 )
@@ -2713,6 +2712,8 @@ def _db_init() -> None:
               recommended_at BIGINT NOT NULL,
               zone_id INTEGER NOT NULL,
               cluster_id TEXT,
+              hotspot_center_lat DOUBLE PRECISION,
+              hotspot_center_lng DOUBLE PRECISION,
               score DOUBLE PRECISION NOT NULL,
               confidence DOUBLE PRECISION NOT NULL,
               converted_to_trip BOOLEAN,
@@ -2720,7 +2721,19 @@ def _db_init() -> None:
             );
             """
         )
+        _try_alter(
+            "ALTER TABLE recommendation_outcomes ADD COLUMN hotspot_center_lat DOUBLE PRECISION;",
+            "ALTER TABLE recommendation_outcomes ADD COLUMN IF NOT EXISTS hotspot_center_lat DOUBLE PRECISION;",
+        )
+        _try_alter(
+            "ALTER TABLE recommendation_outcomes ADD COLUMN hotspot_center_lng DOUBLE PRECISION;",
+            "ALTER TABLE recommendation_outcomes ADD COLUMN IF NOT EXISTS hotspot_center_lng DOUBLE PRECISION;",
+        )
         _db_exec("CREATE INDEX IF NOT EXISTS idx_recommendation_outcomes_time ON recommendation_outcomes(recommended_at DESC);")
+        _db_exec(
+            "CREATE INDEX IF NOT EXISTS idx_recommendation_outcomes_zone_cluster_time "
+            "ON recommendation_outcomes(zone_id, cluster_id, recommended_at DESC);"
+        )
         _db_exec(
             """
             CREATE TABLE IF NOT EXISTS micro_recommendation_outcomes (
@@ -3043,6 +3056,8 @@ def _db_init() -> None:
           recommended_at INTEGER NOT NULL,
           zone_id INTEGER NOT NULL,
           cluster_id TEXT,
+          hotspot_center_lat REAL,
+          hotspot_center_lng REAL,
           score REAL NOT NULL,
           confidence REAL NOT NULL,
           converted_to_trip INTEGER,
@@ -3050,7 +3065,13 @@ def _db_init() -> None:
         );
         """
     )
+    _try_alter("ALTER TABLE recommendation_outcomes ADD COLUMN hotspot_center_lat REAL;")
+    _try_alter("ALTER TABLE recommendation_outcomes ADD COLUMN hotspot_center_lng REAL;")
     _db_exec("CREATE INDEX IF NOT EXISTS idx_recommendation_outcomes_time ON recommendation_outcomes(recommended_at DESC);")
+    _db_exec(
+        "CREATE INDEX IF NOT EXISTS idx_recommendation_outcomes_zone_cluster_time "
+        "ON recommendation_outcomes(zone_id, cluster_id, recommended_at DESC);"
+    )
     _db_exec(
         """
         CREATE TABLE IF NOT EXISTS micro_recommendation_outcomes (
@@ -6811,6 +6832,52 @@ def _choose_primary_recommended_micro_hotspot(micro_hotspots: Any) -> Optional[D
     return ranked[0] if ranked else None
 
 
+def _feature_center_lat_lng(feature: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
+    try:
+        geom_data = (feature or {}).get("geometry")
+        if not geom_data:
+            return (None, None)
+        geom = shape(geom_data)
+        if geom.is_empty:
+            return (None, None)
+        centroid = geom.centroid
+        return (float(centroid.y), float(centroid.x))
+    except Exception:
+        return (None, None)
+
+
+def _log_hotspot_recommendation_outcome(
+    *,
+    user_id: Optional[int],
+    zone_id: int,
+    cluster_id: Optional[str],
+    score: float,
+    confidence: float,
+    recommended_at: int,
+    hotspot_center_lat: Optional[float] = None,
+    hotspot_center_lng: Optional[float] = None,
+) -> None:
+    cluster_key = str(cluster_id or "").strip() or None
+    _db_exec(
+        """
+        INSERT INTO recommendation_outcomes(
+          user_id, recommended_at, zone_id, cluster_id, hotspot_center_lat, hotspot_center_lng, score, confidence, converted_to_trip, minutes_to_trip
+        )
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
+        """,
+        (
+            int(user_id) if user_id is not None else None,
+            int(recommended_at),
+            int(zone_id),
+            cluster_key,
+            float(hotspot_center_lat) if hotspot_center_lat is not None else None,
+            float(hotspot_center_lng) if hotspot_center_lng is not None else None,
+            float(score),
+            float(confidence),
+        ),
+    )
+
+
 def _log_micro_recommendation_outcome(
     *,
     user_id: Optional[int],
@@ -6981,6 +7048,8 @@ def _log_viewer_recommendation_impressions_from_pickup_payload(
         "viewer_logged_micro_impressions": 0,
         "viewer_deduped_hotspot_impressions": 0,
         "viewer_deduped_micro_impressions": 0,
+        "viewer_logged_hotspot_impressions_with_centers": 0,
+        "viewer_logged_micro_impressions_with_centers": 0,
     }
     features = (((payload or {}).get("zone_hotspots") or {}).get("features") or [])
     if not isinstance(features, list):
@@ -7012,6 +7081,7 @@ def _log_viewer_recommendation_impressions_from_pickup_payload(
 
         score_val = float(props.get("final_score") or props.get("hotspot_score") or 0.0)
         confidence_val = float(props.get("confidence") or 0.0)
+        hotspot_center_lat, hotspot_center_lng = _feature_center_lat_lng(feature)
         micro_hotspots = props.get("micro_hotspots") or []
         for zone_id in zone_ids:
             try:
@@ -7023,16 +7093,19 @@ def _log_viewer_recommendation_impressions_from_pickup_payload(
                 ):
                     counts["viewer_deduped_hotspot_impressions"] += 1
                 else:
-                    log_recommendation_outcome(
-                        _db_exec,
+                    _log_hotspot_recommendation_outcome(
                         recommended_at=now_ts,
                         user_id=viewer_user_id,
                         zone_id=zone_id,
                         cluster_id=hotspot_id,
                         score=score_val,
                         confidence=confidence_val,
+                        hotspot_center_lat=hotspot_center_lat,
+                        hotspot_center_lng=hotspot_center_lng,
                     )
                     counts["viewer_logged_hotspot_impressions"] += 1
+                    if hotspot_center_lat is not None and hotspot_center_lng is not None:
+                        counts["viewer_logged_hotspot_impressions_with_centers"] += 1
             except Exception:
                 print(f"[warn] Failed viewer hotspot impression logging for zone={zone_id}", traceback.format_exc())
 
@@ -7042,7 +7115,19 @@ def _log_viewer_recommendation_impressions_from_pickup_payload(
                 micro_cluster_id = str(micro.get("cluster_id") or "").strip() or None
                 if not micro_cluster_id:
                     continue
-                center = micro.get("center") if isinstance(micro.get("center"), dict) else {}
+                center_lat: Optional[float] = None
+                center_lng: Optional[float] = None
+                try:
+                    if micro.get("center_lat") is not None and micro.get("center_lng") is not None:
+                        center_lat = float(micro.get("center_lat"))
+                        center_lng = float(micro.get("center_lng"))
+                    elif isinstance(micro.get("center"), dict):
+                        center = micro.get("center") or {}
+                        center_lat = float(center.get("lat")) if center.get("lat") is not None else None
+                        center_lng = float(center.get("lng")) if center.get("lng") is not None else None
+                except Exception:
+                    center_lat = None
+                    center_lng = None
                 try:
                     if _viewer_recent_micro_impression_exists(
                         user_id=viewer_user_id,
@@ -7060,10 +7145,12 @@ def _log_viewer_recommendation_impressions_from_pickup_payload(
                         score=score_val,
                         confidence=float(micro.get("confidence") or confidence_val),
                         recommended_at=now_ts,
-                        micro_center_lat=float(center.get("lat")) if center.get("lat") is not None else None,
-                        micro_center_lng=float(center.get("lng")) if center.get("lng") is not None else None,
+                        micro_center_lat=center_lat,
+                        micro_center_lng=center_lng,
                     )
                     counts["viewer_logged_micro_impressions"] += 1
+                    if center_lat is not None and center_lng is not None:
+                        counts["viewer_logged_micro_impressions_with_centers"] += 1
                 except Exception:
                     print(f"[warn] Failed viewer micro impression logging for zone={zone_id}", traceback.format_exc())
     return counts
@@ -8084,6 +8171,8 @@ def _recent_pickups_payload(
         response["pickup_hotspot_debug"].setdefault("viewer_logged_micro_impressions", 0)
         response["pickup_hotspot_debug"].setdefault("viewer_deduped_hotspot_impressions", 0)
         response["pickup_hotspot_debug"].setdefault("viewer_deduped_micro_impressions", 0)
+        response["pickup_hotspot_debug"].setdefault("viewer_logged_hotspot_impressions_with_centers", 0)
+        response["pickup_hotspot_debug"].setdefault("viewer_logged_micro_impressions_with_centers", 0)
     if viewer_user_id is not None:
         impression_counts = _log_viewer_recommendation_impressions_from_pickup_payload(
             payload=response,

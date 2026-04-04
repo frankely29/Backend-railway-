@@ -24,6 +24,7 @@ PICKUP_SAVE_SESSION_BREAK_SECONDS = 480
 PICKUP_SAVE_MOTION_STALE_SECONDS = 180
 PICKUP_SAVE_RELOCATION_MIN_MILES = 0.25
 PICKUP_SAVE_SAME_POSITION_MAX_MILES = 0.08
+PICKUP_HOTSPOT_RECOMMENDATION_ATTRIBUTION_MAX_MILES = 0.35
 PICKUP_MICRO_RECOMMENDATION_ATTRIBUTION_MAX_MILES = 0.20
 
 
@@ -186,9 +187,59 @@ def _settle_latest_hotspot_recommendation_outcome_tx(
     cur,
     user_id: int,
     zone_id: int,
+    pickup_lat: float,
+    pickup_lng: float,
     now_ts: int,
-) -> bool:
-    row = _query_one_cur(
+) -> Dict[str, bool]:
+    rows = _query_all_cur(
+        cur,
+        """
+        SELECT id, recommended_at, hotspot_center_lat, hotspot_center_lng
+        FROM recommendation_outcomes
+        WHERE user_id = ?
+          AND zone_id = ?
+          AND converted_to_trip IS NULL
+          AND recommended_at <= ?
+          AND recommended_at >= ?
+          AND hotspot_center_lat IS NOT NULL
+          AND hotspot_center_lng IS NOT NULL
+        """,
+        (int(user_id), int(zone_id), int(now_ts), int(now_ts) - 5400),
+    )
+    best: Optional[Dict[str, Any]] = None
+    for row in rows:
+        distance_miles = _safe_haversine_miles(
+            float(pickup_lat),
+            float(pickup_lng),
+            float(row.get("hotspot_center_lat")),
+            float(row.get("hotspot_center_lng")),
+        )
+        if distance_miles > PICKUP_HOTSPOT_RECOMMENDATION_ATTRIBUTION_MAX_MILES:
+            continue
+        candidate = dict(row)
+        candidate["_distance_miles"] = float(distance_miles)
+        if best is None:
+            best = candidate
+            continue
+        if candidate["_distance_miles"] < best["_distance_miles"]:
+            best = candidate
+            continue
+        if (
+            math.isclose(candidate["_distance_miles"], best["_distance_miles"], rel_tol=0.0, abs_tol=1e-9)
+            and int(candidate.get("recommended_at") or 0) > int(best.get("recommended_at") or 0)
+        ):
+            best = candidate
+    if best is not None:
+        recommended_at = int(best.get("recommended_at") or now_ts)
+        minutes_to_trip = max(0.0, (float(now_ts) - float(recommended_at)) / 60.0)
+        _exec_cur(
+            cur,
+            "UPDATE recommendation_outcomes SET converted_to_trip=?, minutes_to_trip=? WHERE id=?",
+            (_bool_db_value(True), float(minutes_to_trip), int(best["id"])),
+        )
+        return {"settled": True, "spatial": True, "legacy_fallback": False}
+
+    fallback_row = _query_one_cur(
         cur,
         """
         SELECT id, recommended_at
@@ -203,16 +254,16 @@ def _settle_latest_hotspot_recommendation_outcome_tx(
         """,
         (int(user_id), int(zone_id), int(now_ts), int(now_ts) - 5400),
     )
-    if not row:
-        return False
-    recommended_at = int(row.get("recommended_at") or now_ts)
+    if not fallback_row:
+        return {"settled": False, "spatial": False, "legacy_fallback": False}
+    recommended_at = int(fallback_row.get("recommended_at") or now_ts)
     minutes_to_trip = max(0.0, (float(now_ts) - float(recommended_at)) / 60.0)
     _exec_cur(
         cur,
         "UPDATE recommendation_outcomes SET converted_to_trip=?, minutes_to_trip=? WHERE id=?",
-        (_bool_db_value(True), float(minutes_to_trip), int(row["id"])),
+        (_bool_db_value(True), float(minutes_to_trip), int(fallback_row["id"])),
     )
-    return True
+    return {"settled": True, "spatial": False, "legacy_fallback": True}
 
 
 def _settle_latest_micro_recommendation_outcome_tx(
@@ -591,6 +642,9 @@ def create_pickup_record(payload: PickupRecordingPayload, user: Any) -> Dict[str
     expires = now + 24 * 3600
     settled_hotspot_recommendation = False
     settled_micro_recommendation = False
+    settled_hotspot_recommendation_spatial = False
+    settled_micro_recommendation_spatial = False
+    settled_hotspot_recommendation_legacy_fallback = False
 
     with _db_lock:
         conn = _db()
@@ -636,14 +690,21 @@ def create_pickup_record(payload: PickupRecordingPayload, user: Any) -> Dict[str
             _increment_pickup_count_tx(cur, int(user["id"]), now, 1)
             if payload.zone_id is not None:
                 try:
-                    settled_hotspot_recommendation = _settle_latest_hotspot_recommendation_outcome_tx(
+                    hotspot_settlement = _settle_latest_hotspot_recommendation_outcome_tx(
                         cur,
                         user_id=int(user["id"]),
                         zone_id=int(payload.zone_id),
+                        pickup_lat=float(payload.lat),
+                        pickup_lng=float(payload.lng),
                         now_ts=now,
                     )
+                    settled_hotspot_recommendation = bool(hotspot_settlement.get("settled"))
+                    settled_hotspot_recommendation_spatial = bool(hotspot_settlement.get("spatial"))
+                    settled_hotspot_recommendation_legacy_fallback = bool(hotspot_settlement.get("legacy_fallback"))
                 except Exception:
                     settled_hotspot_recommendation = False
+                    settled_hotspot_recommendation_spatial = False
+                    settled_hotspot_recommendation_legacy_fallback = False
                 try:
                     settled_micro_recommendation = _settle_latest_micro_recommendation_outcome_tx(
                         cur,
@@ -653,8 +714,10 @@ def create_pickup_record(payload: PickupRecordingPayload, user: Any) -> Dict[str
                         pickup_lng=float(payload.lng),
                         now_ts=now,
                     )
+                    settled_micro_recommendation_spatial = bool(settled_micro_recommendation)
                 except Exception:
                     settled_micro_recommendation = False
+                    settled_micro_recommendation_spatial = False
             progression_after = get_pickup_progression_for_user(int(user["id"]), cur=cur)
             conn.commit()
             _invalidate_pickup_write_caches()
@@ -678,6 +741,9 @@ def create_pickup_record(payload: PickupRecordingPayload, user: Any) -> Dict[str
         "accepted_guard_reason": str(guard.get("accepted_guard_reason") or ""),
         "settled_hotspot_recommendation": bool(settled_hotspot_recommendation),
         "settled_micro_recommendation": bool(settled_micro_recommendation),
+        "settled_hotspot_recommendation_spatial": bool(settled_hotspot_recommendation_spatial),
+        "settled_micro_recommendation_spatial": bool(settled_micro_recommendation_spatial),
+        "settled_hotspot_recommendation_legacy_fallback": bool(settled_hotspot_recommendation_legacy_fallback),
     }
 
 
