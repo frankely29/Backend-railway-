@@ -938,3 +938,157 @@ def get_admin_experiment_summary(
             "distinct_user_count": _as_int(micro_outcome_row.get("distinct_user_count")),
         },
     }
+
+
+def get_admin_experiment_rankings(
+    since_seconds: Optional[int] = None,
+    user_id: Optional[int] = None,
+    zone_id: Optional[int] = None,
+    limit: int = 20,
+    min_resolved_rows: int = 3,
+) -> Dict[str, Any]:
+    clamped_since_seconds = _clamp_since_seconds(since_seconds)
+    clamped_limit = max(1, min(100, int(limit)))
+    clamped_min_resolved_rows = max(1, min(100, int(min_resolved_rows)))
+
+    filters = {
+        "since_seconds": clamped_since_seconds,
+        "user_id": int(user_id) if user_id is not None else None,
+        "zone_id": int(zone_id) if zone_id is not None else None,
+        "limit": clamped_limit,
+        "min_resolved_rows": clamped_min_resolved_rows,
+    }
+
+    where_clauses: list[str] = []
+    params: list[Any] = []
+    if user_id is not None:
+        where_clauses.append("user_id = ?")
+        params.append(int(user_id))
+    if zone_id is not None:
+        where_clauses.append("zone_id = ?")
+        params.append(int(zone_id))
+    if clamped_since_seconds is not None:
+        cutoff = int(time.time()) - clamped_since_seconds
+        if DB_BACKEND == "postgres":
+            where_clauses.append("recommended_at >= to_timestamp(?)")
+        else:
+            where_clauses.append("recommended_at >= ?")
+        params.append(cutoff)
+    where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+
+    converted_expr = "converted_to_trip = TRUE" if DB_BACKEND == "postgres" else "CAST(converted_to_trip AS INTEGER) = 1"
+    not_converted_expr = "converted_to_trip = FALSE" if DB_BACKEND == "postgres" else "CAST(converted_to_trip AS INTEGER) = 0"
+
+    zone_rows = _db_query_all(
+        f"""
+        SELECT
+            zone_id,
+            COUNT(*) AS total_rows,
+            SUM(CASE WHEN converted_to_trip IS NULL THEN 1 ELSE 0 END) AS pending_rows,
+            SUM(CASE WHEN {converted_expr} THEN 1 ELSE 0 END) AS converted_rows,
+            SUM(CASE WHEN {not_converted_expr} THEN 1 ELSE 0 END) AS not_converted_rows,
+            SUM(CASE WHEN converted_to_trip IS NOT NULL THEN 1 ELSE 0 END) AS resolved_rows,
+            AVG(CASE WHEN {converted_expr} THEN minutes_to_trip END) AS avg_minutes_to_trip_converted,
+            AVG(CASE WHEN {converted_expr} THEN distance_to_recommendation_miles END) AS avg_distance_to_recommendation_miles_converted,
+            MAX(recommended_at) AS latest_recommended_at
+        FROM recommendation_outcomes
+        {where_sql}
+        GROUP BY zone_id
+        HAVING SUM(CASE WHEN converted_to_trip IS NOT NULL THEN 1 ELSE 0 END) >= ?
+        ORDER BY
+            (SUM(CASE WHEN {converted_expr} THEN 1 ELSE 0 END) * 1.0)
+                / NULLIF(SUM(CASE WHEN converted_to_trip IS NOT NULL THEN 1 ELSE 0 END), 0) DESC,
+            SUM(CASE WHEN converted_to_trip IS NOT NULL THEN 1 ELSE 0 END) DESC,
+            MAX(recommended_at) DESC
+        LIMIT ?
+        """,
+        tuple(params + [clamped_min_resolved_rows, clamped_limit]),
+    )
+
+    micro_rows = _db_query_all(
+        f"""
+        SELECT
+            micro_cluster_id,
+            zone_id,
+            parent_hotspot_id,
+            COUNT(*) AS total_rows,
+            SUM(CASE WHEN converted_to_trip IS NULL THEN 1 ELSE 0 END) AS pending_rows,
+            SUM(CASE WHEN {converted_expr} THEN 1 ELSE 0 END) AS converted_rows,
+            SUM(CASE WHEN {not_converted_expr} THEN 1 ELSE 0 END) AS not_converted_rows,
+            SUM(CASE WHEN converted_to_trip IS NOT NULL THEN 1 ELSE 0 END) AS resolved_rows,
+            AVG(CASE WHEN {converted_expr} THEN minutes_to_trip END) AS avg_minutes_to_trip_converted,
+            AVG(CASE WHEN {converted_expr} THEN distance_to_recommendation_miles END) AS avg_distance_to_recommendation_miles_converted,
+            MAX(recommended_at) AS latest_recommended_at
+        FROM micro_recommendation_outcomes
+        {where_sql}
+        GROUP BY micro_cluster_id, zone_id, parent_hotspot_id
+        HAVING SUM(CASE WHEN converted_to_trip IS NOT NULL THEN 1 ELSE 0 END) >= ?
+        ORDER BY
+            (SUM(CASE WHEN {converted_expr} THEN 1 ELSE 0 END) * 1.0)
+                / NULLIF(SUM(CASE WHEN converted_to_trip IS NOT NULL THEN 1 ELSE 0 END), 0) DESC,
+            SUM(CASE WHEN converted_to_trip IS NOT NULL THEN 1 ELSE 0 END) DESC,
+            MAX(recommended_at) DESC
+        LIMIT ?
+        """,
+        tuple(params + [clamped_min_resolved_rows, clamped_limit]),
+    )
+
+    def _as_int(value: Any) -> int:
+        return int(value or 0)
+
+    def _as_float(value: Any) -> Optional[float]:
+        return float(value) if value is not None else None
+
+    hotspot_zone_rankings: List[Dict[str, Any]] = []
+    for row_raw in zone_rows:
+        row = dict(row_raw)
+        resolved_rows = _as_int(row.get("resolved_rows"))
+        converted_rows = _as_int(row.get("converted_rows"))
+        hotspot_zone_rankings.append(
+            {
+                "zone_id": int(row["zone_id"]) if row.get("zone_id") is not None else None,
+                "total_rows": _as_int(row.get("total_rows")),
+                "pending_rows": _as_int(row.get("pending_rows")),
+                "converted_rows": converted_rows,
+                "not_converted_rows": _as_int(row.get("not_converted_rows")),
+                "resolved_rows": resolved_rows,
+                "resolved_conversion_rate": (converted_rows / resolved_rows) if resolved_rows > 0 else None,
+                "avg_minutes_to_trip_converted": _as_float(row.get("avg_minutes_to_trip_converted")),
+                "avg_distance_to_recommendation_miles_converted": _as_float(
+                    row.get("avg_distance_to_recommendation_miles_converted")
+                ),
+                "latest_recommended_at": row.get("latest_recommended_at"),
+                "latest_recommended_at_iso": _to_iso(row.get("latest_recommended_at")),
+            }
+        )
+
+    micro_cluster_rankings: List[Dict[str, Any]] = []
+    for row_raw in micro_rows:
+        row = dict(row_raw)
+        resolved_rows = _as_int(row.get("resolved_rows"))
+        converted_rows = _as_int(row.get("converted_rows"))
+        micro_cluster_rankings.append(
+            {
+                "micro_cluster_id": row.get("micro_cluster_id"),
+                "zone_id": int(row["zone_id"]) if row.get("zone_id") is not None else None,
+                "parent_hotspot_id": row.get("parent_hotspot_id"),
+                "total_rows": _as_int(row.get("total_rows")),
+                "pending_rows": _as_int(row.get("pending_rows")),
+                "converted_rows": converted_rows,
+                "not_converted_rows": _as_int(row.get("not_converted_rows")),
+                "resolved_rows": resolved_rows,
+                "resolved_conversion_rate": (converted_rows / resolved_rows) if resolved_rows > 0 else None,
+                "avg_minutes_to_trip_converted": _as_float(row.get("avg_minutes_to_trip_converted")),
+                "avg_distance_to_recommendation_miles_converted": _as_float(
+                    row.get("avg_distance_to_recommendation_miles_converted")
+                ),
+                "latest_recommended_at": row.get("latest_recommended_at"),
+                "latest_recommended_at_iso": _to_iso(row.get("latest_recommended_at")),
+            }
+        )
+
+    return {
+        "filters": filters,
+        "hotspot_zone_rankings": hotspot_zone_rankings,
+        "micro_cluster_rankings": micro_cluster_rankings,
+    }
