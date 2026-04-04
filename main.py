@@ -6320,6 +6320,124 @@ def _build_cross_zone_merged_hotspot_feature(
     return merged_feature
 
 
+def _apply_final_recommended_hotspot_ownership(
+    clean_zone_ids: List[int],
+    zone_scores: Dict[int, Any],
+    zone_feature_map: Dict[int, List[Dict[str, Any]]],
+    merged_features: List[Dict[str, Any]],
+    consumed_zones: set[int],
+    score_bundle_fresh: bool,
+    now_ts: int,
+    zone_debug_map: Dict[int, Dict[str, Any]],
+) -> Dict[str, int]:
+    merged_feature_by_zone_id: Dict[int, Dict[str, Any]] = {}
+    for merged_feature in merged_features:
+        props = merged_feature.setdefault("properties", {})
+        merged_zone_ids = props.get("merged_zone_ids") or props.get("covered_zone_ids") or []
+        for zone_id_raw in merged_zone_ids:
+            try:
+                merged_feature_by_zone_id[int(zone_id_raw)] = merged_feature
+            except Exception:
+                continue
+
+    final_zone_feature_map: Dict[int, Optional[Dict[str, Any]]] = {}
+    for zone_id in clean_zone_ids:
+        if zone_id in consumed_zones:
+            final_zone_feature_map[zone_id] = merged_feature_by_zone_id.get(zone_id)
+            continue
+        zone_features = zone_feature_map.get(zone_id) or []
+        final_zone_feature_map[zone_id] = _choose_primary_recommended_hotspot_feature(zone_features)
+
+    assignment_count = 0
+    logged_outcome_count = 0
+    for zone_id in clean_zone_ids:
+        zone_features = zone_feature_map.get(zone_id) or []
+        for feature in zone_features:
+            props = feature.setdefault("properties", {})
+            props["recommended_hotspot"] = False
+            if not str(props.get("recommendation_scope") or "").strip():
+                props["recommendation_scope"] = "zone_secondary"
+        zone_debug = zone_debug_map.get(zone_id)
+        if zone_debug is not None:
+            zone_debug["final_recommended_hotspot_id"] = None
+            zone_debug["final_recommendation_scope"] = None
+            zone_debug["recommendation_logged_post_merge"] = False
+            zone_debug["recommendation_logged_cluster_id"] = None
+
+    for zone_id in clean_zone_ids:
+        score = zone_scores.get(zone_id)
+        if score is None or not bool(getattr(score, "recommended", False)):
+            continue
+
+        consumed = zone_id in consumed_zones
+        target_feature: Optional[Dict[str, Any]] = None
+        if consumed:
+            target_feature = merged_feature_by_zone_id.get(zone_id)
+        else:
+            target_feature = final_zone_feature_map.get(zone_id)
+        if target_feature is None:
+            continue
+
+        target_props = target_feature.setdefault("properties", {})
+        target_props["recommended_hotspot"] = True
+        target_scope = "merged_hotspot" if consumed else "hotspot"
+        target_props["recommendation_scope"] = target_scope
+
+        recommended_zone_ids = target_props.get("recommended_zone_ids") or []
+        normalized_zone_ids = {
+            int(z)
+            for z in recommended_zone_ids
+            if isinstance(z, (int, float)) or (isinstance(z, str) and z.strip().isdigit())
+        }
+        normalized_zone_ids.add(int(zone_id))
+        target_props["recommended_zone_ids"] = sorted(normalized_zone_ids)
+
+        recommended_zone_names = [str(name or "").strip() for name in (target_props.get("recommended_zone_names") or []) if str(name or "").strip()]
+        zone_name = ""
+        if zone_features := (zone_feature_map.get(zone_id) or []):
+            zone_name = str(((zone_features[0].get("properties") or {}).get("zone_name")) or "").strip()
+        if zone_name and zone_name not in recommended_zone_names:
+            recommended_zone_names.append(zone_name)
+        target_props["recommended_zone_names"] = sorted(dict.fromkeys(recommended_zone_names))
+
+        if consumed:
+            target_props["final_recommendation_owner"] = "post_merge"
+            if "recommended" in target_props:
+                target_props["recommended"] = True
+
+        assignment_count += 1
+        final_hotspot_id = str(target_props.get("hotspot_id") or "") or None
+        zone_debug = zone_debug_map.get(zone_id)
+        if zone_debug is not None:
+            zone_debug["primary_recommended_hotspot_id"] = final_hotspot_id
+            zone_debug["final_recommended_hotspot_id"] = final_hotspot_id
+            zone_debug["final_recommendation_scope"] = target_scope
+
+        if not score_bundle_fresh:
+            try:
+                log_recommendation_outcome(
+                    _db_exec,
+                    recommended_at=now_ts,
+                    zone_id=zone_id,
+                    score=score.final_score,
+                    confidence=score.confidence,
+                    cluster_id=final_hotspot_id,
+                )
+                logged_outcome_count += 1
+                if zone_debug is not None:
+                    zone_debug["recommendation_logged_post_merge"] = True
+                    zone_debug["recommendation_logged_cluster_id"] = final_hotspot_id
+            except Exception:
+                if zone_debug is not None:
+                    zone_debug["errors"].append("log_recommendation_outcome_failed")
+                print(f"[warn] Failed to log recommendation outcome for zone {zone_id}", traceback.format_exc())
+
+    return {
+        "post_merge_recommendation_assignment_count": assignment_count,
+        "post_merge_logged_outcome_count": logged_outcome_count,
+    }
+
+
 def _pickup_zone_hotspots_with_debug(
     zone_ids: List[int],
     include_debug: bool = False,
@@ -6342,6 +6460,8 @@ def _pickup_zone_hotspots_with_debug(
         "cross_zone_merge_candidates": 0,
         "cross_zone_merge_applied_count": 0,
         "merged_zone_pairs": [],
+        "post_merge_recommendation_assignment_count": 0,
+        "post_merge_logged_outcome_count": 0,
     }
     if include_debug:
         debug.update(
@@ -6486,6 +6606,10 @@ def _pickup_zone_hotspots_with_debug(
                 "refined_hotspot_ids": [],
                 "rejected_refinement_hotspot_ids": [],
                 "primary_recommended_hotspot_id": None,
+                "final_recommended_hotspot_id": None,
+                "final_recommendation_scope": None,
+                "recommendation_logged_post_merge": False,
+                "recommendation_logged_cluster_id": None,
                 "outcome_scope_used": "zone_fallback",
                 "hotspot_specific_outcome_sample_count": 0,
                 "zone_fallback_outcome_sample_count": 0,
@@ -6617,15 +6741,6 @@ def _pickup_zone_hotspots_with_debug(
                 zone_debug["micro_hotspot_count"] = zone_micro_total
 
         score = zone_scores.get(zone_id)
-        primary_feature: Optional[Dict[str, Any]] = None
-        primary_recommended_hotspot_id: Optional[str] = None
-        if score is not None and bool(getattr(score, "recommended", False)) and zone_features:
-            primary_feature = _choose_primary_recommended_hotspot_feature(zone_features)
-            if primary_feature is not None:
-                primary_recommended_hotspot_id = str(
-                    ((primary_feature.get("properties") or {}).get("hotspot_id")) or ""
-                ) or None
-
         zone_micro_total = 0
         for feature in zone_features:
             props = feature.setdefault("properties", {})
@@ -6643,25 +6758,6 @@ def _pickup_zone_hotspots_with_debug(
                 props["weighted_trip_count"] = score.weighted_trip_count
                 props["unique_driver_count"] = score.unique_driver_count
                 props["recommended"] = score.recommended
-        if primary_feature is not None:
-            primary_props = primary_feature.setdefault("properties", {})
-            primary_props["recommended_hotspot"] = True
-            primary_props["recommendation_scope"] = "hotspot"
-
-        if score is not None and score.recommended and not score_bundle_fresh:
-            try:
-                log_recommendation_outcome(
-                    _db_exec,
-                    recommended_at=now_ts,
-                    zone_id=zone_id,
-                    score=score.final_score,
-                    confidence=score.confidence,
-                    cluster_id=primary_recommended_hotspot_id,
-                )
-            except Exception:
-                if zone_debug is not None:
-                    zone_debug["errors"].append("log_recommendation_outcome_failed")
-                print(f"[warn] Failed to log recommendation outcome for zone {zone_id}", traceback.format_exc())
         refinement_debug: Dict[str, Any] = {}
         try:
             refinement_debug = _refine_emitted_zone_hotspot_geometries(
@@ -6738,7 +6834,6 @@ def _pickup_zone_hotspots_with_debug(
                 ):
                     if key in top_props:
                         zone_debug[key] = top_props.get(key)
-            zone_debug["primary_recommended_hotspot_id"] = primary_recommended_hotspot_id
             zone_debug_map[zone_id] = zone_debug
 
     merge_candidate_map: Dict[int, List[Dict[str, Any]]] = {}
@@ -6812,6 +6907,18 @@ def _pickup_zone_hotspots_with_debug(
         if zone_id in consumed_zones:
             continue
         features.extend(zone_feature_map.get(zone_id) or [])
+
+    post_merge_recommendation_debug = _apply_final_recommended_hotspot_ownership(
+        clean_zone_ids=clean_zone_ids,
+        zone_scores=zone_scores,
+        zone_feature_map=zone_feature_map,
+        merged_features=merged_features,
+        consumed_zones=consumed_zones,
+        score_bundle_fresh=score_bundle_fresh,
+        now_ts=now_ts,
+        zone_debug_map=zone_debug_map,
+    )
+    debug.update(post_merge_recommendation_debug)
 
     if include_debug:
         debug["cross_zone_merge_candidates"] = len(merge_results)
