@@ -132,6 +132,12 @@ ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "").strip().lower()
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 ADMIN_BOOTSTRAP_TOKEN = os.environ.get("ADMIN_BOOTSTRAP_TOKEN", "").strip()
 DEBUG_VERBOSE_LOGS = str(os.environ.get("DEBUG_VERBOSE_LOGS", "0")).strip().lower() in ("1", "true", "yes", "on")
+CITYWIDE_TRAP_CANDIDATE_LIVE_PROMOTION_ENABLED = (
+    str(os.environ.get("CITYWIDE_TRAP_CANDIDATE_LIVE_PROMOTION_ENABLED", "0"))
+    .strip()
+    .lower()
+    in {"1", "true", "yes", "on"}
+)
 
 TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "7"))
 TOKEN_TTL_SECONDS = int(os.environ.get("TOKEN_TTL_SECONDS", str(30 * 24 * 3600)))  # 30 days
@@ -3763,6 +3769,12 @@ def status():
         "day_tendency_artifact_in_db": day_tendency_artifact_in_db,
         "trap_candidate_review_artifact_in_db": trap_candidate_review_artifact_in_db,
         "trap_candidate_review_readiness_available": trap_candidate_review_artifact_in_db,
+        "citywide_trap_candidate_live_promotion_enabled": CITYWIDE_TRAP_CANDIDATE_LIVE_PROMOTION_ENABLED,
+        "citywide_visible_source_expected": (
+            "citywide_v3_trap_candidate"
+            if CITYWIDE_TRAP_CANDIDATE_LIVE_PROMOTION_ENABLED
+            else "citywide_v3"
+        ),
         "assistant_outlook_in_db": assistant_outlook_artifact_in_db,
         "assistant_outlook_artifact_in_db": assistant_outlook_artifact_in_db,
         "assistant_outlook_file_present": assistant_outlook_file_present,

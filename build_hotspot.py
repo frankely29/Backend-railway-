@@ -73,6 +73,17 @@ BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS = {
     41, 42, 74, 75, 116, 127, 128, 151, 152, 166, 243, 244
 }
 AIRPORT_ZONE_IDS = {1, 132, 138}
+CITYWIDE_TRAP_CANDIDATE_LIVE_PROMOTION_ENABLED = (
+    str(os.environ.get("CITYWIDE_TRAP_CANDIDATE_LIVE_PROMOTION_ENABLED", "0"))
+    .strip()
+    .lower()
+    in {"1", "true", "yes", "on"}
+)
+
+CITYWIDE_TRAP_CANDIDATE_SCORE_FIELD = "earnings_shadow_score_citywide_v3_trap_candidate"
+CITYWIDE_TRAP_CANDIDATE_CONF_FIELD = "earnings_shadow_confidence_citywide_v3_trap_candidate"
+CITYWIDE_BASELINE_SCORE_FIELD = "earnings_shadow_score_citywide_v3_anchor_shadow"
+CITYWIDE_BASELINE_CONF_FIELD = "earnings_shadow_confidence_citywide_v3"
 V3_PROFILE_CONFIG = {
     "citywide_v3": {
         "score": "earnings_shadow_score_citywide_v3_anchor_shadow",
@@ -293,6 +304,34 @@ def _eligible_for_profile(profile_name: str, props: Dict[str, Any], geometry: An
     return False
 
 
+
+
+def _citywide_visible_source_fields(features: List[Dict[str, Any]]) -> Tuple[str, str, str]:
+    if not CITYWIDE_TRAP_CANDIDATE_LIVE_PROMOTION_ENABLED:
+        return (
+            CITYWIDE_BASELINE_SCORE_FIELD,
+            CITYWIDE_BASELINE_CONF_FIELD,
+            "citywide_v3",
+        )
+
+    candidate_ready = any(
+        isinstance((feature.get("properties") or {}), dict)
+        and (feature.get("properties") or {}).get(CITYWIDE_TRAP_CANDIDATE_SCORE_FIELD) is not None
+        for feature in features
+    )
+    if candidate_ready:
+        return (
+            CITYWIDE_TRAP_CANDIDATE_SCORE_FIELD,
+            CITYWIDE_TRAP_CANDIDATE_CONF_FIELD,
+            "citywide_v3_trap_candidate",
+        )
+
+    return (
+        CITYWIDE_BASELINE_SCORE_FIELD,
+        CITYWIDE_BASELINE_CONF_FIELD,
+        "citywide_v3_fallback_from_missing_candidate",
+    )
+
 def _recalibrate_visible_v3_fields(features: List[Dict[str, Any]]) -> None:
     for feature in features:
         props = feature.get("properties") or {}
@@ -301,8 +340,7 @@ def _recalibrate_visible_v3_fields(features: List[Dict[str, Any]]) -> None:
         else:
             props["airport_excluded"] = False
 
-    citywide_rank_field = V3_PROFILE_CONFIG["citywide_v3"]["score"]
-    citywide_conf_field = V3_PROFILE_CONFIG["citywide_v3"]["confidence"]
+    citywide_rank_field, citywide_conf_field, citywide_visible_source_name = _citywide_visible_source_fields(features)
     for feature in features:
         props = feature.get("properties") or {}
         if not _is_airport_props(props):
@@ -310,6 +348,11 @@ def _recalibrate_visible_v3_fields(features: List[Dict[str, Any]]) -> None:
             props["earnings_shadow_visible_base_score_citywide_v3"] = None
             props["earnings_shadow_visible_score_citywide_v3"] = None
             props["citywide_visual_anchor_discount_factor_shadow"] = 1.0
+            props["citywide_visible_source_shadow"] = citywide_visible_source_name
+            props["citywide_trap_candidate_live_promotion_enabled"] = bool(CITYWIDE_TRAP_CANDIDATE_LIVE_PROMOTION_ENABLED)
+            props["citywide_trap_candidate_live_promotion_fallback_shadow"] = (
+                citywide_visible_source_name == "citywide_v3_fallback_from_missing_candidate"
+            )
 
     citywide_rated = [
         feature for feature in features
@@ -332,7 +375,7 @@ def _recalibrate_visible_v3_fields(features: List[Dict[str, Any]]) -> None:
         citywide_local_rank = 0.0 if n_city <= 1 else (idx / (n_city - 1))
         citywide_anchor_discount_factor = 1.0
         citywide_anchor_input = _clamp01(float(props.get(citywide_rank_field) or 0.0))
-        citywide_conf = _clamp01(float(props.get("earnings_shadow_confidence_citywide_v3") or 0.0))
+        citywide_conf = _clamp01(float(props.get(citywide_conf_field) or 0.0))
         citywide_base_norm = _clamp01(
             0.40 * citywide_local_rank +
             0.46 * citywide_anchor_input +
@@ -2176,6 +2219,17 @@ def build_hotspots_frames(
                     "all_profiles_live": True,
                     "active_shadow_profiles": live_shadow_profiles,
                     "visible_profiles_live": visible_profiles_live,
+                    "citywide_trap_candidate_live_promotion_enabled": bool(CITYWIDE_TRAP_CANDIDATE_LIVE_PROMOTION_ENABLED),
+                    "citywide_visible_source_live": (
+                        "citywide_v3_trap_candidate"
+                        if CITYWIDE_TRAP_CANDIDATE_LIVE_PROMOTION_ENABLED
+                        else "citywide_v3"
+                    ),
+                    "citywide_visible_score_field_live": (
+                        CITYWIDE_TRAP_CANDIDATE_SCORE_FIELD
+                        if CITYWIDE_TRAP_CANDIDATE_LIVE_PROMOTION_ENABLED
+                        else CITYWIDE_BASELINE_SCORE_FIELD
+                    ),
                     "candidate_shadow_profiles": [
                         "citywide_v3_trap_candidate",
                         "manhattan_v3_trap_candidate",
@@ -2213,6 +2267,7 @@ def build_hotspots_frames(
                         "Phase 9 promotes staten_island_v3 to the live visible Staten Island score and completes the visible v3 rollout across citywide and all borough modes.",
                         "Phase 3 adds a trap-candidate review artifact summarizing candidate vs live deltas by profile.",
                         "No live promotion occurs in Phase 3; this phase is proof-only.",
+                        "Citywide trap-candidate live promotion is gated by CITYWIDE_TRAP_CANDIDATE_LIVE_PROMOTION_ENABLED and does not affect borough visible profiles.",
                     ],
                     "shadow_fields": [
                         "pickups_now_shadow",
@@ -2457,6 +2512,11 @@ def build_hotspots_frames(
                 }
 
         # scoring_shadow_manifest is DB-first; do not keep a file copy on volume.
+        if CITYWIDE_TRAP_CANDIDATE_LIVE_PROMOTION_ENABLED:
+            manifest_payload.setdefault("notes", []).append(
+                "Limited citywide live promotion enabled: citywide visible score now uses citywide_v3_trap_candidate while borough visible profiles remain unchanged."
+            )
+
         save_generated_artifact("scoring_shadow_manifest", manifest_payload, compress=False)
         staged_timeline = stage_dir / "timeline.json"
         staged_frames = sorted(stage_dir.glob("frame_*.json"))
