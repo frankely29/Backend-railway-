@@ -13,6 +13,7 @@ from admin_models import (
 )
 from admin_security import require_admin_user
 from admin_service import (
+    get_admin_experiment_rankings,
     get_admin_experiment_summary,
     get_admin_hotspot_experiment_bins,
     get_admin_live,
@@ -175,6 +176,25 @@ def admin_experiment_summary(
         cluster_id=cluster_id,
         user_id=user_id,
         since_seconds=since_seconds,
+    )
+
+
+@router.get("/experiments/rankings")
+def admin_experiment_rankings(
+    since_seconds: int | None = Query(default=None),
+    user_id: int | None = Query(default=None),
+    zone_id: int | None = Query(default=None),
+    limit: int = Query(default=20, ge=1, le=100),
+    min_resolved_rows: int = Query(default=3, ge=1, le=100),
+    admin: sqlite3.Row = Depends(require_admin_user),
+):
+    _ = admin
+    return get_admin_experiment_rankings(
+        since_seconds=since_seconds,
+        user_id=user_id,
+        zone_id=zone_id,
+        limit=limit,
+        min_resolved_rows=min_resolved_rows,
     )
 
 
