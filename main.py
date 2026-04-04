@@ -36,6 +36,7 @@ from pickup_hotspot_intelligence import (
     build_hotspot_quality_modifier,
     build_zone_historical_anchor_components,
     build_zone_historical_anchor_points,
+    convert_historical_components_to_emittable_shapes,
     determine_zone_hotspot_limit,
     get_zone_or_hotspot_outcome_modifier,
     sculpt_hotspot_shapes_from_recent_points,
@@ -5312,6 +5313,115 @@ def _build_fallback_pickup_zone_hotspot_feature(
     return components
 
 
+def _build_historical_fallback_zone_hotspot_features(
+    zone_id: int,
+    zone_data: Dict[str, Any],
+    recent_pts: List[Dict[str, Any]],
+    hotspot_limit: int,
+    now_ts: int,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    debug: Dict[str, Any] = {
+        "historical_fallback_attempted": True,
+        "historical_fallback_ok": False,
+        "historical_fallback_component_count": 0,
+        "historical_fallback_anchor_point_count": 0,
+        "historical_fallback_strongest_support": 0.0,
+        "historical_fallback_reason": "not_attempted",
+    }
+
+    zone_geom = (zone_data or {}).get("geometry")
+    if zone_geom is None or getattr(zone_geom, "is_empty", True):
+        debug["historical_fallback_reason"] = "zone_geometry_missing"
+        return [], debug
+
+    if len(recent_pts) < 2:
+        debug["historical_fallback_reason"] = "recent_signal_too_low"
+        return [], debug
+
+    long_run_rows = _pickup_zone_long_run_points(zone_id, limit=2400)
+    historical_anchor_points = build_zone_historical_anchor_points(
+        pickup_rows=long_run_rows,
+        frame_time=now_ts,
+    )
+    historical_components = build_zone_historical_anchor_components(
+        zone_id=zone_id,
+        zone_geom=zone_geom,
+        weighted_points=historical_anchor_points,
+    )
+    debug["historical_fallback_component_count"] = len(historical_components)
+    debug["historical_fallback_anchor_point_count"] = len(historical_anchor_points)
+    strongest_support = max(
+        [float(c.get("weighted_point_count") or 0.0) for c in historical_components] or [0.0]
+    )
+    debug["historical_fallback_strongest_support"] = strongest_support
+
+    strong_history = (len(historical_anchor_points) >= 10) or (strongest_support >= 6.0)
+    if not strong_history:
+        debug["historical_fallback_reason"] = "historical_support_too_low"
+        return [], debug
+
+    shaped = convert_historical_components_to_emittable_shapes(
+        historical_components=historical_components,
+        zone_geom=zone_geom,
+    )
+    if not shaped:
+        debug["historical_fallback_reason"] = "no_historical_shapes"
+        return [], debug
+
+    safe_limit = 3 if int(hotspot_limit) >= 3 else 2
+    recent_signature = _pickup_zone_signature(recent_pts)
+    zone_name = str((zone_data or {}).get("zone_name") or "")
+    borough = str((zone_data or {}).get("borough") or "")
+    latest_created_at = max((int(p.get("created_at") or 0) for p in recent_pts), default=0)
+    historical_sample_size = len(long_run_rows)
+
+    emitted: List[Dict[str, Any]] = []
+    for hotspot_index, comp in enumerate(shaped[:safe_limit]):
+        polygon = comp.get("polygon_proj")
+        geom_ll = comp.get("geometry")
+        if polygon is None or getattr(polygon, "is_empty", True) or geom_ll is None or getattr(geom_ll, "is_empty", True):
+            continue
+        component_point_count = int(comp.get("point_count") or 0)
+        strongest_component = float(comp.get("weighted_point_count") or 0.0)
+        signature_seed = (
+            f"hist|{zone_id}|{recent_signature}|{round(strongest_component, 3)}|"
+            f"{component_point_count}|{latest_created_at}|{hotspot_index}"
+        )
+        signature = hashlib.sha1(signature_seed.encode("utf-8")).hexdigest()
+        hotspot_id = f"hist:{zone_id}:{signature[:12]}:{hotspot_index}"
+        emitted.append(
+            {
+                "type": "Feature",
+                "geometry": mapping(geom_ll),
+                "properties": {
+                    "zone_id": zone_id,
+                    "zone_name": zone_name,
+                    "borough": borough,
+                    "hotspot_index": hotspot_index,
+                    "hotspot_id": hotspot_id,
+                    "hotspot_method": "historical_anchor_fallback",
+                    "sample_size": len(recent_pts),
+                    "historical_sample_size": historical_sample_size,
+                    "component_point_count": component_point_count,
+                    "latest_created_at": latest_created_at,
+                    "intensity": float(comp.get("intensity") or 0.3),
+                    "confidence": float(comp.get("confidence") or 0.4),
+                    "signature": signature,
+                    "merged_from_count": 1,
+                    "max_points_per_zone": PICKUP_ZONE_HOTSPOT_MAX_POINTS,
+                    "min_points": PICKUP_ZONE_HOTSPOT_MIN_POINTS,
+                    "micro_hotspots": [],
+                },
+                "_hotspot_proj": polygon,
+                "_component_cells": set(comp.get("cells") or []),
+            }
+        )
+
+    debug["historical_fallback_ok"] = bool(emitted)
+    debug["historical_fallback_reason"] = "emitted" if emitted else "shape_emit_empty"
+    return emitted, debug
+
+
 def _build_zone_micro_hotspots_payload(
     zone_id: int,
     zone_meta: Dict[str, Any],
@@ -6347,6 +6457,12 @@ def _pickup_zone_hotspots_with_debug(
                 "primary_ok": False,
                 "fallback_attempted": False,
                 "fallback_ok": False,
+                "historical_fallback_attempted": False,
+                "historical_fallback_ok": False,
+                "historical_fallback_component_count": 0,
+                "historical_fallback_anchor_point_count": 0,
+                "historical_fallback_strongest_support": 0.0,
+                "historical_fallback_reason": "not_attempted",
                 "feature_emitted": False,
                 "micro_hotspot_count": 0,
                 "hotspot_method": "none",
@@ -6440,6 +6556,27 @@ def _pickup_zone_hotspots_with_debug(
                 if zone_debug is not None:
                     zone_debug["errors"].append("fallback_hotspot_build_failed")
                 print(f"[warn] Failed to generate fallback pickup zone hotspot for zone {zone_id}", traceback.format_exc())
+
+        if not zone_features:
+            historical_debug: Dict[str, Any] = {}
+            try:
+                zone_features, historical_debug = _build_historical_fallback_zone_hotspot_features(
+                    zone_id=zone_id,
+                    zone_data=zone_data,
+                    recent_pts=pts,
+                    hotspot_limit=hotspot_limit,
+                    now_ts=now_ts,
+                )
+                if zone_debug is not None:
+                    zone_debug.update(historical_debug)
+                    if zone_features:
+                        zone_debug["hotspot_method"] = "historical_anchor_fallback"
+            except Exception:
+                if zone_debug is not None:
+                    zone_debug["historical_fallback_attempted"] = True
+                    zone_debug["historical_fallback_reason"] = "historical_fallback_build_failed"
+                    zone_debug["errors"].append("historical_fallback_hotspot_build_failed")
+                print(f"[warn] Failed to generate historical fallback hotspot for zone {zone_id}", traceback.format_exc())
 
         if zone_debug is not None and zone_component_debug:
             zone_debug.update(zone_component_debug)
