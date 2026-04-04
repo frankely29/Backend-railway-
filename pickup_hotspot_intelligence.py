@@ -590,40 +590,86 @@ def build_cross_zone_merged_hotspots(
     return merged
 
 
+def _outcome_recency_weight(recommended_at: Optional[int], now_ts: int) -> float:
+    try:
+        rec_ts = int(recommended_at) if recommended_at is not None else None
+    except Exception:
+        rec_ts = None
+    if rec_ts is None:
+        return 0.65
+    age_seconds = max(0, int(now_ts) - rec_ts)
+    day_seconds = 24 * 3600
+    if age_seconds <= day_seconds:
+        weight = 1.00
+    elif age_seconds <= (3 * day_seconds):
+        weight = 0.85
+    elif age_seconds <= (7 * day_seconds):
+        weight = 0.65
+    else:
+        weight = 0.45
+    return float(_clip(weight, 0.45, 1.00))
+
+
 def get_zone_or_hotspot_outcome_modifier(
     outcome_rows: Iterable[Mapping[str, Any]],
     *,
     min_samples: int = 6,
-) -> Dict[str, float]:
+) -> Dict[str, Any]:
+    now_ts = int(time.time())
     rows = list(outcome_rows)
     sample_count = len(rows)
     if sample_count < max(1, min_samples):
-        return {"modifier": 1.0, "sample_count": float(sample_count), "conversion_rate": 0.0, "median_minutes_to_trip": 0.0}
+        return {
+            "modifier": 1.0,
+            "sample_count": float(sample_count),
+            "effective_sample_count": 0.0,
+            "conversion_rate": 0.0,
+            "raw_conversion_rate": 0.0,
+            "median_minutes_to_trip": 0.0,
+            "representative_minutes_to_trip": 0.0,
+            "recency_weight_version": "resolved_recency_v1",
+        }
 
     converted = 0
+    weighted_conversion_mass = 0.0
+    weighted_total = 0.0
     mins: List[float] = []
+    weighted_minutes_mass = 0.0
+    weighted_minutes_total = 0.0
     for row in rows:
+        weight = _outcome_recency_weight(row.get("recommended_at"), now_ts)
+        weighted_total += float(weight)
         flag = row.get("converted_to_trip")
         if flag in (1, True, "1", "true", "TRUE"):
             converted += 1
+            weighted_conversion_mass += float(weight)
         mt = row.get("minutes_to_trip")
         if mt is not None:
             try:
-                mins.append(float(mt))
+                mt_float = float(mt)
+                mins.append(mt_float)
+                weighted_minutes_mass += float(weight) * mt_float
+                weighted_minutes_total += float(weight)
             except Exception:
                 pass
-    conversion_rate = converted / max(1, sample_count)
+    weighted_conversion_rate = weighted_conversion_mass / max(0.0001, weighted_total)
+    raw_conversion_rate = converted / max(1, sample_count)
     mins.sort()
-    median_minutes = mins[len(mins) // 2] if mins else 15.0
+    raw_median_minutes = mins[len(mins) // 2] if mins else 15.0
+    weighted_minutes = weighted_minutes_mass / max(0.0001, weighted_minutes_total) if weighted_minutes_total > 0.0 else 15.0
 
-    conv_boost = (conversion_rate - 0.45) * 0.55
-    speed_boost = (12.0 - median_minutes) / 50.0
+    conv_boost = (weighted_conversion_rate - 0.45) * 0.55
+    speed_boost = (12.0 - weighted_minutes) / 50.0
     modifier = _clip(1.0 + conv_boost + speed_boost, 0.78, 1.22)
     return {
         "modifier": float(modifier),
         "sample_count": float(sample_count),
-        "conversion_rate": float(conversion_rate),
-        "median_minutes_to_trip": float(median_minutes),
+        "effective_sample_count": float(weighted_total),
+        "conversion_rate": float(weighted_conversion_rate),
+        "raw_conversion_rate": float(raw_conversion_rate),
+        "median_minutes_to_trip": float(raw_median_minutes),
+        "representative_minutes_to_trip": float(weighted_minutes),
+        "recency_weight_version": "resolved_recency_v1",
     }
 
 
