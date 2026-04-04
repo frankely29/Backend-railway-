@@ -5915,50 +5915,62 @@ def _settle_stale_hotspot_recommendation_outcomes(now_ts: int) -> int:
     cutoff = int(now_ts) - RECOMMENDATION_OUTCOME_MATURITY_SECONDS
     with _db_lock:
         conn = _db()
-        cur = conn.cursor()
-        cur.execute(
-            _sql(
-                """
-                UPDATE recommendation_outcomes
-                SET converted_to_trip = ?, minutes_to_trip = ?
-                WHERE converted_to_trip IS NULL
-                  AND recommended_at <= ?
-                """
-            ),
-            (
-                False if DB_BACKEND == "postgres" else 0,
-                float(RECOMMENDATION_OUTCOME_MATURITY_SECONDS / 60.0),
-                int(cutoff),
-            ),
-        )
-        updated_rows = int(cur.rowcount or 0)
-        conn.commit()
-    return updated_rows
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                _sql(
+                    """
+                    UPDATE recommendation_outcomes
+                    SET converted_to_trip = ?, minutes_to_trip = ?
+                    WHERE converted_to_trip IS NULL
+                      AND recommended_at <= ?
+                    """
+                ),
+                (
+                    False if DB_BACKEND == "postgres" else 0,
+                    float(RECOMMENDATION_OUTCOME_MATURITY_SECONDS / 60.0),
+                    int(cutoff),
+                ),
+            )
+            updated_rows = int(cur.rowcount or 0)
+            conn.commit()
+            return updated_rows
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
 
 def _settle_stale_micro_recommendation_outcomes(now_ts: int) -> int:
     cutoff = int(now_ts) - RECOMMENDATION_OUTCOME_MATURITY_SECONDS
     with _db_lock:
         conn = _db()
-        cur = conn.cursor()
-        cur.execute(
-            _sql(
-                """
-                UPDATE micro_recommendation_outcomes
-                SET converted_to_trip = ?, minutes_to_trip = ?
-                WHERE converted_to_trip IS NULL
-                  AND recommended_at <= ?
-                """
-            ),
-            (
-                False if DB_BACKEND == "postgres" else 0,
-                float(RECOMMENDATION_OUTCOME_MATURITY_SECONDS / 60.0),
-                int(cutoff),
-            ),
-        )
-        updated_rows = int(cur.rowcount or 0)
-        conn.commit()
-    return updated_rows
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                _sql(
+                    """
+                    UPDATE micro_recommendation_outcomes
+                    SET converted_to_trip = ?, minutes_to_trip = ?
+                    WHERE converted_to_trip IS NULL
+                      AND recommended_at <= ?
+                    """
+                ),
+                (
+                    False if DB_BACKEND == "postgres" else 0,
+                    float(RECOMMENDATION_OUTCOME_MATURITY_SECONDS / 60.0),
+                    int(cutoff),
+                ),
+            )
+            updated_rows = int(cur.rowcount or 0)
+            conn.commit()
+            return updated_rows
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
 
 def _maybe_settle_stale_recommendation_outcomes(now_ts: int) -> Dict[str, int]:
