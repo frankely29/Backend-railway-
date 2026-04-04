@@ -2717,6 +2717,31 @@ def _db_init() -> None:
             """
         )
         _db_exec("CREATE INDEX IF NOT EXISTS idx_recommendation_outcomes_time ON recommendation_outcomes(recommended_at DESC);")
+        _db_exec(
+            """
+            CREATE TABLE IF NOT EXISTS micro_recommendation_outcomes (
+              id BIGSERIAL PRIMARY KEY,
+              user_id BIGINT,
+              recommended_at BIGINT NOT NULL,
+              zone_id INTEGER NOT NULL,
+              parent_hotspot_id TEXT,
+              micro_cluster_id TEXT NOT NULL,
+              score DOUBLE PRECISION NOT NULL,
+              confidence DOUBLE PRECISION NOT NULL,
+              converted_to_trip BOOLEAN,
+              minutes_to_trip DOUBLE PRECISION
+            );
+            """
+        )
+        _db_exec("CREATE INDEX IF NOT EXISTS idx_micro_recommendation_outcomes_time ON micro_recommendation_outcomes(recommended_at DESC);")
+        _db_exec(
+            "CREATE INDEX IF NOT EXISTS idx_micro_recommendation_outcomes_zone_cluster_time "
+            "ON micro_recommendation_outcomes(zone_id, micro_cluster_id, recommended_at DESC);"
+        )
+        _db_exec(
+            "CREATE INDEX IF NOT EXISTS idx_micro_recommendation_outcomes_parent_time "
+            "ON micro_recommendation_outcomes(parent_hotspot_id, recommended_at DESC);"
+        )
 
         _db_exec(
             """
@@ -3012,6 +3037,31 @@ def _db_init() -> None:
         """
     )
     _db_exec("CREATE INDEX IF NOT EXISTS idx_recommendation_outcomes_time ON recommendation_outcomes(recommended_at DESC);")
+    _db_exec(
+        """
+        CREATE TABLE IF NOT EXISTS micro_recommendation_outcomes (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id INTEGER,
+          recommended_at INTEGER NOT NULL,
+          zone_id INTEGER NOT NULL,
+          parent_hotspot_id TEXT,
+          micro_cluster_id TEXT NOT NULL,
+          score REAL NOT NULL,
+          confidence REAL NOT NULL,
+          converted_to_trip INTEGER,
+          minutes_to_trip REAL
+        );
+        """
+    )
+    _db_exec("CREATE INDEX IF NOT EXISTS idx_micro_recommendation_outcomes_time ON micro_recommendation_outcomes(recommended_at DESC);")
+    _db_exec(
+        "CREATE INDEX IF NOT EXISTS idx_micro_recommendation_outcomes_zone_cluster_time "
+        "ON micro_recommendation_outcomes(zone_id, micro_cluster_id, recommended_at DESC);"
+    )
+    _db_exec(
+        "CREATE INDEX IF NOT EXISTS idx_micro_recommendation_outcomes_parent_time "
+        "ON micro_recommendation_outcomes(parent_hotspot_id, recommended_at DESC);"
+    )
 
     _db_exec(
         """
@@ -6611,6 +6661,202 @@ def _apply_micro_hotspot_parent_recommendation_state(features: List[Dict[str, An
     }
 
 
+def _choose_primary_recommended_micro_hotspot(micro_hotspots: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(micro_hotspots, list) or not micro_hotspots:
+        return None
+    ranked = sorted(
+        [micro for micro in micro_hotspots if isinstance(micro, dict)],
+        key=lambda micro: (
+            -float(micro.get("intensity") or 0.0),
+            -float(micro.get("confidence") or 0.0),
+            -int(micro.get("event_count") or 0),
+            int(micro.get("micro_rank") or 10_000),
+        ),
+    )
+    return ranked[0] if ranked else None
+
+
+def _log_micro_recommendation_outcome(
+    *,
+    zone_id: int,
+    parent_hotspot_id: Optional[str],
+    micro_cluster_id: Optional[str],
+    score: float,
+    confidence: float,
+    recommended_at: int,
+) -> None:
+    cluster_key = str(micro_cluster_id or "").strip()
+    if not cluster_key:
+        return
+    _db_exec(
+        """
+        INSERT INTO micro_recommendation_outcomes(
+          user_id, recommended_at, zone_id, parent_hotspot_id, micro_cluster_id, score, confidence, converted_to_trip, minutes_to_trip
+        )
+        VALUES(?, ?, ?, ?, ?, ?, ?, NULL, NULL)
+        """,
+        (
+            None,
+            int(recommended_at),
+            int(zone_id),
+            str(parent_hotspot_id or "").strip() or None,
+            cluster_key,
+            float(score),
+            float(confidence),
+        ),
+    )
+
+
+def _apply_final_recommended_micro_hotspot_ownership(
+    features: List[Dict[str, Any]],
+    score_bundle_fresh: bool,
+    now_ts: int,
+    zone_debug_map: Dict[int, Dict[str, Any]],
+) -> Dict[str, int]:
+    recommended_primary_micro_hotspot_count = 0
+    logged_micro_outcome_count = 0
+    for feature in features:
+        if not isinstance(feature, dict):
+            continue
+        props = feature.setdefault("properties", {})
+        parent_recommended = bool(props.get("recommended_hotspot"))
+        parent_hotspot_id = str(props.get("hotspot_id") or "").strip() or None
+        micro_hotspots = props.get("micro_hotspots")
+        if not isinstance(micro_hotspots, list):
+            continue
+
+        for micro in micro_hotspots:
+            if not isinstance(micro, dict):
+                continue
+            micro["recommended"] = False
+            micro["recommended_micro_hotspot"] = False
+            micro["recommendation_scope"] = "micro_secondary"
+
+        if not parent_recommended:
+            continue
+
+        primary_micro = _choose_primary_recommended_micro_hotspot(micro_hotspots)
+        if not isinstance(primary_micro, dict):
+            continue
+        primary_micro["recommended"] = True
+        primary_micro["recommended_micro_hotspot"] = True
+        primary_micro["recommendation_scope"] = "micro_hotspot_primary"
+        recommended_primary_micro_hotspot_count += 1
+
+        covered_zone_ids = props.get("covered_zone_ids") or [props.get("zone_id")]
+        for raw_zone_id in covered_zone_ids:
+            try:
+                zone_id = int(raw_zone_id)
+            except Exception:
+                continue
+            zone_debug = zone_debug_map.get(zone_id)
+            if zone_debug is None:
+                continue
+            zone_debug["recommended_primary_micro_hotspot_count"] = int(zone_debug.get("recommended_primary_micro_hotspot_count") or 0) + 1
+
+        if score_bundle_fresh:
+            continue
+        try:
+            zone_id = int(primary_micro.get("zone_id") or props.get("zone_id") or 0)
+            _log_micro_recommendation_outcome(
+                zone_id=zone_id,
+                parent_hotspot_id=parent_hotspot_id,
+                micro_cluster_id=str(primary_micro.get("cluster_id") or "").strip() or None,
+                score=float(props.get("final_score") or props.get("hotspot_score") or 0.0),
+                confidence=float(props.get("confidence") or 0.0),
+                recommended_at=now_ts,
+            )
+            logged_micro_outcome_count += 1
+        except Exception:
+            print("[warn] Failed to log micro recommendation outcome", traceback.format_exc())
+
+    return {
+        "recommended_primary_micro_hotspot_count": recommended_primary_micro_hotspot_count,
+        "logged_primary_micro_outcome_count": logged_micro_outcome_count,
+    }
+
+
+def _recent_micro_recommendation_outcomes(zone_id: int, micro_cluster_id: str, max_rows: int = 80) -> List[Dict[str, Any]]:
+    cutoff = int(time.time()) - (30 * 24 * 3600)
+    rows = _db_query_all(
+        """
+        SELECT converted_to_trip, minutes_to_trip
+        FROM micro_recommendation_outcomes
+        WHERE zone_id = ?
+          AND micro_cluster_id = ?
+          AND recommended_at >= ?
+        ORDER BY recommended_at DESC, id DESC
+        LIMIT ?
+        """,
+        (int(zone_id), str(micro_cluster_id), int(cutoff), int(max_rows)),
+    )
+    return [dict(r) for r in rows]
+
+
+def _apply_micro_hotspot_learning(
+    features: List[Dict[str, Any]],
+    zone_debug_map: Dict[int, Dict[str, Any]],
+) -> Dict[str, int]:
+    micro_hotspot_specific_learning_count = 0
+    micro_hotspot_parent_fallback_learning_count = 0
+    for feature in features:
+        if not isinstance(feature, dict):
+            continue
+        props = feature.setdefault("properties", {})
+        parent_outcome_modifier = float(props.get("outcome_modifier") or 1.0)
+        parent_zone_id = int(props.get("zone_id") or 0)
+        micro_hotspots = props.get("micro_hotspots")
+        if not isinstance(micro_hotspots, list):
+            continue
+
+        for micro in micro_hotspots:
+            if not isinstance(micro, dict):
+                continue
+            base_intensity = float(micro.get("intensity") or 0.55)
+            base_confidence = float(micro.get("confidence") or 0.55)
+            micro["micro_learning_version"] = "micro_hotspot_v1"
+            micro["micro_outcome_conversion_rate"] = 0.0
+            micro["micro_outcome_median_minutes_to_trip"] = 0.0
+            if not bool(micro.get("recommended_micro_hotspot")):
+                micro["micro_outcome_modifier"] = round(parent_outcome_modifier, 4)
+                micro["micro_outcome_sample_count"] = 0
+                micro["micro_outcome_scope_used"] = "micro_not_recommended"
+                continue
+
+            zone_id = int(micro.get("zone_id") or parent_zone_id)
+            micro_cluster_id = str(micro.get("cluster_id") or "").strip()
+            rows = _recent_micro_recommendation_outcomes(zone_id, micro_cluster_id) if micro_cluster_id else []
+            if len(rows) >= 6:
+                outcome = get_zone_or_hotspot_outcome_modifier(rows)
+                micro_modifier = float(outcome.get("modifier") or 1.0)
+                micro["micro_outcome_modifier"] = round(micro_modifier, 4)
+                micro["micro_outcome_sample_count"] = int(float(outcome.get("sample_count") or 0.0))
+                micro["micro_outcome_conversion_rate"] = round(float(outcome.get("conversion_rate") or 0.0), 4)
+                micro["micro_outcome_median_minutes_to_trip"] = round(float(outcome.get("median_minutes_to_trip") or 0.0), 4)
+                micro["micro_outcome_scope_used"] = "micro_hotspot_specific"
+                micro["intensity"] = round(max(0.20, min(1.00, base_intensity * micro_modifier)), 4)
+                micro["confidence"] = round(max(0.20, min(0.98, base_confidence * micro_modifier)), 4)
+                micro_hotspot_specific_learning_count += 1
+            else:
+                micro["micro_outcome_scope_used"] = "micro_parent_fallback"
+                micro["micro_outcome_modifier"] = round(parent_outcome_modifier, 4)
+                micro["micro_outcome_sample_count"] = len(rows)
+                micro["intensity"] = round(max(0.20, min(1.00, base_intensity * parent_outcome_modifier)), 4)
+                micro["confidence"] = round(max(0.20, min(0.98, base_confidence * parent_outcome_modifier)), 4)
+                micro_hotspot_parent_fallback_learning_count += 1
+
+                zone_debug = zone_debug_map.get(zone_id)
+                if zone_debug is not None:
+                    zone_debug["micro_hotspot_parent_fallback_learning_count"] = int(
+                        zone_debug.get("micro_hotspot_parent_fallback_learning_count") or 0
+                    ) + 1
+
+    return {
+        "micro_hotspot_specific_learning_count": micro_hotspot_specific_learning_count,
+        "micro_hotspot_parent_fallback_learning_count": micro_hotspot_parent_fallback_learning_count,
+    }
+
+
 def _pickup_zone_hotspots_with_debug(
     zone_ids: List[int],
     include_debug: bool = False,
@@ -6639,6 +6885,10 @@ def _pickup_zone_hotspots_with_debug(
         "merged_hotspot_fallback_learning_count": 0,
         "recommended_micro_hotspot_count": 0,
         "nonrecommended_micro_hotspot_count": 0,
+        "recommended_primary_micro_hotspot_count": 0,
+        "logged_primary_micro_outcome_count": 0,
+        "micro_hotspot_specific_learning_count": 0,
+        "micro_hotspot_parent_fallback_learning_count": 0,
     }
     if include_debug:
         debug.update(
@@ -6788,7 +7038,9 @@ def _pickup_zone_hotspots_with_debug(
                 "recommendation_logged_post_merge": False,
                 "recommendation_logged_cluster_id": None,
                 "recommended_micro_hotspot_count": 0,
+                "recommended_primary_micro_hotspot_count": 0,
                 "micro_hotspot_parent_sync_ok": True,
+                "micro_hotspot_parent_fallback_learning_count": 0,
                 "outcome_scope_used": "zone_fallback",
                 "hotspot_specific_outcome_sample_count": 0,
                 "zone_fallback_outcome_sample_count": 0,
@@ -7099,6 +7351,15 @@ def _pickup_zone_hotspots_with_debug(
     )
     debug.update(post_merge_recommendation_debug)
     debug.update(_apply_micro_hotspot_parent_recommendation_state(features))
+    debug.update(
+        _apply_final_recommended_micro_hotspot_ownership(
+            features=features,
+            score_bundle_fresh=score_bundle_fresh,
+            now_ts=now_ts,
+            zone_debug_map=zone_debug_map,
+        )
+    )
+    debug.update(_apply_micro_hotspot_learning(features, zone_debug_map))
 
     for zone_id, zdebug in zone_debug_map.items():
         zone_recommended_micro_count = 0
