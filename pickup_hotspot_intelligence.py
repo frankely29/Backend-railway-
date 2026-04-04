@@ -614,6 +614,9 @@ def get_zone_or_hotspot_outcome_modifier(
     outcome_rows: Iterable[Mapping[str, Any]],
     *,
     min_samples: int = 6,
+    precision_target_miles: float = 0.12,
+    precision_span_miles: float = 0.40,
+    precision_profile: str = "hotspot_v1",
 ) -> Dict[str, Any]:
     now_ts = int(time.time())
     rows = list(outcome_rows)
@@ -631,6 +634,9 @@ def get_zone_or_hotspot_outcome_modifier(
             "representative_distance_to_recommendation_miles": 0.0,
             "distance_sample_count": 0,
             "precision_boost_component": 0.0,
+            "precision_target_miles": float(precision_target_miles),
+            "precision_span_miles": float(precision_span_miles),
+            "precision_profile": str(precision_profile or ""),
             "raw_modifier_before_support_damping": 1.0,
             "recency_weight_version": "resolved_recency_v1",
         }
@@ -680,7 +686,12 @@ def get_zone_or_hotspot_outcome_modifier(
     representative_distance_miles = (
         weighted_distance_mass / max(0.0001, weighted_distance_total) if weighted_distance_total > 0.0 else 0.0
     )
-    precision_boost = _clip((0.12 - representative_distance_miles) / 0.40, -0.08, 0.08) if distance_sample_count > 0 else 0.0
+    precision_span = max(0.0001, float(precision_span_miles))
+    precision_boost = (
+        _clip((float(precision_target_miles) - representative_distance_miles) / precision_span, -0.08, 0.08)
+        if distance_sample_count > 0
+        else 0.0
+    )
     raw_modifier = 1.0 + conv_boost + speed_boost + precision_boost
     effective_min_support = 4.0
     effective_full_support = 10.0
@@ -703,6 +714,9 @@ def get_zone_or_hotspot_outcome_modifier(
         "representative_distance_to_recommendation_miles": float(representative_distance_miles),
         "distance_sample_count": int(distance_sample_count),
         "precision_boost_component": float(precision_boost),
+        "precision_target_miles": float(precision_target_miles),
+        "precision_span_miles": float(precision_span_miles),
+        "precision_profile": str(precision_profile or ""),
         "raw_modifier_before_support_damping": float(raw_modifier),
         "recency_weight_version": "resolved_recency_v1",
     }

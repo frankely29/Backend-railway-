@@ -6113,7 +6113,12 @@ def _compute_merged_hotspot_learning_payload(
         hotspot_id=merged_hotspot_id if merged_hotspot_id else None,
     )
     if merged_sample_count >= 6:
-        outcome = get_zone_or_hotspot_outcome_modifier(merged_rows)
+        outcome = get_zone_or_hotspot_outcome_modifier(
+            merged_rows,
+            precision_target_miles=0.12,
+            precision_span_miles=0.40,
+            precision_profile="merged_hotspot_v1",
+        )
         outcome_modifier = float(outcome.get("modifier") or 1.0)
         quality_modifier = (
             _metric_from_feature_props(feature_a, "quality_modifier", default=1.0)
@@ -6136,6 +6141,9 @@ def _compute_merged_hotspot_learning_payload(
             ),
             "outcome_distance_sample_count": int(float(outcome.get("distance_sample_count") or 0.0)),
             "outcome_precision_boost_component": float(outcome.get("precision_boost_component") or 0.0),
+            "outcome_precision_target_miles": float(outcome.get("precision_target_miles") or 0.12),
+            "outcome_precision_span_miles": float(outcome.get("precision_span_miles") or 0.40),
+            "outcome_precision_profile": str(outcome.get("precision_profile") or "merged_hotspot_v1"),
             "outcome_raw_modifier_before_support_damping": float(outcome.get("raw_modifier_before_support_damping") or 1.0),
             "outcome_recency_weight_version": str(outcome.get("recency_weight_version") or ""),
             "merged_outcome_scope_used": merged_scope_used,
@@ -6151,6 +6159,9 @@ def _compute_merged_hotspot_learning_payload(
             ),
             "merged_outcome_distance_sample_count": int(float(outcome.get("distance_sample_count") or 0.0)),
             "merged_outcome_precision_boost_component": float(outcome.get("precision_boost_component") or 0.0),
+            "merged_outcome_precision_target_miles": float(outcome.get("precision_target_miles") or 0.12),
+            "merged_outcome_precision_span_miles": float(outcome.get("precision_span_miles") or 0.40),
+            "merged_outcome_precision_profile": str(outcome.get("precision_profile") or "merged_hotspot_v1"),
             "merged_outcome_raw_modifier_before_support_damping": float(outcome.get("raw_modifier_before_support_damping") or 1.0),
             "merged_outcome_recency_weight_version": str(outcome.get("recency_weight_version") or ""),
             "used_merged_hotspot_specific": True,
@@ -6183,6 +6194,9 @@ def _compute_merged_hotspot_learning_payload(
         "outcome_representative_distance_to_recommendation_miles": 0.0,
         "outcome_distance_sample_count": 0,
         "outcome_precision_boost_component": 0.0,
+        "outcome_precision_target_miles": 0.12,
+        "outcome_precision_span_miles": 0.40,
+        "outcome_precision_profile": "merged_hotspot_v1",
         "outcome_raw_modifier_before_support_damping": float(fallback_outcome_modifier),
         "outcome_recency_weight_version": "resolved_recency_v1",
         "merged_outcome_scope_used": "merged_fallback_from_children",
@@ -6196,6 +6210,9 @@ def _compute_merged_hotspot_learning_payload(
         "merged_outcome_representative_distance_to_recommendation_miles": 0.0,
         "merged_outcome_distance_sample_count": 0,
         "merged_outcome_precision_boost_component": 0.0,
+        "merged_outcome_precision_target_miles": 0.12,
+        "merged_outcome_precision_span_miles": 0.40,
+        "merged_outcome_precision_profile": "merged_hotspot_v1",
         "merged_outcome_raw_modifier_before_support_damping": float(fallback_outcome_modifier),
         "merged_outcome_recency_weight_version": "resolved_recency_v1",
         "used_merged_hotspot_specific": False,
@@ -6280,7 +6297,12 @@ def _enrich_emitted_zone_hotspot_features(
             zone_id,
             hotspot_id if hotspot_id else None,
         )
-        outcome = get_zone_or_hotspot_outcome_modifier(outcome_rows)
+        outcome = get_zone_or_hotspot_outcome_modifier(
+            outcome_rows,
+            precision_target_miles=0.12,
+            precision_span_miles=0.40,
+            precision_profile="hotspot_v1",
+        )
         outcome_modifier = float(outcome.get("modifier") or 1.0)
 
         quality = build_hotspot_quality_modifier(
@@ -6320,6 +6342,9 @@ def _enrich_emitted_zone_hotspot_features(
         )
         props["outcome_distance_sample_count"] = int(float(outcome.get("distance_sample_count") or 0.0))
         props["outcome_precision_boost_component"] = round(float(outcome.get("precision_boost_component") or 0.0), 4)
+        props["outcome_precision_target_miles"] = round(float(outcome.get("precision_target_miles") or 0.12), 4)
+        props["outcome_precision_span_miles"] = round(float(outcome.get("precision_span_miles") or 0.40), 4)
+        props["outcome_precision_profile"] = str(outcome.get("precision_profile") or "hotspot_v1")
         props["outcome_support_strength"] = round(float(outcome.get("support_strength") or 0.0), 4)
         props["outcome_raw_modifier_before_support_damping"] = round(float(outcome.get("raw_modifier_before_support_damping") or 1.0), 4)
         props["outcome_recency_weight_version"] = str(outcome.get("recency_weight_version") or "")
@@ -6351,6 +6376,15 @@ def _enrich_emitted_zone_hotspot_features(
         "outcome_distance_sample_count": int(((zone_features[0].get("properties") or {}).get("outcome_distance_sample_count")) if zone_features else 0),
         "outcome_precision_boost_component": float(
             ((zone_features[0].get("properties") or {}).get("outcome_precision_boost_component")) if zone_features else 0.0
+        ),
+        "outcome_precision_target_miles": float(
+            ((zone_features[0].get("properties") or {}).get("outcome_precision_target_miles")) if zone_features else 0.12
+        ),
+        "outcome_precision_span_miles": float(
+            ((zone_features[0].get("properties") or {}).get("outcome_precision_span_miles")) if zone_features else 0.40
+        ),
+        "outcome_precision_profile": str(
+            ((zone_features[0].get("properties") or {}).get("outcome_precision_profile")) if zone_features else "hotspot_v1"
         ),
         "outcome_support_strength": float(((zone_features[0].get("properties") or {}).get("outcome_support_strength")) if zone_features else 0.0),
         "outcome_raw_modifier_before_support_damping": float(
@@ -6693,6 +6727,9 @@ def _build_cross_zone_merged_hotspot_feature(
     )
     merged_props["outcome_distance_sample_count"] = int(merged_learning_payload.get("outcome_distance_sample_count") or 0)
     merged_props["outcome_precision_boost_component"] = round(float(merged_learning_payload.get("outcome_precision_boost_component") or 0.0), 4)
+    merged_props["outcome_precision_target_miles"] = round(float(merged_learning_payload.get("outcome_precision_target_miles") or 0.12), 4)
+    merged_props["outcome_precision_span_miles"] = round(float(merged_learning_payload.get("outcome_precision_span_miles") or 0.40), 4)
+    merged_props["outcome_precision_profile"] = str(merged_learning_payload.get("outcome_precision_profile") or "merged_hotspot_v1")
     merged_props["outcome_support_strength"] = round(float(merged_learning_payload.get("outcome_support_strength") or 0.0), 4)
     merged_props["outcome_raw_modifier_before_support_damping"] = round(
         float(merged_learning_payload.get("outcome_raw_modifier_before_support_damping") or 1.0),
@@ -6717,6 +6754,17 @@ def _build_cross_zone_merged_hotspot_feature(
     merged_props["merged_outcome_precision_boost_component"] = round(
         float(merged_learning_payload.get("merged_outcome_precision_boost_component") or 0.0),
         4,
+    )
+    merged_props["merged_outcome_precision_target_miles"] = round(
+        float(merged_learning_payload.get("merged_outcome_precision_target_miles") or 0.12),
+        4,
+    )
+    merged_props["merged_outcome_precision_span_miles"] = round(
+        float(merged_learning_payload.get("merged_outcome_precision_span_miles") or 0.40),
+        4,
+    )
+    merged_props["merged_outcome_precision_profile"] = str(
+        merged_learning_payload.get("merged_outcome_precision_profile") or "merged_hotspot_v1"
     )
     merged_props["merged_outcome_support_strength"] = round(float(merged_learning_payload.get("merged_outcome_support_strength") or 0.0), 4)
     merged_props["merged_outcome_raw_modifier_before_support_damping"] = round(
@@ -7254,6 +7302,9 @@ def _apply_micro_hotspot_learning(
             micro["micro_outcome_representative_distance_to_recommendation_miles"] = 0.0
             micro["micro_outcome_distance_sample_count"] = 0
             micro["micro_outcome_precision_boost_component"] = 0.0
+            micro["micro_outcome_precision_target_miles"] = 0.05
+            micro["micro_outcome_precision_span_miles"] = 0.20
+            micro["micro_outcome_precision_profile"] = "micro_hotspot_v1"
             micro["micro_outcome_support_strength"] = 0.0
             micro["micro_outcome_raw_modifier_before_support_damping"] = round(parent_outcome_modifier, 4)
             micro["micro_outcome_recency_weight_version"] = "resolved_recency_v1"
@@ -7267,7 +7318,12 @@ def _apply_micro_hotspot_learning(
             micro_cluster_id = str(micro.get("cluster_id") or "").strip()
             rows = _recent_micro_recommendation_outcomes(zone_id, micro_cluster_id) if micro_cluster_id else []
             if len(rows) >= 6:
-                outcome = get_zone_or_hotspot_outcome_modifier(rows)
+                outcome = get_zone_or_hotspot_outcome_modifier(
+                    rows,
+                    precision_target_miles=0.05,
+                    precision_span_miles=0.20,
+                    precision_profile="micro_hotspot_v1",
+                )
                 micro_modifier = float(outcome.get("modifier") or 1.0)
                 micro["micro_outcome_modifier"] = round(micro_modifier, 4)
                 micro["micro_outcome_sample_count"] = int(float(outcome.get("sample_count") or 0.0))
@@ -7282,6 +7338,9 @@ def _apply_micro_hotspot_learning(
                 )
                 micro["micro_outcome_distance_sample_count"] = int(float(outcome.get("distance_sample_count") or 0.0))
                 micro["micro_outcome_precision_boost_component"] = round(float(outcome.get("precision_boost_component") or 0.0), 4)
+                micro["micro_outcome_precision_target_miles"] = round(float(outcome.get("precision_target_miles") or 0.05), 4)
+                micro["micro_outcome_precision_span_miles"] = round(float(outcome.get("precision_span_miles") or 0.20), 4)
+                micro["micro_outcome_precision_profile"] = str(outcome.get("precision_profile") or "micro_hotspot_v1")
                 micro["micro_outcome_support_strength"] = round(float(outcome.get("support_strength") or 0.0), 4)
                 micro["micro_outcome_raw_modifier_before_support_damping"] = round(
                     float(outcome.get("raw_modifier_before_support_damping") or 1.0),
@@ -7302,6 +7361,9 @@ def _apply_micro_hotspot_learning(
                 micro["micro_outcome_representative_distance_to_recommendation_miles"] = 0.0
                 micro["micro_outcome_distance_sample_count"] = 0
                 micro["micro_outcome_precision_boost_component"] = 0.0
+                micro["micro_outcome_precision_target_miles"] = 0.05
+                micro["micro_outcome_precision_span_miles"] = 0.20
+                micro["micro_outcome_precision_profile"] = "micro_hotspot_v1"
                 micro["micro_outcome_support_strength"] = 0.0
                 micro["micro_outcome_raw_modifier_before_support_damping"] = round(parent_outcome_modifier, 4)
                 micro["micro_outcome_recency_weight_version"] = "resolved_recency_v1"
@@ -7865,6 +7927,22 @@ def _pickup_zone_hotspots_with_debug(
             if int(float(micro.get("micro_outcome_distance_sample_count") or 0.0)) > 0:
                 distance_aware_micro_hotspot_learning_count += 1
     debug["distance_aware_micro_hotspot_learning_count"] = distance_aware_micro_hotspot_learning_count
+    debug["hotspot_precision_profile_count"] = sum(
+        1
+        for feature in features
+        if str(((feature.get("properties") or {}).get("outcome_precision_profile") or "")).strip()
+    )
+    debug["merged_hotspot_precision_profile_count"] = sum(
+        1
+        for feature in merged_features
+        if str(((feature.get("properties") or {}).get("merged_outcome_precision_profile") or "")).strip()
+    )
+    debug["micro_hotspot_precision_profile_count"] = sum(
+        1
+        for feature in features
+        for micro in (((feature.get("properties") or {}).get("micro_hotspots")) or [])
+        if isinstance(micro, dict) and str((micro.get("micro_outcome_precision_profile") or "")).strip()
+    )
 
     for zone_id, zdebug in zone_debug_map.items():
         zone_recommended_micro_count = 0
