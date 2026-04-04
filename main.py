@@ -6082,19 +6082,23 @@ def _compute_merged_hotspot_learning_payload(
             "live_combined_modifier": max(0.20, outcome_modifier * quality_modifier),
             "outcome_sample_count": int(float(outcome.get("sample_count") or 0.0)),
             "outcome_effective_sample_count": float(outcome.get("effective_sample_count") or 0.0),
+            "outcome_support_strength": float(outcome.get("support_strength") or 0.0),
             "outcome_scope_used": merged_scope_used,
             "outcome_conversion_rate": float(outcome.get("conversion_rate") or 0.0),
             "outcome_raw_conversion_rate": float(outcome.get("raw_conversion_rate") or 0.0),
             "outcome_median_minutes_to_trip": float(outcome.get("median_minutes_to_trip") or 0.0),
             "outcome_representative_minutes_to_trip": float(outcome.get("representative_minutes_to_trip") or 0.0),
+            "outcome_raw_modifier_before_support_damping": float(outcome.get("raw_modifier_before_support_damping") or 1.0),
             "outcome_recency_weight_version": str(outcome.get("recency_weight_version") or ""),
             "merged_outcome_scope_used": merged_scope_used,
             "merged_outcome_sample_count": int(float(outcome.get("sample_count") or 0.0)),
             "merged_outcome_effective_sample_count": float(outcome.get("effective_sample_count") or 0.0),
+            "merged_outcome_support_strength": float(outcome.get("support_strength") or 0.0),
             "merged_outcome_conversion_rate": float(outcome.get("conversion_rate") or 0.0),
             "merged_outcome_raw_conversion_rate": float(outcome.get("raw_conversion_rate") or 0.0),
             "merged_outcome_median_minutes_to_trip": float(outcome.get("median_minutes_to_trip") or 0.0),
             "merged_outcome_representative_minutes_to_trip": float(outcome.get("representative_minutes_to_trip") or 0.0),
+            "merged_outcome_raw_modifier_before_support_damping": float(outcome.get("raw_modifier_before_support_damping") or 1.0),
             "merged_outcome_recency_weight_version": str(outcome.get("recency_weight_version") or ""),
             "used_merged_hotspot_specific": True,
         }
@@ -6117,19 +6121,23 @@ def _compute_merged_hotspot_learning_payload(
         "live_combined_modifier": fallback_live_combined_modifier,
         "outcome_sample_count": int(merged_sample_count),
         "outcome_effective_sample_count": 0.0,
+        "outcome_support_strength": 0.0,
         "outcome_scope_used": "merged_fallback_from_children",
         "outcome_conversion_rate": 0.0,
         "outcome_raw_conversion_rate": 0.0,
         "outcome_median_minutes_to_trip": 0.0,
         "outcome_representative_minutes_to_trip": 0.0,
+        "outcome_raw_modifier_before_support_damping": float(fallback_outcome_modifier),
         "outcome_recency_weight_version": "",
         "merged_outcome_scope_used": "merged_fallback_from_children",
         "merged_outcome_sample_count": int(merged_sample_count),
         "merged_outcome_effective_sample_count": 0.0,
+        "merged_outcome_support_strength": 0.0,
         "merged_outcome_conversion_rate": 0.0,
         "merged_outcome_raw_conversion_rate": 0.0,
         "merged_outcome_median_minutes_to_trip": 0.0,
         "merged_outcome_representative_minutes_to_trip": 0.0,
+        "merged_outcome_raw_modifier_before_support_damping": float(fallback_outcome_modifier),
         "merged_outcome_recency_weight_version": "",
         "used_merged_hotspot_specific": False,
     }
@@ -6247,6 +6255,8 @@ def _enrich_emitted_zone_hotspot_features(
         props["outcome_effective_sample_count"] = round(float(outcome.get("effective_sample_count") or 0.0), 4)
         props["outcome_raw_conversion_rate"] = round(float(outcome.get("raw_conversion_rate") or 0.0), 4)
         props["outcome_representative_minutes_to_trip"] = round(float(outcome.get("representative_minutes_to_trip") or 0.0), 4)
+        props["outcome_support_strength"] = round(float(outcome.get("support_strength") or 0.0), 4)
+        props["outcome_raw_modifier_before_support_damping"] = round(float(outcome.get("raw_modifier_before_support_damping") or 1.0), 4)
         props["outcome_recency_weight_version"] = str(outcome.get("recency_weight_version") or "")
 
         props["quality_modifier"] = round(quality_modifier, 4)
@@ -6593,6 +6603,11 @@ def _build_cross_zone_merged_hotspot_feature(
     merged_props["outcome_effective_sample_count"] = round(float(merged_learning_payload.get("outcome_effective_sample_count") or 0.0), 4)
     merged_props["outcome_raw_conversion_rate"] = round(float(merged_learning_payload.get("outcome_raw_conversion_rate") or 0.0), 4)
     merged_props["outcome_representative_minutes_to_trip"] = round(float(merged_learning_payload.get("outcome_representative_minutes_to_trip") or 0.0), 4)
+    merged_props["outcome_support_strength"] = round(float(merged_learning_payload.get("outcome_support_strength") or 0.0), 4)
+    merged_props["outcome_raw_modifier_before_support_damping"] = round(
+        float(merged_learning_payload.get("outcome_raw_modifier_before_support_damping") or 1.0),
+        4,
+    )
     merged_props["outcome_recency_weight_version"] = str(merged_learning_payload.get("outcome_recency_weight_version") or "")
     merged_props["live_combined_modifier"] = round(float(merged_learning_payload.get("live_combined_modifier") or 1.0), 4)
     merged_props["quality_modifier"] = round(float(merged_learning_payload.get("quality_modifier") or 1.0), 4)
@@ -6604,6 +6619,11 @@ def _build_cross_zone_merged_hotspot_feature(
     merged_props["merged_outcome_effective_sample_count"] = round(float(merged_learning_payload.get("merged_outcome_effective_sample_count") or 0.0), 4)
     merged_props["merged_outcome_raw_conversion_rate"] = round(float(merged_learning_payload.get("merged_outcome_raw_conversion_rate") or 0.0), 4)
     merged_props["merged_outcome_representative_minutes_to_trip"] = round(float(merged_learning_payload.get("merged_outcome_representative_minutes_to_trip") or 0.0), 4)
+    merged_props["merged_outcome_support_strength"] = round(float(merged_learning_payload.get("merged_outcome_support_strength") or 0.0), 4)
+    merged_props["merged_outcome_raw_modifier_before_support_damping"] = round(
+        float(merged_learning_payload.get("merged_outcome_raw_modifier_before_support_damping") or 1.0),
+        4,
+    )
     merged_props["merged_outcome_recency_weight_version"] = str(merged_learning_payload.get("merged_outcome_recency_weight_version") or "")
 
     if bool(merged_learning_payload.get("used_merged_hotspot_specific")):
@@ -7066,7 +7086,9 @@ def _apply_micro_hotspot_learning(
             micro["micro_outcome_effective_sample_count"] = 0.0
             micro["micro_outcome_raw_conversion_rate"] = 0.0
             micro["micro_outcome_representative_minutes_to_trip"] = 0.0
-            micro["micro_outcome_recency_weight_version"] = ""
+            micro["micro_outcome_support_strength"] = 0.0
+            micro["micro_outcome_raw_modifier_before_support_damping"] = round(parent_outcome_modifier, 4)
+            micro["micro_outcome_recency_weight_version"] = "resolved_recency_v1"
             if not bool(micro.get("recommended_micro_hotspot")):
                 micro["micro_outcome_modifier"] = round(parent_outcome_modifier, 4)
                 micro["micro_outcome_sample_count"] = 0
@@ -7086,6 +7108,11 @@ def _apply_micro_hotspot_learning(
                 micro["micro_outcome_effective_sample_count"] = round(float(outcome.get("effective_sample_count") or 0.0), 4)
                 micro["micro_outcome_raw_conversion_rate"] = round(float(outcome.get("raw_conversion_rate") or 0.0), 4)
                 micro["micro_outcome_representative_minutes_to_trip"] = round(float(outcome.get("representative_minutes_to_trip") or 0.0), 4)
+                micro["micro_outcome_support_strength"] = round(float(outcome.get("support_strength") or 0.0), 4)
+                micro["micro_outcome_raw_modifier_before_support_damping"] = round(
+                    float(outcome.get("raw_modifier_before_support_damping") or 1.0),
+                    4,
+                )
                 micro["micro_outcome_recency_weight_version"] = str(outcome.get("recency_weight_version") or "")
                 micro["micro_outcome_scope_used"] = "micro_hotspot_specific"
                 micro["intensity"] = round(max(0.20, min(1.00, base_intensity * micro_modifier)), 4)
@@ -7095,6 +7122,12 @@ def _apply_micro_hotspot_learning(
                 micro["micro_outcome_scope_used"] = "micro_parent_fallback"
                 micro["micro_outcome_modifier"] = round(parent_outcome_modifier, 4)
                 micro["micro_outcome_sample_count"] = len(rows)
+                micro["micro_outcome_effective_sample_count"] = 0.0
+                micro["micro_outcome_raw_conversion_rate"] = 0.0
+                micro["micro_outcome_representative_minutes_to_trip"] = 0.0
+                micro["micro_outcome_support_strength"] = 0.0
+                micro["micro_outcome_raw_modifier_before_support_damping"] = round(parent_outcome_modifier, 4)
+                micro["micro_outcome_recency_weight_version"] = "resolved_recency_v1"
                 micro["intensity"] = round(max(0.20, min(1.00, base_intensity * parent_outcome_modifier)), 4)
                 micro["confidence"] = round(max(0.20, min(0.98, base_confidence * parent_outcome_modifier)), 4)
                 micro_hotspot_parent_fallback_learning_count += 1
@@ -7678,6 +7711,26 @@ def _pickup_zone_hotspots_with_debug(
 
     _cleanup_pickup_zone_caches(now_monotonic)
     payload = {"type": "FeatureCollection", "features": features}
+    debug["low_support_damped_hotspot_count"] = sum(
+        1
+        for feature in features
+        if float((feature.get("properties") or {}).get("outcome_support_strength") or 0.0) < 0.999
+        and abs(float((feature.get("properties") or {}).get("outcome_raw_modifier_before_support_damping") or 1.0) - 1.0) > 0.01
+    )
+    debug["low_support_damped_merged_hotspot_count"] = sum(
+        1
+        for feature in merged_features
+        if float((feature.get("properties") or {}).get("merged_outcome_support_strength") or 0.0) < 0.999
+        and abs(float((feature.get("properties") or {}).get("merged_outcome_raw_modifier_before_support_damping") or 1.0) - 1.0) > 0.01
+    )
+    debug["low_support_damped_micro_hotspot_count"] = sum(
+        1
+        for feature in features
+        for micro in ((feature.get("properties") or {}).get("micro_hotspots") or [])
+        if isinstance(micro, dict)
+        and float(micro.get("micro_outcome_support_strength") or 0.0) < 0.999
+        and abs(float(micro.get("micro_outcome_raw_modifier_before_support_damping") or 1.0) - 1.0) > 0.01
+    )
     debug["zone_hotspot_count"] = len(features)
     debug["orphan_micro_hotspot_count"] = 0
     debug["top_level_micro_hotspot_count"] = len(_flatten_zone_micro_hotspots(payload))

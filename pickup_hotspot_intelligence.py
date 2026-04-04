@@ -623,10 +623,12 @@ def get_zone_or_hotspot_outcome_modifier(
             "modifier": 1.0,
             "sample_count": float(sample_count),
             "effective_sample_count": 0.0,
+            "support_strength": 0.0,
             "conversion_rate": 0.0,
             "raw_conversion_rate": 0.0,
             "median_minutes_to_trip": 0.0,
             "representative_minutes_to_trip": 0.0,
+            "raw_modifier_before_support_damping": 1.0,
             "recency_weight_version": "resolved_recency_v1",
         }
 
@@ -660,15 +662,26 @@ def get_zone_or_hotspot_outcome_modifier(
 
     conv_boost = (weighted_conversion_rate - 0.45) * 0.55
     speed_boost = (12.0 - weighted_minutes) / 50.0
-    modifier = _clip(1.0 + conv_boost + speed_boost, 0.78, 1.22)
+    raw_modifier = 1.0 + conv_boost + speed_boost
+    effective_min_support = 4.0
+    effective_full_support = 10.0
+    support_strength = _clip(
+        (float(weighted_total) - effective_min_support) / max(0.0001, (effective_full_support - effective_min_support)),
+        0.0,
+        1.0,
+    )
+    damped_modifier = 1.0 + ((raw_modifier - 1.0) * support_strength)
+    modifier = _clip(damped_modifier, 0.78, 1.22)
     return {
         "modifier": float(modifier),
         "sample_count": float(sample_count),
         "effective_sample_count": float(weighted_total),
+        "support_strength": float(support_strength),
         "conversion_rate": float(weighted_conversion_rate),
         "raw_conversion_rate": float(raw_conversion_rate),
         "median_minutes_to_trip": float(raw_median_minutes),
         "representative_minutes_to_trip": float(weighted_minutes),
+        "raw_modifier_before_support_damping": float(raw_modifier),
         "recency_weight_version": "resolved_recency_v1",
     }
 
