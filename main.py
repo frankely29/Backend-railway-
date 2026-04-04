@@ -2729,6 +2729,10 @@ def _db_init() -> None:
             "ALTER TABLE recommendation_outcomes ADD COLUMN hotspot_center_lng DOUBLE PRECISION;",
             "ALTER TABLE recommendation_outcomes ADD COLUMN IF NOT EXISTS hotspot_center_lng DOUBLE PRECISION;",
         )
+        _try_alter(
+            "ALTER TABLE recommendation_outcomes ADD COLUMN distance_to_recommendation_miles DOUBLE PRECISION;",
+            "ALTER TABLE recommendation_outcomes ADD COLUMN IF NOT EXISTS distance_to_recommendation_miles DOUBLE PRECISION;",
+        )
         _db_exec("CREATE INDEX IF NOT EXISTS idx_recommendation_outcomes_time ON recommendation_outcomes(recommended_at DESC);")
         _db_exec(
             "CREATE INDEX IF NOT EXISTS idx_recommendation_outcomes_zone_cluster_time "
@@ -2759,6 +2763,10 @@ def _db_init() -> None:
         _try_alter(
             "ALTER TABLE micro_recommendation_outcomes ADD COLUMN micro_center_lng DOUBLE PRECISION;",
             "ALTER TABLE micro_recommendation_outcomes ADD COLUMN IF NOT EXISTS micro_center_lng DOUBLE PRECISION;",
+        )
+        _try_alter(
+            "ALTER TABLE micro_recommendation_outcomes ADD COLUMN distance_to_recommendation_miles DOUBLE PRECISION;",
+            "ALTER TABLE micro_recommendation_outcomes ADD COLUMN IF NOT EXISTS distance_to_recommendation_miles DOUBLE PRECISION;",
         )
         _db_exec("CREATE INDEX IF NOT EXISTS idx_micro_recommendation_outcomes_time ON micro_recommendation_outcomes(recommended_at DESC);")
         _db_exec(
@@ -3067,6 +3075,7 @@ def _db_init() -> None:
     )
     _try_alter("ALTER TABLE recommendation_outcomes ADD COLUMN hotspot_center_lat REAL;")
     _try_alter("ALTER TABLE recommendation_outcomes ADD COLUMN hotspot_center_lng REAL;")
+    _try_alter("ALTER TABLE recommendation_outcomes ADD COLUMN distance_to_recommendation_miles REAL;")
     _db_exec("CREATE INDEX IF NOT EXISTS idx_recommendation_outcomes_time ON recommendation_outcomes(recommended_at DESC);")
     _db_exec(
         "CREATE INDEX IF NOT EXISTS idx_recommendation_outcomes_zone_cluster_time "
@@ -3092,6 +3101,7 @@ def _db_init() -> None:
     )
     _try_alter("ALTER TABLE micro_recommendation_outcomes ADD COLUMN micro_center_lat REAL;")
     _try_alter("ALTER TABLE micro_recommendation_outcomes ADD COLUMN micro_center_lng REAL;")
+    _try_alter("ALTER TABLE micro_recommendation_outcomes ADD COLUMN distance_to_recommendation_miles REAL;")
     _db_exec("CREATE INDEX IF NOT EXISTS idx_micro_recommendation_outcomes_time ON micro_recommendation_outcomes(recommended_at DESC);")
     _db_exec(
         "CREATE INDEX IF NOT EXISTS idx_micro_recommendation_outcomes_zone_cluster_time "
@@ -5986,7 +5996,7 @@ def _recent_recommendation_outcomes_with_scope(
     if hotspot_id:
         hotspot_rows = _db_query_all(
             """
-            SELECT converted_to_trip, minutes_to_trip, recommended_at
+            SELECT converted_to_trip, minutes_to_trip, recommended_at, distance_to_recommendation_miles
             FROM recommendation_outcomes
             WHERE zone_id = ?
               AND cluster_id = ?
@@ -6002,7 +6012,7 @@ def _recent_recommendation_outcomes_with_scope(
             return [dict(r) for r in hotspot_rows], "hotspot_specific", hotspot_count, 0
         zone_fallback_rows = _db_query_all(
             """
-            SELECT converted_to_trip, minutes_to_trip, recommended_at
+            SELECT converted_to_trip, minutes_to_trip, recommended_at, distance_to_recommendation_miles
             FROM recommendation_outcomes
             WHERE zone_id = ?
               AND converted_to_trip IS NOT NULL
@@ -6016,7 +6026,7 @@ def _recent_recommendation_outcomes_with_scope(
 
     zone_fallback_rows = _db_query_all(
         """
-        SELECT converted_to_trip, minutes_to_trip, recommended_at
+        SELECT converted_to_trip, minutes_to_trip, recommended_at, distance_to_recommendation_miles
         FROM recommendation_outcomes
         WHERE zone_id = ?
           AND converted_to_trip IS NOT NULL
@@ -6063,7 +6073,7 @@ def _recent_recommendation_outcomes_for_merged_hotspot(
     placeholders = ",".join(["?"] * len(normalized_zone_ids))
     rows = _db_query_all(
         f"""
-        SELECT converted_to_trip, minutes_to_trip, recommended_at
+        SELECT converted_to_trip, minutes_to_trip, recommended_at, distance_to_recommendation_miles
         FROM recommendation_outcomes
         WHERE cluster_id = ?
           AND zone_id IN ({placeholders})
@@ -6109,6 +6119,11 @@ def _compute_merged_hotspot_learning_payload(
             "outcome_raw_conversion_rate": float(outcome.get("raw_conversion_rate") or 0.0),
             "outcome_median_minutes_to_trip": float(outcome.get("median_minutes_to_trip") or 0.0),
             "outcome_representative_minutes_to_trip": float(outcome.get("representative_minutes_to_trip") or 0.0),
+            "outcome_representative_distance_to_recommendation_miles": float(
+                outcome.get("representative_distance_to_recommendation_miles") or 0.0
+            ),
+            "outcome_distance_sample_count": int(float(outcome.get("distance_sample_count") or 0.0)),
+            "outcome_precision_boost_component": float(outcome.get("precision_boost_component") or 0.0),
             "outcome_raw_modifier_before_support_damping": float(outcome.get("raw_modifier_before_support_damping") or 1.0),
             "outcome_recency_weight_version": str(outcome.get("recency_weight_version") or ""),
             "merged_outcome_scope_used": merged_scope_used,
@@ -6119,6 +6134,11 @@ def _compute_merged_hotspot_learning_payload(
             "merged_outcome_raw_conversion_rate": float(outcome.get("raw_conversion_rate") or 0.0),
             "merged_outcome_median_minutes_to_trip": float(outcome.get("median_minutes_to_trip") or 0.0),
             "merged_outcome_representative_minutes_to_trip": float(outcome.get("representative_minutes_to_trip") or 0.0),
+            "merged_outcome_representative_distance_to_recommendation_miles": float(
+                outcome.get("representative_distance_to_recommendation_miles") or 0.0
+            ),
+            "merged_outcome_distance_sample_count": int(float(outcome.get("distance_sample_count") or 0.0)),
+            "merged_outcome_precision_boost_component": float(outcome.get("precision_boost_component") or 0.0),
             "merged_outcome_raw_modifier_before_support_damping": float(outcome.get("raw_modifier_before_support_damping") or 1.0),
             "merged_outcome_recency_weight_version": str(outcome.get("recency_weight_version") or ""),
             "used_merged_hotspot_specific": True,
@@ -6148,6 +6168,9 @@ def _compute_merged_hotspot_learning_payload(
         "outcome_raw_conversion_rate": 0.0,
         "outcome_median_minutes_to_trip": 0.0,
         "outcome_representative_minutes_to_trip": 0.0,
+        "outcome_representative_distance_to_recommendation_miles": 0.0,
+        "outcome_distance_sample_count": 0,
+        "outcome_precision_boost_component": 0.0,
         "outcome_raw_modifier_before_support_damping": float(fallback_outcome_modifier),
         "outcome_recency_weight_version": "resolved_recency_v1",
         "merged_outcome_scope_used": "merged_fallback_from_children",
@@ -6158,6 +6181,9 @@ def _compute_merged_hotspot_learning_payload(
         "merged_outcome_raw_conversion_rate": 0.0,
         "merged_outcome_median_minutes_to_trip": 0.0,
         "merged_outcome_representative_minutes_to_trip": 0.0,
+        "merged_outcome_representative_distance_to_recommendation_miles": 0.0,
+        "merged_outcome_distance_sample_count": 0,
+        "merged_outcome_precision_boost_component": 0.0,
         "merged_outcome_raw_modifier_before_support_damping": float(fallback_outcome_modifier),
         "merged_outcome_recency_weight_version": "resolved_recency_v1",
         "used_merged_hotspot_specific": False,
@@ -6276,6 +6302,12 @@ def _enrich_emitted_zone_hotspot_features(
         props["outcome_effective_sample_count"] = round(float(outcome.get("effective_sample_count") or 0.0), 4)
         props["outcome_raw_conversion_rate"] = round(float(outcome.get("raw_conversion_rate") or 0.0), 4)
         props["outcome_representative_minutes_to_trip"] = round(float(outcome.get("representative_minutes_to_trip") or 0.0), 4)
+        props["outcome_representative_distance_to_recommendation_miles"] = round(
+            float(outcome.get("representative_distance_to_recommendation_miles") or 0.0),
+            4,
+        )
+        props["outcome_distance_sample_count"] = int(float(outcome.get("distance_sample_count") or 0.0))
+        props["outcome_precision_boost_component"] = round(float(outcome.get("precision_boost_component") or 0.0), 4)
         props["outcome_support_strength"] = round(float(outcome.get("support_strength") or 0.0), 4)
         props["outcome_raw_modifier_before_support_damping"] = round(float(outcome.get("raw_modifier_before_support_damping") or 1.0), 4)
         props["outcome_recency_weight_version"] = str(outcome.get("recency_weight_version") or "")
@@ -6299,6 +6331,15 @@ def _enrich_emitted_zone_hotspot_features(
         "outcome_effective_sample_count": float(((zone_features[0].get("properties") or {}).get("outcome_effective_sample_count")) if zone_features else 0.0),
         "outcome_raw_conversion_rate": float(((zone_features[0].get("properties") or {}).get("outcome_raw_conversion_rate")) if zone_features else 0.0),
         "outcome_representative_minutes_to_trip": float(((zone_features[0].get("properties") or {}).get("outcome_representative_minutes_to_trip")) if zone_features else 0.0),
+        "outcome_representative_distance_to_recommendation_miles": float(
+            ((zone_features[0].get("properties") or {}).get("outcome_representative_distance_to_recommendation_miles"))
+            if zone_features
+            else 0.0
+        ),
+        "outcome_distance_sample_count": int(((zone_features[0].get("properties") or {}).get("outcome_distance_sample_count")) if zone_features else 0),
+        "outcome_precision_boost_component": float(
+            ((zone_features[0].get("properties") or {}).get("outcome_precision_boost_component")) if zone_features else 0.0
+        ),
         "outcome_support_strength": float(((zone_features[0].get("properties") or {}).get("outcome_support_strength")) if zone_features else 0.0),
         "outcome_raw_modifier_before_support_damping": float(
             ((zone_features[0].get("properties") or {}).get("outcome_raw_modifier_before_support_damping")) if zone_features else 1.0
@@ -6634,6 +6675,12 @@ def _build_cross_zone_merged_hotspot_feature(
     merged_props["outcome_effective_sample_count"] = round(float(merged_learning_payload.get("outcome_effective_sample_count") or 0.0), 4)
     merged_props["outcome_raw_conversion_rate"] = round(float(merged_learning_payload.get("outcome_raw_conversion_rate") or 0.0), 4)
     merged_props["outcome_representative_minutes_to_trip"] = round(float(merged_learning_payload.get("outcome_representative_minutes_to_trip") or 0.0), 4)
+    merged_props["outcome_representative_distance_to_recommendation_miles"] = round(
+        float(merged_learning_payload.get("outcome_representative_distance_to_recommendation_miles") or 0.0),
+        4,
+    )
+    merged_props["outcome_distance_sample_count"] = int(merged_learning_payload.get("outcome_distance_sample_count") or 0)
+    merged_props["outcome_precision_boost_component"] = round(float(merged_learning_payload.get("outcome_precision_boost_component") or 0.0), 4)
     merged_props["outcome_support_strength"] = round(float(merged_learning_payload.get("outcome_support_strength") or 0.0), 4)
     merged_props["outcome_raw_modifier_before_support_damping"] = round(
         float(merged_learning_payload.get("outcome_raw_modifier_before_support_damping") or 1.0),
@@ -6650,6 +6697,15 @@ def _build_cross_zone_merged_hotspot_feature(
     merged_props["merged_outcome_effective_sample_count"] = round(float(merged_learning_payload.get("merged_outcome_effective_sample_count") or 0.0), 4)
     merged_props["merged_outcome_raw_conversion_rate"] = round(float(merged_learning_payload.get("merged_outcome_raw_conversion_rate") or 0.0), 4)
     merged_props["merged_outcome_representative_minutes_to_trip"] = round(float(merged_learning_payload.get("merged_outcome_representative_minutes_to_trip") or 0.0), 4)
+    merged_props["merged_outcome_representative_distance_to_recommendation_miles"] = round(
+        float(merged_learning_payload.get("merged_outcome_representative_distance_to_recommendation_miles") or 0.0),
+        4,
+    )
+    merged_props["merged_outcome_distance_sample_count"] = int(merged_learning_payload.get("merged_outcome_distance_sample_count") or 0)
+    merged_props["merged_outcome_precision_boost_component"] = round(
+        float(merged_learning_payload.get("merged_outcome_precision_boost_component") or 0.0),
+        4,
+    )
     merged_props["merged_outcome_support_strength"] = round(float(merged_learning_payload.get("merged_outcome_support_strength") or 0.0), 4)
     merged_props["merged_outcome_raw_modifier_before_support_damping"] = round(
         float(merged_learning_payload.get("merged_outcome_raw_modifier_before_support_damping") or 1.0),
@@ -6970,7 +7026,7 @@ def _recent_micro_recommendation_outcomes(zone_id: int, micro_cluster_id: str, m
     cutoff = int(time.time()) - (30 * 24 * 3600)
     rows = _db_query_all(
         """
-        SELECT converted_to_trip, minutes_to_trip, recommended_at
+        SELECT converted_to_trip, minutes_to_trip, recommended_at, distance_to_recommendation_miles
         FROM micro_recommendation_outcomes
         WHERE zone_id = ?
           AND micro_cluster_id = ?
@@ -7183,6 +7239,9 @@ def _apply_micro_hotspot_learning(
             micro["micro_outcome_effective_sample_count"] = 0.0
             micro["micro_outcome_raw_conversion_rate"] = 0.0
             micro["micro_outcome_representative_minutes_to_trip"] = 0.0
+            micro["micro_outcome_representative_distance_to_recommendation_miles"] = 0.0
+            micro["micro_outcome_distance_sample_count"] = 0
+            micro["micro_outcome_precision_boost_component"] = 0.0
             micro["micro_outcome_support_strength"] = 0.0
             micro["micro_outcome_raw_modifier_before_support_damping"] = round(parent_outcome_modifier, 4)
             micro["micro_outcome_recency_weight_version"] = "resolved_recency_v1"
@@ -7205,6 +7264,12 @@ def _apply_micro_hotspot_learning(
                 micro["micro_outcome_effective_sample_count"] = round(float(outcome.get("effective_sample_count") or 0.0), 4)
                 micro["micro_outcome_raw_conversion_rate"] = round(float(outcome.get("raw_conversion_rate") or 0.0), 4)
                 micro["micro_outcome_representative_minutes_to_trip"] = round(float(outcome.get("representative_minutes_to_trip") or 0.0), 4)
+                micro["micro_outcome_representative_distance_to_recommendation_miles"] = round(
+                    float(outcome.get("representative_distance_to_recommendation_miles") or 0.0),
+                    4,
+                )
+                micro["micro_outcome_distance_sample_count"] = int(float(outcome.get("distance_sample_count") or 0.0))
+                micro["micro_outcome_precision_boost_component"] = round(float(outcome.get("precision_boost_component") or 0.0), 4)
                 micro["micro_outcome_support_strength"] = round(float(outcome.get("support_strength") or 0.0), 4)
                 micro["micro_outcome_raw_modifier_before_support_damping"] = round(
                     float(outcome.get("raw_modifier_before_support_damping") or 1.0),
@@ -7222,6 +7287,9 @@ def _apply_micro_hotspot_learning(
                 micro["micro_outcome_effective_sample_count"] = 0.0
                 micro["micro_outcome_raw_conversion_rate"] = 0.0
                 micro["micro_outcome_representative_minutes_to_trip"] = 0.0
+                micro["micro_outcome_representative_distance_to_recommendation_miles"] = 0.0
+                micro["micro_outcome_distance_sample_count"] = 0
+                micro["micro_outcome_precision_boost_component"] = 0.0
                 micro["micro_outcome_support_strength"] = 0.0
                 micro["micro_outcome_raw_modifier_before_support_damping"] = round(parent_outcome_modifier, 4)
                 micro["micro_outcome_recency_weight_version"] = "resolved_recency_v1"
@@ -7267,6 +7335,9 @@ def _pickup_zone_hotspots_with_debug(
         "post_merge_logged_outcome_count": 0,
         "merged_hotspot_specific_learning_count": 0,
         "merged_hotspot_fallback_learning_count": 0,
+        "distance_aware_hotspot_learning_count": 0,
+        "distance_aware_merged_hotspot_learning_count": 0,
+        "distance_aware_micro_hotspot_learning_count": 0,
         "recommended_micro_hotspot_count": 0,
         "nonrecommended_micro_hotspot_count": 0,
         "recommended_primary_micro_hotspot_count": 0,
@@ -7763,6 +7834,25 @@ def _pickup_zone_hotspots_with_debug(
         )
     )
     debug.update(_apply_micro_hotspot_learning(features, zone_debug_map))
+    debug["distance_aware_hotspot_learning_count"] = sum(
+        1
+        for feature in features
+        if int(float(((feature.get("properties") or {}).get("outcome_distance_sample_count") or 0.0)) > 0)
+    )
+    debug["distance_aware_merged_hotspot_learning_count"] = sum(
+        1
+        for feature in merged_features
+        if int(float(((feature.get("properties") or {}).get("merged_outcome_distance_sample_count") or 0.0)) > 0)
+    )
+    distance_aware_micro_hotspot_learning_count = 0
+    for feature in features:
+        props = (feature or {}).get("properties") or {}
+        for micro in (props.get("micro_hotspots") or []):
+            if not isinstance(micro, dict):
+                continue
+            if int(float(micro.get("micro_outcome_distance_sample_count") or 0.0)) > 0:
+                distance_aware_micro_hotspot_learning_count += 1
+    debug["distance_aware_micro_hotspot_learning_count"] = distance_aware_micro_hotspot_learning_count
 
     for zone_id, zdebug in zone_debug_map.items():
         zone_recommended_micro_count = 0
