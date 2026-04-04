@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from admin_models import (
     AdminLiveResponse,
@@ -73,37 +73,91 @@ def admin_pickup_reports(
 @router.get("/experiments/hotspots", response_model=AdminReportsResponse)
 def admin_hotspot_experiment_bins(
     limit: int = Query(default=200, ge=1, le=1000),
+    zone_id: int | None = Query(default=None),
+    since_seconds: int | None = Query(default=None),
+    recommended_only: bool | None = Query(default=None),
     admin: sqlite3.Row = Depends(require_admin_user),
 ):
     _ = admin
-    return {"items": get_admin_hotspot_experiment_bins(limit=limit)}
+    return {
+        "items": get_admin_hotspot_experiment_bins(
+            limit=limit,
+            zone_id=zone_id,
+            since_seconds=since_seconds,
+            recommended_only=recommended_only,
+        )
+    }
 
 
 @router.get("/experiments/micro_hotspots", response_model=AdminReportsResponse)
 def admin_micro_hotspot_experiment_bins(
     limit: int = Query(default=200, ge=1, le=1000),
+    zone_id: int | None = Query(default=None),
+    cluster_id: str | None = Query(default=None),
+    since_seconds: int | None = Query(default=None),
+    recommended_only: bool | None = Query(default=None),
     admin: sqlite3.Row = Depends(require_admin_user),
 ):
     _ = admin
-    return {"items": get_admin_micro_hotspot_experiment_bins(limit=limit)}
+    return {
+        "items": get_admin_micro_hotspot_experiment_bins(
+            limit=limit,
+            zone_id=zone_id,
+            cluster_id=cluster_id,
+            since_seconds=since_seconds,
+            recommended_only=recommended_only,
+        )
+    }
 
 
 @router.get("/experiments/recommendation_outcomes", response_model=AdminReportsResponse)
 def admin_recommendation_outcomes(
     limit: int = Query(default=200, ge=1, le=1000),
+    zone_id: int | None = Query(default=None),
+    cluster_id: str | None = Query(default=None),
+    user_id: int | None = Query(default=None),
+    outcome_status: str | None = Query(default=None),
+    since_seconds: int | None = Query(default=None),
     admin: sqlite3.Row = Depends(require_admin_user),
 ):
     _ = admin
-    return {"items": get_admin_recommendation_outcomes(limit=limit)}
+    try:
+        items = get_admin_recommendation_outcomes(
+            limit=limit,
+            zone_id=zone_id,
+            cluster_id=cluster_id,
+            user_id=user_id,
+            outcome_status=outcome_status,
+            since_seconds=since_seconds,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"items": items}
 
 
 @router.get("/experiments/micro_recommendation_outcomes", response_model=AdminReportsResponse)
 def admin_micro_recommendation_outcomes(
     limit: int = Query(default=200, ge=1, le=1000),
+    zone_id: int | None = Query(default=None),
+    cluster_id: str | None = Query(default=None),
+    user_id: int | None = Query(default=None),
+    outcome_status: str | None = Query(default=None),
+    since_seconds: int | None = Query(default=None),
     admin: sqlite3.Row = Depends(require_admin_user),
 ):
     _ = admin
-    return {"items": get_admin_micro_recommendation_outcomes(limit=limit)}
+    try:
+        items = get_admin_micro_recommendation_outcomes(
+            limit=limit,
+            zone_id=zone_id,
+            cluster_id=cluster_id,
+            user_id=user_id,
+            outcome_status=outcome_status,
+            since_seconds=since_seconds,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"items": items}
 
 
 @router.get("/system", response_model=AdminSystemResponse)

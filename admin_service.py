@@ -44,6 +44,59 @@ def _to_iso(ts: Any) -> Optional[str]:
         return str(ts)
 
 
+def _build_recent_filter_clause_and_params(
+    zone_id: Optional[int] = None,
+    cluster_id: Optional[str] = None,
+    user_id: Optional[int] = None,
+    outcome_status: Optional[str] = None,
+    since_seconds: Optional[int] = None,
+    time_column: str = "recommended_at",
+    cluster_column: str = "cluster_id",
+) -> tuple[list[str], list[Any]]:
+    clauses: list[str] = []
+    params: list[Any] = []
+
+    if zone_id is not None:
+        clauses.append("zone_id = ?")
+        params.append(int(zone_id))
+
+    if cluster_id is not None:
+        clauses.append(f"{cluster_column} = ?")
+        params.append(str(cluster_id))
+
+    if user_id is not None:
+        clauses.append("user_id = ?")
+        params.append(int(user_id))
+
+    if outcome_status is not None:
+        normalized = str(outcome_status).strip().lower()
+        if normalized == "pending":
+            clauses.append("converted_to_trip IS NULL")
+        elif normalized == "converted":
+            if DB_BACKEND == "postgres":
+                clauses.append("converted_to_trip = TRUE")
+            else:
+                clauses.append("CAST(converted_to_trip AS INTEGER) = 1")
+        elif normalized == "not_converted":
+            if DB_BACKEND == "postgres":
+                clauses.append("converted_to_trip = FALSE")
+            else:
+                clauses.append("CAST(converted_to_trip AS INTEGER) = 0")
+        else:
+            raise ValueError("outcome_status must be one of: pending, converted, not_converted")
+
+    if since_seconds is not None:
+        clamped_since_seconds = max(1, min(2_592_000, int(since_seconds)))
+        cutoff = int(time.time()) - clamped_since_seconds
+        if DB_BACKEND == "postgres":
+            clauses.append(f"{time_column} >= to_timestamp(?)")
+        else:
+            clauses.append(f"{time_column} >= ?")
+        params.append(cutoff)
+
+    return clauses, params
+
+
 def _safe_count(table: str) -> Optional[int]:
     try:
         row = _db_query_one(f"SELECT COUNT(*) AS c FROM {table}")
@@ -342,10 +395,38 @@ def get_admin_pickup_logs(limit: int = 500) -> List[Dict[str, Any]]:
     ]
 
 
-def get_admin_hotspot_experiment_bins(limit: int = 200) -> List[Dict[str, Any]]:
+def get_admin_hotspot_experiment_bins(
+    limit: int = 200,
+    zone_id: Optional[int] = None,
+    since_seconds: Optional[int] = None,
+    recommended_only: Optional[bool] = None,
+) -> List[Dict[str, Any]]:
     clamped_limit = max(1, min(1000, int(limit)))
+    where_clauses: list[str] = []
+    params: list[Any] = []
+
+    if zone_id is not None:
+        where_clauses.append("zone_id = ?")
+        params.append(int(zone_id))
+
+    if since_seconds is not None:
+        clamped_since_seconds = max(1, min(2_592_000, int(since_seconds)))
+        cutoff = int(time.time()) - clamped_since_seconds
+        if DB_BACKEND == "postgres":
+            where_clauses.append("bin_time >= to_timestamp(?)")
+        else:
+            where_clauses.append("bin_time >= ?")
+        params.append(cutoff)
+
+    if recommended_only is True:
+        if DB_BACKEND == "postgres":
+            where_clauses.append("recommended = TRUE")
+        else:
+            where_clauses.append("CAST(recommended AS INTEGER) = 1")
+
+    where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
     rows = _db_query_all(
-        """
+        f"""
         SELECT
             id, bin_time, zone_id, final_score, confidence,
             historical_component, live_component, same_timeslot_component,
@@ -354,10 +435,11 @@ def get_admin_hotspot_experiment_bins(limit: int = 200) -> List[Dict[str, Any]]:
             hotspot_limit_used, density_penalty, weighted_trip_count,
             unique_driver_count, recommended
         FROM hotspot_experiment_bins
+        {where_sql}
         ORDER BY bin_time DESC, id DESC
         LIMIT ?
         """,
-        (clamped_limit,),
+        tuple(params + [clamped_limit]),
     )
     return [
         {
@@ -385,10 +467,43 @@ def get_admin_hotspot_experiment_bins(limit: int = 200) -> List[Dict[str, Any]]:
     ]
 
 
-def get_admin_micro_hotspot_experiment_bins(limit: int = 200) -> List[Dict[str, Any]]:
+def get_admin_micro_hotspot_experiment_bins(
+    limit: int = 200,
+    zone_id: Optional[int] = None,
+    cluster_id: Optional[str] = None,
+    since_seconds: Optional[int] = None,
+    recommended_only: Optional[bool] = None,
+) -> List[Dict[str, Any]]:
     clamped_limit = max(1, min(1000, int(limit)))
+    where_clauses: list[str] = []
+    params: list[Any] = []
+
+    if zone_id is not None:
+        where_clauses.append("zone_id = ?")
+        params.append(int(zone_id))
+
+    if cluster_id is not None:
+        where_clauses.append("cluster_id = ?")
+        params.append(str(cluster_id))
+
+    if since_seconds is not None:
+        clamped_since_seconds = max(1, min(2_592_000, int(since_seconds)))
+        cutoff = int(time.time()) - clamped_since_seconds
+        if DB_BACKEND == "postgres":
+            where_clauses.append("bin_time >= to_timestamp(?)")
+        else:
+            where_clauses.append("bin_time >= ?")
+        params.append(cutoff)
+
+    if recommended_only is True:
+        if DB_BACKEND == "postgres":
+            where_clauses.append("recommended = TRUE")
+        else:
+            where_clauses.append("CAST(recommended AS INTEGER) = 1")
+
+    where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
     rows = _db_query_all(
-        """
+        f"""
         SELECT
             id, bin_time, zone_id, cluster_id, final_score, confidence,
             weighted_trip_count, unique_driver_count, crowding_penalty,
@@ -396,10 +511,11 @@ def get_admin_micro_hotspot_experiment_bins(limit: int = 200) -> List[Dict[str, 
             baseline_component, live_component, same_timeslot_component,
             eta_alignment, recommended
         FROM micro_hotspot_experiment_bins
+        {where_sql}
         ORDER BY bin_time DESC, id DESC
         LIMIT ?
         """,
-        (clamped_limit,),
+        tuple(params + [clamped_limit]),
     )
     return [
         {
@@ -427,19 +543,37 @@ def get_admin_micro_hotspot_experiment_bins(limit: int = 200) -> List[Dict[str, 
     ]
 
 
-def get_admin_recommendation_outcomes(limit: int = 200) -> List[Dict[str, Any]]:
+def get_admin_recommendation_outcomes(
+    limit: int = 200,
+    zone_id: Optional[int] = None,
+    cluster_id: Optional[str] = None,
+    user_id: Optional[int] = None,
+    outcome_status: Optional[str] = None,
+    since_seconds: Optional[int] = None,
+) -> List[Dict[str, Any]]:
     clamped_limit = max(1, min(1000, int(limit)))
+    where_clauses, params = _build_recent_filter_clause_and_params(
+        zone_id=zone_id,
+        cluster_id=cluster_id,
+        user_id=user_id,
+        outcome_status=outcome_status,
+        since_seconds=since_seconds,
+        time_column="recommended_at",
+        cluster_column="cluster_id",
+    )
+    where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
     rows = _db_query_all(
-        """
+        f"""
         SELECT
             id, user_id, recommended_at, zone_id, cluster_id,
             hotspot_center_lat, hotspot_center_lng, score, confidence,
             converted_to_trip, minutes_to_trip, distance_to_recommendation_miles
         FROM recommendation_outcomes
+        {where_sql}
         ORDER BY recommended_at DESC, id DESC
         LIMIT ?
         """,
-        (clamped_limit,),
+        tuple(params + [clamped_limit]),
     )
     return [
         {
@@ -462,19 +596,37 @@ def get_admin_recommendation_outcomes(limit: int = 200) -> List[Dict[str, Any]]:
     ]
 
 
-def get_admin_micro_recommendation_outcomes(limit: int = 200) -> List[Dict[str, Any]]:
+def get_admin_micro_recommendation_outcomes(
+    limit: int = 200,
+    zone_id: Optional[int] = None,
+    cluster_id: Optional[str] = None,
+    user_id: Optional[int] = None,
+    outcome_status: Optional[str] = None,
+    since_seconds: Optional[int] = None,
+) -> List[Dict[str, Any]]:
     clamped_limit = max(1, min(1000, int(limit)))
+    where_clauses, params = _build_recent_filter_clause_and_params(
+        zone_id=zone_id,
+        cluster_id=cluster_id,
+        user_id=user_id,
+        outcome_status=outcome_status,
+        since_seconds=since_seconds,
+        time_column="recommended_at",
+        cluster_column="micro_cluster_id",
+    )
+    where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
     rows = _db_query_all(
-        """
+        f"""
         SELECT
             id, user_id, recommended_at, zone_id, parent_hotspot_id, micro_cluster_id,
             micro_center_lat, micro_center_lng, score, confidence,
             converted_to_trip, minutes_to_trip, distance_to_recommendation_miles
         FROM micro_recommendation_outcomes
+        {where_sql}
         ORDER BY recommended_at DESC, id DESC
         LIMIT ?
         """,
-        (clamped_limit,),
+        tuple(params + [clamped_limit]),
     )
     return [
         {
