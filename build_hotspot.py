@@ -5,6 +5,7 @@ from typing import List, Dict, Any, Tuple
 from datetime import datetime, timedelta
 import json
 import math
+import statistics
 import os
 import logging
 import shutil
@@ -96,6 +97,63 @@ V3_PROFILE_CONFIG = {
     "staten_island_v3": {
         "score": "earnings_shadow_score_raw_staten_island_v3",
         "confidence": "earnings_shadow_confidence_staten_island_v3",
+    },
+}
+
+TRAP_CANDIDATE_REVIEW_PROFILE_CONFIG: Dict[str, Dict[str, str]] = {
+    "citywide_v3_trap_candidate": {
+        "live_score_field": "earnings_shadow_score_citywide_v3",
+        "live_rating_field": "earnings_shadow_rating_citywide_v3",
+        "live_bucket_field": "earnings_shadow_bucket_citywide_v3",
+        "candidate_score_field": "earnings_shadow_score_citywide_v3_trap_candidate",
+        "candidate_rating_field": "earnings_shadow_rating_citywide_v3_trap_candidate",
+        "candidate_bucket_field": "earnings_shadow_bucket_citywide_v3_trap_candidate",
+        "delta_field": "earnings_shadow_delta_citywide_v3_trap_candidate",
+    },
+    "manhattan_v3_trap_candidate": {
+        "live_score_field": "earnings_shadow_score_manhattan_v3",
+        "live_rating_field": "earnings_shadow_rating_manhattan_v3",
+        "live_bucket_field": "earnings_shadow_bucket_manhattan_v3",
+        "candidate_score_field": "earnings_shadow_score_manhattan_v3_trap_candidate",
+        "candidate_rating_field": "earnings_shadow_rating_manhattan_v3_trap_candidate",
+        "candidate_bucket_field": "earnings_shadow_bucket_manhattan_v3_trap_candidate",
+        "delta_field": "earnings_shadow_delta_manhattan_v3_trap_candidate",
+    },
+    "bronx_wash_heights_v3_trap_candidate": {
+        "live_score_field": "earnings_shadow_score_bronx_wash_heights_v3",
+        "live_rating_field": "earnings_shadow_rating_bronx_wash_heights_v3",
+        "live_bucket_field": "earnings_shadow_bucket_bronx_wash_heights_v3",
+        "candidate_score_field": "earnings_shadow_score_bronx_wash_heights_v3_trap_candidate",
+        "candidate_rating_field": "earnings_shadow_rating_bronx_wash_heights_v3_trap_candidate",
+        "candidate_bucket_field": "earnings_shadow_bucket_bronx_wash_heights_v3_trap_candidate",
+        "delta_field": "earnings_shadow_delta_bronx_wash_heights_v3_trap_candidate",
+    },
+    "queens_v3_trap_candidate": {
+        "live_score_field": "earnings_shadow_score_queens_v3",
+        "live_rating_field": "earnings_shadow_rating_queens_v3",
+        "live_bucket_field": "earnings_shadow_bucket_queens_v3",
+        "candidate_score_field": "earnings_shadow_score_queens_v3_trap_candidate",
+        "candidate_rating_field": "earnings_shadow_rating_queens_v3_trap_candidate",
+        "candidate_bucket_field": "earnings_shadow_bucket_queens_v3_trap_candidate",
+        "delta_field": "earnings_shadow_delta_queens_v3_trap_candidate",
+    },
+    "brooklyn_v3_trap_candidate": {
+        "live_score_field": "earnings_shadow_score_brooklyn_v3",
+        "live_rating_field": "earnings_shadow_rating_brooklyn_v3",
+        "live_bucket_field": "earnings_shadow_bucket_brooklyn_v3",
+        "candidate_score_field": "earnings_shadow_score_brooklyn_v3_trap_candidate",
+        "candidate_rating_field": "earnings_shadow_rating_brooklyn_v3_trap_candidate",
+        "candidate_bucket_field": "earnings_shadow_bucket_brooklyn_v3_trap_candidate",
+        "delta_field": "earnings_shadow_delta_brooklyn_v3_trap_candidate",
+    },
+    "staten_island_v3_trap_candidate": {
+        "live_score_field": "earnings_shadow_score_staten_island_v3",
+        "live_rating_field": "earnings_shadow_rating_staten_island_v3",
+        "live_bucket_field": "earnings_shadow_bucket_staten_island_v3",
+        "candidate_score_field": "earnings_shadow_score_staten_island_v3_trap_candidate",
+        "candidate_rating_field": "earnings_shadow_rating_staten_island_v3_trap_candidate",
+        "candidate_bucket_field": "earnings_shadow_bucket_staten_island_v3_trap_candidate",
+        "delta_field": "earnings_shadow_delta_staten_island_v3_trap_candidate",
     },
 }
 
@@ -377,6 +435,137 @@ def _as_finite_number(value: Any) -> float | None:
     if not math.isfinite(number):
         return None
     return number
+
+
+def _safe_float(value: Any) -> float | None:
+    parsed = _as_finite_number(value)
+    return None if parsed is None else float(parsed)
+
+
+def _safe_int(value: Any) -> int | None:
+    parsed = _safe_float(value)
+    if parsed is None:
+        return None
+    try:
+        return int(parsed)
+    except Exception:
+        return None
+
+
+def _safe_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _bucket_change_direction(live_bucket: Any, candidate_bucket: Any) -> str:
+    bucket_order = {
+        "red": 0,
+        "orange": 1,
+        "yellow": 2,
+        "sky": 3,
+        "blue": 4,
+        "indigo": 5,
+        "purple": 6,
+        "green": 7,
+    }
+    live = str(live_bucket or "").strip().lower()
+    candidate = str(candidate_bucket or "").strip().lower()
+    if not live or not candidate:
+        return "unknown"
+    live_rank = bucket_order.get(live)
+    candidate_rank = bucket_order.get(candidate)
+    if live_rank is None or candidate_rank is None:
+        return "unknown"
+    if candidate_rank > live_rank:
+        return "better"
+    if candidate_rank < live_rank:
+        return "worse"
+    return "same"
+
+
+def _build_profile_candidate_review(frame_time: str, profile_name: str, features: list[dict]) -> dict:
+    profile_lookup = {
+        "citywide_v3_trap_candidate": "citywide_v3",
+        "manhattan_v3_trap_candidate": "manhattan_v3",
+        "bronx_wash_heights_v3_trap_candidate": "bronx_wash_heights_v3",
+        "queens_v3_trap_candidate": "queens_v3",
+        "brooklyn_v3_trap_candidate": "brooklyn_v3",
+        "staten_island_v3_trap_candidate": "staten_island_v3",
+    }
+    eligibility_profile = profile_lookup.get(profile_name)
+    if eligibility_profile is None:
+        return {"frame_time": frame_time, "profile_name": profile_name, "eligible_zone_count": 0}
+    cfg = TRAP_CANDIDATE_REVIEW_PROFILE_CONFIG[profile_name]
+    row_items: list[dict] = []
+    deltas: list[float] = []
+    promoted_count = 0
+    demoted_count = 0
+    near_unchanged_count = 0
+    changed_count = 0
+
+    for feature in features:
+        if not isinstance(feature, dict):
+            continue
+        props = feature.get("properties")
+        if not isinstance(props, dict) or _is_airport_props(props):
+            continue
+        geometry = feature.get("geometry")
+        if not _eligible_for_profile(eligibility_profile, props, geometry):
+            continue
+        delta = _safe_float(props.get(cfg["delta_field"]))
+        if delta is None:
+            delta = 0.0
+        if abs(delta) > 0.000001:
+            changed_count += 1
+        if delta > 0.03:
+            promoted_count += 1
+        elif delta < -0.03:
+            demoted_count += 1
+        else:
+            near_unchanged_count += 1
+        deltas.append(delta)
+        row_items.append({
+            "LocationID": _safe_int(props.get("LocationID")),
+            "zone_name": _safe_text(props.get("zone_name")),
+            "borough": _safe_text(props.get("borough")),
+            "live_score": _safe_float(props.get(cfg["live_score_field"])),
+            "live_rating": _safe_int(props.get(cfg["live_rating_field"])),
+            "live_bucket": _safe_text(props.get(cfg["live_bucket_field"])),
+            "candidate_score": _safe_float(props.get(cfg["candidate_score_field"])),
+            "candidate_rating": _safe_int(props.get(cfg["candidate_rating_field"])),
+            "candidate_bucket": _safe_text(props.get(cfg["candidate_bucket_field"])),
+            "bucket_change_direction": _bucket_change_direction(
+                props.get(cfg["live_bucket_field"]),
+                props.get(cfg["candidate_bucket_field"]),
+            ),
+            "delta": float(delta),
+            "return_risk_shadow": _safe_float(props.get("return_risk_shadow")),
+            "escape_quality_shadow": _safe_float(props.get("escape_quality_shadow")),
+            "airport_exit_share_shadow": _safe_float(props.get("airport_exit_share_shadow")),
+            "out_of_scored_network_exit_share_shadow": _safe_float(props.get("out_of_scored_network_exit_share_shadow")),
+            "short_external_exit_share_8mi_40min_shadow": _safe_float(props.get("short_external_exit_share_8mi_40min_shadow")),
+            "good_long_external_exit_share_shadow": _safe_float(props.get("good_long_external_exit_share_shadow")),
+        })
+
+    sorted_deltas = sorted(deltas)
+    top_demotions = sorted(row_items, key=lambda item: item["delta"])[:20]
+    top_promotions = sorted(row_items, key=lambda item: item["delta"], reverse=True)[:20]
+    return {
+        "frame_time": frame_time,
+        "profile_name": profile_name,
+        "eligible_zone_count": len(row_items),
+        "changed_count": changed_count,
+        "promoted_count": promoted_count,
+        "demoted_count": demoted_count,
+        "near_unchanged_count": near_unchanged_count,
+        "average_delta": (sum(deltas) / len(deltas)) if deltas else 0.0,
+        "median_delta": statistics.median(sorted_deltas) if sorted_deltas else 0.0,
+        "min_delta": sorted_deltas[0] if sorted_deltas else 0.0,
+        "max_delta": sorted_deltas[-1] if sorted_deltas else 0.0,
+        "top_demotions": top_demotions,
+        "top_promotions": top_promotions,
+    }
 
 
 def _resolve_popup_metrics(
@@ -1411,6 +1600,21 @@ def build_hotspots_frames(
         week_start = datetime(2025, 1, 6, 0, 0, 0)  # Monday anchor
         timeline: List[str] = []
         frame_count = 0
+        candidate_review_by_profile: Dict[str, Dict[str, Any]] = {
+            profile_name: {
+                "frame_count": 0,
+                "eligible_zone_observations": 0,
+                "promoted_observations": 0,
+                "demoted_observations": 0,
+                "sum_delta": 0.0,
+                "delta_observation_count": 0,
+                "min_delta_seen": None,
+                "max_delta_seen": None,
+                "recurring_demotions_by_zone": {},
+                "recurring_promotions_by_zone": {},
+            }
+            for profile_name in TRAP_CANDIDATE_REVIEW_PROFILE_CONFIG
+        }
 
         current_key: Tuple[int, int] | None = None
         current_features: List[Dict[str, Any]] = []
@@ -1423,6 +1627,75 @@ def build_hotspots_frames(
                 return
 
             _recalibrate_visible_v3_fields(current_features)
+            per_frame_candidate_review: Dict[str, Any] = {}
+            for profile_name in TRAP_CANDIDATE_REVIEW_PROFILE_CONFIG:
+                profile_review = _build_profile_candidate_review(current_time_iso, profile_name, current_features)
+                per_frame_candidate_review[profile_name] = profile_review
+                accumulator = candidate_review_by_profile[profile_name]
+                accumulator["frame_count"] += 1
+                eligible_zone_count = int(profile_review.get("eligible_zone_count") or 0)
+                accumulator["eligible_zone_observations"] += eligible_zone_count
+                accumulator["promoted_observations"] += int(profile_review.get("promoted_count") or 0)
+                accumulator["demoted_observations"] += int(profile_review.get("demoted_count") or 0)
+                accumulator["sum_delta"] += float(profile_review.get("average_delta") or 0.0) * eligible_zone_count
+                accumulator["delta_observation_count"] += eligible_zone_count
+                frame_min = _safe_float(profile_review.get("min_delta"))
+                frame_max = _safe_float(profile_review.get("max_delta"))
+                min_seen = accumulator["min_delta_seen"]
+                max_seen = accumulator["max_delta_seen"]
+                if frame_min is not None:
+                    accumulator["min_delta_seen"] = frame_min if min_seen is None else min(min_seen, frame_min)
+                if frame_max is not None:
+                    accumulator["max_delta_seen"] = frame_max if max_seen is None else max(max_seen, frame_max)
+
+                for item in profile_review.get("top_demotions", []):
+                    delta = _safe_float(item.get("delta"))
+                    if delta is None or delta >= -0.03:
+                        continue
+                    location_id = _safe_int(item.get("LocationID"))
+                    if location_id is None:
+                        continue
+                    recurring = accumulator["recurring_demotions_by_zone"].setdefault(
+                        location_id,
+                        {
+                            "LocationID": location_id,
+                            "zone_name": _safe_text(item.get("zone_name")),
+                            "borough": _safe_text(item.get("borough")),
+                            "appearances": 0,
+                            "cumulative_delta": 0.0,
+                            "worst_delta_seen": delta,
+                            "best_delta_seen": delta,
+                        },
+                    )
+                    recurring["appearances"] += 1
+                    recurring["cumulative_delta"] += delta
+                    recurring["worst_delta_seen"] = min(float(recurring["worst_delta_seen"]), delta)
+                    recurring["best_delta_seen"] = max(float(recurring["best_delta_seen"]), delta)
+
+                for item in profile_review.get("top_promotions", []):
+                    delta = _safe_float(item.get("delta"))
+                    if delta is None or delta <= 0.03:
+                        continue
+                    location_id = _safe_int(item.get("LocationID"))
+                    if location_id is None:
+                        continue
+                    recurring = accumulator["recurring_promotions_by_zone"].setdefault(
+                        location_id,
+                        {
+                            "LocationID": location_id,
+                            "zone_name": _safe_text(item.get("zone_name")),
+                            "borough": _safe_text(item.get("borough")),
+                            "appearances": 0,
+                            "cumulative_delta": 0.0,
+                            "worst_delta_seen": delta,
+                            "best_delta_seen": delta,
+                        },
+                    )
+                    recurring["appearances"] += 1
+                    recurring["cumulative_delta"] += delta
+                    recurring["worst_delta_seen"] = min(float(recurring["worst_delta_seen"]), delta)
+                    recurring["best_delta_seen"] = max(float(recurring["best_delta_seen"]), delta)
+
             _validate_popup_metric_consistency(
                 current_features,
                 current_time_iso,
@@ -1805,6 +2078,52 @@ def build_hotspots_frames(
         timeline_payload = {"timeline": timeline, "count": len(timeline)}
         # Keep timeline.json on volume for compatibility while mirroring metadata copy in DB.
         save_generated_artifact("timeline", timeline_payload, compress=False)
+
+        trap_candidate_review_payload = {
+            "generated_at_utc": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+            "engine_release": "team-joseo-score-v2-final-live",
+            "bin_minutes": int(bin_minutes),
+            "profile_reviews": {},
+        }
+        for profile_name, accumulator in candidate_review_by_profile.items():
+            demotions = list(accumulator["recurring_demotions_by_zone"].values())
+            promotions = list(accumulator["recurring_promotions_by_zone"].values())
+            for collection in (demotions, promotions):
+                for item in collection:
+                    appearances = max(1, int(item.get("appearances") or 0))
+                    item["average_delta"] = float(item.get("cumulative_delta") or 0.0) / appearances
+            recurring_top_demotions = sorted(
+                demotions,
+                key=lambda item: (
+                    float(item.get("average_delta") or 0.0),
+                    float(item.get("cumulative_delta") or 0.0),
+                ),
+            )[:30]
+            recurring_top_promotions = sorted(
+                promotions,
+                key=lambda item: (
+                    float(item.get("average_delta") or 0.0),
+                    float(item.get("cumulative_delta") or 0.0),
+                ),
+                reverse=True,
+            )[:30]
+            delta_observation_count = int(accumulator["delta_observation_count"] or 0)
+            trap_candidate_review_payload["profile_reviews"][profile_name] = {
+                "frame_count": int(accumulator["frame_count"] or 0),
+                "eligible_zone_observations": int(accumulator["eligible_zone_observations"] or 0),
+                "promoted_observations": int(accumulator["promoted_observations"] or 0),
+                "demoted_observations": int(accumulator["demoted_observations"] or 0),
+                "average_delta_overall": (
+                    float(accumulator["sum_delta"]) / delta_observation_count
+                    if delta_observation_count > 0 else 0.0
+                ),
+                "min_delta_seen": accumulator["min_delta_seen"],
+                "max_delta_seen": accumulator["max_delta_seen"],
+                "recurring_top_demotions": recurring_top_demotions,
+                "recurring_top_promotions": recurring_top_promotions,
+            }
+        save_generated_artifact("trap_candidate_review", trap_candidate_review_payload, compress=False)
+
         legacy_assistant_outlook_path = out_dir / "assistant_outlook.json"
         stage_assistant_outlook_path = stage_dir / "assistant_outlook.json"
         try:
@@ -1857,7 +2176,14 @@ def build_hotspots_frames(
                     "all_profiles_live": True,
                     "active_shadow_profiles": live_shadow_profiles,
                     "visible_profiles_live": visible_profiles_live,
-                    "candidate_shadow_profiles": [],
+                    "candidate_shadow_profiles": [
+                        "citywide_v3_trap_candidate",
+                        "manhattan_v3_trap_candidate",
+                        "bronx_wash_heights_v3_trap_candidate",
+                        "queens_v3_trap_candidate",
+                        "brooklyn_v3_trap_candidate",
+                        "staten_island_v3_trap_candidate",
+                    ],
                     "comparison_profiles": [
                         "citywide_v2",
                         "manhattan_v2",
@@ -1885,6 +2211,8 @@ def build_hotspots_frames(
                         "Phase 7 promotes queens_v3 to the live visible Queens score while Brooklyn and Staten Island remain on v2 visible profiles.",
                         "Phase 8 promotes brooklyn_v3 to the live visible Brooklyn score while Staten Island remains on the v2 visible profile.",
                         "Phase 9 promotes staten_island_v3 to the live visible Staten Island score and completes the visible v3 rollout across citywide and all borough modes.",
+                        "Phase 3 adds a trap-candidate review artifact summarizing candidate vs live deltas by profile.",
+                        "No live promotion occurs in Phase 3; this phase is proof-only.",
                     ],
                     "shadow_fields": [
                         "pickups_now_shadow",
