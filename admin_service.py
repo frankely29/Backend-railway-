@@ -326,6 +326,160 @@ def get_admin_pickup_logs(limit: int = 500) -> List[Dict[str, Any]]:
     ]
 
 
+def get_admin_hotspot_experiment_bins(limit: int = 200) -> List[Dict[str, Any]]:
+    clamped_limit = max(1, min(1000, int(limit)))
+    rows = _db_query_all(
+        """
+        SELECT
+            id, bin_time, zone_id, final_score, confidence,
+            historical_component, live_component, same_timeslot_component,
+            long_run_historical_component, recent_shape_component,
+            outcome_modifier, quality_modifier, saturation_modifier,
+            hotspot_limit_used, density_penalty, weighted_trip_count,
+            unique_driver_count, recommended
+        FROM hotspot_experiment_bins
+        ORDER BY bin_time DESC, id DESC
+        LIMIT ?
+        """,
+        (clamped_limit,),
+    )
+    return [
+        {
+            "id": int(dict(r)["id"]) if dict(r).get("id") is not None else None,
+            "bin_time": dict(r).get("bin_time"),
+            "bin_time_iso": _to_iso(dict(r).get("bin_time")),
+            "zone_id": int(dict(r)["zone_id"]) if dict(r).get("zone_id") is not None else None,
+            "final_score": float(dict(r)["final_score"]) if dict(r).get("final_score") is not None else None,
+            "confidence": float(dict(r)["confidence"]) if dict(r).get("confidence") is not None else None,
+            "historical_component": float(dict(r)["historical_component"]) if dict(r).get("historical_component") is not None else None,
+            "live_component": float(dict(r)["live_component"]) if dict(r).get("live_component") is not None else None,
+            "same_timeslot_component": float(dict(r)["same_timeslot_component"]) if dict(r).get("same_timeslot_component") is not None else None,
+            "long_run_historical_component": float(dict(r)["long_run_historical_component"]) if dict(r).get("long_run_historical_component") is not None else None,
+            "recent_shape_component": float(dict(r)["recent_shape_component"]) if dict(r).get("recent_shape_component") is not None else None,
+            "outcome_modifier": float(dict(r)["outcome_modifier"]) if dict(r).get("outcome_modifier") is not None else None,
+            "quality_modifier": float(dict(r)["quality_modifier"]) if dict(r).get("quality_modifier") is not None else None,
+            "saturation_modifier": float(dict(r)["saturation_modifier"]) if dict(r).get("saturation_modifier") is not None else None,
+            "hotspot_limit_used": int(dict(r)["hotspot_limit_used"]) if dict(r).get("hotspot_limit_used") is not None else None,
+            "density_penalty": float(dict(r)["density_penalty"]) if dict(r).get("density_penalty") is not None else None,
+            "weighted_trip_count": float(dict(r)["weighted_trip_count"]) if dict(r).get("weighted_trip_count") is not None else None,
+            "unique_driver_count": int(dict(r)["unique_driver_count"]) if dict(r).get("unique_driver_count") is not None else None,
+            "recommended": _flag_to_bool(dict(r).get("recommended")),
+        }
+        for r in rows
+    ]
+
+
+def get_admin_micro_hotspot_experiment_bins(limit: int = 200) -> List[Dict[str, Any]]:
+    clamped_limit = max(1, min(1000, int(limit)))
+    rows = _db_query_all(
+        """
+        SELECT
+            id, bin_time, zone_id, cluster_id, final_score, confidence,
+            weighted_trip_count, unique_driver_count, crowding_penalty,
+            center_lat, center_lng, radius_m, intensity,
+            baseline_component, live_component, same_timeslot_component,
+            eta_alignment, recommended
+        FROM micro_hotspot_experiment_bins
+        ORDER BY bin_time DESC, id DESC
+        LIMIT ?
+        """,
+        (clamped_limit,),
+    )
+    return [
+        {
+            "id": int(dict(r)["id"]) if dict(r).get("id") is not None else None,
+            "bin_time": dict(r).get("bin_time"),
+            "bin_time_iso": _to_iso(dict(r).get("bin_time")),
+            "zone_id": int(dict(r)["zone_id"]) if dict(r).get("zone_id") is not None else None,
+            "cluster_id": dict(r).get("cluster_id"),
+            "final_score": float(dict(r)["final_score"]) if dict(r).get("final_score") is not None else None,
+            "confidence": float(dict(r)["confidence"]) if dict(r).get("confidence") is not None else None,
+            "weighted_trip_count": float(dict(r)["weighted_trip_count"]) if dict(r).get("weighted_trip_count") is not None else None,
+            "unique_driver_count": int(dict(r)["unique_driver_count"]) if dict(r).get("unique_driver_count") is not None else None,
+            "crowding_penalty": float(dict(r)["crowding_penalty"]) if dict(r).get("crowding_penalty") is not None else None,
+            "center_lat": float(dict(r)["center_lat"]) if dict(r).get("center_lat") is not None else None,
+            "center_lng": float(dict(r)["center_lng"]) if dict(r).get("center_lng") is not None else None,
+            "radius_m": float(dict(r)["radius_m"]) if dict(r).get("radius_m") is not None else None,
+            "intensity": float(dict(r)["intensity"]) if dict(r).get("intensity") is not None else None,
+            "baseline_component": float(dict(r)["baseline_component"]) if dict(r).get("baseline_component") is not None else None,
+            "live_component": float(dict(r)["live_component"]) if dict(r).get("live_component") is not None else None,
+            "same_timeslot_component": float(dict(r)["same_timeslot_component"]) if dict(r).get("same_timeslot_component") is not None else None,
+            "eta_alignment": float(dict(r)["eta_alignment"]) if dict(r).get("eta_alignment") is not None else None,
+            "recommended": _flag_to_bool(dict(r).get("recommended")),
+        }
+        for r in rows
+    ]
+
+
+def get_admin_recommendation_outcomes(limit: int = 200) -> List[Dict[str, Any]]:
+    clamped_limit = max(1, min(1000, int(limit)))
+    rows = _db_query_all(
+        """
+        SELECT
+            id, user_id, recommended_at, zone_id, cluster_id,
+            hotspot_center_lat, hotspot_center_lng, score, confidence,
+            converted_to_trip, minutes_to_trip, distance_to_recommendation_miles
+        FROM recommendation_outcomes
+        ORDER BY recommended_at DESC, id DESC
+        LIMIT ?
+        """,
+        (clamped_limit,),
+    )
+    return [
+        {
+            "id": int(dict(r)["id"]) if dict(r).get("id") is not None else None,
+            "user_id": int(dict(r)["user_id"]) if dict(r).get("user_id") is not None else None,
+            "recommended_at": dict(r).get("recommended_at"),
+            "recommended_at_iso": _to_iso(dict(r).get("recommended_at")),
+            "zone_id": int(dict(r)["zone_id"]) if dict(r).get("zone_id") is not None else None,
+            "cluster_id": dict(r).get("cluster_id"),
+            "hotspot_center_lat": float(dict(r)["hotspot_center_lat"]) if dict(r).get("hotspot_center_lat") is not None else None,
+            "hotspot_center_lng": float(dict(r)["hotspot_center_lng"]) if dict(r).get("hotspot_center_lng") is not None else None,
+            "score": float(dict(r)["score"]) if dict(r).get("score") is not None else None,
+            "confidence": float(dict(r)["confidence"]) if dict(r).get("confidence") is not None else None,
+            "converted_to_trip": _flag_to_bool(dict(r).get("converted_to_trip")),
+            "minutes_to_trip": float(dict(r)["minutes_to_trip"]) if dict(r).get("minutes_to_trip") is not None else None,
+            "distance_to_recommendation_miles": float(dict(r)["distance_to_recommendation_miles"]) if dict(r).get("distance_to_recommendation_miles") is not None else None,
+        }
+        for r in rows
+    ]
+
+
+def get_admin_micro_recommendation_outcomes(limit: int = 200) -> List[Dict[str, Any]]:
+    clamped_limit = max(1, min(1000, int(limit)))
+    rows = _db_query_all(
+        """
+        SELECT
+            id, user_id, recommended_at, zone_id, parent_hotspot_id, micro_cluster_id,
+            micro_center_lat, micro_center_lng, score, confidence,
+            converted_to_trip, minutes_to_trip, distance_to_recommendation_miles
+        FROM micro_recommendation_outcomes
+        ORDER BY recommended_at DESC, id DESC
+        LIMIT ?
+        """,
+        (clamped_limit,),
+    )
+    return [
+        {
+            "id": int(dict(r)["id"]) if dict(r).get("id") is not None else None,
+            "user_id": int(dict(r)["user_id"]) if dict(r).get("user_id") is not None else None,
+            "recommended_at": dict(r).get("recommended_at"),
+            "recommended_at_iso": _to_iso(dict(r).get("recommended_at")),
+            "zone_id": int(dict(r)["zone_id"]) if dict(r).get("zone_id") is not None else None,
+            "parent_hotspot_id": int(dict(r)["parent_hotspot_id"]) if dict(r).get("parent_hotspot_id") is not None else None,
+            "micro_cluster_id": dict(r).get("micro_cluster_id"),
+            "micro_center_lat": float(dict(r)["micro_center_lat"]) if dict(r).get("micro_center_lat") is not None else None,
+            "micro_center_lng": float(dict(r)["micro_center_lng"]) if dict(r).get("micro_center_lng") is not None else None,
+            "score": float(dict(r)["score"]) if dict(r).get("score") is not None else None,
+            "confidence": float(dict(r)["confidence"]) if dict(r).get("confidence") is not None else None,
+            "converted_to_trip": _flag_to_bool(dict(r).get("converted_to_trip")),
+            "minutes_to_trip": float(dict(r)["minutes_to_trip"]) if dict(r).get("minutes_to_trip") is not None else None,
+            "distance_to_recommendation_miles": float(dict(r)["distance_to_recommendation_miles"]) if dict(r).get("distance_to_recommendation_miles") is not None else None,
+        }
+        for r in rows
+    ]
+
+
 def get_admin_system() -> Dict[str, Any]:
     frames = _frames_info()
     return {
@@ -341,5 +495,9 @@ def get_admin_system() -> Dict[str, Any]:
             "events": _safe_count("events"),
             "pickup_logs": _safe_count("pickup_logs"),
             "chat_messages": _safe_count("chat_messages"),
+            "hotspot_experiment_bins": _safe_count("hotspot_experiment_bins"),
+            "micro_hotspot_experiment_bins": _safe_count("micro_hotspot_experiment_bins"),
+            "recommendation_outcomes": _safe_count("recommendation_outcomes"),
+            "micro_recommendation_outcomes": _safe_count("micro_recommendation_outcomes"),
         },
     }

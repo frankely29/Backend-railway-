@@ -13,9 +13,13 @@ from admin_models import (
 )
 from admin_security import require_admin_user
 from admin_service import (
+    get_admin_hotspot_experiment_bins,
     get_admin_live,
+    get_admin_micro_hotspot_experiment_bins,
+    get_admin_micro_recommendation_outcomes,
     get_admin_pickup_logs,
     get_admin_police_reports,
+    get_admin_recommendation_outcomes,
     get_admin_summary,
     get_admin_system,
     get_admin_users,
@@ -64,6 +68,42 @@ def admin_pickup_reports(
 ):
     _ = admin
     return {"items": get_admin_pickup_logs(limit=limit)}
+
+
+@router.get("/experiments/hotspots", response_model=AdminReportsResponse)
+def admin_hotspot_experiment_bins(
+    limit: int = Query(default=200, ge=1, le=1000),
+    admin: sqlite3.Row = Depends(require_admin_user),
+):
+    _ = admin
+    return {"items": get_admin_hotspot_experiment_bins(limit=limit)}
+
+
+@router.get("/experiments/micro_hotspots", response_model=AdminReportsResponse)
+def admin_micro_hotspot_experiment_bins(
+    limit: int = Query(default=200, ge=1, le=1000),
+    admin: sqlite3.Row = Depends(require_admin_user),
+):
+    _ = admin
+    return {"items": get_admin_micro_hotspot_experiment_bins(limit=limit)}
+
+
+@router.get("/experiments/recommendation_outcomes", response_model=AdminReportsResponse)
+def admin_recommendation_outcomes(
+    limit: int = Query(default=200, ge=1, le=1000),
+    admin: sqlite3.Row = Depends(require_admin_user),
+):
+    _ = admin
+    return {"items": get_admin_recommendation_outcomes(limit=limit)}
+
+
+@router.get("/experiments/micro_recommendation_outcomes", response_model=AdminReportsResponse)
+def admin_micro_recommendation_outcomes(
+    limit: int = Query(default=200, ge=1, le=1000),
+    admin: sqlite3.Row = Depends(require_admin_user),
+):
+    _ = admin
+    return {"items": get_admin_micro_recommendation_outcomes(limit=limit)}
 
 
 @router.get("/system", response_model=AdminSystemResponse)
