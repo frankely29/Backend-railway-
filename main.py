@@ -6104,8 +6104,10 @@ def _build_cross_zone_merged_hotspot_feature(
 ) -> Dict[str, Any]:
     props_a = (feature_a or {}).get("properties") or {}
     props_b = (feature_b or {}).get("properties") or {}
-    merged_zone_ids = list(merge_result.get("merged_zone_ids") or [])
+    merged_zone_ids = sorted(int(z) for z in (merge_result.get("merged_zone_ids") or []) if z is not None)
     merged_zone_names = [str(name or "") for name in (merge_result.get("merged_zone_names") or [])]
+    if len(merged_zone_names) != len(merged_zone_ids):
+        merged_zone_names = [str((zone_name or "")) for zone_name in (props_a.get("covered_zone_names") or [])][: len(merged_zone_ids)]
     primary_zone_id = int(merge_result.get("primary_zone_id") or (merged_zone_ids[0] if merged_zone_ids else 0))
     if len(merged_zone_ids) >= 2:
         small_zone_id, large_zone_id = sorted(merged_zone_ids[:2])
@@ -6166,7 +6168,7 @@ def _build_cross_zone_merged_hotspot_feature(
             "hotspot_id": merged_hotspot_id,
             "hotspot_method": "cross_zone_merge",
             "merged": True,
-            "merged_zone_count": 2,
+            "merged_zone_count": len(merged_zone_ids) or 2,
             "merged_zone_ids": merged_zone_ids,
             "merged_zone_names": merged_zone_names,
             "covered_zone_ids": merged_zone_ids,
