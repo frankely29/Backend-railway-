@@ -97,6 +97,49 @@ def _build_recent_filter_clause_and_params(
     return clauses, params
 
 
+def _clamp_since_seconds(since_seconds: Optional[int]) -> Optional[int]:
+    if since_seconds is None:
+        return None
+    return max(1, min(2_592_000, int(since_seconds)))
+
+
+def _normalize_cluster_id(cluster_id: Optional[str]) -> Optional[str]:
+    if cluster_id is None:
+        return None
+    normalized = str(cluster_id).strip()
+    return normalized or None
+
+
+def _build_bin_filter_clause_and_params(
+    zone_id: Optional[int] = None,
+    cluster_id: Optional[str] = None,
+    since_seconds: Optional[int] = None,
+    time_column: str = "bin_time",
+    cluster_column: str = "cluster_id",
+) -> tuple[list[str], list[Any]]:
+    clauses: list[str] = []
+    params: list[Any] = []
+
+    if zone_id is not None:
+        clauses.append("zone_id = ?")
+        params.append(int(zone_id))
+
+    if cluster_id is not None:
+        clauses.append(f"{cluster_column} = ?")
+        params.append(str(cluster_id))
+
+    clamped_since_seconds = _clamp_since_seconds(since_seconds)
+    if clamped_since_seconds is not None:
+        cutoff = int(time.time()) - clamped_since_seconds
+        if DB_BACKEND == "postgres":
+            clauses.append(f"{time_column} >= to_timestamp(?)")
+        else:
+            clauses.append(f"{time_column} >= ?")
+        params.append(cutoff)
+
+    return clauses, params
+
+
 def _safe_count(table: str) -> Optional[int]:
     try:
         row = _db_query_one(f"SELECT COUNT(*) AS c FROM {table}")
@@ -669,5 +712,229 @@ def get_admin_system() -> Dict[str, Any]:
             "micro_hotspot_experiment_bins": _safe_count("micro_hotspot_experiment_bins"),
             "recommendation_outcomes": _safe_count("recommendation_outcomes"),
             "micro_recommendation_outcomes": _safe_count("micro_recommendation_outcomes"),
+        },
+    }
+
+
+def get_admin_experiment_summary(
+    zone_id: Optional[int] = None,
+    cluster_id: Optional[str] = None,
+    user_id: Optional[int] = None,
+    since_seconds: Optional[int] = None,
+) -> Dict[str, Any]:
+    normalized_cluster_id = _normalize_cluster_id(cluster_id)
+    clamped_since_seconds = _clamp_since_seconds(since_seconds)
+
+    hotspot_base_clauses, hotspot_base_params = _build_bin_filter_clause_and_params(zone_id=zone_id)
+    hotspot_recent_clauses, hotspot_recent_params = _build_bin_filter_clause_and_params(
+        zone_id=zone_id,
+        since_seconds=clamped_since_seconds,
+    )
+
+    hotspot_base_where = f"WHERE {' AND '.join(hotspot_base_clauses)}" if hotspot_base_clauses else ""
+    hotspot_recent_where = f"WHERE {' AND '.join(hotspot_recent_clauses)}" if hotspot_recent_clauses else ""
+
+    hotspot_recommended_expr = (
+        "recommended = TRUE" if DB_BACKEND == "postgres" else "CAST(recommended AS INTEGER) = 1"
+    )
+    hotspot_row = _db_query_one(
+        f"""
+        SELECT
+            (SELECT COUNT(*) FROM hotspot_experiment_bins {hotspot_base_where}) AS total_rows,
+            COUNT(*) AS recent_rows,
+            SUM(CASE WHEN {hotspot_recommended_expr} THEN 1 ELSE 0 END) AS recommended_rows,
+            COUNT(DISTINCT zone_id) AS distinct_zone_count,
+            AVG(final_score) AS avg_final_score,
+            AVG(confidence) AS avg_confidence
+        FROM hotspot_experiment_bins
+        {hotspot_recent_where}
+        """,
+        tuple(hotspot_base_params + hotspot_recent_params),
+    ) or {}
+
+    micro_base_clauses, micro_base_params = _build_bin_filter_clause_and_params(
+        zone_id=zone_id,
+        cluster_id=normalized_cluster_id,
+    )
+    micro_recent_clauses, micro_recent_params = _build_bin_filter_clause_and_params(
+        zone_id=zone_id,
+        cluster_id=normalized_cluster_id,
+        since_seconds=clamped_since_seconds,
+    )
+    micro_base_where = f"WHERE {' AND '.join(micro_base_clauses)}" if micro_base_clauses else ""
+    micro_recent_where = f"WHERE {' AND '.join(micro_recent_clauses)}" if micro_recent_clauses else ""
+
+    micro_recommended_expr = (
+        "recommended = TRUE" if DB_BACKEND == "postgres" else "CAST(recommended AS INTEGER) = 1"
+    )
+    micro_row = _db_query_one(
+        f"""
+        SELECT
+            (SELECT COUNT(*) FROM micro_hotspot_experiment_bins {micro_base_where}) AS total_rows,
+            COUNT(*) AS recent_rows,
+            SUM(CASE WHEN {micro_recommended_expr} THEN 1 ELSE 0 END) AS recommended_rows,
+            COUNT(DISTINCT zone_id) AS distinct_zone_count,
+            COUNT(DISTINCT cluster_id) AS distinct_cluster_count,
+            AVG(final_score) AS avg_final_score,
+            AVG(confidence) AS avg_confidence,
+            AVG(intensity) AS avg_intensity
+        FROM micro_hotspot_experiment_bins
+        {micro_recent_where}
+        """,
+        tuple(micro_base_params + micro_recent_params),
+    ) or {}
+
+    outcome_base_clauses, outcome_base_params = _build_recent_filter_clause_and_params(
+        zone_id=zone_id,
+        cluster_id=normalized_cluster_id,
+        user_id=user_id,
+        time_column="recommended_at",
+        cluster_column="cluster_id",
+    )
+    outcome_recent_clauses, outcome_recent_params = _build_recent_filter_clause_and_params(
+        zone_id=zone_id,
+        cluster_id=normalized_cluster_id,
+        user_id=user_id,
+        since_seconds=clamped_since_seconds,
+        time_column="recommended_at",
+        cluster_column="cluster_id",
+    )
+    outcome_base_where = f"WHERE {' AND '.join(outcome_base_clauses)}" if outcome_base_clauses else ""
+    outcome_recent_where = f"WHERE {' AND '.join(outcome_recent_clauses)}" if outcome_recent_clauses else ""
+
+    converted_expr = "converted_to_trip = TRUE" if DB_BACKEND == "postgres" else "CAST(converted_to_trip AS INTEGER) = 1"
+    not_converted_expr = "converted_to_trip = FALSE" if DB_BACKEND == "postgres" else "CAST(converted_to_trip AS INTEGER) = 0"
+    outcome_row = _db_query_one(
+        f"""
+        SELECT
+            (SELECT COUNT(*) FROM recommendation_outcomes {outcome_base_where}) AS total_rows,
+            SUM(CASE WHEN converted_to_trip IS NULL THEN 1 ELSE 0 END) AS pending_rows,
+            SUM(CASE WHEN {converted_expr} THEN 1 ELSE 0 END) AS converted_rows,
+            SUM(CASE WHEN {not_converted_expr} THEN 1 ELSE 0 END) AS not_converted_rows,
+            SUM(CASE WHEN converted_to_trip IS NOT NULL THEN 1 ELSE 0 END) AS resolved_rows,
+            AVG(CASE WHEN {converted_expr} THEN minutes_to_trip END) AS avg_minutes_to_trip_converted,
+            AVG(CASE WHEN {converted_expr} THEN distance_to_recommendation_miles END) AS avg_distance_to_recommendation_miles_converted,
+            COUNT(DISTINCT zone_id) AS distinct_zone_count,
+            COUNT(DISTINCT cluster_id) AS distinct_cluster_count,
+            COUNT(DISTINCT user_id) AS distinct_user_count
+        FROM recommendation_outcomes
+        {outcome_recent_where}
+        """,
+        tuple(outcome_base_params + outcome_recent_params),
+    ) or {}
+
+    micro_outcome_base_clauses, micro_outcome_base_params = _build_recent_filter_clause_and_params(
+        zone_id=zone_id,
+        cluster_id=normalized_cluster_id,
+        user_id=user_id,
+        time_column="recommended_at",
+        cluster_column="micro_cluster_id",
+    )
+    micro_outcome_recent_clauses, micro_outcome_recent_params = _build_recent_filter_clause_and_params(
+        zone_id=zone_id,
+        cluster_id=normalized_cluster_id,
+        user_id=user_id,
+        since_seconds=clamped_since_seconds,
+        time_column="recommended_at",
+        cluster_column="micro_cluster_id",
+    )
+    micro_outcome_base_where = (
+        f"WHERE {' AND '.join(micro_outcome_base_clauses)}" if micro_outcome_base_clauses else ""
+    )
+    micro_outcome_recent_where = (
+        f"WHERE {' AND '.join(micro_outcome_recent_clauses)}" if micro_outcome_recent_clauses else ""
+    )
+
+    micro_outcome_row = _db_query_one(
+        f"""
+        SELECT
+            (SELECT COUNT(*) FROM micro_recommendation_outcomes {micro_outcome_base_where}) AS total_rows,
+            SUM(CASE WHEN converted_to_trip IS NULL THEN 1 ELSE 0 END) AS pending_rows,
+            SUM(CASE WHEN {converted_expr} THEN 1 ELSE 0 END) AS converted_rows,
+            SUM(CASE WHEN {not_converted_expr} THEN 1 ELSE 0 END) AS not_converted_rows,
+            SUM(CASE WHEN converted_to_trip IS NOT NULL THEN 1 ELSE 0 END) AS resolved_rows,
+            AVG(CASE WHEN {converted_expr} THEN minutes_to_trip END) AS avg_minutes_to_trip_converted,
+            AVG(CASE WHEN {converted_expr} THEN distance_to_recommendation_miles END) AS avg_distance_to_recommendation_miles_converted,
+            COUNT(DISTINCT zone_id) AS distinct_zone_count,
+            COUNT(DISTINCT micro_cluster_id) AS distinct_micro_cluster_count,
+            COUNT(DISTINCT parent_hotspot_id) AS distinct_parent_hotspot_count,
+            COUNT(DISTINCT user_id) AS distinct_user_count
+        FROM micro_recommendation_outcomes
+        {micro_outcome_recent_where}
+        """,
+        tuple(micro_outcome_base_params + micro_outcome_recent_params),
+    ) or {}
+
+    def _as_int(value: Any) -> int:
+        return int(value or 0)
+
+    def _as_float(value: Any) -> Optional[float]:
+        return float(value) if value is not None else None
+
+    recommendation_resolved_rows = _as_int(outcome_row.get("resolved_rows"))
+    recommendation_converted_rows = _as_int(outcome_row.get("converted_rows"))
+    recommendation_conversion_rate = (
+        recommendation_converted_rows / recommendation_resolved_rows if recommendation_resolved_rows > 0 else None
+    )
+
+    micro_resolved_rows = _as_int(micro_outcome_row.get("resolved_rows"))
+    micro_converted_rows = _as_int(micro_outcome_row.get("converted_rows"))
+    micro_conversion_rate = micro_converted_rows / micro_resolved_rows if micro_resolved_rows > 0 else None
+
+    return {
+        "filters": {
+            "zone_id": int(zone_id) if zone_id is not None else None,
+            "cluster_id": normalized_cluster_id,
+            "user_id": int(user_id) if user_id is not None else None,
+            "since_seconds": clamped_since_seconds,
+        },
+        "hotspot_experiment_bins": {
+            "total_rows": _as_int(hotspot_row.get("total_rows")),
+            "recent_rows": _as_int(hotspot_row.get("recent_rows")),
+            "recommended_rows": _as_int(hotspot_row.get("recommended_rows")),
+            "distinct_zone_count": _as_int(hotspot_row.get("distinct_zone_count")),
+            "avg_final_score": _as_float(hotspot_row.get("avg_final_score")),
+            "avg_confidence": _as_float(hotspot_row.get("avg_confidence")),
+        },
+        "micro_hotspot_experiment_bins": {
+            "total_rows": _as_int(micro_row.get("total_rows")),
+            "recent_rows": _as_int(micro_row.get("recent_rows")),
+            "recommended_rows": _as_int(micro_row.get("recommended_rows")),
+            "distinct_zone_count": _as_int(micro_row.get("distinct_zone_count")),
+            "distinct_cluster_count": _as_int(micro_row.get("distinct_cluster_count")),
+            "avg_final_score": _as_float(micro_row.get("avg_final_score")),
+            "avg_confidence": _as_float(micro_row.get("avg_confidence")),
+            "avg_intensity": _as_float(micro_row.get("avg_intensity")),
+        },
+        "recommendation_outcomes": {
+            "total_rows": _as_int(outcome_row.get("total_rows")),
+            "pending_rows": _as_int(outcome_row.get("pending_rows")),
+            "converted_rows": recommendation_converted_rows,
+            "not_converted_rows": _as_int(outcome_row.get("not_converted_rows")),
+            "resolved_rows": recommendation_resolved_rows,
+            "resolved_conversion_rate": recommendation_conversion_rate,
+            "avg_minutes_to_trip_converted": _as_float(outcome_row.get("avg_minutes_to_trip_converted")),
+            "avg_distance_to_recommendation_miles_converted": _as_float(
+                outcome_row.get("avg_distance_to_recommendation_miles_converted")
+            ),
+            "distinct_zone_count": _as_int(outcome_row.get("distinct_zone_count")),
+            "distinct_cluster_count": _as_int(outcome_row.get("distinct_cluster_count")),
+            "distinct_user_count": _as_int(outcome_row.get("distinct_user_count")),
+        },
+        "micro_recommendation_outcomes": {
+            "total_rows": _as_int(micro_outcome_row.get("total_rows")),
+            "pending_rows": _as_int(micro_outcome_row.get("pending_rows")),
+            "converted_rows": micro_converted_rows,
+            "not_converted_rows": _as_int(micro_outcome_row.get("not_converted_rows")),
+            "resolved_rows": micro_resolved_rows,
+            "resolved_conversion_rate": micro_conversion_rate,
+            "avg_minutes_to_trip_converted": _as_float(micro_outcome_row.get("avg_minutes_to_trip_converted")),
+            "avg_distance_to_recommendation_miles_converted": _as_float(
+                micro_outcome_row.get("avg_distance_to_recommendation_miles_converted")
+            ),
+            "distinct_zone_count": _as_int(micro_outcome_row.get("distinct_zone_count")),
+            "distinct_micro_cluster_count": _as_int(micro_outcome_row.get("distinct_micro_cluster_count")),
+            "distinct_parent_hotspot_count": _as_int(micro_outcome_row.get("distinct_parent_hotspot_count")),
+            "distinct_user_count": _as_int(micro_outcome_row.get("distinct_user_count")),
         },
     }

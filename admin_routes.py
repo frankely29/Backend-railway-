@@ -13,6 +13,7 @@ from admin_models import (
 )
 from admin_security import require_admin_user
 from admin_service import (
+    get_admin_experiment_summary,
     get_admin_hotspot_experiment_bins,
     get_admin_live,
     get_admin_micro_hotspot_experiment_bins,
@@ -158,6 +159,23 @@ def admin_micro_recommendation_outcomes(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"items": items}
+
+
+@router.get("/experiments/summary")
+def admin_experiment_summary(
+    zone_id: int | None = Query(default=None),
+    cluster_id: str | None = Query(default=None),
+    user_id: int | None = Query(default=None),
+    since_seconds: int | None = Query(default=None),
+    admin: sqlite3.Row = Depends(require_admin_user),
+):
+    _ = admin
+    return get_admin_experiment_summary(
+        zone_id=zone_id,
+        cluster_id=cluster_id,
+        user_id=user_id,
+        since_seconds=since_seconds,
+    )
 
 
 @router.get("/system", response_model=AdminSystemResponse)
