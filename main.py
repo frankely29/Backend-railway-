@@ -5688,10 +5688,29 @@ def _pickup_zone_long_run_points(zone_id: int, limit: int = 2400) -> List[Dict[s
     return [dict(r) for r in rows]
 
 
-def _recent_recommendation_outcomes(zone_id: int, hotspot_id: Optional[str] = None, max_rows: int = 80) -> List[Dict[str, Any]]:
+def _choose_primary_recommended_hotspot_feature(zone_features: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not zone_features:
+        return None
+    ranked = sorted(
+        [f for f in zone_features if isinstance(f, dict)],
+        key=lambda feature: (
+            -float((feature.get("properties") or {}).get("intensity") or 0.0),
+            -float((feature.get("properties") or {}).get("confidence") or 0.0),
+            int((feature.get("properties") or {}).get("hotspot_index") or 10_000),
+        ),
+    )
+    return ranked[0] if ranked else None
+
+
+def _recent_recommendation_outcomes_with_scope(
+    zone_id: int,
+    hotspot_id: Optional[str] = None,
+    max_rows: int = 80,
+) -> Tuple[List[Dict[str, Any]], str, int, int]:
     cutoff = int(time.time()) - (30 * 24 * 3600)
+    zone_fallback_rows: List[Dict[str, Any]] = []
     if hotspot_id:
-        rows = _db_query_all(
+        hotspot_rows = _db_query_all(
             """
             SELECT converted_to_trip, minutes_to_trip
             FROM recommendation_outcomes
@@ -5703,8 +5722,10 @@ def _recent_recommendation_outcomes(zone_id: int, hotspot_id: Optional[str] = No
             """,
             (int(zone_id), str(hotspot_id), int(cutoff), int(max_rows)),
         )
-    else:
-        rows = _db_query_all(
+        hotspot_count = len(hotspot_rows)
+        if hotspot_count >= 6:
+            return [dict(r) for r in hotspot_rows], "hotspot_specific", hotspot_count, 0
+        zone_fallback_rows = _db_query_all(
             """
             SELECT converted_to_trip, minutes_to_trip
             FROM recommendation_outcomes
@@ -5715,7 +5736,29 @@ def _recent_recommendation_outcomes(zone_id: int, hotspot_id: Optional[str] = No
             """,
             (int(zone_id), int(cutoff), int(max_rows)),
         )
-    return [dict(r) for r in rows]
+        return [dict(r) for r in zone_fallback_rows], "zone_fallback", hotspot_count, len(zone_fallback_rows)
+
+    zone_fallback_rows = _db_query_all(
+        """
+        SELECT converted_to_trip, minutes_to_trip
+        FROM recommendation_outcomes
+        WHERE zone_id = ?
+          AND recommended_at >= ?
+        ORDER BY recommended_at DESC, id DESC
+        LIMIT ?
+        """,
+        (int(zone_id), int(cutoff), int(max_rows)),
+    )
+    return [dict(r) for r in zone_fallback_rows], "zone_fallback", 0, len(zone_fallback_rows)
+
+
+def _recent_recommendation_outcomes(zone_id: int, hotspot_id: Optional[str] = None, max_rows: int = 80) -> List[Dict[str, Any]]:
+    rows, _scope, _hotspot_count, _zone_count = _recent_recommendation_outcomes_with_scope(
+        zone_id=zone_id,
+        hotspot_id=hotspot_id,
+        max_rows=max_rows,
+    )
+    return rows
 
 
 def _pickup_zone_density_penalty(zone_ids: List[int]) -> Dict[int, float]:
@@ -5792,7 +5835,10 @@ def _enrich_emitted_zone_hotspot_features(
     for feature in zone_features:
         props = feature.setdefault("properties", {})
         hotspot_id = str(props.get("hotspot_id") or "")
-        outcome_rows = _recent_recommendation_outcomes(zone_id, hotspot_id if hotspot_id else None)
+        outcome_rows, outcome_scope_used, hotspot_specific_count, zone_fallback_count = _recent_recommendation_outcomes_with_scope(
+            zone_id,
+            hotspot_id if hotspot_id else None,
+        )
         outcome = get_zone_or_hotspot_outcome_modifier(outcome_rows)
         outcome_modifier = float(outcome.get("modifier") or 1.0)
 
@@ -5819,6 +5865,9 @@ def _enrich_emitted_zone_hotspot_features(
 
         props["outcome_modifier"] = round(outcome_modifier, 4)
         props["outcome_sample_count"] = int(float(outcome.get("sample_count") or 0.0))
+        props["outcome_scope_used"] = outcome_scope_used
+        props["hotspot_specific_outcome_sample_count"] = hotspot_specific_count
+        props["zone_fallback_outcome_sample_count"] = zone_fallback_count
         props["outcome_conversion_rate"] = round(float(outcome.get("conversion_rate") or 0.0), 4)
         props["outcome_median_minutes_to_trip"] = round(float(outcome.get("median_minutes_to_trip") or 0.0), 4)
 
@@ -5837,6 +5886,9 @@ def _enrich_emitted_zone_hotspot_features(
         "historical_anchor_point_count": historical_anchor_point_count,
         "historical_component_count": historical_component_count,
         "historical_strength": round(historical_strength, 4),
+        "outcome_scope_used": str(((zone_features[0].get("properties") or {}).get("outcome_scope_used")) if zone_features else "zone_fallback"),
+        "hotspot_specific_outcome_sample_count": int(((zone_features[0].get("properties") or {}).get("hotspot_specific_outcome_sample_count")) if zone_features else 0),
+        "zone_fallback_outcome_sample_count": int(((zone_features[0].get("properties") or {}).get("zone_fallback_outcome_sample_count")) if zone_features else 0),
     }
 
 
@@ -6314,6 +6366,10 @@ def _pickup_zone_hotspots_with_debug(
                 "historical_component_count_for_refinement": 0,
                 "refined_hotspot_ids": [],
                 "rejected_refinement_hotspot_ids": [],
+                "primary_recommended_hotspot_id": None,
+                "outcome_scope_used": "zone_fallback",
+                "hotspot_specific_outcome_sample_count": 0,
+                "zone_fallback_outcome_sample_count": 0,
                 "errors": [],
             }
             if qualified:
@@ -6420,11 +6476,22 @@ def _pickup_zone_hotspots_with_debug(
                 zone_debug["micro_hotspot_count"] = zone_micro_total
 
         score = zone_scores.get(zone_id)
+        primary_feature: Optional[Dict[str, Any]] = None
+        primary_recommended_hotspot_id: Optional[str] = None
+        if score is not None and bool(getattr(score, "recommended", False)) and zone_features:
+            primary_feature = _choose_primary_recommended_hotspot_feature(zone_features)
+            if primary_feature is not None:
+                primary_recommended_hotspot_id = str(
+                    ((primary_feature.get("properties") or {}).get("hotspot_id")) or ""
+                ) or None
+
         zone_micro_total = 0
         for feature in zone_features:
             props = feature.setdefault("properties", {})
             props["signature"] = signature
             zone_micro_total += len(props.get("micro_hotspots") or [])
+            props["recommended_hotspot"] = False
+            props["recommendation_scope"] = "zone_secondary"
             if score is not None:
                 _pickup_zone_score_cache[zone_id] = score.final_score
                 props["hotspot_score"] = score.final_score
@@ -6435,20 +6502,25 @@ def _pickup_zone_hotspots_with_debug(
                 props["weighted_trip_count"] = score.weighted_trip_count
                 props["unique_driver_count"] = score.unique_driver_count
                 props["recommended"] = score.recommended
-                if score.recommended and not score_bundle_fresh:
-                    try:
-                        log_recommendation_outcome(
-                            _db_exec,
-                            recommended_at=now_ts,
-                            zone_id=zone_id,
-                            score=score.final_score,
-                            confidence=score.confidence,
-                            cluster_id=None,
-                        )
-                    except Exception:
-                        if zone_debug is not None:
-                            zone_debug["errors"].append("log_recommendation_outcome_failed")
-                        print(f"[warn] Failed to log recommendation outcome for zone {zone_id}", traceback.format_exc())
+        if primary_feature is not None:
+            primary_props = primary_feature.setdefault("properties", {})
+            primary_props["recommended_hotspot"] = True
+            primary_props["recommendation_scope"] = "hotspot"
+
+        if score is not None and score.recommended and not score_bundle_fresh:
+            try:
+                log_recommendation_outcome(
+                    _db_exec,
+                    recommended_at=now_ts,
+                    zone_id=zone_id,
+                    score=score.final_score,
+                    confidence=score.confidence,
+                    cluster_id=primary_recommended_hotspot_id,
+                )
+            except Exception:
+                if zone_debug is not None:
+                    zone_debug["errors"].append("log_recommendation_outcome_failed")
+                print(f"[warn] Failed to log recommendation outcome for zone {zone_id}", traceback.format_exc())
         refinement_debug: Dict[str, Any] = {}
         try:
             refinement_debug = _refine_emitted_zone_hotspot_geometries(
@@ -6497,6 +6569,9 @@ def _pickup_zone_hotspots_with_debug(
                 ("historical_strength", 0.0),
                 ("outcome_modifier", 1.0),
                 ("outcome_sample_count", 0),
+                ("outcome_scope_used", "zone_fallback"),
+                ("hotspot_specific_outcome_sample_count", 0),
+                ("zone_fallback_outcome_sample_count", 0),
                 ("quality_modifier", 1.0),
                 ("short_trip_trap_penalty", 0.0),
                 ("continuation_bonus", 0.0),
@@ -6510,6 +6585,9 @@ def _pickup_zone_hotspots_with_debug(
                 for key in (
                     "outcome_modifier",
                     "outcome_sample_count",
+                    "outcome_scope_used",
+                    "hotspot_specific_outcome_sample_count",
+                    "zone_fallback_outcome_sample_count",
                     "quality_modifier",
                     "short_trip_trap_penalty",
                     "continuation_bonus",
@@ -6519,6 +6597,7 @@ def _pickup_zone_hotspots_with_debug(
                 ):
                     if key in top_props:
                         zone_debug[key] = top_props.get(key)
+            zone_debug["primary_recommended_hotspot_id"] = primary_recommended_hotspot_id
             zone_debug_map[zone_id] = zone_debug
 
     merge_candidate_map: Dict[int, List[Dict[str, Any]]] = {}
