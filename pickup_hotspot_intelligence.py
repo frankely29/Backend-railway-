@@ -466,8 +466,24 @@ def should_merge_adjacent_zone_hotspots(
         "sample_size",
         default=0.0,
     )
-    point_count_a = _feature_or_component_metric(comp_a, "point_count", "component_point_count", "sample_size", default=0.0)
-    point_count_b = _feature_or_component_metric(comp_b, "point_count", "component_point_count", "sample_size", default=0.0)
+    point_count_a = _feature_or_component_metric(
+        comp_a,
+        "point_count",
+        "component_point_count",
+        "weighted_point_count",
+        "historical_weighted_support",
+        "sample_size",
+        default=0.0,
+    )
+    point_count_b = _feature_or_component_metric(
+        comp_b,
+        "point_count",
+        "component_point_count",
+        "weighted_point_count",
+        "historical_weighted_support",
+        "sample_size",
+        default=0.0,
+    )
     combined_support = support_a + support_b
     if combined_support < 14.0:
         return {"eligible": False, "reason": "insufficient_historical_support", "combined_support": combined_support}

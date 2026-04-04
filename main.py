@@ -6200,10 +6200,11 @@ def _build_cross_zone_merged_hotspot_feature(
         },
     }
     for key in ("final_score", "hotspot_score"):
-        merged_feature["properties"][key] = max(
-            _metric_from_feature_props(feature_a, key),
-            _metric_from_feature_props(feature_b, key),
-        )
+        if key in props_a or key in props_b:
+            merged_feature["properties"][key] = max(
+                _metric_from_feature_props(feature_a, key),
+                _metric_from_feature_props(feature_b, key),
+            )
     return merged_feature
 
 
