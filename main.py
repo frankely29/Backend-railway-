@@ -186,12 +186,16 @@ PICKUP_HOTSPOT_CACHE_TTL_SECONDS = float(os.environ.get("PICKUP_HOTSPOT_CACHE_TT
 PICKUP_HOTSPOT_CACHE_STALE_SECONDS = float(os.environ.get("PICKUP_HOTSPOT_CACHE_STALE_SECONDS", "900"))
 PICKUP_SCORE_CACHE_TTL_SECONDS = float(os.environ.get("PICKUP_SCORE_CACHE_TTL_SECONDS", "15"))
 PICKUP_EXPERIMENT_PRUNE_INTERVAL_SECONDS = float(os.environ.get("PICKUP_EXPERIMENT_PRUNE_INTERVAL_SECONDS", "300"))
+RECOMMENDATION_OUTCOME_MATURITY_SECONDS = 5400
+OUTCOME_SETTLEMENT_SWEEP_INTERVAL_SECONDS = 120
 _pickup_recent_cache: Dict[str, Dict[str, Any]] = {}
 _pickup_recent_cache_lock = threading.Lock()
 _pickup_zone_score_bundle_cache: Dict[str, Dict[str, Any]] = {}
 _pickup_zone_score_bundle_lock = threading.Lock()
 _pickup_zone_maintenance_lock = threading.Lock()
 _pickup_last_experiment_prune_monotonic = 0.0
+_outcome_settlement_lock = threading.Lock()
+_last_outcome_settlement_monotonic = 0.0
 _presence_viewport_cache: Dict[str, Dict[str, Any]] = {}
 _presence_viewport_cache_lock = threading.Lock()
 _presence_cursor_lock = threading.Lock()
@@ -5876,6 +5880,81 @@ def _choose_primary_recommended_hotspot_feature(zone_features: List[Dict[str, An
     return ranked[0] if ranked else None
 
 
+def _settle_stale_hotspot_recommendation_outcomes(now_ts: int) -> int:
+    cutoff = int(now_ts) - RECOMMENDATION_OUTCOME_MATURITY_SECONDS
+    with _db_lock:
+        conn = _db()
+        cur = conn.cursor()
+        cur.execute(
+            _sql(
+                """
+                UPDATE recommendation_outcomes
+                SET converted_to_trip = ?, minutes_to_trip = ?
+                WHERE converted_to_trip IS NULL
+                  AND recommended_at <= ?
+                """
+            ),
+            (
+                False if DB_BACKEND == "postgres" else 0,
+                float(RECOMMENDATION_OUTCOME_MATURITY_SECONDS / 60.0),
+                int(cutoff),
+            ),
+        )
+        updated_rows = int(cur.rowcount or 0)
+        conn.commit()
+    return updated_rows
+
+
+def _settle_stale_micro_recommendation_outcomes(now_ts: int) -> int:
+    cutoff = int(now_ts) - RECOMMENDATION_OUTCOME_MATURITY_SECONDS
+    with _db_lock:
+        conn = _db()
+        cur = conn.cursor()
+        cur.execute(
+            _sql(
+                """
+                UPDATE micro_recommendation_outcomes
+                SET converted_to_trip = ?, minutes_to_trip = ?
+                WHERE converted_to_trip IS NULL
+                  AND recommended_at <= ?
+                """
+            ),
+            (
+                False if DB_BACKEND == "postgres" else 0,
+                float(RECOMMENDATION_OUTCOME_MATURITY_SECONDS / 60.0),
+                int(cutoff),
+            ),
+        )
+        updated_rows = int(cur.rowcount or 0)
+        conn.commit()
+    return updated_rows
+
+
+def _maybe_settle_stale_recommendation_outcomes(now_ts: int) -> Dict[str, int]:
+    global _last_outcome_settlement_monotonic
+    now_monotonic = time.monotonic()
+    if (now_monotonic - float(_last_outcome_settlement_monotonic or 0.0)) < OUTCOME_SETTLEMENT_SWEEP_INTERVAL_SECONDS:
+        return {
+            "settled_stale_hotspot_outcomes": 0,
+            "settled_stale_micro_outcomes": 0,
+        }
+
+    with _outcome_settlement_lock:
+        refreshed_monotonic = time.monotonic()
+        if (refreshed_monotonic - float(_last_outcome_settlement_monotonic or 0.0)) < OUTCOME_SETTLEMENT_SWEEP_INTERVAL_SECONDS:
+            return {
+                "settled_stale_hotspot_outcomes": 0,
+                "settled_stale_micro_outcomes": 0,
+            }
+        settled_hotspot = _settle_stale_hotspot_recommendation_outcomes(now_ts)
+        settled_micro = _settle_stale_micro_recommendation_outcomes(now_ts)
+        _last_outcome_settlement_monotonic = refreshed_monotonic
+    return {
+        "settled_stale_hotspot_outcomes": int(settled_hotspot),
+        "settled_stale_micro_outcomes": int(settled_micro),
+    }
+
+
 def _recent_recommendation_outcomes_with_scope(
     zone_id: int,
     hotspot_id: Optional[str] = None,
@@ -5890,6 +5969,7 @@ def _recent_recommendation_outcomes_with_scope(
             FROM recommendation_outcomes
             WHERE zone_id = ?
               AND cluster_id = ?
+              AND converted_to_trip IS NOT NULL
               AND recommended_at >= ?
             ORDER BY recommended_at DESC, id DESC
             LIMIT ?
@@ -5904,6 +5984,7 @@ def _recent_recommendation_outcomes_with_scope(
             SELECT converted_to_trip, minutes_to_trip
             FROM recommendation_outcomes
             WHERE zone_id = ?
+              AND converted_to_trip IS NOT NULL
               AND recommended_at >= ?
             ORDER BY recommended_at DESC, id DESC
             LIMIT ?
@@ -5917,6 +5998,7 @@ def _recent_recommendation_outcomes_with_scope(
         SELECT converted_to_trip, minutes_to_trip
         FROM recommendation_outcomes
         WHERE zone_id = ?
+          AND converted_to_trip IS NOT NULL
           AND recommended_at >= ?
         ORDER BY recommended_at DESC, id DESC
         LIMIT ?
@@ -5964,6 +6046,7 @@ def _recent_recommendation_outcomes_for_merged_hotspot(
         FROM recommendation_outcomes
         WHERE cluster_id = ?
           AND zone_id IN ({placeholders})
+          AND converted_to_trip IS NOT NULL
           AND recommended_at >= ?
         ORDER BY recommended_at DESC, id DESC
         LIMIT ?
@@ -6766,6 +6849,7 @@ def _recent_micro_recommendation_outcomes(zone_id: int, micro_cluster_id: str, m
         FROM micro_recommendation_outcomes
         WHERE zone_id = ?
           AND micro_cluster_id = ?
+          AND converted_to_trip IS NOT NULL
           AND recommended_at >= ?
         ORDER BY recommended_at DESC, id DESC
         LIMIT ?
@@ -7023,6 +7107,9 @@ def _pickup_zone_hotspots_with_debug(
         "logged_primary_micro_outcome_count": 0,
         "micro_hotspot_specific_learning_count": 0,
         "micro_hotspot_parent_fallback_learning_count": 0,
+        "settled_stale_hotspot_outcomes": 0,
+        "settled_stale_micro_outcomes": 0,
+        "outcome_learning_resolved_only": True,
     }
     if include_debug:
         debug.update(
@@ -7038,6 +7125,8 @@ def _pickup_zone_hotspots_with_debug(
 
     now_ts = int(time.time())
     now_monotonic = time.monotonic()
+    settlement_counts = _maybe_settle_stale_recommendation_outcomes(now_ts)
+    debug.update(settlement_counts)
     zone_geoms: Dict[int, Dict[str, Any]] = {}
     try:
         zone_geoms = _load_pickup_zone_geometries()
