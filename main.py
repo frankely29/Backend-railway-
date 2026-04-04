@@ -6128,7 +6128,7 @@ def _compute_merged_hotspot_learning_payload(
         "outcome_median_minutes_to_trip": 0.0,
         "outcome_representative_minutes_to_trip": 0.0,
         "outcome_raw_modifier_before_support_damping": float(fallback_outcome_modifier),
-        "outcome_recency_weight_version": "",
+        "outcome_recency_weight_version": "resolved_recency_v1",
         "merged_outcome_scope_used": "merged_fallback_from_children",
         "merged_outcome_sample_count": int(merged_sample_count),
         "merged_outcome_effective_sample_count": 0.0,
@@ -6138,7 +6138,7 @@ def _compute_merged_hotspot_learning_payload(
         "merged_outcome_median_minutes_to_trip": 0.0,
         "merged_outcome_representative_minutes_to_trip": 0.0,
         "merged_outcome_raw_modifier_before_support_damping": float(fallback_outcome_modifier),
-        "merged_outcome_recency_weight_version": "",
+        "merged_outcome_recency_weight_version": "resolved_recency_v1",
         "used_merged_hotspot_specific": False,
     }
 
@@ -6275,6 +6275,16 @@ def _enrich_emitted_zone_hotspot_features(
         "historical_component_count": historical_component_count,
         "historical_strength": round(historical_strength, 4),
         "outcome_scope_used": str(((zone_features[0].get("properties") or {}).get("outcome_scope_used")) if zone_features else "zone_fallback"),
+        "outcome_effective_sample_count": float(((zone_features[0].get("properties") or {}).get("outcome_effective_sample_count")) if zone_features else 0.0),
+        "outcome_raw_conversion_rate": float(((zone_features[0].get("properties") or {}).get("outcome_raw_conversion_rate")) if zone_features else 0.0),
+        "outcome_representative_minutes_to_trip": float(((zone_features[0].get("properties") or {}).get("outcome_representative_minutes_to_trip")) if zone_features else 0.0),
+        "outcome_support_strength": float(((zone_features[0].get("properties") or {}).get("outcome_support_strength")) if zone_features else 0.0),
+        "outcome_raw_modifier_before_support_damping": float(
+            ((zone_features[0].get("properties") or {}).get("outcome_raw_modifier_before_support_damping")) if zone_features else 1.0
+        ),
+        "outcome_recency_weight_version": str(
+            ((zone_features[0].get("properties") or {}).get("outcome_recency_weight_version")) if zone_features else "resolved_recency_v1"
+        ),
         "hotspot_specific_outcome_sample_count": int(((zone_features[0].get("properties") or {}).get("hotspot_specific_outcome_sample_count")) if zone_features else 0),
         "zone_fallback_outcome_sample_count": int(((zone_features[0].get("properties") or {}).get("zone_fallback_outcome_sample_count")) if zone_features else 0),
     }
@@ -7534,6 +7544,12 @@ def _pickup_zone_hotspots_with_debug(
                 ("outcome_scope_used", "zone_fallback"),
                 ("hotspot_specific_outcome_sample_count", 0),
                 ("zone_fallback_outcome_sample_count", 0),
+                ("outcome_effective_sample_count", 0.0),
+                ("outcome_raw_conversion_rate", 0.0),
+                ("outcome_representative_minutes_to_trip", 0.0),
+                ("outcome_support_strength", 0.0),
+                ("outcome_raw_modifier_before_support_damping", 1.0),
+                ("outcome_recency_weight_version", "resolved_recency_v1"),
                 ("quality_modifier", 1.0),
                 ("short_trip_trap_penalty", 0.0),
                 ("continuation_bonus", 0.0),
@@ -7550,6 +7566,12 @@ def _pickup_zone_hotspots_with_debug(
                     "outcome_scope_used",
                     "hotspot_specific_outcome_sample_count",
                     "zone_fallback_outcome_sample_count",
+                    "outcome_effective_sample_count",
+                    "outcome_raw_conversion_rate",
+                    "outcome_representative_minutes_to_trip",
+                    "outcome_support_strength",
+                    "outcome_raw_modifier_before_support_damping",
+                    "outcome_recency_weight_version",
                     "quality_modifier",
                     "short_trip_trap_penalty",
                     "continuation_bonus",
