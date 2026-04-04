@@ -392,6 +392,8 @@ def _component_geometry_proj(comp: Mapping[str, Any]):
         return None
     try:
         if isinstance(geom_obj, dict):
+            if geom_obj.get("type") == "Feature" and isinstance(geom_obj.get("geometry"), dict):
+                geom_obj = geom_obj.get("geometry")
             geom_obj = shape(geom_obj)
         return transform(_TO_3857.transform, geom_obj)
     except Exception:
@@ -575,8 +577,8 @@ def build_cross_zone_merged_hotspots(
                     "primary_zone_id": a,
                     "merged_zone_ids": [a, b],
                     "merged_zone_names": [
-                        str((meta_a if zone_a == a else meta_b).get("zone_name") or ""),
-                        str((meta_b if zone_b == b else meta_a).get("zone_name") or ""),
+                        str((zone_meta_map.get(a) or {}).get("zone_name") or ""),
+                        str((zone_meta_map.get(b) or {}).get("zone_name") or ""),
                     ],
                     "borough": str(meta_a.get("borough") or meta_b.get("borough") or ""),
                     "component_a": comp_a,
