@@ -81,6 +81,7 @@ def build_zone_earnings_shadow_sql(
     has_request_datetime = "request_datetime" in cols if cols else True
     has_shared_match_flag = "shared_match_flag" in cols if cols else False
     has_shared_request_flag = "shared_request_flag" in cols if cols else False
+    has_airport_fee = "airport_fee" in cols if cols else False
 
     lag_min_expr = minute_diff_sql("pickup_datetime", "request_datetime")
     pay_per_min_expr = safe_div_sql("driver_pay", "GREATEST(trip_time / 60.0, 1.0 / 60.0)", "NULL")
@@ -176,6 +177,7 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
         TRY_CAST(driver_pay AS DOUBLE) AS driver_pay,
         TRY_CAST(trip_time AS DOUBLE) AS trip_time,
         TRY_CAST(trip_miles AS DOUBLE) AS trip_miles,
+        {"TRY_CAST(airport_fee AS DOUBLE) AS airport_fee," if has_airport_fee else "NULL::DOUBLE AS airport_fee,"}
         {shared_expr} AS shared_flag
       FROM read_parquet([{parquet_sql}])
       WHERE PULocationID IS NOT NULL
@@ -194,6 +196,7 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
         driver_pay,
         trip_time,
         trip_miles,
+        airport_fee,
         shared_flag,
         CASE
           WHEN request_datetime IS NULL THEN NULL
@@ -213,6 +216,7 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
         driver_pay,
         trip_time,
         trip_miles,
+        airport_fee,
         pay_per_min,
         pay_per_mile,
         request_to_pickup_min,
@@ -220,7 +224,57 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
         CASE WHEN shared_flag = 1 THEN 1 ELSE 0 END AS is_shared,
         CASE WHEN trip_time >= 1200 THEN 1 ELSE 0 END AS is_long_trip_20plus,
         CASE WHEN trip_miles BETWEEN 3.0 AND 10.0 AND trip_time BETWEEN 720.0 AND 2400.0 THEN 1 ELSE 0 END AS is_balanced_trip,
-        CASE WHEN DOLocationID = PULocationID THEN 1 ELSE 0 END AS is_same_zone_dropoff
+        CASE WHEN DOLocationID = PULocationID THEN 1 ELSE 0 END AS is_same_zone_dropoff,
+        CASE
+          WHEN COALESCE(airport_fee, 0.0) > 0 THEN 1
+          WHEN DOLocationID IN (SELECT PULocationID FROM zone_metadata WHERE airport_excluded = TRUE) THEN 1
+          ELSE 0
+        END AS is_airport_exit,
+        CASE
+          WHEN DOLocationID IN (SELECT PULocationID FROM zone_metadata WHERE airport_excluded = FALSE) THEN 1
+          ELSE 0
+        END AS is_scored_network_dropoff,
+        CASE
+          WHEN DOLocationID IS NULL THEN 1
+          WHEN DOLocationID NOT IN (SELECT PULocationID FROM zone_metadata WHERE airport_excluded = FALSE) THEN 1
+          ELSE 0
+        END AS is_out_of_scored_network_exit,
+        CASE
+          WHEN (
+            CASE
+              WHEN DOLocationID IS NULL THEN 1
+              WHEN DOLocationID NOT IN (SELECT PULocationID FROM zone_metadata WHERE airport_excluded = FALSE) THEN 1
+              ELSE 0
+            END
+          ) = 1
+          AND trip_miles <= 6.0
+          AND trip_time <= 1800.0
+          THEN 1 ELSE 0
+        END AS is_short_external_exit_6mi_30min,
+        CASE
+          WHEN (
+            CASE
+              WHEN DOLocationID IS NULL THEN 1
+              WHEN DOLocationID NOT IN (SELECT PULocationID FROM zone_metadata WHERE airport_excluded = FALSE) THEN 1
+              ELSE 0
+            END
+          ) = 1
+          AND trip_miles <= 8.0
+          AND trip_time <= 2400.0
+          THEN 1 ELSE 0
+        END AS is_short_external_exit_8mi_40min,
+        CASE
+          WHEN (
+            CASE
+              WHEN DOLocationID IS NULL THEN 1
+              WHEN DOLocationID NOT IN (SELECT PULocationID FROM zone_metadata WHERE airport_excluded = FALSE) THEN 1
+              ELSE 0
+            END
+          ) = 1
+          AND trip_miles >= 12.0
+          AND COALESCE(driver_pay, 0.0) >= 25.0
+          THEN 1 ELSE 0
+        END AS is_good_long_external_exit
       FROM prepared
       WHERE PULocationID IS NOT NULL
     ),
@@ -238,7 +292,12 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
         AVG(is_shared * 1.0) AS shared_ride_share,
         AVG(is_long_trip_20plus * 1.0) AS long_trip_share_20plus,
         AVG(is_balanced_trip * 1.0) AS balanced_trip_share,
-        AVG(is_same_zone_dropoff * 1.0) AS same_zone_dropoff_share
+        AVG(is_same_zone_dropoff * 1.0) AS same_zone_dropoff_share,
+        AVG(is_airport_exit * 1.0) AS airport_exit_share,
+        AVG(is_out_of_scored_network_exit * 1.0) AS out_of_scored_network_exit_share,
+        AVG(is_short_external_exit_6mi_30min * 1.0) AS short_external_exit_share_6mi_30min,
+        AVG(is_short_external_exit_8mi_40min * 1.0) AS short_external_exit_share_8mi_40min,
+        AVG(is_good_long_external_exit * 1.0) AS good_long_external_exit_share
       FROM binned
       GROUP BY 1,2,3
       HAVING COUNT(*) >= {min_trips_per_window}
@@ -269,6 +328,11 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
         COALESCE(long_trip_share_20plus, 0.0) AS long_trip_share_20plus,
         COALESCE(balanced_trip_share, 0.0) AS balanced_trip_share,
         COALESCE(same_zone_dropoff_share, 0.0) AS same_zone_dropoff_share,
+        COALESCE(airport_exit_share, 0.0) AS airport_exit_share,
+        COALESCE(out_of_scored_network_exit_share, 0.0) AS out_of_scored_network_exit_share,
+        COALESCE(short_external_exit_share_6mi_30min, 0.0) AS short_external_exit_share_6mi_30min,
+        COALESCE(short_external_exit_share_8mi_40min, 0.0) AS short_external_exit_share_8mi_40min,
+        COALESCE(good_long_external_exit_share, 0.0) AS good_long_external_exit_share,
         (dow_m * {bins_per_day} + CAST(bin_start_min / {bin_minutes} AS INTEGER)) AS bin_index
       FROM with_next
     ),
@@ -341,6 +405,11 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
         z.long_trip_share_20plus,
         z.balanced_trip_share,
         z.same_zone_dropoff_share,
+        z.airport_exit_share,
+        z.out_of_scored_network_exit_share,
+        z.short_external_exit_share_6mi_30min,
+        z.short_external_exit_share_8mi_40min,
+        z.good_long_external_exit_share,
         COALESCE(d.downstream_next_value_raw, 0.0) AS downstream_next_value_raw,
         COALESCE(d.downstream_coverage, 0.0) AS downstream_coverage,
         g.zone_area_sq_miles,
@@ -385,7 +454,17 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
         ROW_NUMBER() OVER (PARTITION BY dow_m, bin_start_min ORDER BY balanced_trip_share) AS balanced_trip_share_rn,
         COUNT(balanced_trip_share) OVER (PARTITION BY dow_m, bin_start_min) AS balanced_trip_share_n,
         ROW_NUMBER() OVER (PARTITION BY dow_m, bin_start_min ORDER BY same_zone_dropoff_share) AS same_zone_retention_penalty_rn,
-        COUNT(same_zone_dropoff_share) OVER (PARTITION BY dow_m, bin_start_min) AS same_zone_retention_penalty_n
+        COUNT(same_zone_dropoff_share) OVER (PARTITION BY dow_m, bin_start_min) AS same_zone_retention_penalty_n,
+        ROW_NUMBER() OVER (PARTITION BY dow_m, bin_start_min ORDER BY airport_exit_share) AS airport_exit_share_rn,
+        COUNT(airport_exit_share) OVER (PARTITION BY dow_m, bin_start_min) AS airport_exit_share_n,
+        ROW_NUMBER() OVER (PARTITION BY dow_m, bin_start_min ORDER BY out_of_scored_network_exit_share) AS out_of_scored_network_exit_share_rn,
+        COUNT(out_of_scored_network_exit_share) OVER (PARTITION BY dow_m, bin_start_min) AS out_of_scored_network_exit_share_n,
+        ROW_NUMBER() OVER (PARTITION BY dow_m, bin_start_min ORDER BY short_external_exit_share_6mi_30min) AS short_external_exit_share_6mi_30min_rn,
+        COUNT(short_external_exit_share_6mi_30min) OVER (PARTITION BY dow_m, bin_start_min) AS short_external_exit_share_6mi_30min_n,
+        ROW_NUMBER() OVER (PARTITION BY dow_m, bin_start_min ORDER BY short_external_exit_share_8mi_40min) AS short_external_exit_share_8mi_40min_rn,
+        COUNT(short_external_exit_share_8mi_40min) OVER (PARTITION BY dow_m, bin_start_min) AS short_external_exit_share_8mi_40min_n,
+        ROW_NUMBER() OVER (PARTITION BY dow_m, bin_start_min ORDER BY good_long_external_exit_share) AS good_long_external_exit_share_rn,
+        COUNT(good_long_external_exit_share) OVER (PARTITION BY dow_m, bin_start_min) AS good_long_external_exit_share_n
       FROM joined
     ),
     normalized AS (
@@ -404,6 +483,11 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
         long_trip_share_20plus,
         balanced_trip_share,
         same_zone_dropoff_share,
+        airport_exit_share,
+        out_of_scored_network_exit_share,
+        short_external_exit_share_6mi_30min,
+        short_external_exit_share_8mi_40min,
+        good_long_external_exit_share,
         zone_area_sq_miles,
         centroid_latitude,
         borough_name,
@@ -456,6 +540,31 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
           WHEN balanced_trip_share_n <= 1 THEN 0.0
           ELSE (balanced_trip_share_rn - 1) * 1.0 / (balanced_trip_share_n - 1)
         END AS balanced_trip_share_n,
+        CASE
+          WHEN airport_exit_share IS NULL THEN NULL
+          WHEN airport_exit_share_n <= 1 THEN 0.0
+          ELSE (airport_exit_share_rn - 1) * 1.0 / (airport_exit_share_n - 1)
+        END AS airport_exit_share_n,
+        CASE
+          WHEN out_of_scored_network_exit_share IS NULL THEN NULL
+          WHEN out_of_scored_network_exit_share_n <= 1 THEN 0.0
+          ELSE (out_of_scored_network_exit_share_rn - 1) * 1.0 / (out_of_scored_network_exit_share_n - 1)
+        END AS out_of_scored_network_exit_share_n,
+        CASE
+          WHEN short_external_exit_share_6mi_30min IS NULL THEN NULL
+          WHEN short_external_exit_share_6mi_30min_n <= 1 THEN 0.0
+          ELSE (short_external_exit_share_6mi_30min_rn - 1) * 1.0 / (short_external_exit_share_6mi_30min_n - 1)
+        END AS short_external_exit_share_6mi_30min_n,
+        CASE
+          WHEN short_external_exit_share_8mi_40min IS NULL THEN NULL
+          WHEN short_external_exit_share_8mi_40min_n <= 1 THEN 0.0
+          ELSE (short_external_exit_share_8mi_40min_rn - 1) * 1.0 / (short_external_exit_share_8mi_40min_n - 1)
+        END AS short_external_exit_share_8mi_40min_n,
+        CASE
+          WHEN good_long_external_exit_share IS NULL THEN NULL
+          WHEN good_long_external_exit_share_n <= 1 THEN 0.0
+          ELSE (good_long_external_exit_share_rn - 1) * 1.0 / (good_long_external_exit_share_n - 1)
+        END AS good_long_external_exit_share_n,
         downstream_coverage
       FROM ranked
     ),
@@ -613,6 +722,35 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
           1.0
         ) AS market_saturation_penalty_n
       FROM normalized_support
+    ),
+    trap_exit_shadow AS (
+      SELECT
+        *,
+        LEAST(GREATEST(
+          0.24 * short_trip_penalty_n +
+          0.20 * COALESCE(same_zone_retention_penalty_n, 0.0) +
+          0.18 * COALESCE(airport_exit_share_n, 0.0) +
+          0.18 * COALESCE(out_of_scored_network_exit_share_n, 0.0) +
+          0.14 * COALESCE(short_external_exit_share_8mi_40min_n, 0.0) -
+          0.10 * COALESCE(good_long_external_exit_share_n, 0.0) -
+          0.10 * COALESCE(downstream_value_n, 0.0)
+        , 0.0), 1.0) AS return_risk_shadow,
+        LEAST(GREATEST(
+          0.42 * COALESCE(downstream_value_n, 0.0) +
+          0.18 * COALESCE(good_long_external_exit_share_n, 0.0) +
+          0.16 * COALESCE(pay_per_min_n, 0.0) +
+          0.12 * COALESCE(pay_per_mile_n, 0.0) -
+          0.12 * LEAST(GREATEST(
+            0.24 * short_trip_penalty_n +
+            0.20 * COALESCE(same_zone_retention_penalty_n, 0.0) +
+            0.18 * COALESCE(airport_exit_share_n, 0.0) +
+            0.18 * COALESCE(out_of_scored_network_exit_share_n, 0.0) +
+            0.14 * COALESCE(short_external_exit_share_8mi_40min_n, 0.0) -
+            0.10 * COALESCE(good_long_external_exit_share_n, 0.0) -
+            0.10 * COALESCE(downstream_value_n, 0.0)
+          , 0.0), 1.0)
+        , 0.0), 1.0) AS escape_quality_shadow
+      FROM normalized_support_enriched
     ),
     scored_pre_tier AS (
       SELECT
@@ -786,7 +924,7 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
           {sw3.market_saturation_penalty_weight:.8f} * COALESCE(market_saturation_penalty_n, 0.0)
         ) AS negative_score_staten_island_v3,
         LEAST(1.0, pickups_now / 40.0) * (0.70 + 0.30 * downstream_coverage) AS earnings_shadow_confidence_citywide_v2
-      FROM normalized_support_enriched
+      FROM trap_exit_shadow
     ),
     scored AS (
       SELECT
@@ -1277,7 +1415,19 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
         WHEN earnings_shadow_rating_staten_island_v3 >= 33 THEN '#ffd400'
         WHEN earnings_shadow_rating_staten_island_v3 >= 25 THEN '#ff8c00'
         ELSE '#e60000'
-      END AS earnings_shadow_color_staten_island_v3
+      END AS earnings_shadow_color_staten_island_v3,
+      airport_exit_share,
+      out_of_scored_network_exit_share,
+      short_external_exit_share_6mi_30min,
+      short_external_exit_share_8mi_40min,
+      good_long_external_exit_share,
+      airport_exit_share_n,
+      out_of_scored_network_exit_share_n,
+      short_external_exit_share_6mi_30min_n,
+      short_external_exit_share_8mi_40min_n,
+      good_long_external_exit_share_n,
+      return_risk_shadow,
+      escape_quality_shadow
     FROM final
     ORDER BY dow_m, bin_start_min, PULocationID
     """
