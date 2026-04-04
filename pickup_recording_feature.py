@@ -190,7 +190,7 @@ def _settle_latest_hotspot_recommendation_outcome_tx(
     pickup_lat: float,
     pickup_lng: float,
     now_ts: int,
-) -> Dict[str, bool]:
+) -> Dict[str, Any]:
     rows = _query_all_cur(
         cur,
         """
@@ -234,10 +234,16 @@ def _settle_latest_hotspot_recommendation_outcome_tx(
         minutes_to_trip = max(0.0, (float(now_ts) - float(recommended_at)) / 60.0)
         _exec_cur(
             cur,
-            "UPDATE recommendation_outcomes SET converted_to_trip=?, minutes_to_trip=? WHERE id=?",
-            (_bool_db_value(True), float(minutes_to_trip), int(best["id"])),
+            "UPDATE recommendation_outcomes SET converted_to_trip=?, minutes_to_trip=?, distance_to_recommendation_miles=? WHERE id=?",
+            (_bool_db_value(True), float(minutes_to_trip), float(best["_distance_miles"]), int(best["id"])),
         )
-        return {"settled": True, "spatial": True, "legacy_fallback": False}
+        return {
+            "settled": True,
+            "spatial": True,
+            "legacy_fallback": False,
+            "used_spatial_match": True,
+            "matched_distance_miles": float(best["_distance_miles"]),
+        }
 
     fallback_row = _query_one_cur(
         cur,
@@ -255,15 +261,21 @@ def _settle_latest_hotspot_recommendation_outcome_tx(
         (int(user_id), int(zone_id), int(now_ts), int(now_ts) - 5400),
     )
     if not fallback_row:
-        return {"settled": False, "spatial": False, "legacy_fallback": False}
+        return {"settled": False, "spatial": False, "legacy_fallback": False, "used_spatial_match": False, "matched_distance_miles": None}
     recommended_at = int(fallback_row.get("recommended_at") or now_ts)
     minutes_to_trip = max(0.0, (float(now_ts) - float(recommended_at)) / 60.0)
     _exec_cur(
         cur,
-        "UPDATE recommendation_outcomes SET converted_to_trip=?, minutes_to_trip=? WHERE id=?",
-        (_bool_db_value(True), float(minutes_to_trip), int(fallback_row["id"])),
+        "UPDATE recommendation_outcomes SET converted_to_trip=?, minutes_to_trip=?, distance_to_recommendation_miles=? WHERE id=?",
+        (_bool_db_value(True), float(minutes_to_trip), None, int(fallback_row["id"])),
     )
-    return {"settled": True, "spatial": False, "legacy_fallback": True}
+    return {
+        "settled": True,
+        "spatial": False,
+        "legacy_fallback": True,
+        "used_spatial_match": False,
+        "matched_distance_miles": None,
+    }
 
 
 def _settle_latest_micro_recommendation_outcome_tx(
@@ -273,7 +285,7 @@ def _settle_latest_micro_recommendation_outcome_tx(
     pickup_lat: float,
     pickup_lng: float,
     now_ts: int,
-) -> bool:
+) -> Dict[str, Any]:
     rows = _query_all_cur(
         cur,
         """
@@ -313,15 +325,15 @@ def _settle_latest_micro_recommendation_outcome_tx(
         ):
             best = candidate
     if best is None:
-        return False
+        return {"settled": False, "used_spatial_match": False, "matched_distance_miles": None}
     recommended_at = int(best.get("recommended_at") or now_ts)
     minutes_to_trip = max(0.0, (float(now_ts) - float(recommended_at)) / 60.0)
     _exec_cur(
         cur,
-        "UPDATE micro_recommendation_outcomes SET converted_to_trip=?, minutes_to_trip=? WHERE id=?",
-        (_bool_db_value(True), float(minutes_to_trip), int(best["id"])),
+        "UPDATE micro_recommendation_outcomes SET converted_to_trip=?, minutes_to_trip=?, distance_to_recommendation_miles=? WHERE id=?",
+        (_bool_db_value(True), float(minutes_to_trip), float(best["_distance_miles"]), int(best["id"])),
     )
-    return True
+    return {"settled": True, "used_spatial_match": True, "matched_distance_miles": float(best["_distance_miles"])}
 
 
 def record_pickup_presence_heartbeat(user_id: int, lat: float, lng: float, now_ts: int) -> None:
@@ -706,7 +718,7 @@ def create_pickup_record(payload: PickupRecordingPayload, user: Any) -> Dict[str
                     settled_hotspot_recommendation_spatial = False
                     settled_hotspot_recommendation_legacy_fallback = False
                 try:
-                    settled_micro_recommendation = _settle_latest_micro_recommendation_outcome_tx(
+                    micro_settlement = _settle_latest_micro_recommendation_outcome_tx(
                         cur,
                         user_id=int(user["id"]),
                         zone_id=int(payload.zone_id),
@@ -714,7 +726,8 @@ def create_pickup_record(payload: PickupRecordingPayload, user: Any) -> Dict[str
                         pickup_lng=float(payload.lng),
                         now_ts=now,
                     )
-                    settled_micro_recommendation_spatial = bool(settled_micro_recommendation)
+                    settled_micro_recommendation = bool(micro_settlement.get("settled"))
+                    settled_micro_recommendation_spatial = bool(micro_settlement.get("used_spatial_match"))
                 except Exception:
                     settled_micro_recommendation = False
                     settled_micro_recommendation_spatial = False

@@ -628,6 +628,9 @@ def get_zone_or_hotspot_outcome_modifier(
             "raw_conversion_rate": 0.0,
             "median_minutes_to_trip": 0.0,
             "representative_minutes_to_trip": 0.0,
+            "representative_distance_to_recommendation_miles": 0.0,
+            "distance_sample_count": 0,
+            "precision_boost_component": 0.0,
             "raw_modifier_before_support_damping": 1.0,
             "recency_weight_version": "resolved_recency_v1",
         }
@@ -638,6 +641,9 @@ def get_zone_or_hotspot_outcome_modifier(
     mins: List[float] = []
     weighted_minutes_mass = 0.0
     weighted_minutes_total = 0.0
+    weighted_distance_mass = 0.0
+    weighted_distance_total = 0.0
+    distance_sample_count = 0
     for row in rows:
         weight = _outcome_recency_weight(row.get("recommended_at"), now_ts)
         weighted_total += float(weight)
@@ -654,6 +660,15 @@ def get_zone_or_hotspot_outcome_modifier(
                 weighted_minutes_total += float(weight)
             except Exception:
                 pass
+        distance_miles = row.get("distance_to_recommendation_miles")
+        if distance_miles is not None:
+            try:
+                distance_float = max(0.0, float(distance_miles))
+                weighted_distance_mass += float(weight) * distance_float
+                weighted_distance_total += float(weight)
+                distance_sample_count += 1
+            except Exception:
+                pass
     weighted_conversion_rate = weighted_conversion_mass / max(0.0001, weighted_total)
     raw_conversion_rate = converted / max(1, sample_count)
     mins.sort()
@@ -662,7 +677,11 @@ def get_zone_or_hotspot_outcome_modifier(
 
     conv_boost = (weighted_conversion_rate - 0.45) * 0.55
     speed_boost = (12.0 - weighted_minutes) / 50.0
-    raw_modifier = 1.0 + conv_boost + speed_boost
+    representative_distance_miles = (
+        weighted_distance_mass / max(0.0001, weighted_distance_total) if weighted_distance_total > 0.0 else 0.0
+    )
+    precision_boost = _clip((0.12 - representative_distance_miles) / 0.40, -0.08, 0.08) if distance_sample_count > 0 else 0.0
+    raw_modifier = 1.0 + conv_boost + speed_boost + precision_boost
     effective_min_support = 4.0
     effective_full_support = 10.0
     support_strength = _clip(
@@ -681,6 +700,9 @@ def get_zone_or_hotspot_outcome_modifier(
         "raw_conversion_rate": float(raw_conversion_rate),
         "median_minutes_to_trip": float(raw_median_minutes),
         "representative_minutes_to_trip": float(weighted_minutes),
+        "representative_distance_to_recommendation_miles": float(representative_distance_miles),
+        "distance_sample_count": int(distance_sample_count),
+        "precision_boost_component": float(precision_boost),
         "raw_modifier_before_support_damping": float(raw_modifier),
         "recency_weight_version": "resolved_recency_v1",
     }
