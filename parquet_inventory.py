@@ -4,16 +4,46 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List
 
+MONTH_NAME_TO_NUM = {
+    "january": 1,
+    "february": 2,
+    "march": 3,
+    "april": 4,
+    "may": 5,
+    "june": 6,
+    "july": 7,
+    "august": 8,
+    "september": 9,
+    "october": 10,
+    "november": 11,
+    "december": 12,
+    "dicember": 12,
+}
+
+
 def _infer_month_alias(filename: str) -> str | None:
-    match = re.search(r"(20\d{2})[-_](\d{2,3})", filename)
-    if not match:
+    stem = Path(filename).stem.lower()
+
+    numeric_match = re.search(r"(20\d{2})[-_](\d{1,3})", stem)
+    if numeric_match:
+        year, month_raw = numeric_match.groups()
+        try:
+            month_int = int(month_raw)
+        except ValueError:
+            month_int = -1
+        if 1 <= month_int <= 12:
+            return f"{year}-{month_int:02d}"
+
+    month_name_match = re.search(
+        r"(january|february|march|april|may|june|july|august|september|october|november|december|dicember)[-_](20\d{2})",
+        stem,
+    )
+    if not month_name_match:
         return None
-    year, month_raw = match.groups()
-    try:
-        month_int = int(month_raw)
-    except Exception:
-        return None
-    if month_int < 1 or month_int > 12:
+
+    month_name, year = month_name_match.groups()
+    month_int = MONTH_NAME_TO_NUM.get(month_name)
+    if month_int is None:
         return None
     return f"{year}-{month_int:02d}"
 
