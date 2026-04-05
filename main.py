@@ -711,12 +711,13 @@ def _frame_payload_viewport_subset(
     max_lng: float,
     padding_ratio: float = 0.18,
 ) -> Dict[str, Any]:
+    safe_padding = max(0.0, min(float(padding_ratio), 1.0))
     expanded_bbox = _expand_viewport_bbox(
         min_lat=min_lat,
         min_lng=min_lng,
         max_lat=max_lat,
         max_lng=max_lng,
-        padding_ratio=padding_ratio,
+        padding_ratio=safe_padding,
     )
     source_payload = frame_payload if isinstance(frame_payload, dict) else {}
     polygons = source_payload.get("polygons")
@@ -747,7 +748,7 @@ def _frame_payload_viewport_subset(
             "max_lat": max(min_lat, max_lat),
             "max_lng": max(min_lng, max_lng),
         }
-        payload["_viewport_padding_ratio"] = float(padding_ratio)
+        payload["_viewport_padding_ratio"] = safe_padding
         payload["_source_feature_count"] = source_count
         payload["_returned_feature_count"] = source_count
         payload["_viewport_fallback_reason"] = "no_intersections"
@@ -766,7 +767,7 @@ def _frame_payload_viewport_subset(
         "max_lat": max(min_lat, max_lat),
         "max_lng": max(min_lng, max_lng),
     }
-    payload["_viewport_padding_ratio"] = float(padding_ratio)
+    payload["_viewport_padding_ratio"] = safe_padding
     payload["_source_feature_count"] = source_count
     payload["_returned_feature_count"] = len(subset_features)
     _record_perf_metric("frame.viewport_subset_hit")
@@ -783,12 +784,13 @@ def _viewport_frame_etag(
 ) -> Optional[str]:
     if not base_etag:
         return None
+    safe_padding = max(0.0, min(float(padding_ratio), 1.0))
     normalized = (
         round(min(min_lat, max_lat), 4),
         round(min(min_lng, max_lng), 4),
         round(max(min_lat, max_lat), 4),
         round(max(min_lng, max_lng), 4),
-        round(float(padding_ratio), 4),
+        round(safe_padding, 4),
     )
     suffix = hashlib.sha1(f"{normalized}".encode("utf-8")).hexdigest()[:12]
     return f'{base_etag[:-1]}-vp-{suffix}"' if base_etag.endswith('"') else f'{base_etag}-vp-{suffix}'
