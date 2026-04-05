@@ -901,13 +901,17 @@ def build_hotspots_frames(
     temp_root.mkdir(parents=True, exist_ok=True)
     temp_run_dir_ctx = tempfile.TemporaryDirectory(prefix="build_", dir=str(temp_root))
     temp_run_dir = Path(temp_run_dir_ctx.name)
-    stage_dir = temp_run_dir / "frames.__building__"
     duckdb_tmp_dir = temp_run_dir / "duckdb_tmp"
-    stage_dir.mkdir(parents=True, exist_ok=True)
     duckdb_tmp_dir.mkdir(parents=True, exist_ok=True)
     exact_history_dir = out_dir.parent / "exact_history"
-    exact_history_dir.mkdir(parents=True, exist_ok=True)
+    exact_history_stage_dir = out_dir.parent / "exact_history.__building__"
+    exact_history_backup_dir = out_dir.parent / "exact_history.__backup__"
+    stage_dir = exact_history_stage_dir
+    if exact_history_stage_dir.exists():
+        shutil.rmtree(exact_history_stage_dir, ignore_errors=True)
+    exact_history_stage_dir.mkdir(parents=True, exist_ok=True)
     exact_history_db_path = exact_history_dir / "exact_shadow.duckdb"
+    staged_exact_history_db_path = exact_history_stage_dir / "exact_shadow.duckdb"
 
     con = None
     build_result: Dict[str, Any] | None = None
@@ -944,19 +948,8 @@ def build_hotspots_frames(
         if not geom_by_id:
             raise RuntimeError("taxi_zones.geojson missing usable properties.LocationID geometry.")
 
-        # ----------------------------
-        # DuckDB (spill to volume)
-        # ----------------------------
-        duckdb_db_path = exact_history_db_path
-        con = duckdb.connect(database=str(duckdb_db_path))
-        con.execute("PRAGMA enable_progress_bar=false")
-        con.execute("PRAGMA threads=2")
-        con.execute(f"PRAGMA temp_directory='{duckdb_tmp_dir.as_posix()}'")
-
         parquet_list = [str(p) for p in parquet_files]
-        parquet_sql = ", ".join("'" + p.replace("'", "''") + "'" for p in parquet_list)
-        schema_rows = con.execute(f"DESCRIBE SELECT * FROM read_parquet([{parquet_sql}])").fetchall()
-        available_columns = {str(row[0]) for row in schema_rows}
+        sorted_parquet_files = sorted(parquet_list)
 
         zone_geometry_rows = build_zone_geometry_metrics_rows(zones_geojson_path)
         zone_geometry_by_id: Dict[int, Dict[str, float | None]] = {
@@ -966,210 +959,101 @@ def build_hotspots_frames(
             }
             for row in zone_geometry_rows
         }
-        con.execute("CREATE TEMP TABLE zone_geometry_metrics (PULocationID INTEGER, zone_area_sq_miles DOUBLE, centroid_latitude DOUBLE)")
-        if zone_geometry_rows:
-            con.executemany(
-                "INSERT INTO zone_geometry_metrics (PULocationID, zone_area_sq_miles, centroid_latitude) VALUES (?, ?, ?)",
-                [
-                    (
-                        int(row["PULocationID"]),
-                        None if row["zone_area_sq_miles"] is None else float(row["zone_area_sq_miles"]),
-                        None if row.get("centroid_latitude") is None else float(row["centroid_latitude"]),
-                    )
-                    for row in zone_geometry_rows
-                ],
+        zone_metadata_rows = [
+            (
+                int(zid),
+                str(name_by_id.get(zid, "") or ""),
+                str(borough_by_id.get(zid, "") or ""),
+                bool(is_airport_zone(zid, name_by_id.get(zid, ""), borough_by_id.get(zid, ""))),
             )
-        con.execute("CREATE TEMP TABLE zone_metadata (PULocationID INTEGER, zone_name VARCHAR, borough_name VARCHAR, airport_excluded BOOLEAN)")
-        con.executemany(
-            "INSERT INTO zone_metadata (PULocationID, zone_name, borough_name, airport_excluded) VALUES (?, ?, ?, ?)",
-            [
-                (
-                    int(zid),
-                    str(name_by_id.get(zid, "") or ""),
-                    str(borough_by_id.get(zid, "") or ""),
-                    bool(is_airport_zone(zid, name_by_id.get(zid, ""), borough_by_id.get(zid, ""))),
+            for zid in sorted(name_by_id.keys())
+        ]
+
+        def _open_incremental_connection() -> duckdb.DuckDBPyConnection:
+            connection = duckdb.connect(database=str(staged_exact_history_db_path))
+            connection.execute("PRAGMA enable_progress_bar=false")
+            connection.execute("PRAGMA threads=1")
+            connection.execute(f"PRAGMA temp_directory='{duckdb_tmp_dir.as_posix()}'")
+            memory_limit = str(os.environ.get("DUCKDB_MEMORY_LIMIT", "512MB")).strip() or "512MB"
+            connection.execute(f"PRAGMA memory_limit='{memory_limit}'")
+            connection.execute(
+                "CREATE TEMP TABLE zone_geometry_metrics (PULocationID INTEGER, zone_area_sq_miles DOUBLE, centroid_latitude DOUBLE)"
+            )
+            if zone_geometry_rows:
+                connection.executemany(
+                    "INSERT INTO zone_geometry_metrics (PULocationID, zone_area_sq_miles, centroid_latitude) VALUES (?, ?, ?)",
+                    [
+                        (
+                            int(row["PULocationID"]),
+                            None if row["zone_area_sq_miles"] is None else float(row["zone_area_sq_miles"]),
+                            None if row.get("centroid_latitude") is None else float(row["centroid_latitude"]),
+                        )
+                        for row in zone_geometry_rows
+                    ],
                 )
-                for zid in sorted(name_by_id.keys())
-            ],
-        )
-
-        # ----------------------------
-        # SQL build
-        #
-        # - "busy" drives score (pickups) more than pay, as you requested.
-        # - Per-window normalization uses percentile rank (no max/min) so airports don't dominate.
-        # - Baseline per-zone normalization ALSO uses percentile rank (no global min/max),
-        #   so airports cannot compress base_score either.
-        # - Confidence scales down low-sample windows (still data-driven).
-        # ----------------------------
-        sql = f"""
-        WITH base AS (
-          SELECT
-            CAST(PULocationID AS INTEGER) AS PULocationID,
-            pickup_datetime,
-            TRY_CAST(driver_pay AS DOUBLE) AS driver_pay
-          FROM read_parquet([{parquet_sql}])
-          WHERE PULocationID IS NOT NULL
-            AND pickup_datetime IS NOT NULL
-            AND CAST(PULocationID AS INTEGER) NOT IN (1, 132, 138)
-            AND CAST(PULocationID AS INTEGER) IN (
-              SELECT PULocationID FROM zone_metadata WHERE airport_excluded = FALSE
+            connection.execute(
+                "CREATE TEMP TABLE zone_metadata (PULocationID INTEGER, zone_name VARCHAR, borough_name VARCHAR, airport_excluded BOOLEAN)"
             )
-        ),
-        t AS (
-          SELECT
-            PULocationID,
-            CAST(EXTRACT('dow' FROM pickup_datetime) AS INTEGER) AS dow_i,  -- 0=Sun..6=Sat
-            CAST(EXTRACT('hour' FROM pickup_datetime) AS INTEGER) AS hour_i,
-            CAST(EXTRACT('minute' FROM pickup_datetime) AS INTEGER) AS minute_i,
-            driver_pay
-          FROM base
-        ),
-        binned AS (
-          SELECT
-            PULocationID,
-            CASE WHEN dow_i = 0 THEN 6 ELSE dow_i - 1 END AS dow_m,  -- Mon=0..Sun=6
-            CAST(FLOOR((hour_i*60 + minute_i) / {int(bin_minutes)}) * {int(bin_minutes)} AS INTEGER) AS bin_start_min,
-            driver_pay
-          FROM t
-        ),
-        agg AS (
-          SELECT
-            PULocationID,
-            dow_m,
-            bin_start_min,
-            COUNT(*) AS pickups,
-            AVG(driver_pay) AS avg_driver_pay
-          FROM binned
-          GROUP BY 1,2,3
-          HAVING COUNT(*) >= {int(min_trips_per_window)}
-        ),
+            connection.executemany(
+                "INSERT INTO zone_metadata (PULocationID, zone_name, borough_name, airport_excluded) VALUES (?, ?, ?, ?)",
+                zone_metadata_rows,
+            )
+            return connection
 
-        -- ----------------------------
-        -- Per-window percentile-rank normalization (robust to airport outliers)
-        -- ----------------------------
-        win AS (
-          SELECT
-            *,
-            LN(1 + pickups) AS log_pickups,
-            ROW_NUMBER() OVER (PARTITION BY dow_m, bin_start_min ORDER BY LN(1 + pickups)) AS rn_pickups,
-            ROW_NUMBER() OVER (PARTITION BY dow_m, bin_start_min ORDER BY avg_driver_pay) AS rn_pay,
-            COUNT(*) OVER (PARTITION BY dow_m, bin_start_min) AS n_in_window
-          FROM agg
-        ),
-        win_scored AS (
-          SELECT
-            PULocationID, dow_m, bin_start_min, pickups, avg_driver_pay,
-            CASE
-              WHEN n_in_window <= 1 THEN 0.0
-              ELSE (rn_pickups - 1) * 1.0 / (n_in_window - 1)
-            END AS vol_n,
-            CASE
-              WHEN n_in_window <= 1 THEN 0.0
-              ELSE (rn_pay - 1) * 1.0 / (n_in_window - 1)
-            END AS pay_n
-          FROM win
-        ),
+        rows_total_in_shadow = 0
+        for parquet_index, parquet_path in enumerate(sorted_parquet_files):
+            logger.info("exact_history_append_start filename=%s", Path(parquet_path).name)
+            if con is not None:
+                con.close()
+            con = _open_incremental_connection()
+            parquet_single_sql = "'" + parquet_path.replace("'", "''") + "'"
+            schema_rows = con.execute(f"DESCRIBE SELECT * FROM read_parquet([{parquet_single_sql}])").fetchall()
+            available_columns = {str(row[0]) for row in schema_rows}
+            shadow_sql = build_zone_earnings_shadow_sql(
+                [parquet_path],
+                bin_minutes=int(bin_minutes),
+                min_trips_per_window=int(min_trips_per_window),
+                profile=ZONE_MODE_PROFILES["citywide_v2"],
+                citywide_v3_profile=ZONE_MODE_PROFILES["citywide_v3"],
+                manhattan_profile=ZONE_MODE_PROFILES["manhattan_v2"],
+                bronx_wash_heights_profile=ZONE_MODE_PROFILES["bronx_wash_heights_v2"],
+                queens_profile=ZONE_MODE_PROFILES["queens_v2"],
+                brooklyn_profile=ZONE_MODE_PROFILES["brooklyn_v2"],
+                staten_island_profile=ZONE_MODE_PROFILES["staten_island_v2"],
+                manhattan_v3_profile=ZONE_MODE_PROFILES["manhattan_v3"],
+                bronx_wash_heights_v3_profile=ZONE_MODE_PROFILES["bronx_wash_heights_v3"],
+                queens_v3_profile=ZONE_MODE_PROFILES["queens_v3"],
+                brooklyn_v3_profile=ZONE_MODE_PROFILES["brooklyn_v3"],
+                staten_island_v3_profile=ZONE_MODE_PROFILES["staten_island_v3"],
+                available_columns=available_columns,
+            )
+            if parquet_index == 0:
+                con.execute(
+                    f"""
+                    CREATE OR REPLACE TABLE exact_shadow_rows AS
+                    {shadow_sql}
+                    """
+                )
+            else:
+                con.execute(
+                    f"""
+                    INSERT INTO exact_shadow_rows
+                    {shadow_sql}
+                    """
+                )
+            rows_total_in_shadow = int(
+                con.execute("SELECT COUNT(*) FROM exact_shadow_rows").fetchone()[0] or 0
+            )
+            con.execute("CHECKPOINT")
+            logger.info(
+                "exact_history_append_done filename=%s rows_total=%d",
+                Path(parquet_path).name,
+                rows_total_in_shadow,
+            )
 
-        -- ----------------------------
-        -- Baseline per-zone (historical typical level)
-        -- IMPORTANT CHANGE: baseline normalization uses percentile ranks (NOT min/max)
-        -- so airports cannot compress baseline for all other zones.
-        -- ----------------------------
-        zone_base AS (
-          SELECT
-            PULocationID,
-            LN(1 + AVG(pickups)) AS base_log_pickups,
-            AVG(avg_driver_pay) AS base_pay
-          FROM agg
-          GROUP BY 1
-        ),
-        zone_ranked AS (
-          SELECT
-            *,
-            ROW_NUMBER() OVER (ORDER BY base_log_pickups) AS rn_base_pickups,
-            ROW_NUMBER() OVER (ORDER BY base_pay) AS rn_base_pay,
-            COUNT(*) OVER () AS n_zones
-          FROM zone_base
-        ),
-        zone_norm AS (
-          SELECT
-            PULocationID,
-            CASE
-              WHEN n_zones <= 1 THEN 0.0
-              ELSE (rn_base_pickups - 1) * 1.0 / (n_zones - 1)
-            END AS base_vol_n,
-            CASE
-              WHEN n_zones <= 1 THEN 0.0
-              ELSE (rn_base_pay - 1) * 1.0 / (n_zones - 1)
-            END AS base_pay_n
-          FROM zone_ranked
-        ),
+        if con is None:
+            raise RuntimeError("No parquet files available for exact-history append.")
 
-        final AS (
-          SELECT
-            w.PULocationID,
-            w.dow_m,
-            w.bin_start_min,
-            w.pickups,
-            w.avg_driver_pay,
-
-            -- Your rule: mostly busy, some driver pay
-            (0.85*w.vol_n + 0.15*w.pay_n) AS moment_score,
-            (0.85*z.base_vol_n + 0.15*z.base_pay_n) AS base_score,
-
-            -- confidence: more pickups -> more trust in moment_score
-            LEAST(1.0, w.pickups / 50.0) AS conf
-          FROM win_scored w
-          JOIN zone_norm z USING (PULocationID)
-        )
-
-        SELECT
-          PULocationID,
-          dow_m,
-          bin_start_min,
-          pickups,
-          avg_driver_pay,
-          CAST(
-            ROUND(
-              1 + 99 * LEAST(
-                GREATEST(
-                  ((0.70*moment_score + 0.30*base_score) * (0.50 + 0.50*conf)),
-                  0.0
-                ),
-                1.0
-              )
-            ) AS INTEGER
-          ) AS rating
-        FROM final
-        ORDER BY dow_m, bin_start_min, PULocationID;
-        """
-
-        shadow_sql = build_zone_earnings_shadow_sql(
-            parquet_list,
-            bin_minutes=int(bin_minutes),
-            min_trips_per_window=int(min_trips_per_window),
-            profile=ZONE_MODE_PROFILES["citywide_v2"],
-            citywide_v3_profile=ZONE_MODE_PROFILES["citywide_v3"],
-            manhattan_profile=ZONE_MODE_PROFILES["manhattan_v2"],
-            bronx_wash_heights_profile=ZONE_MODE_PROFILES["bronx_wash_heights_v2"],
-            queens_profile=ZONE_MODE_PROFILES["queens_v2"],
-            brooklyn_profile=ZONE_MODE_PROFILES["brooklyn_v2"],
-            staten_island_profile=ZONE_MODE_PROFILES["staten_island_v2"],
-            manhattan_v3_profile=ZONE_MODE_PROFILES["manhattan_v3"],
-            bronx_wash_heights_v3_profile=ZONE_MODE_PROFILES["bronx_wash_heights_v3"],
-            queens_v3_profile=ZONE_MODE_PROFILES["queens_v3"],
-            brooklyn_v3_profile=ZONE_MODE_PROFILES["brooklyn_v3"],
-            staten_island_v3_profile=ZONE_MODE_PROFILES["staten_island_v3"],
-            available_columns=available_columns,
-        )
-
-        con.execute(
-            f"""
-            CREATE OR REPLACE TABLE exact_shadow_rows AS
-            {shadow_sql}
-            """
-        )
         con.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_exact_shadow_rows_ts
@@ -1764,6 +1648,27 @@ def build_hotspots_frames(
 
         flush_frame()
 
+        timeline_rows = con.execute(
+            """
+            SELECT DISTINCT
+                exact_bin_local_ts,
+                exact_bin_date_local,
+                exact_weekday_name_local,
+                exact_bin_time_label_local
+            FROM exact_shadow_rows
+            ORDER BY exact_bin_local_ts
+            """
+        ).fetchall()
+        timeline_entries = [
+            {
+                "frame_time": str(row[0]),
+                "frame_date": None if row[1] is None else str(row[1]),
+                "frame_weekday_name": None if row[2] is None else str(row[2]),
+                "frame_time_label": None if row[3] is None else str(row[3]),
+                "bin_minutes": int(bin_minutes),
+            }
+            for row in timeline_rows
+        ]
         timeline = [str(entry.get("frame_time")) for entry in timeline_entries]
         timeline_payload = {
             "timeline": timeline,
@@ -1778,6 +1683,7 @@ def build_hotspots_frames(
             json.dumps(timeline_payload, separators=(",", ":")),
             encoding="utf-8"
         )
+        logger.info("exact_history_build_timeline_done count=%d", len(timeline_entries))
         # Keep timeline.json on volume for compatibility while mirroring metadata copy in DB.
         save_generated_artifact("timeline", timeline_payload, compress=False)
 
@@ -2177,8 +2083,11 @@ def build_hotspots_frames(
             )
 
         save_generated_artifact("scoring_shadow_manifest", manifest_payload, compress=False)
+        if con is not None:
+            con.close()
+            con = None
         staged_timeline = stage_dir / "timeline.json"
-        exact_store_ready = exact_history_db_path.exists() and exact_history_db_path.stat().st_size > 0
+        exact_store_ready = staged_exact_history_db_path.exists() and staged_exact_history_db_path.stat().st_size > 0
         if not staged_timeline.exists() or not exact_store_ready:
             raise RuntimeError("Staged artifact build did not produce required files.")
         legacy_manifest_path = out_dir / "scoring_shadow_manifest.json"
@@ -2199,9 +2108,23 @@ def build_hotspots_frames(
                     generated_path.unlink()
             except Exception:
                 pass
-        for built_file in stage_dir.iterdir():
-            if built_file.is_file():
-                shutil.move(str(built_file), str(out_dir / built_file.name))
+        if exact_history_backup_dir.exists():
+            shutil.rmtree(exact_history_backup_dir, ignore_errors=True)
+        try:
+            if exact_history_dir.exists():
+                exact_history_dir.rename(exact_history_backup_dir)
+            exact_history_stage_dir.rename(exact_history_dir)
+            if exact_history_backup_dir.exists():
+                shutil.rmtree(exact_history_backup_dir, ignore_errors=True)
+        except Exception:
+            if exact_history_dir.exists():
+                shutil.rmtree(exact_history_dir, ignore_errors=True)
+            if exact_history_backup_dir.exists():
+                exact_history_backup_dir.rename(exact_history_dir)
+            raise
+
+        shutil.move(str(staged_timeline), str(out_dir / "timeline.json"))
+        logger.info("exact_history_publish_done")
 
         build_result = {
             "ok": True,

@@ -1087,8 +1087,10 @@ def _artifact_runtime_policy_snapshot() -> Dict[str, Any]:
             "exact_history/exact_shadow.duckdb",
         ],
         "db_required": [
-            "day_tendency_model",
             "scoring_shadow_manifest",
+        ],
+        "db_optional": [
+            "day_tendency_model",
         ],
         "db_mirrored_optional": ["timeline"],
         "must_not_remain_on_volume": [
@@ -1113,9 +1115,12 @@ def _artifact_runtime_integrity_report() -> Dict[str, Any]:
             timeline_count = 0
     required_volume_ok = parquet_count > 0 and timeline_count > 0 and zones_present and timeline_present and exact_store_present
 
-    required_db_keys = ["day_tendency_model", "scoring_shadow_manifest"]
+    required_db_keys = ["scoring_shadow_manifest"]
     missing_required_db_artifacts = [key for key in required_db_keys if not generated_artifact_present(key)]
     required_db_ok = len(missing_required_db_artifacts) == 0
+    optional_artifacts_missing: List[str] = []
+    if not generated_artifact_present("day_tendency_model"):
+        optional_artifacts_missing.append("day_tendency_model")
 
     optional_db_mirror = {"timeline": generated_artifact_present("timeline")}
 
@@ -1136,12 +1141,15 @@ def _artifact_runtime_integrity_report() -> Dict[str, Any]:
     if not exact_store_present:
         missing_required_volume.append("exact_history/exact_shadow.duckdb")
 
-    ok = required_volume_ok and required_db_ok and not redundant_file_copies_present
+    core_map_ready = required_volume_ok and required_db_ok
+    ok = core_map_ready and not redundant_file_copies_present
     return {
         "ok": ok,
+        "core_map_ready": core_map_ready,
         "required_volume_ok": required_volume_ok,
         "required_db_ok": required_db_ok,
         "optional_db_mirror": optional_db_mirror,
+        "optional_artifacts_missing": optional_artifacts_missing,
         "redundant_file_copies_present": redundant_file_copies_present,
         "missing_required_volume": missing_required_volume,
         "missing_required_db_artifacts": missing_required_db_artifacts,
@@ -2175,7 +2183,7 @@ def _get_state() -> Dict[str, Any]:
         return dict(_generate_state)
 
 
-def _generate_worker(bin_minutes: int, min_trips_per_window: int) -> None:
+def _generate_worker(bin_minutes: int, min_trips_per_window: int, include_day_tendency: bool = False) -> None:
     from build_day_tendency import build_day_tendency_model
     from build_hotspot import ensure_zones_geojson, build_hotspots_frames
 
@@ -2217,24 +2225,40 @@ def _generate_worker(bin_minutes: int, min_trips_per_window: int) -> None:
             bin_minutes=bin_minutes,
             min_trips_per_window=min_trips_per_window,
         )
-        day_tendency_result = build_day_tendency_model(
-            parquet_files=parquets,
-            out_dir=DAY_TENDENCY_DIR,
-            zones_geojson_path=zones_path,
-            bin_minutes=bin_minutes,
-            persist_file=False,
-        )
-        try:
-            model_payload = ((day_tendency_result or {}).get("payload") if isinstance(day_tendency_result, dict) else None) or _read_day_tendency_model()
-            save_generated_artifact("day_tendency_model", model_payload, compress=False)
-            DAY_TENDENCY_MODEL_PATH.unlink(missing_ok=True)
-            _prune_redundant_db_backed_artifact_files()
-        except Exception:
-            print("[warn] unable to persist day tendency model into generated_artifact_store")
-            print(traceback.format_exc())
+        day_tendency_result: Dict[str, Any] = {
+            "ok": False,
+            "skipped": not include_day_tendency,
+            "warning": None,
+        }
+        if include_day_tendency:
+            try:
+                day_tendency_result = build_day_tendency_model(
+                    parquet_files=parquets,
+                    out_dir=DAY_TENDENCY_DIR,
+                    zones_geojson_path=zones_path,
+                    bin_minutes=bin_minutes,
+                    persist_file=False,
+                )
+                try:
+                    model_payload = ((day_tendency_result or {}).get("payload") if isinstance(day_tendency_result, dict) else None) or _read_day_tendency_model()
+                    save_generated_artifact("day_tendency_model", model_payload, compress=False)
+                    DAY_TENDENCY_MODEL_PATH.unlink(missing_ok=True)
+                    _prune_redundant_db_backed_artifact_files()
+                except Exception:
+                    print("[warn] unable to persist day tendency model into generated_artifact_store")
+                    print(traceback.format_exc())
+            except Exception as day_tendency_exc:
+                print("[warn] optional day_tendency build failed")
+                print(traceback.format_exc())
+                day_tendency_result = {
+                    "ok": False,
+                    "warning": f"optional_day_tendency_failed: {str(day_tendency_exc)}",
+                    "skipped": False,
+                }
         result = {
             "frames": frames_result,
             "day_tendency": day_tendency_result,
+            "include_day_tendency": bool(include_day_tendency),
             "timeline_mode": "exact_historical",
             "frame_time_model": "exact_local_20min",
             "synthetic_week_enabled": False,
@@ -2275,7 +2299,12 @@ def _generate_worker(bin_minutes: int, min_trips_per_window: int) -> None:
         _clear_lock()
 
 
-def start_generate(bin_minutes: int, min_trips_per_window: int, force_clear_lock: bool = False) -> Dict[str, Any]:
+def start_generate(
+    bin_minutes: int,
+    min_trips_per_window: int,
+    force_clear_lock: bool = False,
+    include_day_tendency: bool = False,
+) -> Dict[str, Any]:
     global _generate_thread
     st = _get_state()
     if st["state"] in ("started", "running") and _generate_thread_alive():
@@ -2284,6 +2313,7 @@ def start_generate(bin_minutes: int, min_trips_per_window: int, force_clear_lock
             "state": st["state"],
             "bin_minutes": st["bin_minutes"],
             "min_trips_per_window": st["min_trips_per_window"],
+            "include_day_tendency": bool(include_day_tendency),
         }
 
     cleanup_result = None
@@ -2311,12 +2341,17 @@ def start_generate(bin_minutes: int, min_trips_per_window: int, force_clear_lock
                 "min_trips_per_window": min_trips_per_window,
                 "cleanup": cleanup_result,
                 "lock_cleared": lock_cleared,
+                "include_day_tendency": bool(include_day_tendency),
             }
 
     _write_lock()
     _set_state(state="started", bin_minutes=bin_minutes, min_trips_per_window=min_trips_per_window)
 
-    t = threading.Thread(target=_generate_worker, args=(bin_minutes, min_trips_per_window), daemon=True)
+    t = threading.Thread(
+        target=_generate_worker,
+        args=(bin_minutes, min_trips_per_window, bool(include_day_tendency)),
+        daemon=True,
+    )
     _generate_thread = t
     t.start()
 
@@ -2327,6 +2362,7 @@ def start_generate(bin_minutes: int, min_trips_per_window: int, force_clear_lock
         "min_trips_per_window": min_trips_per_window,
         "cleanup": cleanup_result,
         "lock_cleared": lock_cleared,
+        "include_day_tendency": bool(include_day_tendency),
     }
 
 
@@ -4099,6 +4135,8 @@ def status():
         "generated_artifact_store_report": generated_artifact_report(),
         "artifact_runtime_policy": _artifact_runtime_policy_snapshot(),
         "artifact_runtime_integrity": artifact_runtime_integrity,
+        "core_map_ready": bool(artifact_runtime_integrity.get("core_map_ready")),
+        "optional_artifacts_missing": list(artifact_runtime_integrity.get("optional_artifacts_missing") or []),
         "generate_state": _get_state(),
         "generate_lock": _generate_lock_snapshot(),
         "generate_stale_lock_detected": stale_lock_detected,
@@ -4449,11 +4487,13 @@ def generate_get(
     bin_minutes: int = DEFAULT_BIN_MINUTES,
     min_trips_per_window: int = DEFAULT_MIN_TRIPS_PER_WINDOW,
     force_clear_lock: int = 0,
+    include_day_tendency: int = 0,
 ):
     return start_generate(
         bin_minutes,
         min_trips_per_window,
         force_clear_lock=bool(int(force_clear_lock or 0)),
+        include_day_tendency=bool(int(include_day_tendency or 0)),
     )
 
 
