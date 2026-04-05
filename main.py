@@ -320,6 +320,7 @@ _generate_state: Dict[str, Any] = {
     "month_key": None,
     "build_all_months": False,
     "include_day_tendency": False,
+    "build_review_artifacts": False,
     "started_at_unix": None,
     "finished_at_unix": None,
     "duration_sec": None,
@@ -2523,6 +2524,7 @@ def _ensure_requested_month_available_or_start_generate(
         DEFAULT_MIN_TRIPS_PER_WINDOW,
         force_clear_lock=False,
         include_day_tendency=False,
+        build_review_artifacts=False,
         month_key=month_key,
         build_all_months=False,
     )
@@ -2549,6 +2551,7 @@ def _generate_worker(
     min_trips_per_window: int,
     run_token: str,
     include_day_tendency: bool = False,
+    build_review_artifacts: bool = False,
     month_key: Optional[str] = None,
     build_all_months: bool = False,
 ) -> None:
@@ -2564,6 +2567,7 @@ def _generate_worker(
         month_key=(str(month_key).strip() if month_key else None),
         build_all_months=bool(build_all_months),
         include_day_tendency=bool(include_day_tendency),
+        build_review_artifacts=bool(build_review_artifacts),
         started_at_unix=start,
         finished_at_unix=None,
         duration_sec=None,
@@ -2623,6 +2627,8 @@ def _generate_worker(
                 exact_history_backup_dir=backup_dir,
                 timeline_output_path=month_dir / "timeline.json",
                 cleanup_out_dir_frames=False,
+                month_key=mk,
+                build_review_artifacts=bool(build_review_artifacts),
             )
             timeline_path = month_dir / "timeline.json"
             timeline_payload = _read_json(timeline_path) if timeline_path.exists() else {}
@@ -2686,6 +2692,7 @@ def _generate_worker(
             "frames": frames_result,
             "day_tendency": day_tendency_result,
             "include_day_tendency": bool(include_day_tendency),
+            "build_review_artifacts": bool(build_review_artifacts),
             "timeline_mode": "monthly_exact_historical",
             "frame_time_model": "exact_local_20min",
             "synthetic_week_enabled": False,
@@ -2735,6 +2742,7 @@ def start_generate(
     min_trips_per_window: int,
     force_clear_lock: bool = False,
     include_day_tendency: bool = False,
+    build_review_artifacts: bool = False,
     month_key: Optional[str] = None,
     build_all_months: bool = False,
 ) -> Dict[str, Any]:
@@ -2753,6 +2761,7 @@ def start_generate(
             str(st.get("month_key") or "").strip() == str(requested_month_key or "").strip()
             and bool(st.get("build_all_months")) == bool(build_all_months)
             and bool(st.get("include_day_tendency")) == bool(include_day_tendency)
+            and bool(st.get("build_review_artifacts")) == bool(build_review_artifacts)
         )
         if state_name in {"started", "running"} and same_job:
             return {
@@ -2761,6 +2770,7 @@ def start_generate(
                 "bin_minutes": st["bin_minutes"],
                 "min_trips_per_window": st["min_trips_per_window"],
                 "include_day_tendency": bool(st.get("include_day_tendency")),
+                "build_review_artifacts": bool(st.get("build_review_artifacts")),
                 "month_key": st.get("month_key"),
                 "build_all_months": bool(st.get("build_all_months")),
                 "run_token": st.get("run_token"),
@@ -2792,6 +2802,7 @@ def start_generate(
                     month_key=requested_month_key,
                     build_all_months=bool(build_all_months),
                     include_day_tendency=bool(include_day_tendency),
+                    build_review_artifacts=bool(build_review_artifacts),
                 )
                 return {
                     "ok": True,
@@ -2801,6 +2812,7 @@ def start_generate(
                     "cleanup": cleanup_result,
                     "lock_cleared": lock_cleared,
                     "include_day_tendency": bool(include_day_tendency),
+                    "build_review_artifacts": bool(build_review_artifacts),
                     "month_key": requested_month_key,
                     "build_all_months": bool(build_all_months),
                     "run_token": _read_lock_token(),
@@ -2816,11 +2828,20 @@ def start_generate(
             month_key=requested_month_key,
             build_all_months=bool(build_all_months),
             include_day_tendency=bool(include_day_tendency),
+            build_review_artifacts=bool(build_review_artifacts),
         )
 
         t = threading.Thread(
             target=_generate_worker,
-            args=(bin_minutes, min_trips_per_window, run_token, bool(include_day_tendency), requested_month_key, bool(build_all_months)),
+            args=(
+                bin_minutes,
+                min_trips_per_window,
+                run_token,
+                bool(include_day_tendency),
+                bool(build_review_artifacts),
+                requested_month_key,
+                bool(build_all_months),
+            ),
             daemon=True,
         )
         _generate_thread = t
@@ -2834,6 +2855,7 @@ def start_generate(
             "cleanup": cleanup_result,
             "lock_cleared": lock_cleared,
             "include_day_tendency": bool(include_day_tendency),
+            "build_review_artifacts": bool(build_review_artifacts),
             "month_key": requested_month_key,
             "build_all_months": bool(build_all_months),
             "run_token": run_token,
@@ -4513,6 +4535,7 @@ def root():
             "/admin/users",
             "/admin/users/disable",
             "/admin/users/reset_password",
+            "/admin/exact_history/build_review_artifacts",
             "/admin/artifacts/trap_candidate_review",
             "/admin/artifacts/trap_candidate_review/metadata",
             "/admin/artifacts/trap_candidate_review/readiness",
@@ -4566,6 +4589,16 @@ def status():
     pending_month_key = str(generate_state.get("month_key") or "").strip() if state_name in {"started", "running"} else ""
     pending_month_key = pending_month_key or None
     pending_month_label = _format_month_key_label(pending_month_key) if pending_month_key else None
+    active_month_core_ready = bool(
+        MONTH_MANIFEST_PATH.exists()
+        and month_manifest.get("months", {}).get(active_month_key)
+        and timeline_file_present
+        and exact_history_store_present
+        and generated_artifact_present("scoring_shadow_manifest")
+    )
+    build_review_artifacts_in_progress = bool(
+        state_name in {"started", "running"} and bool(generate_state.get("build_review_artifacts"))
+    )
     return {
         "status": "ok",
         "timeline_mode": "monthly_exact_historical",
@@ -4641,6 +4674,8 @@ def status():
         "artifact_runtime_policy": _artifact_runtime_policy_snapshot(),
         "artifact_runtime_integrity": artifact_runtime_integrity,
         "core_map_ready": bool(artifact_runtime_integrity.get("core_map_ready")),
+        "active_month_core_ready": active_month_core_ready,
+        "build_review_artifacts_in_progress": build_review_artifacts_in_progress,
         "optional_artifacts_missing": list(artifact_runtime_integrity.get("optional_artifacts_missing") or []),
         "generate_state": _get_state(),
         "run_token": state_run_token,
@@ -4999,14 +5034,36 @@ def generate_get(
     month_key: Optional[str] = None,
     build_all_months: int = 0,
     include_day_tendency: int = 0,
+    build_review_artifacts: int = 0,
 ):
     return start_generate(
         bin_minutes,
         min_trips_per_window,
         force_clear_lock=bool(int(force_clear_lock or 0)),
         include_day_tendency=bool(int(include_day_tendency or 0)),
+        build_review_artifacts=bool(int(build_review_artifacts or 0)),
         month_key=(str(month_key).strip() if month_key else None),
         build_all_months=bool(int(build_all_months or 0)),
+    )
+
+
+@app.post("/admin/exact_history/build_review_artifacts")
+def admin_build_review_artifacts(
+    month_key: str,
+    admin: sqlite3.Row = Depends(require_admin),
+):
+    _ = admin
+    requested_month_key = str(month_key or "").strip()
+    if not _safe_parse_month_key(requested_month_key):
+        raise HTTPException(status_code=400, detail="invalid month_key format; expected YYYY-MM")
+    return start_generate(
+        DEFAULT_BIN_MINUTES,
+        DEFAULT_MIN_TRIPS_PER_WINDOW,
+        force_clear_lock=False,
+        include_day_tendency=False,
+        build_review_artifacts=True,
+        month_key=requested_month_key,
+        build_all_months=False,
     )
 
 
