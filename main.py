@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Depends, Response
+from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -312,6 +313,9 @@ _generate_state: Dict[str, Any] = {
     "state": "idle",  # idle | started | running | done | error
     "bin_minutes": None,
     "min_trips_per_window": None,
+    "month_key": None,
+    "build_all_months": False,
+    "include_day_tendency": False,
     "started_at_unix": None,
     "finished_at_unix": None,
     "duration_sec": None,
@@ -541,6 +545,17 @@ def _month_store_path(month_key: str) -> Path:
     return _month_dir(month_key) / "exact_shadow.duckdb"
 
 
+def _available_source_month_keys() -> List[str]:
+    grouped = _group_parquets_by_month(_list_parquets())
+    return sorted(grouped.keys())
+
+
+def _format_month_key_label(month_key: str) -> str:
+    year, month = _parse_month_key(month_key)
+    month_name = datetime(year=year, month=month, day=1).strftime("%B")
+    return f"{month_name} {year:04d}"
+
+
 def _load_month_manifest() -> Dict[str, Any]:
     if not MONTH_MANIFEST_PATH.exists() or MONTH_MANIFEST_PATH.stat().st_size <= 0:
         return {"available_month_keys": [], "months": {}}
@@ -581,6 +596,27 @@ def resolve_active_month_key(target_dt_nyc: datetime, available_month_keys: List
     return valid[-1]
 
 
+def _resolve_target_month_key_for_request(month_key: Optional[str] = None, target_dt_nyc: Optional[datetime] = None) -> str:
+    manifest = _load_month_manifest()
+    built_month_keys = sorted(list(manifest.get("available_month_keys") or []))
+    source_month_keys = _available_source_month_keys()
+
+    if month_key:
+        requested = str(month_key).strip()
+        if requested in set(source_month_keys) or requested in set(built_month_keys):
+            return requested
+        raise HTTPException(status_code=404, detail=f"month_key not available: {requested}")
+
+    target = target_dt_nyc or datetime.now(timezone.utc).astimezone(NYC_TZ)
+    candidate = resolve_active_month_key(target, source_month_keys)
+    if candidate:
+        return candidate
+    fallback = resolve_active_month_key(target, built_month_keys)
+    if fallback:
+        return fallback
+    raise HTTPException(status_code=409, detail="No source parquet month data available. Upload parquet files first.")
+
+
 def _resolve_active_month_key(month_key: Optional[str] = None, target_dt_nyc: Optional[datetime] = None) -> Tuple[str, Dict[str, Any]]:
     manifest = _load_month_manifest()
     available = list(manifest.get("available_month_keys") or [])
@@ -596,6 +632,56 @@ def _resolve_active_month_key(month_key: Optional[str] = None, target_dt_nyc: Op
         raise HTTPException(status_code=409, detail="No monthly exact-history partitions available. Call /generate first.")
     print(f"active_month_resolved month_key={resolved}")
     return resolved, manifest
+
+
+def _month_partition_ready(month_key: str) -> bool:
+    timeline_path = _month_timeline_path(month_key)
+    store_path = _month_store_path(month_key)
+    timeline_ok = timeline_path.exists() and timeline_path.is_file() and timeline_path.stat().st_size > 0
+    store_ok = store_path.exists() and store_path.is_file() and store_path.stat().st_size > 0
+    return bool(timeline_ok and store_ok)
+
+
+def _build_preparing_month_payload(
+    month_key: str,
+    request_kind: str,
+    generate_started: bool,
+    retry_after_sec: int = 3,
+) -> Dict[str, Any]:
+    return {
+        "ok": False,
+        "status": "preparing_month",
+        "request_kind": str(request_kind),
+        "target_month_key": month_key,
+        "target_month_label": _format_month_key_label(month_key),
+        "message": f"Preparing {_format_month_key_label(month_key)} historical data",
+        "retry_after_sec": int(retry_after_sec),
+        "generate_started": bool(generate_started),
+        "generate_state": _get_state(),
+        "monthly_partition_mode": True,
+    }
+
+
+def _preparing_month_response(
+    month_key: str,
+    request_kind: str,
+    generate_started: bool,
+    retry_after_sec: int = 3,
+) -> JSONResponse:
+    payload = _build_preparing_month_payload(
+        month_key=month_key,
+        request_kind=request_kind,
+        generate_started=generate_started,
+        retry_after_sec=retry_after_sec,
+    )
+    return JSONResponse(
+        status_code=202,
+        content=payload,
+        headers={
+            "Retry-After": str(int(retry_after_sec)),
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 def _artifact_freshness_snapshot() -> Dict[str, Any]:
@@ -2344,6 +2430,50 @@ def _generate_lock_snapshot() -> Dict[str, Any]:
     }
 
 
+def _ensure_requested_month_available_or_start_generate(
+    *,
+    month_key: str,
+    request_kind: str,
+    retry_after_sec: int = 3,
+) -> Optional[JSONResponse]:
+    if _month_partition_ready(month_key):
+        return None
+
+    state = _get_state()
+    thread_alive = _generate_thread_alive()
+    if thread_alive:
+        running_month_key = str(state.get("month_key") or "").strip() or None
+        running_build_all = bool(state.get("build_all_months"))
+        if running_month_key == month_key and not running_build_all:
+            return _preparing_month_response(
+                month_key=month_key,
+                request_kind=request_kind,
+                generate_started=False,
+                retry_after_sec=retry_after_sec,
+            )
+        return _preparing_month_response(
+            month_key=month_key,
+            request_kind=request_kind,
+            generate_started=False,
+            retry_after_sec=retry_after_sec,
+        )
+
+    start_generate(
+        DEFAULT_BIN_MINUTES,
+        DEFAULT_MIN_TRIPS_PER_WINDOW,
+        force_clear_lock=True,
+        include_day_tendency=False,
+        month_key=month_key,
+        build_all_months=False,
+    )
+    return _preparing_month_response(
+        month_key=month_key,
+        request_kind=request_kind,
+        generate_started=True,
+        retry_after_sec=retry_after_sec,
+    )
+
+
 def _set_state(**kwargs):
     with _state_lock:
         _generate_state.update(kwargs)
@@ -2369,6 +2499,9 @@ def _generate_worker(
         state="running",
         bin_minutes=bin_minutes,
         min_trips_per_window=min_trips_per_window,
+        month_key=(str(month_key).strip() if month_key else None),
+        build_all_months=bool(build_all_months),
+        include_day_tendency=bool(include_day_tendency),
         started_at_unix=start,
         finished_at_unix=None,
         duration_sec=None,
@@ -2540,6 +2673,13 @@ def start_generate(
     build_all_months: bool = False,
 ) -> Dict[str, Any]:
     global _generate_thread
+    requested_month_key = str(month_key).strip() if month_key else None
+    if not requested_month_key and not bool(build_all_months):
+        try:
+            requested_month_key = _resolve_target_month_key_for_request()
+        except HTTPException:
+            requested_month_key = None
+
     st = _get_state()
     if st["state"] in ("started", "running") and _generate_thread_alive():
         return {
@@ -2547,7 +2687,9 @@ def start_generate(
             "state": st["state"],
             "bin_minutes": st["bin_minutes"],
             "min_trips_per_window": st["min_trips_per_window"],
-            "include_day_tendency": bool(include_day_tendency),
+            "include_day_tendency": bool(st.get("include_day_tendency")),
+            "month_key": st.get("month_key"),
+            "build_all_months": bool(st.get("build_all_months")),
         }
 
     cleanup_result = None
@@ -2567,7 +2709,14 @@ def start_generate(
             if state_now.get("state") == "running" and not _generate_thread_alive():
                 _set_state(state="idle")
         if _lock_is_present():
-            _set_state(state="running", bin_minutes=bin_minutes, min_trips_per_window=min_trips_per_window)
+            _set_state(
+                state="running",
+                bin_minutes=bin_minutes,
+                min_trips_per_window=min_trips_per_window,
+                month_key=requested_month_key,
+                build_all_months=bool(build_all_months),
+                include_day_tendency=bool(include_day_tendency),
+            )
             return {
                 "ok": True,
                 "state": "running",
@@ -2576,14 +2725,23 @@ def start_generate(
                 "cleanup": cleanup_result,
                 "lock_cleared": lock_cleared,
                 "include_day_tendency": bool(include_day_tendency),
+                "month_key": requested_month_key,
+                "build_all_months": bool(build_all_months),
             }
 
     _write_lock()
-    _set_state(state="started", bin_minutes=bin_minutes, min_trips_per_window=min_trips_per_window)
+    _set_state(
+        state="started",
+        bin_minutes=bin_minutes,
+        min_trips_per_window=min_trips_per_window,
+        month_key=requested_month_key,
+        build_all_months=bool(build_all_months),
+        include_day_tendency=bool(include_day_tendency),
+    )
 
     t = threading.Thread(
         target=_generate_worker,
-        args=(bin_minutes, min_trips_per_window, bool(include_day_tendency), month_key, bool(build_all_months)),
+        args=(bin_minutes, min_trips_per_window, bool(include_day_tendency), requested_month_key, bool(build_all_months)),
         daemon=True,
     )
     _generate_thread = t
@@ -2597,7 +2755,7 @@ def start_generate(
         "cleanup": cleanup_result,
         "lock_cleared": lock_cleared,
         "include_day_tendency": bool(include_day_tendency),
-        "month_key": month_key,
+        "month_key": requested_month_key,
         "build_all_months": bool(build_all_months),
     }
 
@@ -4287,6 +4445,7 @@ def root():
 @app.get("/status")
 def status():
     parquets = [p.name for p in _list_parquets()]
+    source_month_keys = _available_source_month_keys()
     zones_path = DATA_DIR / "taxi_zones.geojson"
     manifest_path = FRAMES_DIR / "scoring_shadow_manifest.json"
     timeline_artifact_in_db = generated_artifact_present("timeline")
@@ -4302,7 +4461,8 @@ def status():
     manifest_file_present = manifest_path.exists() and manifest_path.stat().st_size > 0 if manifest_path.exists() else False
     month_manifest = _load_month_manifest()
     available_month_keys = list(month_manifest.get("available_month_keys") or [])
-    active_month_key = resolve_active_month_key(datetime.now(timezone.utc).astimezone(NYC_TZ), available_month_keys)
+    target_month_key_candidate = resolve_active_month_key(datetime.now(timezone.utc).astimezone(NYC_TZ), source_month_keys)
+    active_month_key = resolve_active_month_key(datetime.now(timezone.utc).astimezone(NYC_TZ), available_month_keys) or target_month_key_candidate
     active_timeline_path = _month_timeline_path(active_month_key) if active_month_key else None
     active_store_path = _month_store_path(active_month_key) if active_month_key else None
     timeline_file_present = bool(active_timeline_path and active_timeline_path.exists() and active_timeline_path.stat().st_size > 0)
@@ -4315,6 +4475,11 @@ def status():
     artifact_runtime_integrity = _artifact_runtime_integrity_report()
     leaderboard_runtime = get_leaderboard_runtime_snapshot()
     stale_lock_detected = bool(_lock_is_present() and not _generate_thread_alive())
+    generate_state = _get_state()
+    state_name = str(generate_state.get("state") or "")
+    pending_month_key = str(generate_state.get("month_key") or "").strip() if state_name in {"started", "running"} else ""
+    pending_month_key = pending_month_key or None
+    pending_month_label = _format_month_key_label(pending_month_key) if pending_month_key else None
     return {
         "status": "ok",
         "timeline_mode": "monthly_exact_historical",
@@ -4325,6 +4490,8 @@ def status():
         "upload_streaming_enabled": True,
         "parquet_delete_enabled": True,
         "parquets": parquets,
+        "source_month_keys": source_month_keys,
+        "target_month_key_candidate": target_month_key_candidate,
         "parquet_inventory_warning_count": int(_parquet_inventory_snapshot.get("warning_count") or 0),
         "parquet_inventory_warnings": list(_parquet_inventory_snapshot.get("warnings") or []),
         "zones_geojson": zones_path.name if zones_path.exists() else None,
@@ -4376,11 +4543,14 @@ def status():
         "month_manifest_path": str(MONTH_MANIFEST_PATH),
         "month_manifest_present": MONTH_MANIFEST_PATH.exists(),
         "monthly_partition_mode": True,
+        "auto_month_generation_enabled": True,
         "active_month_key": active_month_key,
         "available_month_keys": available_month_keys,
         "monthly_partition_count": len(available_month_keys),
         "active_month_store_present": exact_history_store_present,
         "active_month_timeline_present": timeline_file_present,
+        "pending_month_key": pending_month_key,
+        "pending_month_label": pending_month_label,
         "generated_artifact_store_report": generated_artifact_report(),
         "artifact_runtime_policy": _artifact_runtime_policy_snapshot(),
         "artifact_runtime_integrity": artifact_runtime_integrity,
@@ -4964,10 +5134,19 @@ def day_tendency_frame_context(
 
 @app.get("/timeline")
 def timeline(request: Request, month_key: Optional[str] = None):
-    if not _has_frames(month_key=month_key):
-        raise HTTPException(status_code=409, detail="timeline not ready. Call /generate first.")
-    cached = _read_timeline_cached(month_key=month_key)
-    return _json_cached_response(request, cached["data"], etag=cached.get("etag"))
+    target_month_key = _resolve_target_month_key_for_request(month_key=month_key)
+    preparing_response = _ensure_requested_month_available_or_start_generate(
+        month_key=target_month_key,
+        request_kind="timeline",
+    )
+    if preparing_response is not None:
+        return preparing_response
+    cached = _read_timeline_cached(month_key=target_month_key)
+    timeline_payload = dict(cached["data"])
+    timeline_payload["active_month_key"] = target_month_key
+    timeline_payload["available_month_keys"] = list(_load_month_manifest().get("available_month_keys") or [])
+    timeline_payload["timeline_scope"] = "monthly_exact_historical"
+    return _json_cached_response(request, timeline_payload, etag=cached.get("etag"))
 
 
 def _parse_assistant_location_ids(location_ids: Optional[str]) -> List[str]:
@@ -5044,9 +5223,14 @@ def assistant_outlook(
 
 @app.get("/frame/{idx}")
 def frame(idx: int, request: Request, month_key: Optional[str] = None):
-    if not _has_frames(month_key=month_key):
-        raise HTTPException(status_code=409, detail="timeline not ready. Call /generate first.")
-    cached = _read_frame_cached(idx, month_key=month_key)
+    target_month_key = _resolve_target_month_key_for_request(month_key=month_key)
+    preparing_response = _ensure_requested_month_available_or_start_generate(
+        month_key=target_month_key,
+        request_kind="frame",
+    )
+    if preparing_response is not None:
+        return preparing_response
+    cached = _read_frame_cached(idx, month_key=target_month_key)
     return _json_cached_response(request, cached["data"], etag=cached.get("etag"))
 
 
@@ -5061,9 +5245,14 @@ def frame_viewport(
     month_key: Optional[str] = None,
     padding_ratio: float = 0.18,
 ):
-    if not _has_frames(month_key=month_key):
-        raise HTTPException(status_code=409, detail="timeline not ready. Call /generate first.")
-    cached = _read_frame_cached(idx, month_key=month_key)
+    target_month_key = _resolve_target_month_key_for_request(month_key=month_key)
+    preparing_response = _ensure_requested_month_available_or_start_generate(
+        month_key=target_month_key,
+        request_kind="frame_viewport",
+    )
+    if preparing_response is not None:
+        return preparing_response
+    cached = _read_frame_cached(idx, month_key=target_month_key)
     payload = _frame_payload_viewport_subset(
         cached["data"],
         min_lat=min_lat,
