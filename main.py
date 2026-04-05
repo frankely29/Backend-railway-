@@ -2214,15 +2214,20 @@ def start_generate(bin_minutes: int, min_trips_per_window: int, force_clear_lock
 
     cleanup_result = None
     lock_cleared = False
-    if not _generate_thread_alive():
+    thread_alive = _generate_thread_alive()
+    if not thread_alive:
         cleanup_result = cleanup_artifact_storage(DATA_DIR, FRAMES_DIR)
         if force_clear_lock and _lock_is_present():
             _clear_lock()
             lock_cleared = True
 
     if _lock_is_present():
-        if not _generate_thread_alive():
-            _clear_stale_lock()
+        if not thread_alive:
+            _clear_lock()
+            lock_cleared = True
+            state_now = _get_state()
+            if state_now.get("state") == "running" and not _generate_thread_alive():
+                _set_state(state="idle")
         if _lock_is_present():
             _set_state(state="running", bin_minutes=bin_minutes, min_trips_per_window=min_trips_per_window)
             return {
@@ -3938,6 +3943,7 @@ def status():
     identity = _backend_identity_snapshot(freshness)
     artifact_runtime_integrity = _artifact_runtime_integrity_report()
     leaderboard_runtime = get_leaderboard_runtime_snapshot()
+    stale_lock_detected = bool(_lock_is_present() and not _generate_thread_alive())
     return {
         "status": "ok",
         "timeline_mode": "exact_historical",
@@ -3996,6 +4002,7 @@ def status():
         "artifact_runtime_integrity": artifact_runtime_integrity,
         "generate_state": _get_state(),
         "generate_lock": _generate_lock_snapshot(),
+        "generate_stale_lock_detected": stale_lock_detected,
         "artifact_freshness": freshness,
         "storage_report": get_artifact_storage_report(DATA_DIR, FRAMES_DIR),
         "community_db": os.environ.get("COMMUNITY_DB", str(DATA_DIR / "community.db")),
@@ -4339,8 +4346,37 @@ def system_diagnostics(admin: sqlite3.Row = Depends(require_admin)):
 
 
 @app.get("/generate")
-def generate_get(bin_minutes: int = DEFAULT_BIN_MINUTES, min_trips_per_window: int = DEFAULT_MIN_TRIPS_PER_WINDOW):
-    return start_generate(bin_minutes, min_trips_per_window)
+def generate_get(
+    bin_minutes: int = DEFAULT_BIN_MINUTES,
+    min_trips_per_window: int = DEFAULT_MIN_TRIPS_PER_WINDOW,
+    force_clear_lock: int = 0,
+):
+    return start_generate(
+        bin_minutes,
+        min_trips_per_window,
+        force_clear_lock=bool(int(force_clear_lock or 0)),
+    )
+
+
+@app.post("/admin/generate/clear_lock")
+def admin_generate_clear_lock(admin: sqlite3.Row = Depends(require_admin)):
+    _ = admin
+    lock_present = _lock_is_present()
+    lock_cleared = False
+    if lock_present:
+        _clear_lock()
+        lock_cleared = True
+    thread_alive = _generate_thread_alive()
+    state_now = _get_state()
+    if not thread_alive and state_now.get("state") == "running":
+        _set_state(state="idle")
+        state_now = _get_state()
+    return {
+        "ok": True,
+        "lock_cleared": lock_cleared,
+        "thread_alive": thread_alive,
+        "state": state_now.get("state"),
+    }
 
 
 @app.get("/generate_status")
