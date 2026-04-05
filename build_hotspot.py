@@ -18,6 +18,11 @@ from zone_geometry_metrics import build_zone_geometry_metrics_rows
 from zone_mode_profiles import ZONE_MODE_PROFILES, validate_zone_mode_profiles_for_live_engine
 from artifact_freshness import build_expected_artifact_signature
 from artifact_db_store import save_generated_artifact
+from exact_history_feature_builder import (
+    bucket_and_color_from_rating,
+    _build_shadow_props_from_row,
+    build_feature_properties_from_shadow_row,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,35 +43,6 @@ def ensure_zones_geojson(data_dir: Path, force: bool = False) -> Path:
         except Exception:
             pass
     raise RuntimeError("Missing /data/taxi_zones.geojson. Upload it via POST /upload_zones_geojson.")
-
-
-def bucket_and_color_from_rating(rating: int) -> tuple[str, str]:
-    """
-    STRICT bucket order requested:
-      Green  = Highest
-      Purple = High
-      Blue   = Medium
-      Sky    = Normal
-      Yellow = Below Normal
-      Red    = Very Low / Avoid
-    """
-    r = int(rating)
-
-    if r >= 87:
-        return "green", "#00b050"
-    if r >= 73:
-        return "purple", "#8000ff"
-    if r >= 60:
-        return "indigo", "#4b3cff"
-    if r >= 48:
-        return "blue", "#0066ff"
-    if r >= 40:
-        return "sky", "#66ccff"
-    if r >= 33:
-        return "yellow", "#ffd400"
-    if r >= 25:
-        return "orange", "#ff8c00"
-    return "red", "#e60000"
 
 
 BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS = {
@@ -611,58 +587,6 @@ def _build_profile_candidate_review(frame_time: str, profile_name: str, features
     }
 
 
-def _resolve_popup_metrics(
-    *,
-    raw_shadow_props: Dict[str, Any],
-    visible_pickups: int,
-    geometry_area_sq_miles: float | None,
-) -> Dict[str, float]:
-    pickups_now = _as_finite_number(raw_shadow_props.get("pickups_now_shadow"))
-    if pickups_now is None or pickups_now < 0:
-        pickups_now = float(max(0, int(visible_pickups)))
-
-    pickups_next = _as_finite_number(raw_shadow_props.get("next_pickups_shadow"))
-    if pickups_next is None or pickups_next < 0:
-        pickups_next = pickups_now
-
-    zone_area = _as_finite_number(raw_shadow_props.get("zone_area_sq_miles_shadow"))
-    if zone_area is None or zone_area <= 0:
-        zone_area = _as_finite_number(geometry_area_sq_miles)
-
-    density_now = _as_finite_number(raw_shadow_props.get("pickups_per_sq_mile_now_shadow"))
-    if (density_now is None or density_now < 0) and zone_area is not None and zone_area > 0:
-        density_now = pickups_now / zone_area
-
-    density_next = _as_finite_number(raw_shadow_props.get("pickups_per_sq_mile_next_shadow"))
-    if (density_next is None or density_next < 0) and zone_area is not None and zone_area > 0:
-        density_next = pickups_next / zone_area
-
-    if zone_area is None or zone_area <= 0:
-        if density_now is not None and density_now > 0:
-            zone_area = max(pickups_now / density_now, 0.01)
-        elif density_next is not None and density_next > 0:
-            zone_area = max(pickups_next / density_next, 0.01)
-        else:
-            zone_area = 1.0
-
-    if density_now is None or density_now < 0:
-        density_now = max(pickups_now / max(zone_area, 0.01), 0.0)
-    if density_next is None or density_next < 0:
-        density_next = max(pickups_next / max(zone_area, 0.01), 0.0)
-
-    resolved = {
-        "pickups_now_shadow": float(pickups_now),
-        "next_pickups_shadow": float(pickups_next),
-        "zone_area_sq_miles_shadow": float(zone_area),
-        "pickups_per_sq_mile_now_shadow": float(density_now),
-        "pickups_per_sq_mile_next_shadow": float(density_next),
-    }
-    for metric_name, metric_value in resolved.items():
-        if not math.isfinite(metric_value):
-            raise ValueError(f"popup metric {metric_name} resolved to non-finite value")
-    return resolved
-
-
 def _popup_failure_diagnostics_payload(
     *,
     location_id: int,
@@ -1070,25 +994,11 @@ def build_hotspots_frames(
 
         con.execute(
             """
-            CREATE INDEX IF NOT EXISTS idx_exact_shadow_rows_ts
-            ON exact_shadow_rows(exact_bin_local_ts)
-            """
-        )
-        con.execute(
-            """
             CREATE INDEX IF NOT EXISTS idx_exact_shadow_rows_ts_zone
             ON exact_shadow_rows(exact_bin_local_ts, PULocationID)
             """
         )
-        con.execute(
-            """
-            CREATE OR REPLACE TABLE exact_frame_features (
-                exact_bin_local_ts VARCHAR,
-                PULocationID INTEGER,
-                feature_properties_json VARCHAR
-            )
-            """
-        )
+        logger.info("exact_shadow_rows_materialized month_key=%s row_count=%d", month_key, rows_total_in_shadow)
         shadow_cursor = con.execute(
             """
             SELECT *
@@ -1097,37 +1007,6 @@ def build_hotspots_frames(
             """
         )
         shadow_columns = [str(desc[0]) for desc in (shadow_cursor.description or [])]
-
-        def _build_shadow_props_from_row(row_map: Dict[str, Any]) -> Dict[str, Any]:
-            shadow_props = dict(row_map)
-            shadow_props["exact_bin_local_ts"] = None if row_map.get("exact_bin_local_ts") is None else str(row_map.get("exact_bin_local_ts"))
-            shadow_props["exact_bin_date_local"] = None if row_map.get("exact_bin_date_local") is None else str(row_map.get("exact_bin_date_local"))
-            shadow_props["exact_bin_unix_utc"] = None if row_map.get("exact_bin_unix_utc") is None else int(row_map.get("exact_bin_unix_utc"))
-            shadow_props["pickups_now_shadow"] = None if row_map.get("pickups_now") is None else int(row_map.get("pickups_now"))
-            shadow_props["next_pickups_shadow"] = None if row_map.get("pickups_next") is None else int(row_map.get("pickups_next"))
-            shadow_props["median_driver_pay_shadow"] = None if row_map.get("median_driver_pay") is None else float(row_map.get("median_driver_pay"))
-            shadow_props["median_pay_per_min_shadow"] = None if row_map.get("median_pay_per_min") is None else float(row_map.get("median_pay_per_min"))
-            shadow_props["median_pay_per_mile_shadow"] = None if row_map.get("median_pay_per_mile") is None else float(row_map.get("median_pay_per_mile"))
-            shadow_props["median_request_to_pickup_min_shadow"] = None if row_map.get("median_request_to_pickup_min") is None else float(row_map.get("median_request_to_pickup_min"))
-            shadow_props["short_trip_share_shadow"] = None if row_map.get("short_trip_share_3mi_12min") is None else float(row_map.get("short_trip_share_3mi_12min"))
-            shadow_props["shared_ride_share_shadow"] = None if row_map.get("shared_ride_share") is None else float(row_map.get("shared_ride_share"))
-            shadow_props["zone_area_sq_miles_shadow"] = None if row_map.get("zone_area_sq_miles") is None else float(row_map.get("zone_area_sq_miles"))
-            shadow_props["pickups_per_sq_mile_now_shadow"] = None if row_map.get("pickups_per_sq_mile_now") is None else float(row_map.get("pickups_per_sq_mile_now"))
-            shadow_props["pickups_per_sq_mile_next_shadow"] = None if row_map.get("pickups_per_sq_mile_next") is None else float(row_map.get("pickups_per_sq_mile_next"))
-            shadow_props["long_trip_share_20plus_shadow"] = None if row_map.get("long_trip_share_20plus") is None else float(row_map.get("long_trip_share_20plus"))
-            shadow_props["balanced_trip_share_shadow"] = None if row_map.get("balanced_trip_share") is None else float(row_map.get("balanced_trip_share"))
-            shadow_props["same_zone_dropoff_share_shadow"] = None if row_map.get("same_zone_dropoff_share") is None else float(row_map.get("same_zone_dropoff_share"))
-            shadow_props["downstream_value_shadow"] = None if row_map.get("downstream_next_value_raw") is None else float(row_map.get("downstream_next_value_raw"))
-            shadow_props["demand_now_n_shadow"] = None if row_map.get("demand_now_n") is None else float(row_map.get("demand_now_n"))
-            shadow_props["demand_next_n_shadow"] = None if row_map.get("demand_next_n") is None else float(row_map.get("demand_next_n"))
-            shadow_props["pay_n_shadow"] = None if row_map.get("pay_n") is None else float(row_map.get("pay_n"))
-            shadow_props["pay_per_min_n_shadow"] = None if row_map.get("pay_per_min_n") is None else float(row_map.get("pay_per_min_n"))
-            shadow_props["pay_per_mile_n_shadow"] = None if row_map.get("pay_per_mile_n") is None else float(row_map.get("pay_per_mile_n"))
-            shadow_props["pickup_friction_penalty_n_shadow"] = None if row_map.get("pickup_friction_penalty_n") is None else float(row_map.get("pickup_friction_penalty_n"))
-            shadow_props["short_trip_penalty_n_shadow"] = None if row_map.get("short_trip_penalty_n") is None else float(row_map.get("short_trip_penalty_n"))
-            shadow_props["shared_ride_penalty_n_shadow"] = None if row_map.get("shared_ride_penalty_n") is None else float(row_map.get("shared_ride_penalty_n"))
-            shadow_props["downstream_value_n_shadow"] = None if row_map.get("downstream_value_n") is None else float(row_map.get("downstream_value_n"))
-            return shadow_props
 
         timeline_entries: List[Dict[str, Any]] = []
         frame_count = 0
@@ -1245,35 +1124,6 @@ def build_hotspots_frames(
                     "bin_minutes": int(bin_minutes),
                 }
             )
-            feature_rows = []
-            for feature in current_features:
-                props = feature.get("properties") if isinstance(feature, dict) else None
-                if not isinstance(props, dict):
-                    continue
-                location_id = props.get("LocationID")
-                try:
-                    location_id_int = int(location_id)
-                except Exception:
-                    continue
-                feature_rows.append(
-                    (
-                        str(current_time_iso),
-                        location_id_int,
-                        json.dumps(props, separators=(",", ":")),
-                    )
-                )
-            if feature_rows:
-                con.executemany(
-                    """
-                    INSERT INTO exact_frame_features (
-                        exact_bin_local_ts,
-                        PULocationID,
-                        feature_properties_json
-                    )
-                    VALUES (?, ?, ?)
-                    """,
-                    feature_rows,
-                )
 
             frame_count += 1
             if frame_count % 250 == 0:
@@ -1307,8 +1157,6 @@ def build_hotspots_frames(
                 exact_weekday_name_local = row_map.get("exact_weekday_name_local")
                 exact_bin_time_label_local = row_map.get("exact_bin_time_label_local")
                 pickups = row_map.get("pickups_now")
-                avg_pay = row_map.get("median_driver_pay")
-                rating = row_map.get("earnings_shadow_rating_citywide_v3")
                 total_rows += 1
                 key = str(exact_bin_local_ts)
 
@@ -1328,8 +1176,6 @@ def build_hotspots_frames(
                 if not geom:
                     continue
 
-                r = int(rating)
-                bucket, fill = bucket_and_color_from_rating(r)
                 shadow_props = _build_shadow_props_from_row(row_map)
                 geometry_area_sq_miles = None
                 if zid_i in zone_geometry_by_id:
@@ -1337,9 +1183,10 @@ def build_hotspots_frames(
                 fallback_resolution_attempted = False
                 try:
                     fallback_resolution_attempted = True
-                    popup_metrics = _resolve_popup_metrics(
-                        raw_shadow_props=shadow_props,
-                        visible_pickups=int(pickups),
+                    feature_properties = build_feature_properties_from_shadow_row(
+                        row_map=row_map,
+                        zone_name=name_by_id.get(zid_i, ""),
+                        borough=borough_by_id.get(zid_i, ""),
                         geometry_area_sq_miles=geometry_area_sq_miles,
                     )
                 except Exception as exc:
@@ -1364,6 +1211,13 @@ def build_hotspots_frames(
                             f"LocationID={zid_i} zone_name={name_by_id.get(zid_i, '')!r} frame_time={current_time_iso}"
                         ) from exc
                     raise
+                popup_metrics = {
+                    "pickups_now_shadow": feature_properties.get("pickups_now_shadow"),
+                    "next_pickups_shadow": feature_properties.get("next_pickups_shadow"),
+                    "zone_area_sq_miles_shadow": feature_properties.get("zone_area_sq_miles_shadow"),
+                    "pickups_per_sq_mile_now_shadow": feature_properties.get("pickups_per_sq_mile_now_shadow"),
+                    "pickups_per_sq_mile_next_shadow": feature_properties.get("pickups_per_sq_mile_next_shadow"),
+                }
                 if not bool(is_airport_zone(zid_i, name_by_id.get(zid_i, ""), borough_by_id.get(zid_i, ""))):
                     current_popup_metric_diagnostics_by_location_id[zid_i] = {
                         "fallback_resolution_attempted": fallback_resolution_attempted,
@@ -1379,23 +1233,6 @@ def build_hotspots_frames(
                         "pickups_per_sq_mile_now_shadow": shadow_props.get("pickups_per_sq_mile_now_shadow"),
                         "pickups_per_sq_mile_next_shadow": shadow_props.get("pickups_per_sq_mile_next_shadow"),
                     }
-                if (not bool(is_airport_zone(zid_i, name_by_id.get(zid_i, ""), borough_by_id.get(zid_i, "")))) and popup_metrics is None:
-                    popup_diagnostics = _popup_failure_diagnostics_payload(
-                        location_id=zid_i,
-                        zone_name=name_by_id.get(zid_i, ""),
-                        borough=borough_by_id.get(zid_i, ""),
-                        frame_time=current_time_iso,
-                        shadow_props=shadow_props,
-                        zone_geometry_by_id=zone_geometry_by_id,
-                        geometry_area_sq_miles=geometry_area_sq_miles,
-                        visible_pickups=int(pickups),
-                        fallback_resolution_attempted=fallback_resolution_attempted,
-                    )
-                    logger.error("non_airport_popup_metric_resolution_failed %s", json.dumps(popup_diagnostics, sort_keys=True))
-                    raise RuntimeError(
-                        "Popup metric resolution failed for non-airport zone "
-                        f"LocationID={zid_i} zone_name={name_by_id.get(zid_i, '')!r} frame_time={current_time_iso}"
-                    )
                 if total_rows % 100000 == 0:
                     logger.info(
                         "stream_exact_history_progress rows_processed=%d frames_built=%d current_exact_bin_local_ts=%s",
@@ -1407,254 +1244,7 @@ def build_hotspots_frames(
                 current_features.append({
                     "type": "Feature",
                     "geometry": geom,
-                    "properties": {
-                        "LocationID": zid_i,
-                        "zone_name": name_by_id.get(zid_i, ""),
-                        "borough": borough_by_id.get(zid_i, ""),
-                        "airport_excluded": bool(is_airport_zone(zid_i, name_by_id.get(zid_i, ""), borough_by_id.get(zid_i, ""))),
-                        "rating": r,
-                        "bucket": bucket,
-                        "pickups": int(pickups),
-                        "avg_driver_pay": None if avg_pay is None else float(avg_pay),
-                        "avg_tips": None,
-                        "style": {
-                            "color": fill,
-                            "opacity": 0,
-                            "weight": 0,
-                            "fillColor": fill,
-                            "fillOpacity": 0.82
-                        },
-                        "next_pickups_shadow": popup_metrics.get("next_pickups_shadow") if popup_metrics else shadow_props.get("next_pickups_shadow"),
-                        "pickups_now_shadow": popup_metrics.get("pickups_now_shadow") if popup_metrics else shadow_props.get("pickups_now_shadow"),
-                        "median_driver_pay_shadow": shadow_props.get("median_driver_pay_shadow"),
-                        "median_pay_per_min_shadow": shadow_props.get("median_pay_per_min_shadow"),
-                        "median_pay_per_mile_shadow": shadow_props.get("median_pay_per_mile_shadow"),
-                        "median_request_to_pickup_min_shadow": shadow_props.get("median_request_to_pickup_min_shadow"),
-                        "short_trip_share_shadow": shadow_props.get("short_trip_share_shadow"),
-                        "shared_ride_share_shadow": shadow_props.get("shared_ride_share_shadow"),
-                        "zone_area_sq_miles_shadow": popup_metrics.get("zone_area_sq_miles_shadow") if popup_metrics else shadow_props.get("zone_area_sq_miles_shadow"),
-                        "pickups_per_sq_mile_now_shadow": popup_metrics.get("pickups_per_sq_mile_now_shadow") if popup_metrics else shadow_props.get("pickups_per_sq_mile_now_shadow"),
-                        "pickups_per_sq_mile_next_shadow": popup_metrics.get("pickups_per_sq_mile_next_shadow") if popup_metrics else shadow_props.get("pickups_per_sq_mile_next_shadow"),
-                        "long_trip_share_20plus_shadow": shadow_props.get("long_trip_share_20plus_shadow"),
-                        "balanced_trip_share_shadow": shadow_props.get("balanced_trip_share_shadow"),
-                        "same_zone_dropoff_share_shadow": shadow_props.get("same_zone_dropoff_share_shadow"),
-                        "downstream_value_shadow": shadow_props.get("downstream_value_shadow"),
-                        "demand_now_n_shadow": shadow_props.get("demand_now_n_shadow"),
-                        "demand_next_n_shadow": shadow_props.get("demand_next_n_shadow"),
-                        "pay_n_shadow": shadow_props.get("pay_n_shadow"),
-                        "pay_per_min_n_shadow": shadow_props.get("pay_per_min_n_shadow"),
-                        "pay_per_mile_n_shadow": shadow_props.get("pay_per_mile_n_shadow"),
-                        "pickup_friction_penalty_n_shadow": shadow_props.get("pickup_friction_penalty_n_shadow"),
-                        "short_trip_penalty_n_shadow": shadow_props.get("short_trip_penalty_n_shadow"),
-                        "shared_ride_penalty_n_shadow": shadow_props.get("shared_ride_penalty_n_shadow"),
-                        "downstream_value_n_shadow": shadow_props.get("downstream_value_n_shadow"),
-                        "demand_density_now_n_shadow": shadow_props.get("demand_density_now_n_shadow"),
-                        "demand_density_next_n_shadow": shadow_props.get("demand_density_next_n_shadow"),
-                        "demand_support_n_shadow": shadow_props.get("demand_support_n_shadow"),
-                        "density_support_n_shadow": shadow_props.get("density_support_n_shadow"),
-                        "effective_demand_density_now_n_shadow": shadow_props.get("effective_demand_density_now_n_shadow"),
-                        "effective_demand_density_next_n_shadow": shadow_props.get("effective_demand_density_next_n_shadow"),
-                        "busy_now_base_n_shadow": shadow_props.get("busy_now_base_n_shadow"),
-                        "busy_next_base_n_shadow": shadow_props.get("busy_next_base_n_shadow"),
-                        "long_trip_share_20plus_n_shadow": shadow_props.get("long_trip_share_20plus_n_shadow"),
-                        "balanced_trip_share_n_shadow": shadow_props.get("balanced_trip_share_n_shadow"),
-                        "same_zone_retention_penalty_n_shadow": shadow_props.get("same_zone_retention_penalty_n_shadow"),
-                        "churn_pressure_n_shadow": shadow_props.get("churn_pressure_n_shadow"),
-                        "manhattan_core_saturation_proxy_n_shadow": shadow_props.get("manhattan_core_saturation_proxy_n_shadow"),
-                        "manhattan_core_saturation_penalty_n_shadow": shadow_props.get("manhattan_core_saturation_penalty_n_shadow"),
-                        "market_saturation_pressure_n_shadow": shadow_props.get("market_saturation_pressure_n_shadow"),
-                        "market_saturation_penalty_n_shadow": shadow_props.get("market_saturation_penalty_n_shadow"),
-                        "citywide_manhattan_saturation_discount_factor_shadow": shadow_props.get("citywide_manhattan_saturation_discount_factor_shadow"),
-                        "earnings_shadow_positive_citywide_v3": shadow_props.get("earnings_shadow_positive_citywide_v3"),
-                        "earnings_shadow_negative_citywide_v3": shadow_props.get("earnings_shadow_negative_citywide_v3"),
-                        "earnings_shadow_score_raw_citywide_v3": shadow_props.get("earnings_shadow_score_raw_citywide_v3"),
-                        "earnings_shadow_score_raw_citywide_v3_pre_manhattan_discount_shadow": shadow_props.get("earnings_shadow_score_raw_citywide_v3_pre_manhattan_discount_shadow"),
-                        "earnings_shadow_score_citywide_v3_anchor_shadow": shadow_props.get("earnings_shadow_score_citywide_v3_anchor_shadow"),
-                        "earnings_shadow_score_raw_manhattan_v3": shadow_props.get("earnings_shadow_score_raw_manhattan_v3"),
-                        "earnings_shadow_score_raw_bronx_wash_heights_v3": shadow_props.get("earnings_shadow_score_raw_bronx_wash_heights_v3"),
-                        "earnings_shadow_score_raw_queens_v3": shadow_props.get("earnings_shadow_score_raw_queens_v3"),
-                        "earnings_shadow_score_raw_brooklyn_v3": shadow_props.get("earnings_shadow_score_raw_brooklyn_v3"),
-                        "earnings_shadow_score_raw_staten_island_v3": shadow_props.get("earnings_shadow_score_raw_staten_island_v3"),
-                        "earnings_shadow_busy_size_positive_citywide_v3": shadow_props.get("earnings_shadow_busy_size_positive_citywide_v3"),
-                        "earnings_shadow_pay_quality_positive_citywide_v3": shadow_props.get("earnings_shadow_pay_quality_positive_citywide_v3"),
-                        "earnings_shadow_trip_mix_positive_citywide_v3": shadow_props.get("earnings_shadow_trip_mix_positive_citywide_v3"),
-                        "earnings_shadow_continuation_positive_citywide_v3": shadow_props.get("earnings_shadow_continuation_positive_citywide_v3"),
-                        "earnings_shadow_short_trip_penalty_citywide_v3": shadow_props.get("earnings_shadow_short_trip_penalty_citywide_v3"),
-                        "earnings_shadow_retention_penalty_citywide_v3": shadow_props.get("earnings_shadow_retention_penalty_citywide_v3"),
-                        "earnings_shadow_friction_penalty_citywide_v3": shadow_props.get("earnings_shadow_friction_penalty_citywide_v3"),
-                        "earnings_shadow_saturation_penalty_citywide_v3": shadow_props.get("earnings_shadow_saturation_penalty_citywide_v3"),
-                        "earnings_shadow_busy_size_positive_manhattan_v3": shadow_props.get("earnings_shadow_busy_size_positive_manhattan_v3"),
-                        "earnings_shadow_pay_quality_positive_manhattan_v3": shadow_props.get("earnings_shadow_pay_quality_positive_manhattan_v3"),
-                        "earnings_shadow_trip_mix_positive_manhattan_v3": shadow_props.get("earnings_shadow_trip_mix_positive_manhattan_v3"),
-                        "earnings_shadow_continuation_positive_manhattan_v3": shadow_props.get("earnings_shadow_continuation_positive_manhattan_v3"),
-                        "earnings_shadow_short_trip_penalty_manhattan_v3": shadow_props.get("earnings_shadow_short_trip_penalty_manhattan_v3"),
-                        "earnings_shadow_retention_penalty_manhattan_v3": shadow_props.get("earnings_shadow_retention_penalty_manhattan_v3"),
-                        "earnings_shadow_friction_penalty_manhattan_v3": shadow_props.get("earnings_shadow_friction_penalty_manhattan_v3"),
-                        "earnings_shadow_saturation_penalty_manhattan_v3": shadow_props.get("earnings_shadow_saturation_penalty_manhattan_v3"),
-                        "earnings_shadow_busy_size_positive_bronx_wash_heights_v3": shadow_props.get("earnings_shadow_busy_size_positive_bronx_wash_heights_v3"),
-                        "earnings_shadow_pay_quality_positive_bronx_wash_heights_v3": shadow_props.get("earnings_shadow_pay_quality_positive_bronx_wash_heights_v3"),
-                        "earnings_shadow_trip_mix_positive_bronx_wash_heights_v3": shadow_props.get("earnings_shadow_trip_mix_positive_bronx_wash_heights_v3"),
-                        "earnings_shadow_continuation_positive_bronx_wash_heights_v3": shadow_props.get("earnings_shadow_continuation_positive_bronx_wash_heights_v3"),
-                        "earnings_shadow_short_trip_penalty_bronx_wash_heights_v3": shadow_props.get("earnings_shadow_short_trip_penalty_bronx_wash_heights_v3"),
-                        "earnings_shadow_retention_penalty_bronx_wash_heights_v3": shadow_props.get("earnings_shadow_retention_penalty_bronx_wash_heights_v3"),
-                        "earnings_shadow_friction_penalty_bronx_wash_heights_v3": shadow_props.get("earnings_shadow_friction_penalty_bronx_wash_heights_v3"),
-                        "earnings_shadow_saturation_penalty_bronx_wash_heights_v3": shadow_props.get("earnings_shadow_saturation_penalty_bronx_wash_heights_v3"),
-                        "earnings_shadow_busy_size_positive_queens_v3": shadow_props.get("earnings_shadow_busy_size_positive_queens_v3"),
-                        "earnings_shadow_pay_quality_positive_queens_v3": shadow_props.get("earnings_shadow_pay_quality_positive_queens_v3"),
-                        "earnings_shadow_trip_mix_positive_queens_v3": shadow_props.get("earnings_shadow_trip_mix_positive_queens_v3"),
-                        "earnings_shadow_continuation_positive_queens_v3": shadow_props.get("earnings_shadow_continuation_positive_queens_v3"),
-                        "earnings_shadow_short_trip_penalty_queens_v3": shadow_props.get("earnings_shadow_short_trip_penalty_queens_v3"),
-                        "earnings_shadow_retention_penalty_queens_v3": shadow_props.get("earnings_shadow_retention_penalty_queens_v3"),
-                        "earnings_shadow_friction_penalty_queens_v3": shadow_props.get("earnings_shadow_friction_penalty_queens_v3"),
-                        "earnings_shadow_saturation_penalty_queens_v3": shadow_props.get("earnings_shadow_saturation_penalty_queens_v3"),
-                        "earnings_shadow_busy_size_positive_brooklyn_v3": shadow_props.get("earnings_shadow_busy_size_positive_brooklyn_v3"),
-                        "earnings_shadow_pay_quality_positive_brooklyn_v3": shadow_props.get("earnings_shadow_pay_quality_positive_brooklyn_v3"),
-                        "earnings_shadow_trip_mix_positive_brooklyn_v3": shadow_props.get("earnings_shadow_trip_mix_positive_brooklyn_v3"),
-                        "earnings_shadow_continuation_positive_brooklyn_v3": shadow_props.get("earnings_shadow_continuation_positive_brooklyn_v3"),
-                        "earnings_shadow_short_trip_penalty_brooklyn_v3": shadow_props.get("earnings_shadow_short_trip_penalty_brooklyn_v3"),
-                        "earnings_shadow_retention_penalty_brooklyn_v3": shadow_props.get("earnings_shadow_retention_penalty_brooklyn_v3"),
-                        "earnings_shadow_friction_penalty_brooklyn_v3": shadow_props.get("earnings_shadow_friction_penalty_brooklyn_v3"),
-                        "earnings_shadow_saturation_penalty_brooklyn_v3": shadow_props.get("earnings_shadow_saturation_penalty_brooklyn_v3"),
-                        "earnings_shadow_busy_size_positive_staten_island_v3": shadow_props.get("earnings_shadow_busy_size_positive_staten_island_v3"),
-                        "earnings_shadow_pay_quality_positive_staten_island_v3": shadow_props.get("earnings_shadow_pay_quality_positive_staten_island_v3"),
-                        "earnings_shadow_trip_mix_positive_staten_island_v3": shadow_props.get("earnings_shadow_trip_mix_positive_staten_island_v3"),
-                        "earnings_shadow_continuation_positive_staten_island_v3": shadow_props.get("earnings_shadow_continuation_positive_staten_island_v3"),
-                        "earnings_shadow_short_trip_penalty_staten_island_v3": shadow_props.get("earnings_shadow_short_trip_penalty_staten_island_v3"),
-                        "earnings_shadow_retention_penalty_staten_island_v3": shadow_props.get("earnings_shadow_retention_penalty_staten_island_v3"),
-                        "earnings_shadow_friction_penalty_staten_island_v3": shadow_props.get("earnings_shadow_friction_penalty_staten_island_v3"),
-                        "earnings_shadow_saturation_penalty_staten_island_v3": shadow_props.get("earnings_shadow_saturation_penalty_staten_island_v3"),
-                        "earnings_shadow_score_citywide_v3": shadow_props.get("earnings_shadow_score_citywide_v3"),
-                        "earnings_shadow_confidence_citywide_v3": shadow_props.get("earnings_shadow_confidence_citywide_v3"),
-                        "earnings_shadow_citywide_anchor_input_v3": shadow_props.get("earnings_shadow_citywide_anchor_input_v3"),
-                        "earnings_shadow_citywide_anchor_base_v3": shadow_props.get("earnings_shadow_citywide_anchor_base_v3"),
-                        "earnings_shadow_citywide_anchor_display_v3": shadow_props.get("earnings_shadow_citywide_anchor_display_v3"),
-                        "earnings_shadow_citywide_anchor_norm_v3": shadow_props.get("earnings_shadow_citywide_anchor_norm_v3"),
-                        "earnings_shadow_rating_citywide_v3": shadow_props.get("earnings_shadow_rating_citywide_v3"),
-                        "earnings_shadow_bucket_citywide_v3": shadow_props.get("earnings_shadow_bucket_citywide_v3"),
-                        "earnings_shadow_color_citywide_v3": shadow_props.get("earnings_shadow_color_citywide_v3"),
-                        "earnings_shadow_score_citywide_v2": shadow_props.get("earnings_shadow_score_citywide_v2"),
-                        "earnings_shadow_confidence_citywide_v2": shadow_props.get("earnings_shadow_confidence_citywide_v2"),
-                        "earnings_shadow_rating_citywide_v2": shadow_props.get("earnings_shadow_rating_citywide_v2"),
-                        "earnings_shadow_bucket_citywide_v2": shadow_props.get("earnings_shadow_bucket_citywide_v2"),
-                        "earnings_shadow_color_citywide_v2": shadow_props.get("earnings_shadow_color_citywide_v2"),
-                        "earnings_shadow_score_manhattan_v2": shadow_props.get("earnings_shadow_score_manhattan_v2"),
-                        "earnings_shadow_confidence_manhattan_v2": shadow_props.get("earnings_shadow_confidence_manhattan_v2"),
-                        "earnings_shadow_rating_manhattan_v2": shadow_props.get("earnings_shadow_rating_manhattan_v2"),
-                        "earnings_shadow_bucket_manhattan_v2": shadow_props.get("earnings_shadow_bucket_manhattan_v2"),
-                        "earnings_shadow_color_manhattan_v2": shadow_props.get("earnings_shadow_color_manhattan_v2"),
-                        "earnings_shadow_score_bronx_wash_heights_v2": shadow_props.get("earnings_shadow_score_bronx_wash_heights_v2"),
-                        "earnings_shadow_confidence_bronx_wash_heights_v2": shadow_props.get("earnings_shadow_confidence_bronx_wash_heights_v2"),
-                        "earnings_shadow_rating_bronx_wash_heights_v2": shadow_props.get("earnings_shadow_rating_bronx_wash_heights_v2"),
-                        "earnings_shadow_bucket_bronx_wash_heights_v2": shadow_props.get("earnings_shadow_bucket_bronx_wash_heights_v2"),
-                        "earnings_shadow_color_bronx_wash_heights_v2": shadow_props.get("earnings_shadow_color_bronx_wash_heights_v2"),
-                        "earnings_shadow_score_queens_v2": shadow_props.get("earnings_shadow_score_queens_v2"),
-                        "earnings_shadow_confidence_queens_v2": shadow_props.get("earnings_shadow_confidence_queens_v2"),
-                        "earnings_shadow_rating_queens_v2": shadow_props.get("earnings_shadow_rating_queens_v2"),
-                        "earnings_shadow_bucket_queens_v2": shadow_props.get("earnings_shadow_bucket_queens_v2"),
-                        "earnings_shadow_color_queens_v2": shadow_props.get("earnings_shadow_color_queens_v2"),
-                        "earnings_shadow_score_brooklyn_v2": shadow_props.get("earnings_shadow_score_brooklyn_v2"),
-                        "earnings_shadow_confidence_brooklyn_v2": shadow_props.get("earnings_shadow_confidence_brooklyn_v2"),
-                        "earnings_shadow_rating_brooklyn_v2": shadow_props.get("earnings_shadow_rating_brooklyn_v2"),
-                        "earnings_shadow_bucket_brooklyn_v2": shadow_props.get("earnings_shadow_bucket_brooklyn_v2"),
-                        "earnings_shadow_color_brooklyn_v2": shadow_props.get("earnings_shadow_color_brooklyn_v2"),
-                        "earnings_shadow_score_staten_island_v2": shadow_props.get("earnings_shadow_score_staten_island_v2"),
-                        "earnings_shadow_confidence_staten_island_v2": shadow_props.get("earnings_shadow_confidence_staten_island_v2"),
-                        "earnings_shadow_rating_staten_island_v2": shadow_props.get("earnings_shadow_rating_staten_island_v2"),
-                        "earnings_shadow_bucket_staten_island_v2": shadow_props.get("earnings_shadow_bucket_staten_island_v2"),
-                        "earnings_shadow_color_staten_island_v2": shadow_props.get("earnings_shadow_color_staten_island_v2"),
-                        "earnings_shadow_score_manhattan_v3": shadow_props.get("earnings_shadow_score_manhattan_v3"),
-                        "earnings_shadow_confidence_manhattan_v3": shadow_props.get("earnings_shadow_confidence_manhattan_v3"),
-                        "earnings_shadow_rating_manhattan_v3": shadow_props.get("earnings_shadow_rating_manhattan_v3"),
-                        "earnings_shadow_bucket_manhattan_v3": shadow_props.get("earnings_shadow_bucket_manhattan_v3"),
-                        "earnings_shadow_color_manhattan_v3": shadow_props.get("earnings_shadow_color_manhattan_v3"),
-                        "earnings_shadow_score_bronx_wash_heights_v3": shadow_props.get("earnings_shadow_score_bronx_wash_heights_v3"),
-                        "earnings_shadow_confidence_bronx_wash_heights_v3": shadow_props.get("earnings_shadow_confidence_bronx_wash_heights_v3"),
-                        "earnings_shadow_rating_bronx_wash_heights_v3": shadow_props.get("earnings_shadow_rating_bronx_wash_heights_v3"),
-                        "earnings_shadow_bucket_bronx_wash_heights_v3": shadow_props.get("earnings_shadow_bucket_bronx_wash_heights_v3"),
-                        "earnings_shadow_color_bronx_wash_heights_v3": shadow_props.get("earnings_shadow_color_bronx_wash_heights_v3"),
-                        "earnings_shadow_score_queens_v3": shadow_props.get("earnings_shadow_score_queens_v3"),
-                        "earnings_shadow_confidence_queens_v3": shadow_props.get("earnings_shadow_confidence_queens_v3"),
-                        "earnings_shadow_rating_queens_v3": shadow_props.get("earnings_shadow_rating_queens_v3"),
-                        "earnings_shadow_bucket_queens_v3": shadow_props.get("earnings_shadow_bucket_queens_v3"),
-                        "earnings_shadow_color_queens_v3": shadow_props.get("earnings_shadow_color_queens_v3"),
-                        "earnings_shadow_score_brooklyn_v3": shadow_props.get("earnings_shadow_score_brooklyn_v3"),
-                        "earnings_shadow_confidence_brooklyn_v3": shadow_props.get("earnings_shadow_confidence_brooklyn_v3"),
-                        "earnings_shadow_rating_brooklyn_v3": shadow_props.get("earnings_shadow_rating_brooklyn_v3"),
-                        "earnings_shadow_bucket_brooklyn_v3": shadow_props.get("earnings_shadow_bucket_brooklyn_v3"),
-                        "earnings_shadow_color_brooklyn_v3": shadow_props.get("earnings_shadow_color_brooklyn_v3"),
-                        "earnings_shadow_score_staten_island_v3": shadow_props.get("earnings_shadow_score_staten_island_v3"),
-                        "earnings_shadow_confidence_staten_island_v3": shadow_props.get("earnings_shadow_confidence_staten_island_v3"),
-                        "citywide_v3_confidence_profile_shadow": shadow_props.get("citywide_v3_confidence_profile_shadow"),
-                        "manhattan_v3_confidence_profile_shadow": shadow_props.get("manhattan_v3_confidence_profile_shadow"),
-                        "bronx_wash_heights_v3_confidence_profile_shadow": shadow_props.get("bronx_wash_heights_v3_confidence_profile_shadow"),
-                        "queens_v3_confidence_profile_shadow": shadow_props.get("queens_v3_confidence_profile_shadow"),
-                        "brooklyn_v3_confidence_profile_shadow": shadow_props.get("brooklyn_v3_confidence_profile_shadow"),
-                        "staten_island_v3_confidence_profile_shadow": shadow_props.get("staten_island_v3_confidence_profile_shadow"),
-                        "earnings_shadow_rating_staten_island_v3": shadow_props.get("earnings_shadow_rating_staten_island_v3"),
-                        "earnings_shadow_bucket_staten_island_v3": shadow_props.get("earnings_shadow_bucket_staten_island_v3"),
-                        "earnings_shadow_color_staten_island_v3": shadow_props.get("earnings_shadow_color_staten_island_v3"),
-                        "airport_exit_share_shadow": shadow_props.get("airport_exit_share_shadow"),
-                        "out_of_scored_network_exit_share_shadow": shadow_props.get("out_of_scored_network_exit_share_shadow"),
-                        "short_external_exit_share_6mi_30min_shadow": shadow_props.get("short_external_exit_share_6mi_30min_shadow"),
-                        "short_external_exit_share_8mi_40min_shadow": shadow_props.get("short_external_exit_share_8mi_40min_shadow"),
-                        "good_long_external_exit_share_shadow": shadow_props.get("good_long_external_exit_share_shadow"),
-                        "airport_exit_share_n_shadow": shadow_props.get("airport_exit_share_n_shadow"),
-                        "out_of_scored_network_exit_share_n_shadow": shadow_props.get("out_of_scored_network_exit_share_n_shadow"),
-                        "short_external_exit_share_6mi_30min_n_shadow": shadow_props.get("short_external_exit_share_6mi_30min_n_shadow"),
-                        "short_external_exit_share_8mi_40min_n_shadow": shadow_props.get("short_external_exit_share_8mi_40min_n_shadow"),
-                        "good_long_external_exit_share_n_shadow": shadow_props.get("good_long_external_exit_share_n_shadow"),
-                        "return_risk_shadow": shadow_props.get("return_risk_shadow"),
-                        "escape_quality_shadow": shadow_props.get("escape_quality_shadow"),
-                        "safe_return_risk": shadow_props.get("safe_return_risk"),
-                        "safe_escape_quality": shadow_props.get("safe_escape_quality"),
-                        "safe_airport_exit": shadow_props.get("safe_airport_exit"),
-                        "safe_external_exit": shadow_props.get("safe_external_exit"),
-                        "safe_short_external": shadow_props.get("safe_short_external"),
-                        "safe_good_long_external": shadow_props.get("safe_good_long_external"),
-                        "safe_downstream": shadow_props.get("safe_downstream"),
-                        "citywide_trap_adjustment_factor": shadow_props.get("citywide_trap_adjustment_factor"),
-                        "queens_trap_adjustment_factor": shadow_props.get("queens_trap_adjustment_factor"),
-                        "bronx_wash_heights_trap_adjustment_factor": shadow_props.get("bronx_wash_heights_trap_adjustment_factor"),
-                        "brooklyn_trap_adjustment_factor": shadow_props.get("brooklyn_trap_adjustment_factor"),
-                        "staten_island_trap_adjustment_factor": shadow_props.get("staten_island_trap_adjustment_factor"),
-                        "manhattan_trap_adjustment_factor": shadow_props.get("manhattan_trap_adjustment_factor"),
-                        "earnings_shadow_score_citywide_v3_trap_candidate": shadow_props.get("earnings_shadow_score_citywide_v3_trap_candidate"),
-                        "earnings_shadow_score_manhattan_v3_trap_candidate": shadow_props.get("earnings_shadow_score_manhattan_v3_trap_candidate"),
-                        "earnings_shadow_score_bronx_wash_heights_v3_trap_candidate": shadow_props.get("earnings_shadow_score_bronx_wash_heights_v3_trap_candidate"),
-                        "earnings_shadow_score_queens_v3_trap_candidate": shadow_props.get("earnings_shadow_score_queens_v3_trap_candidate"),
-                        "earnings_shadow_score_brooklyn_v3_trap_candidate": shadow_props.get("earnings_shadow_score_brooklyn_v3_trap_candidate"),
-                        "earnings_shadow_score_staten_island_v3_trap_candidate": shadow_props.get("earnings_shadow_score_staten_island_v3_trap_candidate"),
-                        "earnings_shadow_confidence_citywide_v3_trap_candidate": shadow_props.get("earnings_shadow_confidence_citywide_v3_trap_candidate"),
-                        "earnings_shadow_confidence_manhattan_v3_trap_candidate": shadow_props.get("earnings_shadow_confidence_manhattan_v3_trap_candidate"),
-                        "earnings_shadow_confidence_bronx_wash_heights_v3_trap_candidate": shadow_props.get("earnings_shadow_confidence_bronx_wash_heights_v3_trap_candidate"),
-                        "earnings_shadow_confidence_queens_v3_trap_candidate": shadow_props.get("earnings_shadow_confidence_queens_v3_trap_candidate"),
-                        "earnings_shadow_confidence_brooklyn_v3_trap_candidate": shadow_props.get("earnings_shadow_confidence_brooklyn_v3_trap_candidate"),
-                        "earnings_shadow_confidence_staten_island_v3_trap_candidate": shadow_props.get("earnings_shadow_confidence_staten_island_v3_trap_candidate"),
-                        "earnings_shadow_rating_citywide_v3_trap_candidate": shadow_props.get("earnings_shadow_rating_citywide_v3_trap_candidate"),
-                        "earnings_shadow_bucket_citywide_v3_trap_candidate": shadow_props.get("earnings_shadow_bucket_citywide_v3_trap_candidate"),
-                        "earnings_shadow_color_citywide_v3_trap_candidate": shadow_props.get("earnings_shadow_color_citywide_v3_trap_candidate"),
-                        "earnings_shadow_rating_manhattan_v3_trap_candidate": shadow_props.get("earnings_shadow_rating_manhattan_v3_trap_candidate"),
-                        "earnings_shadow_bucket_manhattan_v3_trap_candidate": shadow_props.get("earnings_shadow_bucket_manhattan_v3_trap_candidate"),
-                        "earnings_shadow_color_manhattan_v3_trap_candidate": shadow_props.get("earnings_shadow_color_manhattan_v3_trap_candidate"),
-                        "earnings_shadow_rating_bronx_wash_heights_v3_trap_candidate": shadow_props.get("earnings_shadow_rating_bronx_wash_heights_v3_trap_candidate"),
-                        "earnings_shadow_bucket_bronx_wash_heights_v3_trap_candidate": shadow_props.get("earnings_shadow_bucket_bronx_wash_heights_v3_trap_candidate"),
-                        "earnings_shadow_color_bronx_wash_heights_v3_trap_candidate": shadow_props.get("earnings_shadow_color_bronx_wash_heights_v3_trap_candidate"),
-                        "earnings_shadow_rating_queens_v3_trap_candidate": shadow_props.get("earnings_shadow_rating_queens_v3_trap_candidate"),
-                        "earnings_shadow_bucket_queens_v3_trap_candidate": shadow_props.get("earnings_shadow_bucket_queens_v3_trap_candidate"),
-                        "earnings_shadow_color_queens_v3_trap_candidate": shadow_props.get("earnings_shadow_color_queens_v3_trap_candidate"),
-                        "earnings_shadow_rating_brooklyn_v3_trap_candidate": shadow_props.get("earnings_shadow_rating_brooklyn_v3_trap_candidate"),
-                        "earnings_shadow_bucket_brooklyn_v3_trap_candidate": shadow_props.get("earnings_shadow_bucket_brooklyn_v3_trap_candidate"),
-                        "earnings_shadow_color_brooklyn_v3_trap_candidate": shadow_props.get("earnings_shadow_color_brooklyn_v3_trap_candidate"),
-                        "earnings_shadow_rating_staten_island_v3_trap_candidate": shadow_props.get("earnings_shadow_rating_staten_island_v3_trap_candidate"),
-                        "earnings_shadow_bucket_staten_island_v3_trap_candidate": shadow_props.get("earnings_shadow_bucket_staten_island_v3_trap_candidate"),
-                        "earnings_shadow_color_staten_island_v3_trap_candidate": shadow_props.get("earnings_shadow_color_staten_island_v3_trap_candidate"),
-                        "earnings_shadow_delta_citywide_v3_trap_candidate": shadow_props.get("earnings_shadow_delta_citywide_v3_trap_candidate"),
-                        "earnings_shadow_delta_manhattan_v3_trap_candidate": shadow_props.get("earnings_shadow_delta_manhattan_v3_trap_candidate"),
-                        "earnings_shadow_delta_bronx_wash_heights_v3_trap_candidate": shadow_props.get("earnings_shadow_delta_bronx_wash_heights_v3_trap_candidate"),
-                        "earnings_shadow_delta_queens_v3_trap_candidate": shadow_props.get("earnings_shadow_delta_queens_v3_trap_candidate"),
-                        "earnings_shadow_delta_brooklyn_v3_trap_candidate": shadow_props.get("earnings_shadow_delta_brooklyn_v3_trap_candidate"),
-                        "earnings_shadow_delta_staten_island_v3_trap_candidate": shadow_props.get("earnings_shadow_delta_staten_island_v3_trap_candidate"),
-                    }
+                    "properties": feature_properties,
                 })
 
         if not any_rows:
@@ -1697,7 +1287,7 @@ def build_hotspots_frames(
             json.dumps(timeline_payload, separators=(",", ":")),
             encoding="utf-8"
         )
-        logger.info("exact_history_build_timeline_done count=%d", len(timeline_entries))
+        logger.info("monthly_partition_timeline_ready month_key=%s frame_count=%d", month_key, len(timeline_entries))
         # Keep timeline.json on volume for compatibility while mirroring metadata copy in DB.
         save_generated_artifact("timeline", timeline_payload, compress=False)
 
@@ -2138,7 +1728,7 @@ def build_hotspots_frames(
 
         resolved_timeline_output_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(staged_timeline), str(resolved_timeline_output_path))
-        logger.info("exact_history_publish_done")
+        logger.info("monthly_partition_publish_done month_key=%s", month_key)
 
         build_result = {
             "ok": True,

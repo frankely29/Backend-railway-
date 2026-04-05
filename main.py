@@ -29,6 +29,7 @@ from pyproj import Transformer
 from shapely.geometry import MultiPolygon, Point, Polygon, mapping, shape
 from shapely.ops import transform, unary_union
 from starlette.middleware.base import BaseHTTPMiddleware
+from exact_history_feature_builder import build_feature_properties_from_shadow_row
 
 from hotspot_experiments import (
     log_micro_bins,
@@ -889,6 +890,8 @@ def _read_frame_cached(idx: int, month_key: Optional[str] = None) -> Dict[str, A
 
 
 def _build_frame_payload_on_demand(frame_time: str, month_key: Optional[str] = None) -> Dict[str, Any]:
+    from build_hotspot import _recalibrate_visible_v3_fields
+
     resolved_month_key, _ = _resolve_active_month_key(month_key=month_key)
     store_path = _month_store_path(resolved_month_key)
     if not store_path.exists():
@@ -898,44 +901,39 @@ def _build_frame_payload_on_demand(frame_time: str, month_key: Optional[str] = N
         raise HTTPException(status_code=503, detail="taxi_zones.geojson unavailable")
     con = duckdb.connect(database=str(store_path), read_only=True)
     try:
-        rows = con.execute(
+        cursor = con.execute(
             """
-            SELECT PULocationID, feature_properties_json
-            FROM exact_frame_features
+            SELECT *
+            FROM exact_shadow_rows
             WHERE exact_bin_local_ts = ?
             ORDER BY PULocationID
             """,
             [str(frame_time)],
-        ).fetchall()
+        )
+        rows = cursor.fetchall()
+        columns = [str(desc[0]) for desc in (cursor.description or [])]
     finally:
         con.close()
     if not rows:
         raise HTTPException(status_code=404, detail=f"frame not found for time: {frame_time}")
 
     features: List[Dict[str, Any]] = []
-    for location_id, props_json in rows:
+    for row in rows:
+        row_map = {columns[idx]: row[idx] for idx in range(len(columns))}
         try:
-            zid = int(location_id)
+            zid = int(row_map.get("PULocationID"))
         except Exception:
             continue
         zone_meta = zone_geoms.get(zid) or {}
         geom = zone_meta.get("geometry")
         if geom is None:
             continue
-        properties: Dict[str, Any] = {}
-        if isinstance(props_json, str) and props_json:
-            try:
-                parsed_props = json.loads(props_json)
-                if isinstance(parsed_props, dict):
-                    properties = parsed_props
-            except Exception:
-                properties = {}
-        if "LocationID" not in properties:
-            properties["LocationID"] = zid
-        if "zone_name" not in properties:
-            properties["zone_name"] = zone_meta.get("zone_name") or ""
-        if "borough" not in properties:
-            properties["borough"] = zone_meta.get("borough") or ""
+        properties = build_feature_properties_from_shadow_row(
+            row_map=row_map,
+            zone_name=str(zone_meta.get("zone_name") or ""),
+            borough=str(zone_meta.get("borough") or ""),
+            geometry_area_sq_miles=None,
+        )
         features.append(
             {
                 "type": "Feature",
@@ -943,6 +941,8 @@ def _build_frame_payload_on_demand(frame_time: str, month_key: Optional[str] = N
                 "properties": properties,
             }
         )
+
+    _recalibrate_visible_v3_fields(features)
     return {
         "time": str(frame_time),
         "polygons": {
