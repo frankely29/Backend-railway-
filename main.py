@@ -804,7 +804,13 @@ def _json_cached_response(
 
 
 def _read_timeline_cached(month_key: Optional[str] = None) -> Dict[str, Any]:
-    resolved_month_key, manifest = _resolve_active_month_key(month_key=month_key)
+    if month_key:
+        resolved_month_key = str(month_key).strip()
+        if not _safe_parse_month_key(resolved_month_key):
+            raise HTTPException(status_code=404, detail=f"month_key not available: {resolved_month_key}")
+        manifest = _load_month_manifest()
+    else:
+        resolved_month_key, manifest = _resolve_active_month_key(month_key=month_key)
     timeline_path = _month_timeline_path(resolved_month_key)
     if timeline_path.exists() and timeline_path.stat().st_size > 0:
         stat_result = timeline_path.stat()
@@ -892,10 +898,15 @@ def _read_frame_cached(idx: int, month_key: Optional[str] = None) -> Dict[str, A
 def _build_frame_payload_on_demand(frame_time: str, month_key: Optional[str] = None) -> Dict[str, Any]:
     from build_hotspot import _recalibrate_visible_v3_fields
 
-    resolved_month_key, _ = _resolve_active_month_key(month_key=month_key)
+    resolved_month_key = str(month_key).strip() if month_key else ""
+    if resolved_month_key:
+        if not _safe_parse_month_key(resolved_month_key):
+            raise HTTPException(status_code=404, detail=f"month_key not available: {resolved_month_key}")
+    else:
+        resolved_month_key, _ = _resolve_active_month_key(month_key=month_key)
     store_path = _month_store_path(resolved_month_key)
-    if not store_path.exists():
-        raise HTTPException(status_code=409, detail="exact history store not ready. Call /generate first.")
+    if not store_path.exists() or store_path.stat().st_size <= 0:
+        raise HTTPException(status_code=503, detail="exact history store not ready for requested month")
     zone_geoms = _load_pickup_zone_geometries()
     if not zone_geoms:
         raise HTTPException(status_code=503, detail="taxi_zones.geojson unavailable")
@@ -4384,7 +4395,7 @@ def startup():
             print(
                 f"[warn] artifact-freshness stale at startup; auto-generate disabled "
                 f"(AUTO_GENERATE_ON_STARTUP=0). reason_codes={reason_codes}. "
-                "Manual /generate is required."
+                "Request-time monthly auto-generation will rebuild on demand."
             )
             _set_state(
                 state="idle",
@@ -4392,7 +4403,7 @@ def startup():
                 min_trips_per_window=DEFAULT_MIN_TRIPS_PER_WINDOW,
                 result={
                     "ok": False,
-                    "reason": "stale_artifacts_manual_generate_required",
+                    "reason": "stale_artifacts_waiting_for_request_time_monthly_auto_generation",
                     "reason_codes": reason_codes,
                 },
             )
