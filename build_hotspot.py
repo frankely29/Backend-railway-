@@ -813,6 +813,8 @@ def build_hotspots_frames(
     exact_history_backup_dir: Path | None = None,
     timeline_output_path: Path | None = None,
     cleanup_out_dir_frames: bool = True,
+    month_key: str | None = None,
+    build_review_artifacts: bool = False,
 ) -> Dict[str, Any]:
     """
     Writes:
@@ -999,258 +1001,253 @@ def build_hotspots_frames(
             """
         )
         logger.info("exact_shadow_rows_materialized month_key=%s row_count=%d", month_key, rows_total_in_shadow)
-        shadow_cursor = con.execute(
-            """
-            SELECT *
-            FROM exact_shadow_rows
-            ORDER BY exact_bin_local_ts, PULocationID
-            """
-        )
-        shadow_columns = [str(desc[0]) for desc in (shadow_cursor.description or [])]
-
-        timeline_entries: List[Dict[str, Any]] = []
-        frame_count = 0
-        candidate_review_by_profile: Dict[str, Dict[str, Any]] = {
-            profile_name: {
-                "frame_count": 0,
-                "eligible_zone_observations": 0,
-                "promoted_observations": 0,
-                "demoted_observations": 0,
-                "sum_delta": 0.0,
-                "delta_observation_count": 0,
-                "min_delta_seen": None,
-                "max_delta_seen": None,
-                "recurring_demotions_by_zone": {},
-                "recurring_promotions_by_zone": {},
-            }
-            for profile_name in TRAP_CANDIDATE_REVIEW_PROFILE_CONFIG
-        }
-
-        current_key: str | None = None
-        current_features: List[Dict[str, Any]] = []
-        current_time_iso: str | None = None
-        current_date_local: str | None = None
-        current_weekday_name_local: str | None = None
-        current_time_label_local: str | None = None
-        current_popup_metric_diagnostics_by_location_id: Dict[int, Dict[str, Any]] = {}
-
-        def flush_frame():
-            nonlocal frame_count, current_features, current_time_iso, current_date_local, current_weekday_name_local, current_time_label_local, current_popup_metric_diagnostics_by_location_id
-            if current_time_iso is None:
-                return
-
-            _recalibrate_visible_v3_fields(current_features)
-            per_frame_candidate_review: Dict[str, Any] = {}
-            for profile_name in TRAP_CANDIDATE_REVIEW_PROFILE_CONFIG:
-                profile_review = _build_profile_candidate_review(current_time_iso, profile_name, current_features)
-                per_frame_candidate_review[profile_name] = profile_review
-                accumulator = candidate_review_by_profile[profile_name]
-                accumulator["frame_count"] += 1
-                eligible_zone_count = int(profile_review.get("eligible_zone_count") or 0)
-                accumulator["eligible_zone_observations"] += eligible_zone_count
-                accumulator["promoted_observations"] += int(profile_review.get("promoted_count") or 0)
-                accumulator["demoted_observations"] += int(profile_review.get("demoted_count") or 0)
-                accumulator["sum_delta"] += float(profile_review.get("average_delta") or 0.0) * eligible_zone_count
-                accumulator["delta_observation_count"] += eligible_zone_count
-                frame_min = _safe_float(profile_review.get("min_delta"))
-                frame_max = _safe_float(profile_review.get("max_delta"))
-                min_seen = accumulator["min_delta_seen"]
-                max_seen = accumulator["max_delta_seen"]
-                if frame_min is not None:
-                    accumulator["min_delta_seen"] = frame_min if min_seen is None else min(min_seen, frame_min)
-                if frame_max is not None:
-                    accumulator["max_delta_seen"] = frame_max if max_seen is None else max(max_seen, frame_max)
-
-                for item in profile_review.get("top_demotions", []):
-                    delta = _safe_float(item.get("delta"))
-                    if delta is None or delta >= -0.03:
-                        continue
-                    location_id = _safe_int(item.get("LocationID"))
-                    if location_id is None:
-                        continue
-                    recurring = accumulator["recurring_demotions_by_zone"].setdefault(
-                        location_id,
-                        {
-                            "LocationID": location_id,
-                            "zone_name": _safe_text(item.get("zone_name")),
-                            "borough": _safe_text(item.get("borough")),
-                            "appearances": 0,
-                            "cumulative_delta": 0.0,
-                            "worst_delta_seen": delta,
-                            "best_delta_seen": delta,
-                        },
-                    )
-                    recurring["appearances"] += 1
-                    recurring["cumulative_delta"] += delta
-                    recurring["worst_delta_seen"] = min(float(recurring["worst_delta_seen"]), delta)
-                    recurring["best_delta_seen"] = max(float(recurring["best_delta_seen"]), delta)
-
-                for item in profile_review.get("top_promotions", []):
-                    delta = _safe_float(item.get("delta"))
-                    if delta is None or delta <= 0.03:
-                        continue
-                    location_id = _safe_int(item.get("LocationID"))
-                    if location_id is None:
-                        continue
-                    recurring = accumulator["recurring_promotions_by_zone"].setdefault(
-                        location_id,
-                        {
-                            "LocationID": location_id,
-                            "zone_name": _safe_text(item.get("zone_name")),
-                            "borough": _safe_text(item.get("borough")),
-                            "appearances": 0,
-                            "cumulative_delta": 0.0,
-                            "worst_delta_seen": delta,
-                            "best_delta_seen": delta,
-                        },
-                    )
-                    recurring["appearances"] += 1
-                    recurring["cumulative_delta"] += delta
-                    recurring["worst_delta_seen"] = min(float(recurring["worst_delta_seen"]), delta)
-                    recurring["best_delta_seen"] = max(float(recurring["best_delta_seen"]), delta)
-
-            _validate_popup_metric_consistency(
-                current_features,
-                current_time_iso,
-                diagnostics_by_location_id=current_popup_metric_diagnostics_by_location_id,
+        total_rows = rows_total_in_shadow
+        if bool(build_review_artifacts):
+            logger.info("monthly_partition_review_pass_start month_key=%s", month_key)
+            shadow_cursor = con.execute(
+                """
+                SELECT *
+                FROM exact_shadow_rows
+                ORDER BY exact_bin_local_ts, PULocationID
+                """
             )
-            _validate_rating_bucket_color_consistency(current_features, current_time_iso)
-            timeline_entries.append(
-                {
-                    "frame_time": current_time_iso,
-                    "frame_date": current_date_local,
-                    "frame_weekday_name": current_weekday_name_local,
-                    "frame_time_label": current_time_label_local,
-                    "bin_minutes": int(bin_minutes),
+            shadow_columns = [str(desc[0]) for desc in (shadow_cursor.description or [])]
+
+            frame_count = 0
+            candidate_review_by_profile: Dict[str, Dict[str, Any]] = {
+                profile_name: {
+                    "frame_count": 0,
+                    "eligible_zone_observations": 0,
+                    "promoted_observations": 0,
+                    "demoted_observations": 0,
+                    "sum_delta": 0.0,
+                    "delta_observation_count": 0,
+                    "min_delta_seen": None,
+                    "max_delta_seen": None,
+                    "recurring_demotions_by_zone": {},
+                    "recurring_promotions_by_zone": {},
                 }
-            )
+                for profile_name in TRAP_CANDIDATE_REVIEW_PROFILE_CONFIG
+            }
 
-            frame_count += 1
-            if frame_count % 250 == 0:
-                logger.info(
-                    "stream_exact_history_progress rows_processed=%d frames_built=%d current_exact_bin_local_ts=%s",
-                    total_rows,
-                    frame_count,
+            current_key: str | None = None
+            current_features: List[Dict[str, Any]] = []
+            current_time_iso: str | None = None
+            current_popup_metric_diagnostics_by_location_id: Dict[int, Dict[str, Any]] = {}
+
+            def flush_frame():
+                nonlocal frame_count, current_features, current_time_iso, current_popup_metric_diagnostics_by_location_id
+                if current_time_iso is None:
+                    return
+
+                _recalibrate_visible_v3_fields(current_features)
+                for profile_name in TRAP_CANDIDATE_REVIEW_PROFILE_CONFIG:
+                    profile_review = _build_profile_candidate_review(current_time_iso, profile_name, current_features)
+                    accumulator = candidate_review_by_profile[profile_name]
+                    accumulator["frame_count"] += 1
+                    eligible_zone_count = int(profile_review.get("eligible_zone_count") or 0)
+                    accumulator["eligible_zone_observations"] += eligible_zone_count
+                    accumulator["promoted_observations"] += int(profile_review.get("promoted_count") or 0)
+                    accumulator["demoted_observations"] += int(profile_review.get("demoted_count") or 0)
+                    accumulator["sum_delta"] += float(profile_review.get("average_delta") or 0.0) * eligible_zone_count
+                    accumulator["delta_observation_count"] += eligible_zone_count
+                    frame_min = _safe_float(profile_review.get("min_delta"))
+                    frame_max = _safe_float(profile_review.get("max_delta"))
+                    min_seen = accumulator["min_delta_seen"]
+                    max_seen = accumulator["max_delta_seen"]
+                    if frame_min is not None:
+                        accumulator["min_delta_seen"] = frame_min if min_seen is None else min(min_seen, frame_min)
+                    if frame_max is not None:
+                        accumulator["max_delta_seen"] = frame_max if max_seen is None else max(max_seen, frame_max)
+
+                    for item in profile_review.get("top_demotions", []):
+                        delta = _safe_float(item.get("delta"))
+                        if delta is None or delta >= -0.03:
+                            continue
+                        location_id = _safe_int(item.get("LocationID"))
+                        if location_id is None:
+                            continue
+                        recurring = accumulator["recurring_demotions_by_zone"].setdefault(
+                            location_id,
+                            {
+                                "LocationID": location_id,
+                                "zone_name": _safe_text(item.get("zone_name")),
+                                "borough": _safe_text(item.get("borough")),
+                                "appearances": 0,
+                                "cumulative_delta": 0.0,
+                                "worst_delta_seen": delta,
+                                "best_delta_seen": delta,
+                            },
+                        )
+                        recurring["appearances"] += 1
+                        recurring["cumulative_delta"] += delta
+                        recurring["worst_delta_seen"] = min(float(recurring["worst_delta_seen"]), delta)
+                        recurring["best_delta_seen"] = max(float(recurring["best_delta_seen"]), delta)
+
+                    for item in profile_review.get("top_promotions", []):
+                        delta = _safe_float(item.get("delta"))
+                        if delta is None or delta <= 0.03:
+                            continue
+                        location_id = _safe_int(item.get("LocationID"))
+                        if location_id is None:
+                            continue
+                        recurring = accumulator["recurring_promotions_by_zone"].setdefault(
+                            location_id,
+                            {
+                                "LocationID": location_id,
+                                "zone_name": _safe_text(item.get("zone_name")),
+                                "borough": _safe_text(item.get("borough")),
+                                "appearances": 0,
+                                "cumulative_delta": 0.0,
+                                "worst_delta_seen": delta,
+                                "best_delta_seen": delta,
+                            },
+                        )
+                        recurring["appearances"] += 1
+                        recurring["cumulative_delta"] += delta
+                        recurring["worst_delta_seen"] = min(float(recurring["worst_delta_seen"]), delta)
+                        recurring["best_delta_seen"] = max(float(recurring["best_delta_seen"]), delta)
+
+                _validate_popup_metric_consistency(
+                    current_features,
                     current_time_iso,
+                    diagnostics_by_location_id=current_popup_metric_diagnostics_by_location_id,
                 )
-            current_features = []
-            current_time_iso = None
-            current_date_local = None
-            current_weekday_name_local = None
-            current_time_label_local = None
-            current_popup_metric_diagnostics_by_location_id = {}
+                _validate_rating_bucket_color_consistency(current_features, current_time_iso)
+                frame_count += 1
+                current_features = []
+                current_time_iso = None
+                current_popup_metric_diagnostics_by_location_id = {}
 
-        total_rows = 0
-        any_rows = False
+            while True:
+                batch = shadow_cursor.fetchmany(250)
+                if not batch:
+                    break
 
-        while True:
-            batch = shadow_cursor.fetchmany(250)
-            if not batch:
-                break
-            any_rows = True
+                for row in batch:
+                    row_map = {shadow_columns[idx]: row[idx] for idx in range(len(shadow_columns))}
+                    zid = row_map.get("PULocationID")
+                    exact_bin_local_ts = row_map.get("exact_bin_local_ts")
+                    pickups = row_map.get("pickups_now")
+                    key = str(exact_bin_local_ts)
 
-            for row in batch:
-                row_map = {shadow_columns[idx]: row[idx] for idx in range(len(shadow_columns))}
-                zid = row_map.get("PULocationID")
-                exact_bin_local_ts = row_map.get("exact_bin_local_ts")
-                exact_bin_date_local = row_map.get("exact_bin_date_local")
-                exact_weekday_name_local = row_map.get("exact_weekday_name_local")
-                exact_bin_time_label_local = row_map.get("exact_bin_time_label_local")
-                pickups = row_map.get("pickups_now")
-                total_rows += 1
-                key = str(exact_bin_local_ts)
+                    if current_key is None:
+                        current_key = key
+                    if key != current_key:
+                        flush_frame()
+                        current_key = key
 
-                if current_key is None:
-                    current_key = key
-                if key != current_key:
-                    flush_frame()
-                    current_key = key
+                    current_time_iso = str(exact_bin_local_ts)
+                    zid_i = int(zid)
+                    geom = geom_by_id.get(zid_i)
+                    if not geom:
+                        continue
 
-                current_time_iso = str(exact_bin_local_ts)
-                current_date_local = None if exact_bin_date_local is None else str(exact_bin_date_local)
-                current_weekday_name_local = None if exact_weekday_name_local is None else str(exact_weekday_name_local)
-                current_time_label_local = None if exact_bin_time_label_local is None else str(exact_bin_time_label_local)
-
-                zid_i = int(zid)
-                geom = geom_by_id.get(zid_i)
-                if not geom:
-                    continue
-
-                shadow_props = _build_shadow_props_from_row(row_map)
-                geometry_area_sq_miles = None
-                if zid_i in zone_geometry_by_id:
-                    geometry_area_sq_miles = zone_geometry_by_id[zid_i].get("zone_area_sq_miles")
-                fallback_resolution_attempted = False
-                try:
-                    fallback_resolution_attempted = True
-                    feature_properties = build_feature_properties_from_shadow_row(
-                        row_map=row_map,
-                        zone_name=name_by_id.get(zid_i, ""),
-                        borough=borough_by_id.get(zid_i, ""),
-                        geometry_area_sq_miles=geometry_area_sq_miles,
-                    )
-                except Exception as exc:
-                    if not bool(is_airport_zone(zid_i, name_by_id.get(zid_i, ""), borough_by_id.get(zid_i, ""))):
-                        popup_diagnostics = _popup_failure_diagnostics_payload(
-                            location_id=zid_i,
+                    shadow_props = _build_shadow_props_from_row(row_map)
+                    geometry_area_sq_miles = None
+                    if zid_i in zone_geometry_by_id:
+                        geometry_area_sq_miles = zone_geometry_by_id[zid_i].get("zone_area_sq_miles")
+                    fallback_resolution_attempted = False
+                    try:
+                        fallback_resolution_attempted = True
+                        feature_properties = build_feature_properties_from_shadow_row(
+                            row_map=row_map,
                             zone_name=name_by_id.get(zid_i, ""),
                             borough=borough_by_id.get(zid_i, ""),
-                            frame_time=current_time_iso,
-                            shadow_props=shadow_props,
-                            zone_geometry_by_id=zone_geometry_by_id,
                             geometry_area_sq_miles=geometry_area_sq_miles,
-                            visible_pickups=int(pickups),
-                            fallback_resolution_attempted=fallback_resolution_attempted,
                         )
-                        logger.error(
-                            "non_airport_popup_metric_resolution_failed %s",
-                            json.dumps(popup_diagnostics, sort_keys=True),
-                        )
-                        raise RuntimeError(
-                            "Popup metric resolution failed for non-airport zone "
-                            f"LocationID={zid_i} zone_name={name_by_id.get(zid_i, '')!r} frame_time={current_time_iso}"
-                        ) from exc
-                    raise
-                popup_metrics = {
-                    "pickups_now_shadow": feature_properties.get("pickups_now_shadow"),
-                    "next_pickups_shadow": feature_properties.get("next_pickups_shadow"),
-                    "zone_area_sq_miles_shadow": feature_properties.get("zone_area_sq_miles_shadow"),
-                    "pickups_per_sq_mile_now_shadow": feature_properties.get("pickups_per_sq_mile_now_shadow"),
-                    "pickups_per_sq_mile_next_shadow": feature_properties.get("pickups_per_sq_mile_next_shadow"),
+                    except Exception as exc:
+                        if not bool(is_airport_zone(zid_i, name_by_id.get(zid_i, ""), borough_by_id.get(zid_i, ""))):
+                            popup_diagnostics = _popup_failure_diagnostics_payload(
+                                location_id=zid_i,
+                                zone_name=name_by_id.get(zid_i, ""),
+                                borough=borough_by_id.get(zid_i, ""),
+                                frame_time=current_time_iso,
+                                shadow_props=shadow_props,
+                                zone_geometry_by_id=zone_geometry_by_id,
+                                geometry_area_sq_miles=geometry_area_sq_miles,
+                                visible_pickups=int(pickups),
+                                fallback_resolution_attempted=fallback_resolution_attempted,
+                            )
+                            logger.error(
+                                "non_airport_popup_metric_resolution_failed %s",
+                                json.dumps(popup_diagnostics, sort_keys=True),
+                            )
+                            raise RuntimeError(
+                                "Popup metric resolution failed for non-airport zone "
+                                f"LocationID={zid_i} zone_name={name_by_id.get(zid_i, '')!r} frame_time={current_time_iso}"
+                            ) from exc
+                        raise
+
+                    if not bool(is_airport_zone(zid_i, name_by_id.get(zid_i, ""), borough_by_id.get(zid_i, ""))):
+                        current_popup_metric_diagnostics_by_location_id[zid_i] = {
+                            "fallback_resolution_attempted": fallback_resolution_attempted,
+                            "geometry_area_row_exists": bool(
+                                zid_i in zone_geometry_by_id
+                                and _as_finite_number(zone_geometry_by_id[zid_i].get("zone_area_sq_miles")) is not None
+                                and float(zone_geometry_by_id[zid_i]["zone_area_sq_miles"]) > 0
+                            ),
+                            "shadow_sql_row_exists": bool(shadow_props),
+                            "pickups_now_shadow": shadow_props.get("pickups_now_shadow"),
+                            "next_pickups_shadow": shadow_props.get("next_pickups_shadow"),
+                            "zone_area_sq_miles_shadow": shadow_props.get("zone_area_sq_miles_shadow"),
+                            "pickups_per_sq_mile_now_shadow": shadow_props.get("pickups_per_sq_mile_now_shadow"),
+                            "pickups_per_sq_mile_next_shadow": shadow_props.get("pickups_per_sq_mile_next_shadow"),
+                        }
+                    current_features.append({
+                        "type": "Feature",
+                        "geometry": geom,
+                        "properties": feature_properties,
+                    })
+
+            flush_frame()
+            trap_candidate_review_payload = {
+                "generated_at_utc": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+                "engine_release": "team-joseo-score-v2-final-live",
+                "bin_minutes": int(bin_minutes),
+                "profile_reviews": {},
+            }
+            for profile_name, accumulator in candidate_review_by_profile.items():
+                demotions = list(accumulator["recurring_demotions_by_zone"].values())
+                promotions = list(accumulator["recurring_promotions_by_zone"].values())
+                for collection in (demotions, promotions):
+                    for item in collection:
+                        appearances = max(1, int(item.get("appearances") or 0))
+                        item["average_delta"] = float(item.get("cumulative_delta") or 0.0) / appearances
+                recurring_top_demotions = sorted(
+                    demotions,
+                    key=lambda item: (
+                        float(item.get("average_delta") or 0.0),
+                        float(item.get("cumulative_delta") or 0.0),
+                    ),
+                )[:30]
+                recurring_top_promotions = sorted(
+                    promotions,
+                    key=lambda item: (
+                        float(item.get("average_delta") or 0.0),
+                        float(item.get("cumulative_delta") or 0.0),
+                    ),
+                    reverse=True,
+                )[:30]
+                delta_observation_count = int(accumulator["delta_observation_count"] or 0)
+                trap_candidate_review_payload["profile_reviews"][profile_name] = {
+                    "frame_count": int(accumulator["frame_count"] or 0),
+                    "eligible_zone_observations": int(accumulator["eligible_zone_observations"] or 0),
+                    "promoted_observations": int(accumulator["promoted_observations"] or 0),
+                    "demoted_observations": int(accumulator["demoted_observations"] or 0),
+                    "average_delta_overall": (
+                        float(accumulator["sum_delta"]) / delta_observation_count
+                        if delta_observation_count > 0 else 0.0
+                    ),
+                    "min_delta_seen": accumulator["min_delta_seen"],
+                    "max_delta_seen": accumulator["max_delta_seen"],
+                    "recurring_top_demotions": recurring_top_demotions,
+                    "recurring_top_promotions": recurring_top_promotions,
                 }
-                if not bool(is_airport_zone(zid_i, name_by_id.get(zid_i, ""), borough_by_id.get(zid_i, ""))):
-                    current_popup_metric_diagnostics_by_location_id[zid_i] = {
-                        "fallback_resolution_attempted": fallback_resolution_attempted,
-                        "geometry_area_row_exists": bool(
-                            zid_i in zone_geometry_by_id
-                            and _as_finite_number(zone_geometry_by_id[zid_i].get("zone_area_sq_miles")) is not None
-                            and float(zone_geometry_by_id[zid_i]["zone_area_sq_miles"]) > 0
-                        ),
-                        "shadow_sql_row_exists": bool(shadow_props),
-                        "pickups_now_shadow": shadow_props.get("pickups_now_shadow"),
-                        "next_pickups_shadow": shadow_props.get("next_pickups_shadow"),
-                        "zone_area_sq_miles_shadow": shadow_props.get("zone_area_sq_miles_shadow"),
-                        "pickups_per_sq_mile_now_shadow": shadow_props.get("pickups_per_sq_mile_now_shadow"),
-                        "pickups_per_sq_mile_next_shadow": shadow_props.get("pickups_per_sq_mile_next_shadow"),
-                    }
-                if total_rows % 100000 == 0:
-                    logger.info(
-                        "stream_exact_history_progress rows_processed=%d frames_built=%d current_exact_bin_local_ts=%s",
-                        total_rows,
-                        frame_count,
-                        current_time_iso,
-                    )
-
-                current_features.append({
-                    "type": "Feature",
-                    "geometry": geom,
-                    "properties": feature_properties,
-                })
-
-        if not any_rows:
-            raise RuntimeError("No data after filtering. Lower min_trips_per_window.")
-
-        flush_frame()
+            save_generated_artifact("trap_candidate_review", trap_candidate_review_payload, compress=False)
+            logger.info("monthly_partition_review_pass_done month_key=%s", month_key)
+        else:
+            logger.info("monthly_partition_review_pass_skipped month_key=%s", month_key)
 
         timeline_rows = con.execute(
             """
@@ -1290,51 +1287,6 @@ def build_hotspots_frames(
         logger.info("monthly_partition_timeline_ready month_key=%s frame_count=%d", month_key, len(timeline_entries))
         # Keep timeline.json on volume for compatibility while mirroring metadata copy in DB.
         save_generated_artifact("timeline", timeline_payload, compress=False)
-
-        trap_candidate_review_payload = {
-            "generated_at_utc": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
-            "engine_release": "team-joseo-score-v2-final-live",
-            "bin_minutes": int(bin_minutes),
-            "profile_reviews": {},
-        }
-        for profile_name, accumulator in candidate_review_by_profile.items():
-            demotions = list(accumulator["recurring_demotions_by_zone"].values())
-            promotions = list(accumulator["recurring_promotions_by_zone"].values())
-            for collection in (demotions, promotions):
-                for item in collection:
-                    appearances = max(1, int(item.get("appearances") or 0))
-                    item["average_delta"] = float(item.get("cumulative_delta") or 0.0) / appearances
-            recurring_top_demotions = sorted(
-                demotions,
-                key=lambda item: (
-                    float(item.get("average_delta") or 0.0),
-                    float(item.get("cumulative_delta") or 0.0),
-                ),
-            )[:30]
-            recurring_top_promotions = sorted(
-                promotions,
-                key=lambda item: (
-                    float(item.get("average_delta") or 0.0),
-                    float(item.get("cumulative_delta") or 0.0),
-                ),
-                reverse=True,
-            )[:30]
-            delta_observation_count = int(accumulator["delta_observation_count"] or 0)
-            trap_candidate_review_payload["profile_reviews"][profile_name] = {
-                "frame_count": int(accumulator["frame_count"] or 0),
-                "eligible_zone_observations": int(accumulator["eligible_zone_observations"] or 0),
-                "promoted_observations": int(accumulator["promoted_observations"] or 0),
-                "demoted_observations": int(accumulator["demoted_observations"] or 0),
-                "average_delta_overall": (
-                    float(accumulator["sum_delta"]) / delta_observation_count
-                    if delta_observation_count > 0 else 0.0
-                ),
-                "min_delta_seen": accumulator["min_delta_seen"],
-                "max_delta_seen": accumulator["max_delta_seen"],
-                "recurring_top_demotions": recurring_top_demotions,
-                "recurring_top_promotions": recurring_top_promotions,
-            }
-        save_generated_artifact("trap_candidate_review", trap_candidate_review_payload, compress=False)
 
         legacy_assistant_outlook_path = out_dir / "assistant_outlook.json"
         stage_assistant_outlook_path = stage_dir / "assistant_outlook.json"
