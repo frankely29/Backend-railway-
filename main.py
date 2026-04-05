@@ -6,6 +6,7 @@ import gzip
 import json
 import math
 import os
+import errno
 import copy
 import re
 import sqlite3
@@ -3906,6 +3907,8 @@ def status():
     return {
         "status": "ok",
         "data_dir": str(DATA_DIR),
+        "data_dir_exists": DATA_DIR.exists(),
+        "upload_streaming_enabled": True,
         "parquets": parquets,
         "zones_geojson": zones_path.name if zones_path.exists() else None,
         "zones_present": zones_path.exists(),
@@ -4631,21 +4634,72 @@ async def upload_zones_geojson(file: UploadFile = File(...)):
     return {"saved": str(target), "size_mb": round(target.stat().st_size / (1024 * 1024), 2)}
 
 
+def _safe_upload_filename(raw_name: str, default_name: str) -> str:
+    cleaned = (raw_name or default_name).replace("\\", "/").split("/")[-1].strip()
+    if not cleaned:
+        cleaned = default_name
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", cleaned)
+    return cleaned
+
+
+def _cleanup_path_quiet(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+async def _stream_upload_to_path(upload: UploadFile, target: Path, chunk_size: int = 8 * 1024 * 1024) -> int:
+    tmp_target = target.with_suffix(target.suffix + ".uploading")
+    _cleanup_path_quiet(tmp_target)
+    total_written = 0
+    try:
+        with tmp_target.open("wb") as out:
+            while True:
+                chunk = await upload.read(chunk_size)
+                if not chunk:
+                    break
+                out.write(chunk)
+                total_written += len(chunk)
+            out.flush()
+            os.fsync(out.fileno())
+        if total_written <= 0:
+            _cleanup_path_quiet(tmp_target)
+            raise HTTPException(status_code=400, detail="Empty upload.")
+        tmp_target.replace(target)
+        return total_written
+    except HTTPException:
+        _cleanup_path_quiet(tmp_target)
+        raise
+    except OSError as exc:
+        _cleanup_path_quiet(tmp_target)
+        if getattr(exc, "errno", None) == errno.ENOSPC:
+            raise HTTPException(status_code=507, detail="Upload failed: no space left on target volume")
+        detail = f"Upload write failed: {exc}"
+        raise HTTPException(status_code=500, detail=detail)
+    except Exception as exc:
+        _cleanup_path_quiet(tmp_target)
+        detail = f"Upload failed: {exc}"
+        raise HTTPException(status_code=500, detail=detail)
+
+
 @app.post("/upload_parquet")
 async def upload_parquet(file: UploadFile = File(...)):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    filename = (file.filename or "upload.parquet").replace("\\", "/").split("/")[-1]
+    filename = _safe_upload_filename(file.filename or "upload.parquet", "upload.parquet")
     if not filename.lower().endswith(".parquet"):
         raise HTTPException(status_code=400, detail="File must be .parquet")
 
     target = DATA_DIR / filename
-    content = await file.read()
-    if not content:
-        raise HTTPException(status_code=400, detail="Empty upload.")
-    target.write_bytes(content)
+    bytes_written = await _stream_upload_to_path(file, target)
 
-    return {"saved": str(target), "size_mb": round(target.stat().st_size / (1024 * 1024), 2)}
+    return {
+        "saved": str(target),
+        "filename": filename,
+        "size_bytes": int(bytes_written),
+        "size_mb": round(bytes_written / (1024 * 1024), 2),
+    }
 
 
 # =========================================================
