@@ -14,6 +14,7 @@ import sqlite3
 import threading
 import time
 import traceback
+import uuid
 from collections import defaultdict, deque
 from datetime import datetime, date, timezone
 from pathlib import Path
@@ -309,11 +310,13 @@ _to_4326 = Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
 # In-memory job state (hotspot generate)
 # =========================================================
 _state_lock = threading.Lock()
+_generate_control_lock = threading.Lock()
 _generate_thread: Optional[threading.Thread] = None
 _generate_state: Dict[str, Any] = {
     "state": "idle",  # idle | started | running | done | error
     "bin_minutes": None,
     "min_trips_per_window": None,
+    "run_token": None,
     "month_key": None,
     "build_all_months": False,
     "include_day_tendency": False,
@@ -2376,12 +2379,17 @@ def _build_assistant_outlook_only() -> Dict[str, Any]:
     }
 
 
-def _write_lock() -> None:
+def _write_lock(run_token: str) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    LOCK_PATH.write_text(str(int(time.time())), encoding="utf-8")
+    payload = {"ts": int(time.time()), "token": str(run_token)}
+    LOCK_PATH.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
 
 
-def _clear_lock() -> None:
+def _clear_lock(expected_token: Optional[str] = None) -> None:
+    if expected_token is not None:
+        current_token = _read_lock_token()
+        if current_token != str(expected_token):
+            return
     try:
         if LOCK_PATH.exists():
             LOCK_PATH.unlink()
@@ -2401,9 +2409,41 @@ def _read_lock_timestamp() -> int | None:
     if not raw:
         return None
     try:
+        payload = json.loads(raw)
+        if isinstance(payload, dict):
+            ts = payload.get("ts")
+            if isinstance(ts, bool):
+                return None
+            if isinstance(ts, (int, float)):
+                return int(ts)
+            if isinstance(ts, str) and ts.strip():
+                return int(ts.strip())
+    except Exception:
+        pass
+    try:
         return int(raw)
     except Exception:
         return None
+
+
+def _read_lock_token() -> Optional[str]:
+    try:
+        raw = LOCK_PATH.read_text(encoding="utf-8").strip()
+    except Exception:
+        return None
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    token = payload.get("token")
+    if token is None:
+        return None
+    token_text = str(token).strip()
+    return token_text or None
 
 
 def _lock_age_seconds() -> int | None:
@@ -2452,16 +2492,25 @@ def _ensure_requested_month_available_or_start_generate(
 
     state = _get_state()
     thread_alive = _generate_thread_alive()
+    state_name = str(state.get("state") or "")
+    running_month_key = str(state.get("month_key") or "").strip() or None
+    running_build_all = bool(state.get("build_all_months"))
+
+    if state_name in {"started", "running"} and running_month_key == month_key and not running_build_all:
+        return _preparing_month_response(
+            month_key=month_key,
+            request_kind=request_kind,
+            generate_started=False,
+            retry_after_sec=retry_after_sec,
+        )
+    if state_name == "error" and thread_alive and running_month_key == month_key:
+        return _preparing_month_response(
+            month_key=month_key,
+            request_kind=request_kind,
+            generate_started=False,
+            retry_after_sec=retry_after_sec,
+        )
     if thread_alive:
-        running_month_key = str(state.get("month_key") or "").strip() or None
-        running_build_all = bool(state.get("build_all_months"))
-        if running_month_key == month_key and not running_build_all:
-            return _preparing_month_response(
-                month_key=month_key,
-                request_kind=request_kind,
-                generate_started=False,
-                retry_after_sec=retry_after_sec,
-            )
         return _preparing_month_response(
             month_key=month_key,
             request_kind=request_kind,
@@ -2472,7 +2521,7 @@ def _ensure_requested_month_available_or_start_generate(
     start_generate(
         DEFAULT_BIN_MINUTES,
         DEFAULT_MIN_TRIPS_PER_WINDOW,
-        force_clear_lock=True,
+        force_clear_lock=False,
         include_day_tendency=False,
         month_key=month_key,
         build_all_months=False,
@@ -2498,6 +2547,7 @@ def _get_state() -> Dict[str, Any]:
 def _generate_worker(
     bin_minutes: int,
     min_trips_per_window: int,
+    run_token: str,
     include_day_tendency: bool = False,
     month_key: Optional[str] = None,
     build_all_months: bool = False,
@@ -2510,6 +2560,7 @@ def _generate_worker(
         state="running",
         bin_minutes=bin_minutes,
         min_trips_per_window=min_trips_per_window,
+        run_token=run_token,
         month_key=(str(month_key).strip() if month_key else None),
         build_all_months=bool(build_all_months),
         include_day_tendency=bool(include_day_tendency),
@@ -2559,7 +2610,7 @@ def _generate_worker(
         for mk in build_month_keys:
             print(f"monthly_partition_build_start month_key={mk}")
             month_dir = _month_dir(mk)
-            stage_dir = EXACT_HISTORY_MONTHS_BUILDING_DIR / mk
+            stage_dir = EXACT_HISTORY_MONTHS_BUILDING_DIR / f"{mk}__{run_token}"
             backup_dir = EXACT_HISTORY_MONTHS_BACKUP_DIR / mk
             month_result = build_hotspots_frames(
                 parquet_files=grouped_parquets.get(mk) or [],
@@ -2672,7 +2723,11 @@ def _generate_worker(
             },
         )
     finally:
-        _clear_lock()
+        _clear_lock(expected_token=run_token)
+        global _generate_thread
+        with _generate_control_lock:
+            if _generate_thread is threading.current_thread():
+                _generate_thread = None
 
 
 def start_generate(
@@ -2684,91 +2739,105 @@ def start_generate(
     build_all_months: bool = False,
 ) -> Dict[str, Any]:
     global _generate_thread
-    requested_month_key = str(month_key).strip() if month_key else None
-    if not requested_month_key and not bool(build_all_months):
-        try:
-            requested_month_key = _resolve_target_month_key_for_request()
-        except HTTPException:
-            requested_month_key = None
+    with _generate_control_lock:
+        requested_month_key = str(month_key).strip() if month_key else None
+        if not requested_month_key and not bool(build_all_months):
+            try:
+                requested_month_key = _resolve_target_month_key_for_request()
+            except HTTPException:
+                requested_month_key = None
 
-    st = _get_state()
-    if st["state"] in ("started", "running") and _generate_thread_alive():
-        return {
-            "ok": True,
-            "state": st["state"],
-            "bin_minutes": st["bin_minutes"],
-            "min_trips_per_window": st["min_trips_per_window"],
-            "include_day_tendency": bool(st.get("include_day_tendency")),
-            "month_key": st.get("month_key"),
-            "build_all_months": bool(st.get("build_all_months")),
-        }
-
-    cleanup_result = None
-    lock_cleared = False
-    thread_alive = _generate_thread_alive()
-    if not thread_alive:
-        cleanup_result = cleanup_artifact_storage(DATA_DIR, FRAMES_DIR)
-        if force_clear_lock and _lock_is_present():
-            _clear_lock()
-            lock_cleared = True
-
-    if _lock_is_present():
-        if not thread_alive:
-            _clear_lock()
-            lock_cleared = True
-            state_now = _get_state()
-            if state_now.get("state") == "running" and not _generate_thread_alive():
-                _set_state(state="idle")
-        if _lock_is_present():
-            _set_state(
-                state="running",
-                bin_minutes=bin_minutes,
-                min_trips_per_window=min_trips_per_window,
-                month_key=requested_month_key,
-                build_all_months=bool(build_all_months),
-                include_day_tendency=bool(include_day_tendency),
-            )
+        st = _get_state()
+        state_name = str(st.get("state") or "")
+        same_job = (
+            str(st.get("month_key") or "").strip() == str(requested_month_key or "").strip()
+            and bool(st.get("build_all_months")) == bool(build_all_months)
+            and bool(st.get("include_day_tendency")) == bool(include_day_tendency)
+        )
+        if state_name in {"started", "running"} and same_job:
             return {
                 "ok": True,
-                "state": "running",
-                "bin_minutes": bin_minutes,
-                "min_trips_per_window": min_trips_per_window,
-                "cleanup": cleanup_result,
-                "lock_cleared": lock_cleared,
-                "include_day_tendency": bool(include_day_tendency),
-                "month_key": requested_month_key,
-                "build_all_months": bool(build_all_months),
+                "state": state_name,
+                "bin_minutes": st["bin_minutes"],
+                "min_trips_per_window": st["min_trips_per_window"],
+                "include_day_tendency": bool(st.get("include_day_tendency")),
+                "month_key": st.get("month_key"),
+                "build_all_months": bool(st.get("build_all_months")),
+                "run_token": st.get("run_token"),
             }
 
-    _write_lock()
-    _set_state(
-        state="started",
-        bin_minutes=bin_minutes,
-        min_trips_per_window=min_trips_per_window,
-        month_key=requested_month_key,
-        build_all_months=bool(build_all_months),
-        include_day_tendency=bool(include_day_tendency),
-    )
+        cleanup_result = None
+        lock_cleared = False
+        thread_alive = _generate_thread_alive()
+        lock_present = _lock_is_present()
+        if not thread_alive:
+            cleanup_result = cleanup_artifact_storage(DATA_DIR, FRAMES_DIR)
+            if force_clear_lock and lock_present:
+                _clear_lock()
+                lock_cleared = True
+                lock_present = _lock_is_present()
 
-    t = threading.Thread(
-        target=_generate_worker,
-        args=(bin_minutes, min_trips_per_window, bool(include_day_tendency), requested_month_key, bool(build_all_months)),
-        daemon=True,
-    )
-    _generate_thread = t
-    t.start()
+        if lock_present:
+            if not thread_alive:
+                _clear_lock()
+                lock_cleared = True
+                state_now = _get_state()
+                if state_now.get("state") == "running" and not _generate_thread_alive():
+                    _set_state(state="idle")
+            if _lock_is_present():
+                _set_state(
+                    state="running",
+                    bin_minutes=bin_minutes,
+                    min_trips_per_window=min_trips_per_window,
+                    month_key=requested_month_key,
+                    build_all_months=bool(build_all_months),
+                    include_day_tendency=bool(include_day_tendency),
+                )
+                return {
+                    "ok": True,
+                    "state": "running",
+                    "bin_minutes": bin_minutes,
+                    "min_trips_per_window": min_trips_per_window,
+                    "cleanup": cleanup_result,
+                    "lock_cleared": lock_cleared,
+                    "include_day_tendency": bool(include_day_tendency),
+                    "month_key": requested_month_key,
+                    "build_all_months": bool(build_all_months),
+                    "run_token": _read_lock_token(),
+                }
 
-    return {
-        "ok": True,
-        "state": "started",
-        "bin_minutes": bin_minutes,
-        "min_trips_per_window": min_trips_per_window,
-        "cleanup": cleanup_result,
-        "lock_cleared": lock_cleared,
-        "include_day_tendency": bool(include_day_tendency),
-        "month_key": requested_month_key,
-        "build_all_months": bool(build_all_months),
-    }
+        run_token = uuid.uuid4().hex
+        _write_lock(run_token)
+        _set_state(
+            state="started",
+            bin_minutes=bin_minutes,
+            min_trips_per_window=min_trips_per_window,
+            run_token=run_token,
+            month_key=requested_month_key,
+            build_all_months=bool(build_all_months),
+            include_day_tendency=bool(include_day_tendency),
+        )
+
+        t = threading.Thread(
+            target=_generate_worker,
+            args=(bin_minutes, min_trips_per_window, run_token, bool(include_day_tendency), requested_month_key, bool(build_all_months)),
+            daemon=True,
+        )
+        _generate_thread = t
+        t.start()
+
+        return {
+            "ok": True,
+            "state": "started",
+            "bin_minutes": bin_minutes,
+            "min_trips_per_window": min_trips_per_window,
+            "cleanup": cleanup_result,
+            "lock_cleared": lock_cleared,
+            "include_day_tendency": bool(include_day_tendency),
+            "month_key": requested_month_key,
+            "build_all_months": bool(build_all_months),
+            "run_token": run_token,
+        }
 
 
 # =========================================================
@@ -4488,6 +4557,12 @@ def status():
     stale_lock_detected = bool(_lock_is_present() and not _generate_thread_alive())
     generate_state = _get_state()
     state_name = str(generate_state.get("state") or "")
+    state_run_token = str(generate_state.get("run_token") or "").strip() or None
+    lock_token = _read_lock_token()
+    if state_run_token and lock_token:
+        lock_token_matches_state: Optional[bool] = lock_token == state_run_token
+    else:
+        lock_token_matches_state = None
     pending_month_key = str(generate_state.get("month_key") or "").strip() if state_name in {"started", "running"} else ""
     pending_month_key = pending_month_key or None
     pending_month_label = _format_month_key_label(pending_month_key) if pending_month_key else None
@@ -4568,6 +4643,10 @@ def status():
         "core_map_ready": bool(artifact_runtime_integrity.get("core_map_ready")),
         "optional_artifacts_missing": list(artifact_runtime_integrity.get("optional_artifacts_missing") or []),
         "generate_state": _get_state(),
+        "run_token": state_run_token,
+        "generate_in_progress": state_name in {"started", "running"},
+        "generate_lock_token_present": lock_token is not None,
+        "generate_lock_token_matches_state": lock_token_matches_state,
         "generate_lock": _generate_lock_snapshot(),
         "generate_stale_lock_detected": stale_lock_detected,
         "artifact_freshness": freshness,
