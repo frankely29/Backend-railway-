@@ -8,6 +8,7 @@ import math
 import os
 import errno
 import copy
+import duckdb
 import re
 import sqlite3
 import threading
@@ -102,6 +103,8 @@ DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 FRAMES_DIR = Path(os.environ.get("FRAMES_DIR", str(DATA_DIR / "frames")))
 TIMELINE_PATH = FRAMES_DIR / "timeline.json"
 ASSISTANT_OUTLOOK_PATH = FRAMES_DIR / "assistant_outlook.json"
+EXACT_HISTORY_DIR = DATA_DIR / "exact_history"
+EXACT_HISTORY_DB_PATH = EXACT_HISTORY_DIR / "exact_shadow.duckdb"
 DAY_TENDENCY_DIR = DATA_DIR / "day_tendency"
 DAY_TENDENCY_MODEL_PATH = DAY_TENDENCY_DIR / "model.json"
 NYC_TZ = ZoneInfo("America/New_York")
@@ -124,6 +127,7 @@ DAY_TENDENCY_CONTEXT_BUCKET_DROP_CAP = 1
 
 DEFAULT_BIN_MINUTES = int(os.environ.get("DEFAULT_BIN_MINUTES", "20"))
 DEFAULT_MIN_TRIPS_PER_WINDOW = int(os.environ.get("DEFAULT_MIN_TRIPS_PER_WINDOW", "25"))
+AUTO_GENERATE_ON_STARTUP = str(os.environ.get("AUTO_GENERATE_ON_STARTUP", "0")).strip().lower() in ("1", "true", "yes", "on")
 
 LOCK_PATH = DATA_DIR / ".generate.lock"
 
@@ -609,17 +613,17 @@ def _read_timeline_cached() -> Dict[str, Any]:
 
 
 def _read_frame_cached(idx: int) -> Dict[str, Any]:
-    frame_path = FRAMES_DIR / f"frame_{idx:06d}.json"
-    if not frame_path.exists():
+    timeline_cached = _read_timeline_cached()
+    timeline_payload = (timeline_cached or {}).get("data") or {}
+    timeline = timeline_payload.get("timeline") or []
+    if idx < 0 or idx >= len(timeline):
         raise HTTPException(status_code=404, detail=f"frame not found: {idx}")
-
-    stat_result = frame_path.stat()
-    mtime = stat_result.st_mtime
-    size = int(stat_result.st_size)
-    etag = _etag_for_path(frame_path, mtime, size)
+    frame_time = str(timeline[idx])
+    timeline_etag = str((timeline_cached or {}).get("etag") or "")
+    etag = f'W/"frame-{idx}-{abs(hash((frame_time, timeline_etag))) & 0xffffffff:x}"'
     with _frame_cache_lock:
         cached = _frame_cache.get(idx)
-        if cached is not None and cached.get("mtime") == mtime and cached.get("size") == size:
+        if cached is not None and cached.get("etag") == etag:
             _record_perf_metric("frame.cache_hit")
             try:
                 _frame_cache_order.remove(idx)
@@ -629,8 +633,8 @@ def _read_frame_cached(idx: int) -> Dict[str, Any]:
             return cached
 
         _record_perf_metric("frame.cache_miss")
-        data = _read_json(frame_path)
-        _frame_cache[idx] = {"data": data, "mtime": mtime, "size": size, "etag": etag}
+        data = _build_frame_payload_on_demand(frame_time)
+        _frame_cache[idx] = {"data": data, "etag": etag, "frame_time": frame_time}
         try:
             _frame_cache_order.remove(idx)
         except ValueError:
@@ -640,6 +644,68 @@ def _read_frame_cached(idx: int) -> Dict[str, Any]:
             evicted_idx = _frame_cache_order.popleft()
             _frame_cache.pop(evicted_idx, None)
         return _frame_cache[idx]
+
+
+def _build_frame_payload_on_demand(frame_time: str) -> Dict[str, Any]:
+    if not EXACT_HISTORY_DB_PATH.exists():
+        raise HTTPException(status_code=409, detail="exact history store not ready. Call /generate first.")
+    zone_geoms = _load_pickup_zone_geometries()
+    if not zone_geoms:
+        raise HTTPException(status_code=503, detail="taxi_zones.geojson unavailable")
+    con = duckdb.connect(database=str(EXACT_HISTORY_DB_PATH), read_only=True)
+    try:
+        rows = con.execute(
+            """
+            SELECT PULocationID, feature_properties_json
+            FROM exact_frame_features
+            WHERE exact_bin_local_ts = ?
+            ORDER BY PULocationID
+            """,
+            [str(frame_time)],
+        ).fetchall()
+    finally:
+        con.close()
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"frame not found for time: {frame_time}")
+
+    features: List[Dict[str, Any]] = []
+    for location_id, props_json in rows:
+        try:
+            zid = int(location_id)
+        except Exception:
+            continue
+        zone_meta = zone_geoms.get(zid) or {}
+        geom = zone_meta.get("geometry")
+        if geom is None:
+            continue
+        properties: Dict[str, Any] = {}
+        if isinstance(props_json, str) and props_json:
+            try:
+                parsed_props = json.loads(props_json)
+                if isinstance(parsed_props, dict):
+                    properties = parsed_props
+            except Exception:
+                properties = {}
+        if "LocationID" not in properties:
+            properties["LocationID"] = zid
+        if "zone_name" not in properties:
+            properties["zone_name"] = zone_meta.get("zone_name") or ""
+        if "borough" not in properties:
+            properties["borough"] = zone_meta.get("borough") or ""
+        features.append(
+            {
+                "type": "Feature",
+                "geometry": mapping(geom),
+                "properties": properties,
+            }
+        )
+    return {
+        "time": str(frame_time),
+        "polygons": {
+            "type": "FeatureCollection",
+            "features": features,
+        },
+    }
 
 
 def _geometry_bounds_from_coordinates(coords: Any) -> Optional[Tuple[float, float, float, float]]:
@@ -1017,8 +1083,8 @@ def _artifact_runtime_policy_snapshot() -> Dict[str, Any]:
         "volume_required": [
             "*.parquet",
             "taxi_zones.geojson",
-            "frames/frame_*.json",
             "frames/timeline.json",
+            "exact_history/exact_shadow.duckdb",
         ],
         "db_required": [
             "day_tendency_model",
@@ -1035,10 +1101,17 @@ def _artifact_runtime_policy_snapshot() -> Dict[str, Any]:
 
 def _artifact_runtime_integrity_report() -> Dict[str, Any]:
     parquet_count = len(_list_parquets())
-    frame_count = len([p for p in FRAMES_DIR.glob("frame_*.json") if p.is_file()])
     zones_present = DATA_DIR.joinpath("taxi_zones.geojson").exists()
     timeline_present = TIMELINE_PATH.exists() and TIMELINE_PATH.is_file()
-    required_volume_ok = parquet_count > 0 and frame_count > 0 and zones_present and timeline_present
+    exact_store_present = EXACT_HISTORY_DB_PATH.exists() and EXACT_HISTORY_DB_PATH.is_file() and EXACT_HISTORY_DB_PATH.stat().st_size > 0
+    timeline_count = 0
+    if timeline_present:
+        try:
+            timeline_payload = _read_json(TIMELINE_PATH)
+            timeline_count = int(timeline_payload.get("count") or len(timeline_payload.get("timeline") or []))
+        except Exception:
+            timeline_count = 0
+    required_volume_ok = parquet_count > 0 and timeline_count > 0 and zones_present and timeline_present and exact_store_present
 
     required_db_keys = ["day_tendency_model", "scoring_shadow_manifest"]
     missing_required_db_artifacts = [key for key in required_db_keys if not generated_artifact_present(key)]
@@ -1058,10 +1131,10 @@ def _artifact_runtime_integrity_report() -> Dict[str, Any]:
         missing_required_volume.append("*.parquet")
     if not zones_present:
         missing_required_volume.append("taxi_zones.geojson")
-    if frame_count <= 0:
-        missing_required_volume.append("frames/frame_*.json")
     if not timeline_present:
         missing_required_volume.append("frames/timeline.json")
+    if not exact_store_present:
+        missing_required_volume.append("exact_history/exact_shadow.duckdb")
 
     ok = required_volume_ok and required_db_ok and not redundant_file_copies_present
     return {
@@ -1073,7 +1146,7 @@ def _artifact_runtime_integrity_report() -> Dict[str, Any]:
         "missing_required_volume": missing_required_volume,
         "missing_required_db_artifacts": missing_required_db_artifacts,
         "unexpected_volume_files_present": list(redundant_file_copies_present),
-        "frame_count": frame_count,
+        "frame_count": timeline_count,
         "parquet_count": parquet_count,
     }
 
@@ -2012,9 +2085,10 @@ def _build_assistant_outlook_only() -> Dict[str, Any]:
     timeline_artifact = load_generated_artifact("timeline")
     if not timeline_artifact and (not TIMELINE_PATH.exists() or TIMELINE_PATH.stat().st_size <= 0):
         raise RuntimeError("timeline.json missing. Cannot serve assistant outlook.")
-    frame_paths = sorted(FRAMES_DIR.glob("frame_*.json"))
-    if not frame_paths:
-        raise RuntimeError("frame artifacts missing. Cannot serve assistant outlook.")
+    if not EXACT_HISTORY_DB_PATH.exists() or EXACT_HISTORY_DB_PATH.stat().st_size <= 0:
+        raise RuntimeError("exact history store missing. Cannot serve assistant outlook.")
+    timeline_payload = (timeline_artifact or {}).get("payload") or _read_json(TIMELINE_PATH)
+    timeline_count = int(timeline_payload.get("count") or len(timeline_payload.get("timeline") or []))
     _prune_legacy_assistant_outlook_artifact_if_present()
     _prune_assistant_outlook_file_if_db_ready()
     _prune_redundant_db_backed_artifact_files()
@@ -2022,7 +2096,7 @@ def _build_assistant_outlook_only() -> Dict[str, Any]:
         "ok": True,
         "mode": "on_demand_frame_bucket",
         "timeline_present": True,
-        "frame_count": len(frame_paths),
+        "frame_count": timeline_count,
     }
 
 
@@ -3774,6 +3848,7 @@ def startup():
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     FRAMES_DIR.mkdir(parents=True, exist_ok=True)
+    EXACT_HISTORY_DIR.mkdir(parents=True, exist_ok=True)
     _db_init()
     ensure_generated_artifact_store_schema()
     _prune_redundant_db_backed_artifact_files()
@@ -3872,8 +3947,25 @@ def startup():
             _log_runtime_integrity_summary()
             return
 
-        print(f"[artifact-freshness] stale -> regenerating reason_codes={reason_codes}")
-        start_generate(DEFAULT_BIN_MINUTES, DEFAULT_MIN_TRIPS_PER_WINDOW)
+        if AUTO_GENERATE_ON_STARTUP:
+            print(f"[artifact-freshness] stale -> regenerating reason_codes={reason_codes}")
+            start_generate(DEFAULT_BIN_MINUTES, DEFAULT_MIN_TRIPS_PER_WINDOW)
+        else:
+            print(
+                f"[warn] artifact-freshness stale at startup; auto-generate disabled "
+                f"(AUTO_GENERATE_ON_STARTUP=0). reason_codes={reason_codes}. "
+                "Manual /generate is required."
+            )
+            _set_state(
+                state="idle",
+                bin_minutes=DEFAULT_BIN_MINUTES,
+                min_trips_per_window=DEFAULT_MIN_TRIPS_PER_WINDOW,
+                result={
+                    "ok": False,
+                    "reason": "stale_artifacts_manual_generate_required",
+                    "reason_codes": reason_codes,
+                },
+            )
     except Exception:
         _set_state(state="idle")
     _log_runtime_integrity_summary()
@@ -3937,6 +4029,8 @@ def status():
     day_tendency_file_present = DAY_TENDENCY_MODEL_PATH.exists() and DAY_TENDENCY_MODEL_PATH.stat().st_size > 0 if DAY_TENDENCY_MODEL_PATH.exists() else False
     manifest_file_present = manifest_path.exists() and manifest_path.stat().st_size > 0 if manifest_path.exists() else False
     timeline_file_present = TIMELINE_PATH.exists() and TIMELINE_PATH.stat().st_size > 0 if TIMELINE_PATH.exists() else False
+    exact_history_store_present = EXACT_HISTORY_DB_PATH.exists() and EXACT_HISTORY_DB_PATH.stat().st_size > 0 if EXACT_HISTORY_DB_PATH.exists() else False
+    exact_history_store_bytes = int(EXACT_HISTORY_DB_PATH.stat().st_size) if EXACT_HISTORY_DB_PATH.exists() and EXACT_HISTORY_DB_PATH.is_file() else 0
     timeline_present = timeline_artifact_in_db or (TIMELINE_PATH.exists() and TIMELINE_PATH.stat().st_size > 0 if TIMELINE_PATH.exists() else False)
     manifest_present = manifest_artifact_in_db
     freshness = _artifact_freshness_snapshot()
@@ -3962,6 +4056,11 @@ def status():
         "backend_release": identity.get("backend_release"),
         "backend_identity_source": identity.get("source"),
         "frames_dir": str(FRAMES_DIR),
+        "exact_history_dir": str(EXACT_HISTORY_DIR),
+        "exact_history_store_path": str(EXACT_HISTORY_DB_PATH),
+        "exact_history_store_present": exact_history_store_present,
+        "exact_history_store_bytes": exact_history_store_bytes,
+        "auto_generate_on_startup": AUTO_GENERATE_ON_STARTUP,
         "manifest_present": manifest_present,
         "timeline_present": timeline_present,
         "has_timeline": _has_frames(),

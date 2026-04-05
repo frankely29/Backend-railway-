@@ -888,13 +888,7 @@ def build_hotspots_frames(
     """
     Writes:
       /data/frames/timeline.json
-      /data/frames/frame_000000.json ... etc
-
-    Each frame contains:
-      - time
-      - polygons FeatureCollection
-      - each feature has:
-          LocationID, zone_name, borough, rating, bucket, pickups, avg_driver_pay, style(fillColor)
+      /data/exact_history/exact_shadow.duckdb
 
     FACTS + REALISM GUARANTEE:
       - Per-window normalization is percentile-rank based (NOT min/max), so airports cannot flatten the city.
@@ -911,6 +905,9 @@ def build_hotspots_frames(
     duckdb_tmp_dir = temp_run_dir / "duckdb_tmp"
     stage_dir.mkdir(parents=True, exist_ok=True)
     duckdb_tmp_dir.mkdir(parents=True, exist_ok=True)
+    exact_history_dir = out_dir.parent / "exact_history"
+    exact_history_dir.mkdir(parents=True, exist_ok=True)
+    exact_history_db_path = exact_history_dir / "exact_shadow.duckdb"
 
     con = None
     build_result: Dict[str, Any] | None = None
@@ -950,7 +947,7 @@ def build_hotspots_frames(
         # ----------------------------
         # DuckDB (spill to volume)
         # ----------------------------
-        duckdb_db_path = temp_run_dir / "build.duckdb"
+        duckdb_db_path = exact_history_db_path
         con = duckdb.connect(database=str(duckdb_db_path))
         con.execute("PRAGMA enable_progress_bar=false")
         con.execute("PRAGMA threads=2")
@@ -1167,7 +1164,40 @@ def build_hotspots_frames(
             available_columns=available_columns,
         )
 
-        shadow_cursor = con.execute(shadow_sql)
+        con.execute(
+            f"""
+            CREATE OR REPLACE TABLE exact_shadow_rows AS
+            {shadow_sql}
+            """
+        )
+        con.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_exact_shadow_rows_ts
+            ON exact_shadow_rows(exact_bin_local_ts)
+            """
+        )
+        con.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_exact_shadow_rows_ts_zone
+            ON exact_shadow_rows(exact_bin_local_ts, PULocationID)
+            """
+        )
+        con.execute(
+            """
+            CREATE OR REPLACE TABLE exact_frame_features (
+                exact_bin_local_ts VARCHAR,
+                PULocationID INTEGER,
+                feature_properties_json VARCHAR
+            )
+            """
+        )
+        shadow_cursor = con.execute(
+            """
+            SELECT *
+            FROM exact_shadow_rows
+            ORDER BY exact_bin_local_ts, PULocationID
+            """
+        )
         shadow_columns = [str(desc[0]) for desc in (shadow_cursor.description or [])]
 
         def _build_shadow_props_from_row(row_map: Dict[str, Any]) -> Dict[str, Any]:
@@ -1313,15 +1343,39 @@ def build_hotspots_frames(
                     "frame_time": current_time_iso,
                     "frame_date": current_date_local,
                     "frame_weekday_name": current_weekday_name_local,
+                    "frame_time_label": current_time_label_local,
                     "bin_minutes": int(bin_minutes),
                 }
             )
-            frame_path = stage_dir / f"frame_{frame_count:06d}.json"
-            payload = {
-                "time": current_time_iso,
-                "polygons": {"type": "FeatureCollection", "features": current_features},
-            }
-            frame_path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+            feature_rows = []
+            for feature in current_features:
+                props = feature.get("properties") if isinstance(feature, dict) else None
+                if not isinstance(props, dict):
+                    continue
+                location_id = props.get("LocationID")
+                try:
+                    location_id_int = int(location_id)
+                except Exception:
+                    continue
+                feature_rows.append(
+                    (
+                        str(current_time_iso),
+                        location_id_int,
+                        json.dumps(props, separators=(",", ":")),
+                    )
+                )
+            if feature_rows:
+                con.executemany(
+                    """
+                    INSERT INTO exact_frame_features (
+                        exact_bin_local_ts,
+                        PULocationID,
+                        feature_properties_json
+                    )
+                    VALUES (?, ?, ?)
+                    """,
+                    feature_rows,
+                )
 
             frame_count += 1
             if frame_count % 250 == 0:
@@ -2124,8 +2178,8 @@ def build_hotspots_frames(
 
         save_generated_artifact("scoring_shadow_manifest", manifest_payload, compress=False)
         staged_timeline = stage_dir / "timeline.json"
-        staged_frames = sorted(stage_dir.glob("frame_*.json"))
-        if not staged_timeline.exists() or not staged_frames:
+        exact_store_ready = exact_history_db_path.exists() and exact_history_db_path.stat().st_size > 0
+        if not staged_timeline.exists() or not exact_store_ready:
             raise RuntimeError("Staged artifact build did not produce required files.")
         legacy_manifest_path = out_dir / "scoring_shadow_manifest.json"
         try:
@@ -2155,6 +2209,7 @@ def build_hotspots_frames(
             "first_frame_datetime": timeline[0] if timeline else None,
             "last_frame_datetime": timeline[-1] if timeline else None,
             "frames_dir": str(out_dir),
+            "exact_history_store": str(exact_history_db_path),
             "rows": total_rows,
             "assistant_outlook": {
                 "mode": "on_demand_frame_bucket",
