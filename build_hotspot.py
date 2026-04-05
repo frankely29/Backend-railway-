@@ -884,6 +884,11 @@ def build_hotspots_frames(
     out_dir: Path,
     bin_minutes: int = 20,
     min_trips_per_window: int = 25,
+    exact_history_dir: Path | None = None,
+    exact_history_stage_dir: Path | None = None,
+    exact_history_backup_dir: Path | None = None,
+    timeline_output_path: Path | None = None,
+    cleanup_out_dir_frames: bool = True,
 ) -> Dict[str, Any]:
     """
     Writes:
@@ -903,15 +908,24 @@ def build_hotspots_frames(
     temp_run_dir = Path(temp_run_dir_ctx.name)
     duckdb_tmp_dir = temp_run_dir / "duckdb_tmp"
     duckdb_tmp_dir.mkdir(parents=True, exist_ok=True)
-    exact_history_dir = out_dir.parent / "exact_history"
-    exact_history_stage_dir = out_dir.parent / "exact_history.__building__"
-    exact_history_backup_dir = out_dir.parent / "exact_history.__backup__"
-    stage_dir = exact_history_stage_dir
-    if exact_history_stage_dir.exists():
-        shutil.rmtree(exact_history_stage_dir, ignore_errors=True)
-    exact_history_stage_dir.mkdir(parents=True, exist_ok=True)
-    exact_history_db_path = exact_history_dir / "exact_shadow.duckdb"
-    staged_exact_history_db_path = exact_history_stage_dir / "exact_shadow.duckdb"
+    resolved_exact_history_dir = Path(exact_history_dir) if exact_history_dir is not None else (out_dir.parent / "exact_history")
+    resolved_exact_history_stage_dir = (
+        Path(exact_history_stage_dir)
+        if exact_history_stage_dir is not None
+        else (out_dir.parent / "exact_history.__building__")
+    )
+    resolved_exact_history_backup_dir = (
+        Path(exact_history_backup_dir)
+        if exact_history_backup_dir is not None
+        else (out_dir.parent / "exact_history.__backup__")
+    )
+    stage_dir = resolved_exact_history_stage_dir
+    if resolved_exact_history_stage_dir.exists():
+        shutil.rmtree(resolved_exact_history_stage_dir, ignore_errors=True)
+    resolved_exact_history_stage_dir.mkdir(parents=True, exist_ok=True)
+    exact_history_db_path = resolved_exact_history_dir / "exact_shadow.duckdb"
+    staged_exact_history_db_path = resolved_exact_history_stage_dir / "exact_shadow.duckdb"
+    resolved_timeline_output_path = Path(timeline_output_path) if timeline_output_path is not None else (out_dir / "timeline.json")
 
     con = None
     build_result: Dict[str, Any] | None = None
@@ -2096,34 +2110,34 @@ def build_hotspots_frames(
         except Exception:
             pass
 
-        for generated in out_dir.glob("frame_*.json"):
-            try:
-                generated.unlink()
-            except Exception:
-                pass
-        for generated_name in ("timeline.json",):
-            generated_path = out_dir / generated_name
-            try:
-                if generated_path.exists() and generated_path.is_file():
-                    generated_path.unlink()
-            except Exception:
-                pass
-        if exact_history_backup_dir.exists():
-            shutil.rmtree(exact_history_backup_dir, ignore_errors=True)
+        if cleanup_out_dir_frames:
+            for generated in out_dir.glob("frame_*.json"):
+                try:
+                    generated.unlink()
+                except Exception:
+                    pass
         try:
-            if exact_history_dir.exists():
-                exact_history_dir.rename(exact_history_backup_dir)
-            exact_history_stage_dir.rename(exact_history_dir)
-            if exact_history_backup_dir.exists():
-                shutil.rmtree(exact_history_backup_dir, ignore_errors=True)
+            if resolved_timeline_output_path.exists() and resolved_timeline_output_path.is_file():
+                resolved_timeline_output_path.unlink()
         except Exception:
-            if exact_history_dir.exists():
-                shutil.rmtree(exact_history_dir, ignore_errors=True)
-            if exact_history_backup_dir.exists():
-                exact_history_backup_dir.rename(exact_history_dir)
+            pass
+        if resolved_exact_history_backup_dir.exists():
+            shutil.rmtree(resolved_exact_history_backup_dir, ignore_errors=True)
+        try:
+            if resolved_exact_history_dir.exists():
+                resolved_exact_history_dir.rename(resolved_exact_history_backup_dir)
+            resolved_exact_history_stage_dir.rename(resolved_exact_history_dir)
+            if resolved_exact_history_backup_dir.exists():
+                shutil.rmtree(resolved_exact_history_backup_dir, ignore_errors=True)
+        except Exception:
+            if resolved_exact_history_dir.exists():
+                shutil.rmtree(resolved_exact_history_dir, ignore_errors=True)
+            if resolved_exact_history_backup_dir.exists():
+                resolved_exact_history_backup_dir.rename(resolved_exact_history_dir)
             raise
 
-        shutil.move(str(staged_timeline), str(out_dir / "timeline.json"))
+        resolved_timeline_output_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(staged_timeline), str(resolved_timeline_output_path))
         logger.info("exact_history_publish_done")
 
         build_result = {
