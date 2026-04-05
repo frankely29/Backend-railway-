@@ -639,20 +639,13 @@ def _read_frame_cached(idx: int) -> Dict[str, Any]:
         return _frame_cache[idx]
 
 
-def _feature_geometry_bounds(feature: Dict[str, Any]) -> Optional[Tuple[float, float, float, float]]:
-    geometry = feature.get("geometry") if isinstance(feature, dict) else None
-    if not isinstance(geometry, dict):
-        return None
-    coordinates = geometry.get("coordinates")
-    if coordinates is None:
-        return None
-
+def _geometry_bounds_from_coordinates(coords: Any) -> Optional[Tuple[float, float, float, float]]:
     min_lat: Optional[float] = None
     min_lng: Optional[float] = None
     max_lat: Optional[float] = None
     max_lng: Optional[float] = None
 
-    def _consume_coords(value: Any) -> None:
+    def _consume(value: Any) -> None:
         nonlocal min_lat, min_lng, max_lat, max_lng
         if isinstance(value, (list, tuple)):
             if len(value) >= 2 and all(isinstance(v, (int, float)) for v in value[:2]):
@@ -666,24 +659,28 @@ def _feature_geometry_bounds(feature: Dict[str, Any]) -> Optional[Tuple[float, f
                 max_lng = lng if max_lng is None else max(max_lng, lng)
                 return
             for item in value:
-                _consume_coords(item)
+                _consume(item)
 
-    _consume_coords(coordinates)
+    _consume(coords)
     if min_lat is None or min_lng is None or max_lat is None or max_lng is None:
         return None
-    return (min_lat, min_lng, max_lat, max_lng)
+    return (min_lng, min_lat, max_lng, max_lat)
 
 
-def _bbox_intersects(
-    a: Tuple[float, float, float, float],
-    b: Tuple[float, float, float, float],
-) -> bool:
-    a_min_lat, a_min_lng, a_max_lat, a_max_lng = a
-    b_min_lat, b_min_lng, b_max_lat, b_max_lng = b
-    return not (a_max_lat < b_min_lat or b_max_lat < a_min_lat or a_max_lng < b_min_lng or b_max_lng < a_min_lng)
+def _feature_geometry_bounds(feature: Dict[str, Any]) -> Optional[Tuple[float, float, float, float]]:
+    geometry = feature.get("geometry") if isinstance(feature, dict) else None
+    if not isinstance(geometry, dict):
+        return None
+    return _geometry_bounds_from_coordinates(geometry.get("coordinates"))
 
 
-def _expand_bbox(
+def _bbox_intersects(a: Tuple[float, float, float, float], b: Tuple[float, float, float, float]) -> bool:
+    a_min_lng, a_min_lat, a_max_lng, a_max_lat = a
+    b_min_lng, b_min_lat, b_max_lng, b_max_lat = b
+    return not (a_max_lng < b_min_lng or b_max_lng < a_min_lng or a_max_lat < b_min_lat or b_max_lat < a_min_lat)
+
+
+def _expand_viewport_bbox(
     min_lat: float,
     min_lng: float,
     max_lat: float,
@@ -699,12 +696,11 @@ def _expand_bbox(
     safe_padding = max(0.0, min(float(padding_ratio), 1.0))
     lat_pad = lat_span * safe_padding
     lng_pad = lng_span * safe_padding
-    return (
-        max(-90.0, low_lat - lat_pad),
-        max(-180.0, low_lng - lng_pad),
-        min(90.0, high_lat + lat_pad),
-        min(180.0, high_lng + lng_pad),
-    )
+    expanded_min_lat = max(-90.0, low_lat - lat_pad)
+    expanded_min_lng = max(-180.0, low_lng - lng_pad)
+    expanded_max_lat = min(90.0, high_lat + lat_pad)
+    expanded_max_lng = min(180.0, high_lng + lng_pad)
+    return (expanded_min_lng, expanded_min_lat, expanded_max_lng, expanded_max_lat)
 
 
 def _frame_payload_viewport_subset(
@@ -715,20 +711,18 @@ def _frame_payload_viewport_subset(
     max_lng: float,
     padding_ratio: float = 0.18,
 ) -> Dict[str, Any]:
-    if not isinstance(frame_payload, dict):
-        return frame_payload
-
-    expanded_bbox = _expand_bbox(
+    expanded_bbox = _expand_viewport_bbox(
         min_lat=min_lat,
         min_lng=min_lng,
         max_lat=max_lat,
         max_lng=max_lng,
         padding_ratio=padding_ratio,
     )
-    polygons = frame_payload.get("polygons")
+    source_payload = frame_payload if isinstance(frame_payload, dict) else {}
+    polygons = source_payload.get("polygons")
     features = polygons.get("features") if isinstance(polygons, dict) else None
     if not isinstance(features, list):
-        payload = dict(frame_payload)
+        payload = copy.deepcopy(source_payload)
         payload["_viewport_subset"] = False
         payload["_viewport_fallback_reason"] = "missing_polygon_features"
         return payload
@@ -745,7 +739,7 @@ def _frame_payload_viewport_subset(
 
     source_count = len(features)
     if not subset_features:
-        payload = dict(frame_payload)
+        payload = copy.deepcopy(source_payload)
         payload["_viewport_subset"] = False
         payload["_viewport_bounds"] = {
             "min_lat": min(min_lat, max_lat),
@@ -760,8 +754,9 @@ def _frame_payload_viewport_subset(
         _record_perf_metric("frame.viewport_subset_fallback_full")
         return payload
 
-    payload = dict(frame_payload)
-    polygons_payload = dict(polygons) if isinstance(polygons, dict) else {}
+    payload = copy.deepcopy(source_payload)
+    polygons_payload = payload.get("polygons")
+    polygons_payload = polygons_payload if isinstance(polygons_payload, dict) else {}
     polygons_payload["features"] = subset_features
     payload["polygons"] = polygons_payload
     payload["_viewport_subset"] = True
@@ -778,7 +773,7 @@ def _frame_payload_viewport_subset(
     return payload
 
 
-def _viewport_subset_etag(
+def _viewport_frame_etag(
     base_etag: Optional[str],
     min_lat: float,
     min_lng: float,
@@ -789,13 +784,13 @@ def _viewport_subset_etag(
     if not base_etag:
         return None
     normalized = (
-        round(min(min_lat, max_lat), 5),
-        round(min(min_lng, max_lng), 5),
-        round(max(min_lat, max_lat), 5),
-        round(max(min_lng, max_lng), 5),
-        round(float(padding_ratio), 5),
+        round(min(min_lat, max_lat), 4),
+        round(min(min_lng, max_lng), 4),
+        round(max(min_lat, max_lat), 4),
+        round(max(min_lng, max_lng), 4),
+        round(float(padding_ratio), 4),
     )
-    suffix = hashlib.sha1(f"{base_etag}|{normalized}".encode("utf-8")).hexdigest()[:12]
+    suffix = hashlib.sha1(f"{normalized}".encode("utf-8")).hexdigest()[:12]
     return f'{base_etag[:-1]}-vp-{suffix}"' if base_etag.endswith('"') else f'{base_etag}-vp-{suffix}'
 
 
@@ -4603,7 +4598,7 @@ def frame_viewport(
         max_lng=max_lng,
         padding_ratio=padding_ratio,
     )
-    etag = _viewport_subset_etag(
+    etag = _viewport_frame_etag(
         cached.get("etag"),
         min_lat=min_lat,
         min_lng=min_lng,
