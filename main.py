@@ -3926,6 +3926,7 @@ def status():
         "data_dir": str(DATA_DIR),
         "data_dir_exists": DATA_DIR.exists(),
         "upload_streaming_enabled": True,
+        "parquet_delete_enabled": True,
         "parquets": parquets,
         "parquet_inventory_warning_count": int(_parquet_inventory_snapshot.get("warning_count") or 0),
         "parquet_inventory_warnings": list(_parquet_inventory_snapshot.get("warnings") or []),
@@ -4661,6 +4662,13 @@ def _safe_upload_filename(raw_name: str, default_name: str) -> str:
     return cleaned
 
 
+def _safe_admin_filename(raw_name: str) -> str:
+    cleaned = str(raw_name or "").strip().replace("\\", "/").split("/")[-1].strip()
+    if not cleaned or cleaned in {".", ".."} or "/" in cleaned:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    return cleaned
+
+
 def _cleanup_path_quiet(path: Path) -> None:
     try:
         path.unlink(missing_ok=True)
@@ -4718,6 +4726,27 @@ async def upload_parquet(file: UploadFile = File(...)):
         "filename": filename,
         "size_bytes": int(bytes_written),
         "size_mb": round(bytes_written / (1024 * 1024), 2),
+    }
+
+
+@app.post("/admin/parquet/delete")
+def admin_delete_parquet(filename: str, admin: sqlite3.Row = Depends(require_admin)):
+    _ = admin
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    filename = _safe_admin_filename(filename)
+    if not filename.lower().endswith(".parquet"):
+        raise HTTPException(status_code=400, detail="Only .parquet files can be deleted")
+
+    target = DATA_DIR / filename
+    if not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail="Parquet file not found")
+
+    target.unlink()
+    return {
+        "ok": True,
+        "deleted": True,
+        "path": str(target),
+        "filename": filename,
     }
 
 
