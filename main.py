@@ -60,6 +60,7 @@ from artifact_db_store import (
     load_generated_artifact_metadata,
     save_generated_artifact,
 )
+from parquet_inventory import inspect_parquet_inventory
 from avatar_assets import (
     AVATAR_THUMB_MIME,
     avatar_thumb_path,
@@ -310,6 +311,7 @@ _generate_state: Dict[str, Any] = {
     "error": None,
     "trace": None,
 }
+_parquet_inventory_snapshot: Dict[str, Any] = {"rows": [], "warnings": [], "warning_count": 0}
 
 # =========================================================
 # App
@@ -2125,6 +2127,14 @@ def _generate_worker(bin_minutes: int, min_trips_per_window: int) -> None:
         parquets = _list_parquets()
         if not parquets:
             raise RuntimeError("No .parquet files found in /data. Upload via POST /upload_parquet.")
+        inventory = inspect_parquet_inventory(parquets)
+        _parquet_inventory_snapshot.clear()
+        _parquet_inventory_snapshot.update(inventory)
+        if int(inventory.get("warning_count") or 0) > 0:
+            raise RuntimeError(
+                "Parquet inventory validation failed due to potential duplicate/overlapping files: "
+                + "; ".join(inventory.get("warnings") or [])
+            )
 
         frames_result = build_hotspots_frames(
             parquet_files=parquets,
@@ -2151,6 +2161,10 @@ def _generate_worker(bin_minutes: int, min_trips_per_window: int) -> None:
         result = {
             "frames": frames_result,
             "day_tendency": day_tendency_result,
+            "timeline_mode": "exact_historical",
+            "frame_time_model": "exact_local_20min",
+            "synthetic_week_enabled": False,
+            "parquet_inventory": inventory,
             "storage_report": get_artifact_storage_report(DATA_DIR, FRAMES_DIR),
         }
 
@@ -3906,10 +3920,15 @@ def status():
     leaderboard_runtime = get_leaderboard_runtime_snapshot()
     return {
         "status": "ok",
+        "timeline_mode": "exact_historical",
+        "frame_time_model": "exact_local_20min",
+        "synthetic_week_enabled": False,
         "data_dir": str(DATA_DIR),
         "data_dir_exists": DATA_DIR.exists(),
         "upload_streaming_enabled": True,
         "parquets": parquets,
+        "parquet_inventory_warning_count": int(_parquet_inventory_snapshot.get("warning_count") or 0),
+        "parquet_inventory_warnings": list(_parquet_inventory_snapshot.get("warnings") or []),
         "zones_geojson": zones_path.name if zones_path.exists() else None,
         "zones_present": zones_path.exists(),
         "backend_build_id": identity.get("backend_build_id"),
