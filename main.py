@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Depends, Response
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from pyproj import Transformer
@@ -75,7 +76,6 @@ from admin_mutation_routes import router as admin_mutation_router
 from admin_test_routes import router as admin_test_router
 from admin_trips_routes import router as admin_trips_router
 from core import (
-    _auth_user_from_request,
     _clean_display_name,
     _db,
     _db_exec,
@@ -92,7 +92,7 @@ from core import (
     _user_block_state,
     _require_jwt_secret,
     ENFORCE_TRIAL,
-    require_user,
+    require_user as core_require_user,
 )
 
 # =========================================================
@@ -3486,8 +3486,28 @@ def _db_init() -> None:
 # =========================================================
 # Auth helpers (no external deps)
 # =========================================================
-def require_admin(req: Request) -> sqlite3.Row:
-    user = _auth_user_from_request(req)
+bearer_scheme = HTTPBearer(auto_error=False)
+
+
+def get_bearer_token(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
+) -> str:
+    if not credentials or not credentials.credentials:
+        raise HTTPException(status_code=401, detail="Missing Bearer token")
+    return credentials.credentials
+
+
+def require_user(req: Request, token: str = Depends(get_bearer_token)) -> sqlite3.Row:
+    # Reuse existing auth/trial checks while flowing through a Swagger-visible bearer scheme.
+    scope = dict(req.scope)
+    scope_headers = [(k, v) for (k, v) in scope.get("headers", []) if k.lower() != b"authorization"]
+    scope_headers.append((b"authorization", f"Bearer {token}".encode("utf-8")))
+    scope["headers"] = scope_headers
+    request_with_bearer = Request(scope, receive=req.receive)
+    return core_require_user(request_with_bearer)
+
+
+def require_admin(user: sqlite3.Row = Depends(require_user)) -> sqlite3.Row:
     if _flag_to_int(user["is_admin"]) != 1:
         raise HTTPException(status_code=403, detail="Admin only")
     return user
