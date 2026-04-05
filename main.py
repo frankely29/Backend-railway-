@@ -639,6 +639,166 @@ def _read_frame_cached(idx: int) -> Dict[str, Any]:
         return _frame_cache[idx]
 
 
+def _feature_geometry_bounds(feature: Dict[str, Any]) -> Optional[Tuple[float, float, float, float]]:
+    geometry = feature.get("geometry") if isinstance(feature, dict) else None
+    if not isinstance(geometry, dict):
+        return None
+    coordinates = geometry.get("coordinates")
+    if coordinates is None:
+        return None
+
+    min_lat: Optional[float] = None
+    min_lng: Optional[float] = None
+    max_lat: Optional[float] = None
+    max_lng: Optional[float] = None
+
+    def _consume_coords(value: Any) -> None:
+        nonlocal min_lat, min_lng, max_lat, max_lng
+        if isinstance(value, (list, tuple)):
+            if len(value) >= 2 and all(isinstance(v, (int, float)) for v in value[:2]):
+                lng = float(value[0])
+                lat = float(value[1])
+                if math.isnan(lat) or math.isnan(lng):
+                    return
+                min_lat = lat if min_lat is None else min(min_lat, lat)
+                max_lat = lat if max_lat is None else max(max_lat, lat)
+                min_lng = lng if min_lng is None else min(min_lng, lng)
+                max_lng = lng if max_lng is None else max(max_lng, lng)
+                return
+            for item in value:
+                _consume_coords(item)
+
+    _consume_coords(coordinates)
+    if min_lat is None or min_lng is None or max_lat is None or max_lng is None:
+        return None
+    return (min_lat, min_lng, max_lat, max_lng)
+
+
+def _bbox_intersects(
+    a: Tuple[float, float, float, float],
+    b: Tuple[float, float, float, float],
+) -> bool:
+    a_min_lat, a_min_lng, a_max_lat, a_max_lng = a
+    b_min_lat, b_min_lng, b_max_lat, b_max_lng = b
+    return not (a_max_lat < b_min_lat or b_max_lat < a_min_lat or a_max_lng < b_min_lng or b_max_lng < a_min_lng)
+
+
+def _expand_bbox(
+    min_lat: float,
+    min_lng: float,
+    max_lat: float,
+    max_lng: float,
+    padding_ratio: float = 0.18,
+) -> Tuple[float, float, float, float]:
+    low_lat = min(min_lat, max_lat)
+    high_lat = max(min_lat, max_lat)
+    low_lng = min(min_lng, max_lng)
+    high_lng = max(min_lng, max_lng)
+    lat_span = max(0.0, high_lat - low_lat)
+    lng_span = max(0.0, high_lng - low_lng)
+    safe_padding = max(0.0, min(float(padding_ratio), 1.0))
+    lat_pad = lat_span * safe_padding
+    lng_pad = lng_span * safe_padding
+    return (
+        max(-90.0, low_lat - lat_pad),
+        max(-180.0, low_lng - lng_pad),
+        min(90.0, high_lat + lat_pad),
+        min(180.0, high_lng + lng_pad),
+    )
+
+
+def _frame_payload_viewport_subset(
+    frame_payload: Dict[str, Any],
+    min_lat: float,
+    min_lng: float,
+    max_lat: float,
+    max_lng: float,
+    padding_ratio: float = 0.18,
+) -> Dict[str, Any]:
+    if not isinstance(frame_payload, dict):
+        return frame_payload
+
+    expanded_bbox = _expand_bbox(
+        min_lat=min_lat,
+        min_lng=min_lng,
+        max_lat=max_lat,
+        max_lng=max_lng,
+        padding_ratio=padding_ratio,
+    )
+    polygons = frame_payload.get("polygons")
+    features = polygons.get("features") if isinstance(polygons, dict) else None
+    if not isinstance(features, list):
+        payload = dict(frame_payload)
+        payload["_viewport_subset"] = False
+        payload["_viewport_fallback_reason"] = "missing_polygon_features"
+        return payload
+
+    subset_features: List[Dict[str, Any]] = []
+    for feature in features:
+        if not isinstance(feature, dict):
+            continue
+        bounds = _feature_geometry_bounds(feature)
+        if bounds is None:
+            continue
+        if _bbox_intersects(bounds, expanded_bbox):
+            subset_features.append(feature)
+
+    source_count = len(features)
+    if not subset_features:
+        payload = dict(frame_payload)
+        payload["_viewport_subset"] = False
+        payload["_viewport_bounds"] = {
+            "min_lat": min(min_lat, max_lat),
+            "min_lng": min(min_lng, max_lng),
+            "max_lat": max(min_lat, max_lat),
+            "max_lng": max(min_lng, max_lng),
+        }
+        payload["_viewport_padding_ratio"] = float(padding_ratio)
+        payload["_source_feature_count"] = source_count
+        payload["_returned_feature_count"] = source_count
+        payload["_viewport_fallback_reason"] = "no_intersections"
+        _record_perf_metric("frame.viewport_subset_fallback_full")
+        return payload
+
+    payload = dict(frame_payload)
+    polygons_payload = dict(polygons) if isinstance(polygons, dict) else {}
+    polygons_payload["features"] = subset_features
+    payload["polygons"] = polygons_payload
+    payload["_viewport_subset"] = True
+    payload["_viewport_bounds"] = {
+        "min_lat": min(min_lat, max_lat),
+        "min_lng": min(min_lng, max_lng),
+        "max_lat": max(min_lat, max_lat),
+        "max_lng": max(min_lng, max_lng),
+    }
+    payload["_viewport_padding_ratio"] = float(padding_ratio)
+    payload["_source_feature_count"] = source_count
+    payload["_returned_feature_count"] = len(subset_features)
+    _record_perf_metric("frame.viewport_subset_hit")
+    return payload
+
+
+def _viewport_subset_etag(
+    base_etag: Optional[str],
+    min_lat: float,
+    min_lng: float,
+    max_lat: float,
+    max_lng: float,
+    padding_ratio: float,
+) -> Optional[str]:
+    if not base_etag:
+        return None
+    normalized = (
+        round(min(min_lat, max_lat), 5),
+        round(min(min_lng, max_lng), 5),
+        round(max(min_lat, max_lat), 5),
+        round(max(min_lng, max_lng), 5),
+        round(float(padding_ratio), 5),
+    )
+    suffix = hashlib.sha1(f"{base_etag}|{normalized}".encode("utf-8")).hexdigest()[:12]
+    return f'{base_etag[:-1]}-vp-{suffix}"' if base_etag.endswith('"') else f'{base_etag}-vp-{suffix}'
+
+
 def _has_assistant_outlook() -> bool:
     try:
         return _has_frames()
@@ -4420,6 +4580,38 @@ def frame(idx: int, request: Request):
         raise HTTPException(status_code=409, detail="timeline not ready. Call /generate first.")
     cached = _read_frame_cached(idx)
     return _json_cached_response(request, cached["data"], etag=cached.get("etag"))
+
+
+@app.get("/frame/{idx}/viewport")
+def frame_viewport(
+    idx: int,
+    request: Request,
+    min_lat: float,
+    min_lng: float,
+    max_lat: float,
+    max_lng: float,
+    padding_ratio: float = 0.18,
+):
+    if not _has_frames():
+        raise HTTPException(status_code=409, detail="timeline not ready. Call /generate first.")
+    cached = _read_frame_cached(idx)
+    payload = _frame_payload_viewport_subset(
+        cached["data"],
+        min_lat=min_lat,
+        min_lng=min_lng,
+        max_lat=max_lat,
+        max_lng=max_lng,
+        padding_ratio=padding_ratio,
+    )
+    etag = _viewport_subset_etag(
+        cached.get("etag"),
+        min_lat=min_lat,
+        min_lng=min_lng,
+        max_lat=max_lat,
+        max_lng=max_lng,
+        padding_ratio=padding_ratio,
+    )
+    return _json_cached_response(request, payload, etag=etag)
 
 
 @app.post("/upload_zones_geojson")
