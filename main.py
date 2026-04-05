@@ -105,6 +105,10 @@ TIMELINE_PATH = FRAMES_DIR / "timeline.json"
 ASSISTANT_OUTLOOK_PATH = FRAMES_DIR / "assistant_outlook.json"
 EXACT_HISTORY_DIR = DATA_DIR / "exact_history"
 EXACT_HISTORY_DB_PATH = EXACT_HISTORY_DIR / "exact_shadow.duckdb"
+EXACT_HISTORY_MONTHS_DIR = EXACT_HISTORY_DIR / "months"
+EXACT_HISTORY_MONTHS_BUILDING_DIR = EXACT_HISTORY_DIR / "months.__building__"
+EXACT_HISTORY_MONTHS_BACKUP_DIR = EXACT_HISTORY_DIR / "months.__backup__"
+MONTH_MANIFEST_PATH = EXACT_HISTORY_DIR / "month_manifest.json"
 DAY_TENDENCY_DIR = DATA_DIR / "day_tendency"
 DAY_TENDENCY_MODEL_PATH = DAY_TENDENCY_DIR / "model.json"
 NYC_TZ = ZoneInfo("America/New_York")
@@ -251,15 +255,15 @@ _pickup_zone_geom_parse_warned = False
 _pickup_zone_hotspot_feature_cache: Dict[int, Dict[str, Any]] = {}
 _pickup_zone_score_cache: Dict[int, float] = {}
 _pickup_zone_hotspot_cache_lock = threading.Lock()
-_timeline_cache_entry: Dict[str, Any] = {}
+_timeline_cache_entry: Dict[str, Dict[str, Any]] = {}
 _timeline_cache_lock = threading.Lock()
 _assistant_outlook_frame_bucket_cache: Dict[str, Dict[str, Any]] = {}
 _assistant_outlook_frame_bucket_order: deque[str] = deque()
 _assistant_outlook_frame_bucket_lock = threading.Lock()
 ASSISTANT_OUTLOOK_FRAME_BUCKET_CACHE_MAX = 6
 _assistant_outlook_legacy_artifact_pruned = False
-_frame_cache: Dict[int, Dict[str, Any]] = {}
-_frame_cache_order: deque[int] = deque()
+_frame_cache: Dict[Tuple[str, int], Dict[str, Any]] = {}
+_frame_cache_order: deque[Tuple[str, int]] = deque()
 _frame_cache_lock = threading.Lock()
 FRAME_CACHE_MAX = 8
 ARTIFACT_CACHE_CONTROL = "public, max-age=60"
@@ -451,6 +455,149 @@ def _list_parquets() -> List[Path]:
     return sorted([p for p in DATA_DIR.glob("*.parquet") if p.is_file()])
 
 
+def _month_key_for_datetime(dt: datetime) -> str:
+    return f"{int(dt.year):04d}-{int(dt.month):02d}"
+
+
+def _parse_month_key(month_key: str) -> Tuple[int, int]:
+    raw = str(month_key or "").strip()
+    match = re.fullmatch(r"(\d{4})-(\d{2})", raw)
+    if not match:
+        raise ValueError(f"Invalid month_key: {raw!r}")
+    year, month = int(match.group(1)), int(match.group(2))
+    if month < 1 or month > 12:
+        raise ValueError(f"Invalid month_key: {raw!r}")
+    return year, month
+
+
+def _safe_parse_month_key(month_key: str) -> Optional[Tuple[int, int]]:
+    try:
+        return _parse_month_key(month_key)
+    except Exception:
+        return None
+
+
+def _month_key_from_parquet_filename(path: Path) -> Optional[str]:
+    stem = path.stem.lower()
+    numeric_match = re.search(r"(20\d{2})[-_](\d{1,2})", stem)
+    if numeric_match:
+        year = int(numeric_match.group(1))
+        month = int(numeric_match.group(2))
+        if 1 <= month <= 12:
+            return f"{year:04d}-{month:02d}"
+    month_name_map = {
+        "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
+        "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12,
+        "dicember": 12,
+    }
+    name_match = re.search(r"(january|february|march|april|may|june|july|august|september|october|november|december|dicember)[-_](20\d{2})", stem)
+    if name_match:
+        month = month_name_map.get(name_match.group(1))
+        year = int(name_match.group(2))
+        if month:
+            return f"{year:04d}-{month:02d}"
+    return None
+
+
+def _month_key_from_parquet_data(path: Path) -> Optional[str]:
+    con = duckdb.connect(database=":memory:")
+    try:
+        file_sql = str(path).replace("'", "''")
+        min_ts = con.execute(
+            f"SELECT MIN(pickup_datetime) FROM read_parquet('{file_sql}')"
+        ).fetchone()[0]
+    finally:
+        con.close()
+    if min_ts is None:
+        return None
+    if isinstance(min_ts, str):
+        try:
+            min_ts = datetime.fromisoformat(min_ts)
+        except Exception:
+            return None
+    if isinstance(min_ts, datetime):
+        return _month_key_for_datetime(min_ts.astimezone(NYC_TZ) if min_ts.tzinfo else min_ts)
+    return None
+
+
+def _group_parquets_by_month(parquets: List[Path]) -> Dict[str, List[Path]]:
+    grouped: Dict[str, List[Path]] = defaultdict(list)
+    for path in parquets:
+        month_key = _month_key_from_parquet_filename(path) or _month_key_from_parquet_data(path)
+        if month_key:
+            grouped[month_key].append(path)
+    return {key: sorted(value) for key, value in sorted(grouped.items())}
+
+
+def _month_dir(month_key: str) -> Path:
+    return EXACT_HISTORY_MONTHS_DIR / month_key
+
+
+def _month_timeline_path(month_key: str) -> Path:
+    return _month_dir(month_key) / "timeline.json"
+
+
+def _month_store_path(month_key: str) -> Path:
+    return _month_dir(month_key) / "exact_shadow.duckdb"
+
+
+def _load_month_manifest() -> Dict[str, Any]:
+    if not MONTH_MANIFEST_PATH.exists() or MONTH_MANIFEST_PATH.stat().st_size <= 0:
+        return {"available_month_keys": [], "months": {}}
+    try:
+        payload = _read_json(MONTH_MANIFEST_PATH)
+    except Exception:
+        return {"available_month_keys": [], "months": {}}
+    months = payload.get("months") if isinstance(payload, dict) else {}
+    if not isinstance(months, dict):
+        months = {}
+    keys = [k for k in months.keys() if _safe_parse_month_key(k)]
+    return {"available_month_keys": sorted(keys), "months": months}
+
+
+def _persist_month_manifest(month_map: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    payload = {
+        "timeline_scope": "monthly_exact_historical",
+        "available_month_keys": sorted(month_map.keys()),
+        "months": month_map,
+        "updated_at_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+    }
+    MONTH_MANIFEST_PATH.parent.mkdir(parents=True, exist_ok=True)
+    MONTH_MANIFEST_PATH.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+    return payload
+
+
+def resolve_active_month_key(target_dt_nyc: datetime, available_month_keys: List[str]) -> Optional[str]:
+    valid = [mk for mk in sorted(available_month_keys) if _safe_parse_month_key(mk)]
+    if not valid:
+        return None
+    target_year = int(target_dt_nyc.year)
+    target_month = int(target_dt_nyc.month)
+    same_month = [mk for mk in valid if (_safe_parse_month_key(mk) or (0, 0))[1] == target_month]
+    if f"{target_year:04d}-{target_month:02d}" in same_month:
+        return f"{target_year:04d}-{target_month:02d}"
+    if same_month:
+        return sorted(same_month)[-1]
+    return valid[-1]
+
+
+def _resolve_active_month_key(month_key: Optional[str] = None, target_dt_nyc: Optional[datetime] = None) -> Tuple[str, Dict[str, Any]]:
+    manifest = _load_month_manifest()
+    available = list(manifest.get("available_month_keys") or [])
+    if month_key:
+        requested = str(month_key).strip()
+        if requested not in available:
+            raise HTTPException(status_code=404, detail=f"month_key not available: {requested}")
+        print(f"active_month_resolved month_key={requested}")
+        return requested, manifest
+    target = target_dt_nyc or datetime.now(timezone.utc).astimezone(NYC_TZ)
+    resolved = resolve_active_month_key(target, available)
+    if not resolved:
+        raise HTTPException(status_code=409, detail="No monthly exact-history partitions available. Call /generate first.")
+    print(f"active_month_resolved month_key={resolved}")
+    return resolved, manifest
+
+
 def _artifact_freshness_snapshot() -> Dict[str, Any]:
     repo_root = Path(__file__).resolve().parent
     try:
@@ -506,9 +653,11 @@ def _backend_identity_snapshot(freshness: Optional[Dict[str, Any]] = None) -> Di
     return {"backend_build_id": None, "backend_release": None, "source": "missing"}
 
 
-def _has_frames() -> bool:
+def _has_frames(month_key: Optional[str] = None) -> bool:
     try:
-        return TIMELINE_PATH.exists() and TIMELINE_PATH.stat().st_size > 0
+        resolved_key, _ = _resolve_active_month_key(month_key=month_key) if month_key else _resolve_active_month_key()
+        timeline_path = _month_timeline_path(resolved_key)
+        return timeline_path.exists() and timeline_path.stat().st_size > 0
     except Exception:
         return False
 
@@ -567,22 +716,27 @@ def _json_cached_response(
     return response
 
 
-def _read_timeline_cached() -> Dict[str, Any]:
-    if TIMELINE_PATH.exists() and TIMELINE_PATH.stat().st_size > 0:
-        stat_result = TIMELINE_PATH.stat()
+def _read_timeline_cached(month_key: Optional[str] = None) -> Dict[str, Any]:
+    resolved_month_key, manifest = _resolve_active_month_key(month_key=month_key)
+    timeline_path = _month_timeline_path(resolved_month_key)
+    if timeline_path.exists() and timeline_path.stat().st_size > 0:
+        stat_result = timeline_path.stat()
         mtime = stat_result.st_mtime
         size = int(stat_result.st_size)
-        etag = _etag_for_path(TIMELINE_PATH, mtime, size)
+        etag = _etag_for_path(timeline_path, mtime, size)
+        cache_key = resolved_month_key
         with _timeline_cache_lock:
-            cached = _timeline_cache_entry
+            cached = _timeline_cache_entry.get(cache_key) or {}
             if cached and cached.get("mtime") == mtime and cached.get("size") == size:
                 _record_perf_metric("timeline.cache_hit")
-                return cached
+                return dict(cached)
             _record_perf_metric("timeline.cache_miss")
-            data = _read_json(TIMELINE_PATH)
-            _timeline_cache_entry.clear()
-            _timeline_cache_entry.update({"data": data, "mtime": mtime, "size": size, "etag": etag})
-            return dict(_timeline_cache_entry)
+            data = _read_json(timeline_path)
+            data["active_month_key"] = resolved_month_key
+            data["available_month_keys"] = list(manifest.get("available_month_keys") or [])
+            data["timeline_scope"] = "monthly_exact_historical"
+            _timeline_cache_entry[cache_key] = {"data": data, "mtime": mtime, "size": size, "etag": etag}
+            return dict(_timeline_cache_entry[cache_key])
 
     artifact = load_generated_artifact("timeline")
     if artifact:
@@ -609,50 +763,54 @@ def _read_timeline_cached() -> Dict[str, Any]:
                 }
             )
             return dict(_timeline_cache_entry)
-    raise FileNotFoundError(f"Missing timeline artifact: {TIMELINE_PATH}")
+    raise FileNotFoundError(f"Missing timeline artifact for month_key={resolved_month_key}: {timeline_path}")
 
 
-def _read_frame_cached(idx: int) -> Dict[str, Any]:
-    timeline_cached = _read_timeline_cached()
+def _read_frame_cached(idx: int, month_key: Optional[str] = None) -> Dict[str, Any]:
+    timeline_cached = _read_timeline_cached(month_key=month_key)
     timeline_payload = (timeline_cached or {}).get("data") or {}
     timeline = timeline_payload.get("timeline") or []
     if idx < 0 or idx >= len(timeline):
         raise HTTPException(status_code=404, detail=f"frame not found: {idx}")
     frame_time = str(timeline[idx])
+    active_month_key = str(timeline_payload.get("active_month_key") or month_key or "")
     timeline_etag = str((timeline_cached or {}).get("etag") or "")
-    etag = f'W/"frame-{idx}-{abs(hash((frame_time, timeline_etag))) & 0xffffffff:x}"'
+    cache_idx = (active_month_key, int(idx))
+    etag = f'W/"frame-{active_month_key}-{idx}-{abs(hash((frame_time, timeline_etag))) & 0xffffffff:x}"'
     with _frame_cache_lock:
-        cached = _frame_cache.get(idx)
+        cached = _frame_cache.get(cache_idx)
         if cached is not None and cached.get("etag") == etag:
             _record_perf_metric("frame.cache_hit")
             try:
-                _frame_cache_order.remove(idx)
+                _frame_cache_order.remove(cache_idx)
             except ValueError:
                 pass
-            _frame_cache_order.append(idx)
+            _frame_cache_order.append(cache_idx)
             return cached
 
         _record_perf_metric("frame.cache_miss")
-        data = _build_frame_payload_on_demand(frame_time)
-        _frame_cache[idx] = {"data": data, "etag": etag, "frame_time": frame_time}
+        data = _build_frame_payload_on_demand(frame_time, month_key=active_month_key)
+        _frame_cache[cache_idx] = {"data": data, "etag": etag, "frame_time": frame_time}
         try:
-            _frame_cache_order.remove(idx)
+            _frame_cache_order.remove(cache_idx)
         except ValueError:
             pass
-        _frame_cache_order.append(idx)
+        _frame_cache_order.append(cache_idx)
         while len(_frame_cache_order) > FRAME_CACHE_MAX:
             evicted_idx = _frame_cache_order.popleft()
             _frame_cache.pop(evicted_idx, None)
-        return _frame_cache[idx]
+        return _frame_cache[cache_idx]
 
 
-def _build_frame_payload_on_demand(frame_time: str) -> Dict[str, Any]:
-    if not EXACT_HISTORY_DB_PATH.exists():
+def _build_frame_payload_on_demand(frame_time: str, month_key: Optional[str] = None) -> Dict[str, Any]:
+    resolved_month_key, _ = _resolve_active_month_key(month_key=month_key)
+    store_path = _month_store_path(resolved_month_key)
+    if not store_path.exists():
         raise HTTPException(status_code=409, detail="exact history store not ready. Call /generate first.")
     zone_geoms = _load_pickup_zone_geometries()
     if not zone_geoms:
         raise HTTPException(status_code=503, detail="taxi_zones.geojson unavailable")
-    con = duckdb.connect(database=str(EXACT_HISTORY_DB_PATH), read_only=True)
+    con = duckdb.connect(database=str(store_path), read_only=True)
     try:
         rows = con.execute(
             """
@@ -1083,8 +1241,9 @@ def _artifact_runtime_policy_snapshot() -> Dict[str, Any]:
         "volume_required": [
             "*.parquet",
             "taxi_zones.geojson",
-            "frames/timeline.json",
-            "exact_history/exact_shadow.duckdb",
+            "exact_history/month_manifest.json",
+            "exact_history/months/<month_key>/timeline.json",
+            "exact_history/months/<month_key>/exact_shadow.duckdb",
         ],
         "db_required": [
             "scoring_shadow_manifest",
@@ -1104,16 +1263,20 @@ def _artifact_runtime_policy_snapshot() -> Dict[str, Any]:
 def _artifact_runtime_integrity_report() -> Dict[str, Any]:
     parquet_count = len(_list_parquets())
     zones_present = DATA_DIR.joinpath("taxi_zones.geojson").exists()
-    timeline_present = TIMELINE_PATH.exists() and TIMELINE_PATH.is_file()
-    exact_store_present = EXACT_HISTORY_DB_PATH.exists() and EXACT_HISTORY_DB_PATH.is_file() and EXACT_HISTORY_DB_PATH.stat().st_size > 0
+    manifest = _load_month_manifest()
+    available_month_keys = list(manifest.get("available_month_keys") or [])
+    active_month_key = resolve_active_month_key(datetime.now(timezone.utc).astimezone(NYC_TZ), available_month_keys)
+    month_manifest_present = MONTH_MANIFEST_PATH.exists() and MONTH_MANIFEST_PATH.is_file() and MONTH_MANIFEST_PATH.stat().st_size > 0
+    timeline_present = bool(active_month_key and _month_timeline_path(active_month_key).exists() and _month_timeline_path(active_month_key).is_file())
+    exact_store_present = bool(active_month_key and _month_store_path(active_month_key).exists() and _month_store_path(active_month_key).is_file() and _month_store_path(active_month_key).stat().st_size > 0)
     timeline_count = 0
-    if timeline_present:
+    if timeline_present and active_month_key:
         try:
-            timeline_payload = _read_json(TIMELINE_PATH)
+            timeline_payload = _read_json(_month_timeline_path(active_month_key))
             timeline_count = int(timeline_payload.get("count") or len(timeline_payload.get("timeline") or []))
         except Exception:
             timeline_count = 0
-    required_volume_ok = parquet_count > 0 and timeline_count > 0 and zones_present and timeline_present and exact_store_present
+    required_volume_ok = parquet_count > 0 and timeline_count > 0 and zones_present and month_manifest_present and timeline_present and exact_store_present
 
     required_db_keys = ["scoring_shadow_manifest"]
     missing_required_db_artifacts = [key for key in required_db_keys if not generated_artifact_present(key)]
@@ -1136,10 +1299,12 @@ def _artifact_runtime_integrity_report() -> Dict[str, Any]:
         missing_required_volume.append("*.parquet")
     if not zones_present:
         missing_required_volume.append("taxi_zones.geojson")
+    if not month_manifest_present:
+        missing_required_volume.append("exact_history/month_manifest.json")
     if not timeline_present:
-        missing_required_volume.append("frames/timeline.json")
+        missing_required_volume.append("exact_history/months/<active_month_key>/timeline.json")
     if not exact_store_present:
-        missing_required_volume.append("exact_history/exact_shadow.duckdb")
+        missing_required_volume.append("exact_history/months/<active_month_key>/exact_shadow.duckdb")
 
     core_map_ready = required_volume_ok and required_db_ok
     ok = core_map_ready and not redundant_file_copies_present
@@ -1156,6 +1321,12 @@ def _artifact_runtime_integrity_report() -> Dict[str, Any]:
         "unexpected_volume_files_present": list(redundant_file_copies_present),
         "frame_count": timeline_count,
         "parquet_count": parquet_count,
+        "monthly_partition_mode": True,
+        "active_month_key": active_month_key,
+        "available_month_keys": available_month_keys,
+        "monthly_partition_count": len(available_month_keys),
+        "active_month_store_present": exact_store_present,
+        "active_month_timeline_present": timeline_present,
     }
 
 
@@ -2183,7 +2354,13 @@ def _get_state() -> Dict[str, Any]:
         return dict(_generate_state)
 
 
-def _generate_worker(bin_minutes: int, min_trips_per_window: int, include_day_tendency: bool = False) -> None:
+def _generate_worker(
+    bin_minutes: int,
+    min_trips_per_window: int,
+    include_day_tendency: bool = False,
+    month_key: Optional[str] = None,
+    build_all_months: bool = False,
+) -> None:
     from build_day_tendency import build_day_tendency_model
     from build_hotspot import ensure_zones_geojson, build_hotspots_frames
 
@@ -2218,13 +2395,68 @@ def _generate_worker(bin_minutes: int, min_trips_per_window: int, include_day_te
                 + "; ".join(inventory.get("warnings") or [])
             )
 
-        frames_result = build_hotspots_frames(
-            parquet_files=parquets,
-            zones_geojson_path=zones_path,
-            out_dir=FRAMES_DIR,
-            bin_minutes=bin_minutes,
-            min_trips_per_window=min_trips_per_window,
+        grouped_parquets = _group_parquets_by_month(parquets)
+        if not grouped_parquets:
+            raise RuntimeError("No month-keyed parquet files found for monthly exact-history build.")
+        requested_month_key = str(month_key or "").strip() or None
+        if requested_month_key:
+            if requested_month_key not in grouped_parquets:
+                raise RuntimeError(f"Requested month_key not found in parquet inventory: {requested_month_key}")
+            build_month_keys = [requested_month_key]
+        elif bool(build_all_months):
+            build_month_keys = sorted(grouped_parquets.keys())
+        else:
+            resolved = resolve_active_month_key(datetime.now(timezone.utc).astimezone(NYC_TZ), sorted(grouped_parquets.keys()))
+            if not resolved:
+                raise RuntimeError("Unable to resolve active month_key from available parquet files.")
+            build_month_keys = [resolved]
+        months_manifest: Dict[str, Dict[str, Any]] = dict((_load_month_manifest().get("months") or {}))
+        build_results: Dict[str, Any] = {}
+        for mk in build_month_keys:
+            print(f"monthly_partition_build_start month_key={mk}")
+            month_dir = _month_dir(mk)
+            stage_dir = EXACT_HISTORY_MONTHS_BUILDING_DIR / mk
+            backup_dir = EXACT_HISTORY_MONTHS_BACKUP_DIR / mk
+            month_result = build_hotspots_frames(
+                parquet_files=grouped_parquets.get(mk) or [],
+                zones_geojson_path=zones_path,
+                out_dir=month_dir,
+                bin_minutes=bin_minutes,
+                min_trips_per_window=min_trips_per_window,
+                exact_history_dir=month_dir,
+                exact_history_stage_dir=stage_dir,
+                exact_history_backup_dir=backup_dir,
+                timeline_output_path=month_dir / "timeline.json",
+                cleanup_out_dir_frames=False,
+            )
+            timeline_path = month_dir / "timeline.json"
+            timeline_payload = _read_json(timeline_path) if timeline_path.exists() else {}
+            timeline = timeline_payload.get("timeline") or []
+            print(f"monthly_partition_build_done month_key={mk} frame_count={len(timeline)}")
+            print(f"monthly_partition_publish_done month_key={mk}")
+            months_manifest[mk] = {
+                "month_key": mk,
+                "source_parquet_filenames": [p.name for p in (grouped_parquets.get(mk) or [])],
+                "store_exists": (month_dir / "exact_shadow.duckdb").exists(),
+                "timeline_exists": timeline_path.exists(),
+                "first_frame_datetime": timeline[0] if timeline else None,
+                "last_frame_datetime": timeline[-1] if timeline else None,
+                "frame_count": int(len(timeline)),
+            }
+            build_results[mk] = month_result
+        manifest_payload = _persist_month_manifest(months_manifest)
+        active_month_key = resolve_active_month_key(
+            datetime.now(timezone.utc).astimezone(NYC_TZ),
+            list(manifest_payload.get("available_month_keys") or []),
         )
+        frames_result = {
+            "ok": True,
+            "mode": "monthly_exact_historical",
+            "built_month_keys": build_month_keys,
+            "active_month_key": active_month_key,
+            "available_month_keys": list(manifest_payload.get("available_month_keys") or []),
+            "month_results": build_results,
+        }
         day_tendency_result: Dict[str, Any] = {
             "ok": False,
             "skipped": not include_day_tendency,
@@ -2259,7 +2491,7 @@ def _generate_worker(bin_minutes: int, min_trips_per_window: int, include_day_te
             "frames": frames_result,
             "day_tendency": day_tendency_result,
             "include_day_tendency": bool(include_day_tendency),
-            "timeline_mode": "exact_historical",
+            "timeline_mode": "monthly_exact_historical",
             "frame_time_model": "exact_local_20min",
             "synthetic_week_enabled": False,
             "parquet_inventory": inventory,
@@ -2304,6 +2536,8 @@ def start_generate(
     min_trips_per_window: int,
     force_clear_lock: bool = False,
     include_day_tendency: bool = False,
+    month_key: Optional[str] = None,
+    build_all_months: bool = False,
 ) -> Dict[str, Any]:
     global _generate_thread
     st = _get_state()
@@ -2349,7 +2583,7 @@ def start_generate(
 
     t = threading.Thread(
         target=_generate_worker,
-        args=(bin_minutes, min_trips_per_window, bool(include_day_tendency)),
+        args=(bin_minutes, min_trips_per_window, bool(include_day_tendency), month_key, bool(build_all_months)),
         daemon=True,
     )
     _generate_thread = t
@@ -2363,6 +2597,8 @@ def start_generate(
         "cleanup": cleanup_result,
         "lock_cleared": lock_cleared,
         "include_day_tendency": bool(include_day_tendency),
+        "month_key": month_key,
+        "build_all_months": bool(build_all_months),
     }
 
 
@@ -4064,10 +4300,15 @@ def status():
     assistant_outlook_source_mode = "on_demand_frame_bucket" if _has_assistant_outlook() else "missing"
     day_tendency_file_present = DAY_TENDENCY_MODEL_PATH.exists() and DAY_TENDENCY_MODEL_PATH.stat().st_size > 0 if DAY_TENDENCY_MODEL_PATH.exists() else False
     manifest_file_present = manifest_path.exists() and manifest_path.stat().st_size > 0 if manifest_path.exists() else False
-    timeline_file_present = TIMELINE_PATH.exists() and TIMELINE_PATH.stat().st_size > 0 if TIMELINE_PATH.exists() else False
-    exact_history_store_present = EXACT_HISTORY_DB_PATH.exists() and EXACT_HISTORY_DB_PATH.stat().st_size > 0 if EXACT_HISTORY_DB_PATH.exists() else False
-    exact_history_store_bytes = int(EXACT_HISTORY_DB_PATH.stat().st_size) if EXACT_HISTORY_DB_PATH.exists() and EXACT_HISTORY_DB_PATH.is_file() else 0
-    timeline_present = timeline_artifact_in_db or (TIMELINE_PATH.exists() and TIMELINE_PATH.stat().st_size > 0 if TIMELINE_PATH.exists() else False)
+    month_manifest = _load_month_manifest()
+    available_month_keys = list(month_manifest.get("available_month_keys") or [])
+    active_month_key = resolve_active_month_key(datetime.now(timezone.utc).astimezone(NYC_TZ), available_month_keys)
+    active_timeline_path = _month_timeline_path(active_month_key) if active_month_key else None
+    active_store_path = _month_store_path(active_month_key) if active_month_key else None
+    timeline_file_present = bool(active_timeline_path and active_timeline_path.exists() and active_timeline_path.stat().st_size > 0)
+    exact_history_store_present = bool(active_store_path and active_store_path.exists() and active_store_path.stat().st_size > 0)
+    exact_history_store_bytes = int(active_store_path.stat().st_size) if active_store_path and active_store_path.exists() and active_store_path.is_file() else 0
+    timeline_present = timeline_artifact_in_db or timeline_file_present
     manifest_present = manifest_artifact_in_db
     freshness = _artifact_freshness_snapshot()
     identity = _backend_identity_snapshot(freshness)
@@ -4076,7 +4317,7 @@ def status():
     stale_lock_detected = bool(_lock_is_present() and not _generate_thread_alive())
     return {
         "status": "ok",
-        "timeline_mode": "exact_historical",
+        "timeline_mode": "monthly_exact_historical",
         "frame_time_model": "exact_local_20min",
         "synthetic_week_enabled": False,
         "data_dir": str(DATA_DIR),
@@ -4093,7 +4334,7 @@ def status():
         "backend_identity_source": identity.get("source"),
         "frames_dir": str(FRAMES_DIR),
         "exact_history_dir": str(EXACT_HISTORY_DIR),
-        "exact_history_store_path": str(EXACT_HISTORY_DB_PATH),
+        "exact_history_store_path": str(active_store_path) if active_store_path else None,
         "exact_history_store_present": exact_history_store_present,
         "exact_history_store_bytes": exact_history_store_bytes,
         "auto_generate_on_startup": AUTO_GENERATE_ON_STARTUP,
@@ -4132,6 +4373,14 @@ def status():
         "day_tendency_file_present": day_tendency_file_present,
         "manifest_file_present": manifest_file_present,
         "timeline_file_present": timeline_file_present,
+        "month_manifest_path": str(MONTH_MANIFEST_PATH),
+        "month_manifest_present": MONTH_MANIFEST_PATH.exists(),
+        "monthly_partition_mode": True,
+        "active_month_key": active_month_key,
+        "available_month_keys": available_month_keys,
+        "monthly_partition_count": len(available_month_keys),
+        "active_month_store_present": exact_history_store_present,
+        "active_month_timeline_present": timeline_file_present,
         "generated_artifact_store_report": generated_artifact_report(),
         "artifact_runtime_policy": _artifact_runtime_policy_snapshot(),
         "artifact_runtime_integrity": artifact_runtime_integrity,
@@ -4487,6 +4736,8 @@ def generate_get(
     bin_minutes: int = DEFAULT_BIN_MINUTES,
     min_trips_per_window: int = DEFAULT_MIN_TRIPS_PER_WINDOW,
     force_clear_lock: int = 0,
+    month_key: Optional[str] = None,
+    build_all_months: int = 0,
     include_day_tendency: int = 0,
 ):
     return start_generate(
@@ -4494,6 +4745,8 @@ def generate_get(
         min_trips_per_window,
         force_clear_lock=bool(int(force_clear_lock or 0)),
         include_day_tendency=bool(int(include_day_tendency or 0)),
+        month_key=(str(month_key).strip() if month_key else None),
+        build_all_months=bool(int(build_all_months or 0)),
     )
 
 
@@ -4710,10 +4963,10 @@ def day_tendency_frame_context(
 
 
 @app.get("/timeline")
-def timeline(request: Request):
-    if not (generated_artifact_present("timeline") or _has_frames()):
+def timeline(request: Request, month_key: Optional[str] = None):
+    if not _has_frames(month_key=month_key):
         raise HTTPException(status_code=409, detail="timeline not ready. Call /generate first.")
-    cached = _read_timeline_cached()
+    cached = _read_timeline_cached(month_key=month_key)
     return _json_cached_response(request, cached["data"], etag=cached.get("etag"))
 
 
@@ -4790,10 +5043,10 @@ def assistant_outlook(
 
 
 @app.get("/frame/{idx}")
-def frame(idx: int, request: Request):
-    if not _has_frames():
+def frame(idx: int, request: Request, month_key: Optional[str] = None):
+    if not _has_frames(month_key=month_key):
         raise HTTPException(status_code=409, detail="timeline not ready. Call /generate first.")
-    cached = _read_frame_cached(idx)
+    cached = _read_frame_cached(idx, month_key=month_key)
     return _json_cached_response(request, cached["data"], etag=cached.get("etag"))
 
 
@@ -4805,11 +5058,12 @@ def frame_viewport(
     min_lng: float,
     max_lat: float,
     max_lng: float,
+    month_key: Optional[str] = None,
     padding_ratio: float = 0.18,
 ):
-    if not _has_frames():
+    if not _has_frames(month_key=month_key):
         raise HTTPException(status_code=409, detail="timeline not ready. Call /generate first.")
-    cached = _read_frame_cached(idx)
+    cached = _read_frame_cached(idx, month_key=month_key)
     payload = _frame_payload_viewport_subset(
         cached["data"],
         min_lat=min_lat,
