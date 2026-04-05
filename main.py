@@ -257,7 +257,8 @@ _frame_cache_order: deque[int] = deque()
 _frame_cache_lock = threading.Lock()
 FRAME_CACHE_MAX = 8
 ARTIFACT_CACHE_CONTROL = "public, max-age=60"
-PICKUP_RECENT_CACHE_TTL_SECONDS = float(os.environ.get("PICKUP_RECENT_CACHE_TTL_SECONDS", "10"))
+PICKUP_RECENT_CACHE_TTL_SECONDS = float(os.environ.get("PICKUP_RECENT_CACHE_TTL_SECONDS", "5"))
+PICKUP_LAST_GOOD_OVERLAY_TTL_SECONDS = float(os.environ.get("PICKUP_LAST_GOOD_OVERLAY_TTL_SECONDS", "45"))
 PICKUP_RECENT_CACHE_MAX = int(os.environ.get("PICKUP_RECENT_CACHE_MAX", "64"))
 PICKUP_HOTSPOT_CACHE_TTL_SECONDS = float(os.environ.get("PICKUP_HOTSPOT_CACHE_TTL_SECONDS", "180"))
 PICKUP_HOTSPOT_CACHE_STALE_SECONDS = float(os.environ.get("PICKUP_HOTSPOT_CACHE_STALE_SECONDS", "900"))
@@ -267,6 +268,8 @@ RECOMMENDATION_OUTCOME_MATURITY_SECONDS = 5400
 OUTCOME_SETTLEMENT_SWEEP_INTERVAL_SECONDS = 120
 _pickup_recent_cache: Dict[str, Dict[str, Any]] = {}
 _pickup_recent_cache_lock = threading.Lock()
+_pickup_recent_last_good_overlay_cache: Dict[str, Dict[str, Any]] = {}
+_pickup_recent_last_good_overlay_lock = threading.Lock()
 _pickup_zone_score_bundle_cache: Dict[str, Dict[str, Any]] = {}
 _pickup_zone_score_bundle_lock = threading.Lock()
 _pickup_zone_maintenance_lock = threading.Lock()
@@ -6149,6 +6152,47 @@ def _purge_pickup_recent_cache(now_monotonic: Optional[float] = None) -> None:
         _pickup_recent_cache.pop(oldest_key, None)
 
 
+def _get_pickup_last_good_overlay(
+    cache_key: str,
+    now_monotonic: Optional[float] = None,
+) -> Optional[Dict[str, Any]]:
+    now_value = now_monotonic if now_monotonic is not None else time.monotonic()
+    with _pickup_recent_last_good_overlay_lock:
+        entry = _pickup_recent_last_good_overlay_cache.get(cache_key)
+        if not entry:
+            return None
+        saved_at_monotonic = float(entry.get("saved_at_monotonic") or 0.0)
+        if (now_value - saved_at_monotonic) > PICKUP_LAST_GOOD_OVERLAY_TTL_SECONDS:
+            _pickup_recent_last_good_overlay_cache.pop(cache_key, None)
+            return None
+        return copy.deepcopy(entry)
+
+
+def _set_pickup_last_good_overlay(
+    cache_key: str,
+    payload: Dict[str, Any],
+    now_monotonic: Optional[float] = None,
+) -> None:
+    now_value = now_monotonic if now_monotonic is not None else time.monotonic()
+    saved_payload = copy.deepcopy(payload)
+    saved_payload["saved_at_monotonic"] = now_value
+    saved_payload["saved_at_unix"] = int(time.time())
+    with _pickup_recent_last_good_overlay_lock:
+        _pickup_recent_last_good_overlay_cache[cache_key] = saved_payload
+
+
+def _purge_pickup_last_good_overlay_cache(now_monotonic: Optional[float] = None) -> None:
+    now_value = now_monotonic if now_monotonic is not None else time.monotonic()
+    with _pickup_recent_last_good_overlay_lock:
+        expired = [
+            key
+            for key, value in _pickup_recent_last_good_overlay_cache.items()
+            if (now_value - float(value.get("saved_at_monotonic") or 0.0)) > PICKUP_LAST_GOOD_OVERLAY_TTL_SECONDS
+        ]
+        for key in expired:
+            _pickup_recent_last_good_overlay_cache.pop(key, None)
+
+
 def _cleanup_pickup_zone_caches(now_monotonic: Optional[float] = None) -> None:
     now_value = now_monotonic if now_monotonic is not None else time.monotonic()
     with _pickup_zone_hotspot_cache_lock:
@@ -6168,6 +6212,7 @@ def _cleanup_pickup_zone_caches(now_monotonic: Optional[float] = None) -> None:
         ]
         for key in stale_bundle_keys:
             _pickup_zone_score_bundle_cache.pop(key, None)
+    _purge_pickup_last_good_overlay_cache(now_value)
 
 
 def _maybe_prune_pickup_experiment_tables(now_ts: int) -> None:
@@ -6188,6 +6233,8 @@ def _maybe_prune_pickup_experiment_tables(now_ts: int) -> None:
 def _invalidate_pickup_overlay_caches() -> None:
     with _pickup_recent_cache_lock:
         _pickup_recent_cache.clear()
+    with _pickup_recent_last_good_overlay_lock:
+        _pickup_recent_last_good_overlay_cache.clear()
     with _pickup_zone_hotspot_cache_lock:
         _pickup_zone_hotspot_feature_cache.clear()
         _pickup_zone_score_cache.clear()
@@ -8802,6 +8849,67 @@ def _recent_pickups_payload(
         micro_hotspots = []
     zone_features = zone_hotspots.get("features") if isinstance(zone_hotspots, dict) else []
     zone_hotspot_count = len(zone_features) if isinstance(zone_features, list) else 0
+    has_recent_items = len(items) > 0
+    has_zone_stats = len(zone_stats) > 0
+    zone_hotspots_empty = zone_hotspot_count <= 0
+    micro_hotspots_empty = len(micro_hotspots) <= 0
+    hotspot_helpers_failed = bool(hotspot_aux_errors)
+    good_overlay = (not zone_hotspots_empty) or (not micro_hotspots_empty)
+    helper_error_empty_overlay = hotspot_helpers_failed and zone_hotspots_empty and micro_hotspots_empty
+    needs_last_good_fallback = (
+        zone_hotspots_empty
+        and micro_hotspots_empty
+        and (hotspot_helpers_failed or has_recent_items or has_zone_stats)
+    )
+    used_last_good_hotspot_overlay_fallback = False
+    last_good_hotspot_overlay_age_seconds = 0.0
+    last_good_hotspot_overlay_reason = ""
+    suppressed_failed_empty_hotspot_cache_write = False
+    if needs_last_good_fallback:
+        last_good_overlay = _get_pickup_last_good_overlay(cache_key, now_monotonic=now_monotonic)
+        if last_good_overlay:
+            fallback_zone_hotspots = last_good_overlay.get("zone_hotspots")
+            fallback_micro_hotspots = last_good_overlay.get("micro_hotspots")
+            fallback_zone_stats = last_good_overlay.get("zone_stats")
+            if isinstance(fallback_zone_hotspots, dict):
+                zone_hotspots = fallback_zone_hotspots
+            if isinstance(fallback_micro_hotspots, list):
+                micro_hotspots = fallback_micro_hotspots
+            if (not has_zone_stats) and isinstance(fallback_zone_stats, list):
+                zone_stats = fallback_zone_stats
+                has_zone_stats = len(zone_stats) > 0
+            if include_debug and isinstance(last_good_overlay.get("pickup_hotspot_debug"), dict):
+                pickup_hotspot_debug = last_good_overlay.get("pickup_hotspot_debug") or pickup_hotspot_debug
+            zone_features = zone_hotspots.get("features") if isinstance(zone_hotspots, dict) else []
+            zone_hotspot_count = len(zone_features) if isinstance(zone_features, list) else 0
+            zone_hotspots_empty = zone_hotspot_count <= 0
+            micro_hotspots_empty = len(micro_hotspots) <= 0
+            good_overlay = (not zone_hotspots_empty) or (not micro_hotspots_empty)
+            used_last_good_hotspot_overlay_fallback = good_overlay
+            saved_at_monotonic = float(last_good_overlay.get("saved_at_monotonic") or now_monotonic)
+            last_good_hotspot_overlay_age_seconds = max(0.0, now_monotonic - saved_at_monotonic)
+            if hotspot_helpers_failed:
+                last_good_hotspot_overlay_reason = "helper_failed_with_empty_overlay"
+            elif has_recent_items:
+                last_good_hotspot_overlay_reason = "recent_items_with_empty_overlay"
+            elif has_zone_stats:
+                last_good_hotspot_overlay_reason = "zone_stats_with_empty_overlay"
+            else:
+                last_good_hotspot_overlay_reason = "transient_empty_overlay"
+    if good_overlay and not helper_error_empty_overlay:
+        overlay_payload: Dict[str, Any] = {
+            "zone_hotspots": zone_hotspots,
+            "micro_hotspots": micro_hotspots,
+            "zone_stats": zone_stats,
+        }
+        if include_debug and isinstance(pickup_hotspot_debug, dict):
+            overlay_payload["pickup_hotspot_debug"] = pickup_hotspot_debug
+        _set_pickup_last_good_overlay(
+            cache_key,
+            overlay_payload,
+            now_monotonic=now_monotonic,
+        )
+
     response = {
         "ok": True,
         "count": len(items),
@@ -8823,6 +8931,10 @@ def _recent_pickups_payload(
         response["pickup_hotspot_debug"].setdefault("viewer_deduped_micro_impressions", 0)
         response["pickup_hotspot_debug"].setdefault("viewer_logged_hotspot_impressions_with_centers", 0)
         response["pickup_hotspot_debug"].setdefault("viewer_logged_micro_impressions_with_centers", 0)
+        response["used_last_good_hotspot_overlay_fallback"] = used_last_good_hotspot_overlay_fallback
+        response["last_good_hotspot_overlay_age_seconds"] = last_good_hotspot_overlay_age_seconds
+        response["last_good_hotspot_overlay_reason"] = last_good_hotspot_overlay_reason
+        response["suppressed_failed_empty_hotspot_cache_write"] = suppressed_failed_empty_hotspot_cache_write
     if viewer_user_id is not None:
         impression_counts = _log_viewer_recommendation_impressions_from_pickup_payload(
             payload=response,
@@ -8832,13 +8944,20 @@ def _recent_pickups_payload(
         if include_debug:
             response.setdefault("pickup_hotspot_debug", {}).update(impression_counts)
     if not include_debug:
+        should_cache_response = True
+        if helper_error_empty_overlay and not used_last_good_hotspot_overlay_fallback:
+            should_cache_response = False
+            suppressed_failed_empty_hotspot_cache_write = True
         with _pickup_recent_cache_lock:
-            _pickup_recent_cache[cache_key] = {
-                "payload": copy.deepcopy(response),
-                "expires_at_monotonic": now_monotonic + PICKUP_RECENT_CACHE_TTL_SECONDS,
-                "last_access_monotonic": now_monotonic,
-            }
+            if should_cache_response:
+                _pickup_recent_cache[cache_key] = {
+                    "payload": copy.deepcopy(response),
+                    "expires_at_monotonic": now_monotonic + PICKUP_RECENT_CACHE_TTL_SECONDS,
+                    "last_access_monotonic": now_monotonic,
+                }
             _purge_pickup_recent_cache(now_monotonic)
+    elif suppressed_failed_empty_hotspot_cache_write:
+        response["suppressed_failed_empty_hotspot_cache_write"] = True
     return response
 
 
