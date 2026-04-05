@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import List, Dict, Any, Tuple
-from datetime import datetime, timedelta
+from datetime import datetime
 import json
 import math
 import statistics
@@ -20,6 +20,11 @@ from artifact_freshness import build_expected_artifact_signature
 from artifact_db_store import save_generated_artifact
 
 logger = logging.getLogger(__name__)
+
+
+def _rows_to_named_dicts(cursor: Any) -> List[Dict[str, Any]]:
+    columns = [str(desc[0]) for desc in (cursor.description or [])]
+    return [{columns[idx]: row[idx] for idx in range(len(columns))} for row in cursor.fetchall()]
 
 def ensure_zones_geojson(data_dir: Path, force: bool = False) -> Path:
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -1165,13 +1170,258 @@ def build_hotspots_frames(
             available_columns=available_columns,
         )
 
-        shadow_rows = con.execute(shadow_sql).fetchall()
-        shadow_by_key: Dict[Tuple[int, int, int], Dict[str, Any]] = {}
-        for row in shadow_rows:
+        shadow_cursor = con.execute(shadow_sql)
+        shadow_rows = _rows_to_named_dicts(shadow_cursor)
+        shadow_by_key: Dict[Tuple[int, str], Dict[str, Any]] = {}
+        for row_map in shadow_rows:
+            row = (
+                row_map.get("PULocationID"),
+                row_map.get("exact_bin_local_ts"),
+                row_map.get("exact_bin_date_local"),
+                row_map.get("exact_weekday_name_local"),
+                row_map.get("exact_bin_time_label_local"),
+                row_map.get("exact_bin_unix_utc"),
+                row_map.get("pickups_now"),
+                row_map.get("pickups_next"),
+                row_map.get("median_driver_pay"),
+                row_map.get("median_pay_per_min"),
+                row_map.get("median_pay_per_mile"),
+                row_map.get("median_request_to_pickup_min"),
+                row_map.get("short_trip_share_3mi_12min"),
+                row_map.get("shared_ride_share"),
+                row_map.get("zone_area_sq_miles"),
+                row_map.get("pickups_per_sq_mile_now"),
+                row_map.get("pickups_per_sq_mile_next"),
+                row_map.get("long_trip_share_20plus"),
+                row_map.get("balanced_trip_share"),
+                row_map.get("same_zone_dropoff_share"),
+                row_map.get("downstream_next_value_raw"),
+                row_map.get("demand_now_n"),
+                row_map.get("demand_next_n"),
+                row_map.get("pay_n"),
+                row_map.get("pay_per_min_n"),
+                row_map.get("pay_per_mile_n"),
+                row_map.get("pickup_friction_penalty_n"),
+                row_map.get("short_trip_penalty_n"),
+                row_map.get("shared_ride_penalty_n"),
+                row_map.get("downstream_value_n"),
+                row_map.get("demand_density_now_n"),
+                row_map.get("demand_density_next_n"),
+                row_map.get("demand_support_n_shadow"),
+                row_map.get("density_support_n_shadow"),
+                row_map.get("effective_demand_density_now_n_shadow"),
+                row_map.get("effective_demand_density_next_n_shadow"),
+                row_map.get("busy_now_base_n_shadow"),
+                row_map.get("busy_next_base_n_shadow"),
+                row_map.get("long_trip_share_20plus_n"),
+                row_map.get("balanced_trip_share_n_shadow"),
+                row_map.get("balanced_trip_share_shadow"),
+                row_map.get("same_zone_retention_penalty_n"),
+                row_map.get("churn_pressure_n_shadow"),
+                row_map.get("manhattan_core_saturation_proxy_n_shadow"),
+                row_map.get("manhattan_core_saturation_penalty_n_shadow"),
+                row_map.get("market_saturation_pressure_n_shadow"),
+                row_map.get("market_saturation_penalty_n_shadow"),
+                row_map.get("citywide_manhattan_saturation_discount_factor_shadow"),
+                row_map.get("earnings_shadow_positive_citywide_v3"),
+                row_map.get("earnings_shadow_negative_citywide_v3"),
+                row_map.get("earnings_shadow_score_raw_citywide_v3"),
+                row_map.get("earnings_shadow_score_raw_citywide_v3_pre_manhattan_discount_shadow"),
+                row_map.get("earnings_shadow_score_citywide_v3_anchor_shadow"),
+                row_map.get("earnings_shadow_score_raw_manhattan_v3"),
+                row_map.get("earnings_shadow_score_raw_bronx_wash_heights_v3"),
+                row_map.get("earnings_shadow_score_raw_queens_v3"),
+                row_map.get("earnings_shadow_score_raw_brooklyn_v3"),
+                row_map.get("earnings_shadow_score_raw_staten_island_v3"),
+                row_map.get("earnings_shadow_busy_size_positive_citywide_v3"),
+                row_map.get("earnings_shadow_pay_quality_positive_citywide_v3"),
+                row_map.get("earnings_shadow_trip_mix_positive_citywide_v3"),
+                row_map.get("earnings_shadow_continuation_positive_citywide_v3"),
+                row_map.get("earnings_shadow_short_trip_penalty_citywide_v3"),
+                row_map.get("earnings_shadow_retention_penalty_citywide_v3"),
+                row_map.get("earnings_shadow_friction_penalty_citywide_v3"),
+                row_map.get("earnings_shadow_saturation_penalty_citywide_v3"),
+            ) + tuple(
+                row_map.get(name) for name in (
+                    "earnings_shadow_busy_size_positive_manhattan_v3",
+                    "earnings_shadow_pay_quality_positive_manhattan_v3",
+                    "earnings_shadow_trip_mix_positive_manhattan_v3",
+                    "earnings_shadow_continuation_positive_manhattan_v3",
+                    "earnings_shadow_short_trip_penalty_manhattan_v3",
+                    "earnings_shadow_retention_penalty_manhattan_v3",
+                    "earnings_shadow_friction_penalty_manhattan_v3",
+                    "earnings_shadow_saturation_penalty_manhattan_v3",
+                    "earnings_shadow_busy_size_positive_bronx_wash_heights_v3",
+                    "earnings_shadow_pay_quality_positive_bronx_wash_heights_v3",
+                    "earnings_shadow_trip_mix_positive_bronx_wash_heights_v3",
+                    "earnings_shadow_continuation_positive_bronx_wash_heights_v3",
+                    "earnings_shadow_short_trip_penalty_bronx_wash_heights_v3",
+                    "earnings_shadow_retention_penalty_bronx_wash_heights_v3",
+                    "earnings_shadow_friction_penalty_bronx_wash_heights_v3",
+                    "earnings_shadow_saturation_penalty_bronx_wash_heights_v3",
+                    "earnings_shadow_busy_size_positive_queens_v3",
+                    "earnings_shadow_pay_quality_positive_queens_v3",
+                    "earnings_shadow_trip_mix_positive_queens_v3",
+                    "earnings_shadow_continuation_positive_queens_v3",
+                    "earnings_shadow_short_trip_penalty_queens_v3",
+                    "earnings_shadow_retention_penalty_queens_v3",
+                    "earnings_shadow_friction_penalty_queens_v3",
+                    "earnings_shadow_saturation_penalty_queens_v3",
+                    "earnings_shadow_busy_size_positive_brooklyn_v3",
+                    "earnings_shadow_pay_quality_positive_brooklyn_v3",
+                    "earnings_shadow_trip_mix_positive_brooklyn_v3",
+                    "earnings_shadow_continuation_positive_brooklyn_v3",
+                    "earnings_shadow_short_trip_penalty_brooklyn_v3",
+                    "earnings_shadow_retention_penalty_brooklyn_v3",
+                    "earnings_shadow_friction_penalty_brooklyn_v3",
+                    "earnings_shadow_saturation_penalty_brooklyn_v3",
+                    "earnings_shadow_busy_size_positive_staten_island_v3",
+                    "earnings_shadow_pay_quality_positive_staten_island_v3",
+                    "earnings_shadow_trip_mix_positive_staten_island_v3",
+                    "earnings_shadow_continuation_positive_staten_island_v3",
+                    "earnings_shadow_short_trip_penalty_staten_island_v3",
+                    "earnings_shadow_retention_penalty_staten_island_v3",
+                    "earnings_shadow_friction_penalty_staten_island_v3",
+                    "earnings_shadow_saturation_penalty_staten_island_v3",
+                )
+            ) + tuple(
+                row_map.get(name) for name in (
+                    "earnings_shadow_score_citywide_v3",
+                    "earnings_shadow_confidence_citywide_v3",
+                    "citywide_v3_confidence_profile_shadow",
+                    "manhattan_v3_confidence_profile_shadow",
+                    "bronx_wash_heights_v3_confidence_profile_shadow",
+                    "queens_v3_confidence_profile_shadow",
+                    "brooklyn_v3_confidence_profile_shadow",
+                    "staten_island_v3_confidence_profile_shadow",
+                    "earnings_shadow_rating_citywide_v3",
+                    "earnings_shadow_bucket_citywide_v3",
+                    "earnings_shadow_color_citywide_v3",
+                    "earnings_shadow_score_citywide_v2",
+                    "earnings_shadow_confidence_citywide_v2",
+                    "earnings_shadow_rating_citywide_v2",
+                    "earnings_shadow_bucket_citywide_v2",
+                    "earnings_shadow_color_citywide_v2",
+                    "earnings_shadow_score_manhattan_v2",
+                    "earnings_shadow_confidence_manhattan_v2",
+                    "earnings_shadow_rating_manhattan_v2",
+                    "earnings_shadow_bucket_manhattan_v2",
+                    "earnings_shadow_color_manhattan_v2",
+                    "earnings_shadow_score_bronx_wash_heights_v2",
+                    "earnings_shadow_confidence_bronx_wash_heights_v2",
+                    "earnings_shadow_rating_bronx_wash_heights_v2",
+                    "earnings_shadow_bucket_bronx_wash_heights_v2",
+                    "earnings_shadow_color_bronx_wash_heights_v2",
+                    "earnings_shadow_score_queens_v2",
+                    "earnings_shadow_confidence_queens_v2",
+                    "earnings_shadow_rating_queens_v2",
+                    "earnings_shadow_bucket_queens_v2",
+                    "earnings_shadow_color_queens_v2",
+                    "earnings_shadow_score_brooklyn_v2",
+                    "earnings_shadow_confidence_brooklyn_v2",
+                    "earnings_shadow_rating_brooklyn_v2",
+                    "earnings_shadow_bucket_brooklyn_v2",
+                    "earnings_shadow_color_brooklyn_v2",
+                    "earnings_shadow_score_staten_island_v2",
+                    "earnings_shadow_confidence_staten_island_v2",
+                    "earnings_shadow_rating_staten_island_v2",
+                    "earnings_shadow_bucket_staten_island_v2",
+                    "earnings_shadow_color_staten_island_v2",
+                    "earnings_shadow_score_manhattan_v3",
+                    "earnings_shadow_confidence_manhattan_v3",
+                    "earnings_shadow_rating_manhattan_v3",
+                    "earnings_shadow_bucket_manhattan_v3",
+                    "earnings_shadow_color_manhattan_v3",
+                    "earnings_shadow_score_bronx_wash_heights_v3",
+                    "earnings_shadow_confidence_bronx_wash_heights_v3",
+                    "earnings_shadow_rating_bronx_wash_heights_v3",
+                    "earnings_shadow_bucket_bronx_wash_heights_v3",
+                    "earnings_shadow_color_bronx_wash_heights_v3",
+                    "earnings_shadow_score_queens_v3",
+                    "earnings_shadow_confidence_queens_v3",
+                    "earnings_shadow_rating_queens_v3",
+                    "earnings_shadow_bucket_queens_v3",
+                    "earnings_shadow_color_queens_v3",
+                    "earnings_shadow_score_brooklyn_v3",
+                    "earnings_shadow_confidence_brooklyn_v3",
+                    "earnings_shadow_rating_brooklyn_v3",
+                    "earnings_shadow_bucket_brooklyn_v3",
+                    "earnings_shadow_color_brooklyn_v3",
+                    "earnings_shadow_score_staten_island_v3",
+                    "earnings_shadow_confidence_staten_island_v3",
+                    "earnings_shadow_rating_staten_island_v3",
+                    "earnings_shadow_bucket_staten_island_v3",
+                    "earnings_shadow_color_staten_island_v3",
+                    "airport_exit_share",
+                    "out_of_scored_network_exit_share",
+                    "short_external_exit_share_6mi_30min",
+                    "short_external_exit_share_8mi_40min",
+                    "good_long_external_exit_share",
+                    "airport_exit_share_n",
+                    "out_of_scored_network_exit_share_n",
+                    "short_external_exit_share_6mi_30min_n",
+                    "short_external_exit_share_8mi_40min_n",
+                    "good_long_external_exit_share_n",
+                    "return_risk_shadow",
+                    "escape_quality_shadow",
+                    "safe_return_risk",
+                    "safe_escape_quality",
+                    "safe_airport_exit",
+                    "safe_external_exit",
+                    "safe_short_external",
+                    "safe_good_long_external",
+                    "safe_downstream",
+                    "citywide_trap_adjustment_factor",
+                    "queens_trap_adjustment_factor",
+                    "bronx_wash_heights_trap_adjustment_factor",
+                    "brooklyn_trap_adjustment_factor",
+                    "staten_island_trap_adjustment_factor",
+                    "manhattan_trap_adjustment_factor",
+                    "earnings_shadow_score_citywide_v3_trap_candidate",
+                    "earnings_shadow_score_manhattan_v3_trap_candidate",
+                    "earnings_shadow_score_bronx_wash_heights_v3_trap_candidate",
+                    "earnings_shadow_score_queens_v3_trap_candidate",
+                    "earnings_shadow_score_brooklyn_v3_trap_candidate",
+                    "earnings_shadow_score_staten_island_v3_trap_candidate",
+                    "earnings_shadow_confidence_citywide_v3_trap_candidate",
+                    "earnings_shadow_confidence_manhattan_v3_trap_candidate",
+                    "earnings_shadow_confidence_bronx_wash_heights_v3_trap_candidate",
+                    "earnings_shadow_confidence_queens_v3_trap_candidate",
+                    "earnings_shadow_confidence_brooklyn_v3_trap_candidate",
+                    "earnings_shadow_confidence_staten_island_v3_trap_candidate",
+                    "earnings_shadow_rating_citywide_v3_trap_candidate",
+                    "earnings_shadow_bucket_citywide_v3_trap_candidate",
+                    "earnings_shadow_color_citywide_v3_trap_candidate",
+                    "earnings_shadow_rating_manhattan_v3_trap_candidate",
+                    "earnings_shadow_bucket_manhattan_v3_trap_candidate",
+                    "earnings_shadow_color_manhattan_v3_trap_candidate",
+                    "earnings_shadow_rating_bronx_wash_heights_v3_trap_candidate",
+                    "earnings_shadow_bucket_bronx_wash_heights_v3_trap_candidate",
+                    "earnings_shadow_color_bronx_wash_heights_v3_trap_candidate",
+                    "earnings_shadow_rating_queens_v3_trap_candidate",
+                    "earnings_shadow_bucket_queens_v3_trap_candidate",
+                    "earnings_shadow_color_queens_v3_trap_candidate",
+                    "earnings_shadow_rating_brooklyn_v3_trap_candidate",
+                    "earnings_shadow_bucket_brooklyn_v3_trap_candidate",
+                    "earnings_shadow_color_brooklyn_v3_trap_candidate",
+                    "earnings_shadow_rating_staten_island_v3_trap_candidate",
+                    "earnings_shadow_bucket_staten_island_v3_trap_candidate",
+                    "earnings_shadow_color_staten_island_v3_trap_candidate",
+                    "earnings_shadow_delta_citywide_v3_trap_candidate",
+                    "earnings_shadow_delta_manhattan_v3_trap_candidate",
+                    "earnings_shadow_delta_bronx_wash_heights_v3_trap_candidate",
+                    "earnings_shadow_delta_queens_v3_trap_candidate",
+                    "earnings_shadow_delta_brooklyn_v3_trap_candidate",
+                    "earnings_shadow_delta_staten_island_v3_trap_candidate",
+                )
+            )
             (
                 pu_id,
-                s_dow_m,
-                s_bin_start_min,
+                exact_bin_local_ts,
+                exact_bin_date_local,
+                exact_weekday_name_local,
+                exact_bin_time_label_local,
+                exact_bin_unix_utc,
                 pickups_now,
                 pickups_next,
                 median_driver_pay,
@@ -1408,7 +1658,13 @@ def build_hotspots_frames(
                 )
             ):
                 continue
-            shadow_by_key[(int(pu_id), int(s_dow_m), int(s_bin_start_min))] = {
+            frame_ts = str(exact_bin_local_ts)
+            shadow_by_key[(int(pu_id), frame_ts)] = {
+                "exact_bin_local_ts": frame_ts,
+                "exact_bin_date_local": None if exact_bin_date_local is None else str(exact_bin_date_local),
+                "exact_weekday_name_local": exact_weekday_name_local,
+                "exact_bin_time_label_local": exact_bin_time_label_local,
+                "exact_bin_unix_utc": None if exact_bin_unix_utc is None else int(exact_bin_unix_utc),
                 "pickups_now_shadow": None if pickups_now is None else int(pickups_now),
                 "next_pickups_shadow": None if pickups_next is None else int(pickups_next),
                 "median_driver_pay_shadow": None if median_driver_pay is None else float(median_driver_pay),
@@ -1637,11 +1893,22 @@ def build_hotspots_frames(
                 "staten_island_v3_confidence_profile_shadow": None if staten_island_v3_confidence_profile_shadow is None else float(staten_island_v3_confidence_profile_shadow),
             }
 
-        cur = con.execute(sql)
-
-        # timeline labels (Mon-based week anchor)
-        week_start = datetime(2025, 1, 6, 0, 0, 0)  # Monday anchor
-        timeline: List[str] = []
+        cur = con.execute(
+            f"""
+            SELECT
+              PULocationID,
+              exact_bin_local_ts,
+              exact_bin_date_local,
+              exact_weekday_name_local,
+              exact_bin_time_label_local,
+              pickups_now,
+              median_driver_pay,
+              earnings_shadow_rating_citywide_v3 AS rating
+            FROM ({shadow_sql}) AS shadow_rows
+            ORDER BY exact_bin_local_ts, PULocationID
+            """
+        )
+        timeline_entries: List[Dict[str, Any]] = []
         frame_count = 0
         candidate_review_by_profile: Dict[str, Dict[str, Any]] = {
             profile_name: {
@@ -1659,13 +1926,16 @@ def build_hotspots_frames(
             for profile_name in TRAP_CANDIDATE_REVIEW_PROFILE_CONFIG
         }
 
-        current_key: Tuple[int, int] | None = None
+        current_key: str | None = None
         current_features: List[Dict[str, Any]] = []
         current_time_iso: str | None = None
+        current_date_local: str | None = None
+        current_weekday_name_local: str | None = None
+        current_time_label_local: str | None = None
         current_popup_metric_diagnostics_by_location_id: Dict[int, Dict[str, Any]] = {}
 
         def flush_frame():
-            nonlocal frame_count, current_features, current_time_iso, current_popup_metric_diagnostics_by_location_id
+            nonlocal frame_count, current_features, current_time_iso, current_date_local, current_weekday_name_local, current_time_label_local, current_popup_metric_diagnostics_by_location_id
             if current_time_iso is None:
                 return
 
@@ -1745,7 +2015,14 @@ def build_hotspots_frames(
                 diagnostics_by_location_id=current_popup_metric_diagnostics_by_location_id,
             )
             _validate_rating_bucket_color_consistency(current_features, current_time_iso)
-            timeline.append(current_time_iso)
+            timeline_entries.append(
+                {
+                    "frame_time": current_time_iso,
+                    "frame_date": current_date_local,
+                    "frame_weekday_name": current_weekday_name_local,
+                    "bin_minutes": int(bin_minutes),
+                }
+            )
             frame_path = stage_dir / f"frame_{frame_count:06d}.json"
             payload = {
                 "time": current_time_iso,
@@ -1756,6 +2033,9 @@ def build_hotspots_frames(
             frame_count += 1
             current_features = []
             current_time_iso = None
+            current_date_local = None
+            current_weekday_name_local = None
+            current_time_label_local = None
             current_popup_metric_diagnostics_by_location_id = {}
 
         total_rows = 0
@@ -1766,10 +2046,20 @@ def build_hotspots_frames(
             if not batch:
                 break
             any_rows = True
+            frame_columns = [str(desc[0]) for desc in (cur.description or [])]
 
-            for (zid, dow_m, bin_start_min, pickups, avg_pay, rating) in batch:
+            for row in batch:
+                row_map = {frame_columns[idx]: row[idx] for idx in range(len(frame_columns))}
+                zid = row_map.get("PULocationID")
+                exact_bin_local_ts = row_map.get("exact_bin_local_ts")
+                exact_bin_date_local = row_map.get("exact_bin_date_local")
+                exact_weekday_name_local = row_map.get("exact_weekday_name_local")
+                exact_bin_time_label_local = row_map.get("exact_bin_time_label_local")
+                pickups = row_map.get("pickups_now")
+                avg_pay = row_map.get("median_driver_pay")
+                rating = row_map.get("rating")
                 total_rows += 1
-                key = (int(dow_m), int(bin_start_min))
+                key = str(exact_bin_local_ts)
 
                 if current_key is None:
                     current_key = key
@@ -1777,10 +2067,10 @@ def build_hotspots_frames(
                     flush_frame()
                     current_key = key
 
-                hour = int(bin_start_min // 60)
-                minute = int(bin_start_min % 60)
-                ts = week_start + timedelta(days=int(dow_m), hours=hour, minutes=minute)
-                current_time_iso = ts.strftime("%Y-%m-%dT%H:%M:%S")
+                current_time_iso = str(exact_bin_local_ts)
+                current_date_local = None if exact_bin_date_local is None else str(exact_bin_date_local)
+                current_weekday_name_local = None if exact_weekday_name_local is None else str(exact_weekday_name_local)
+                current_time_label_local = None if exact_bin_time_label_local is None else str(exact_bin_time_label_local)
 
                 zid_i = int(zid)
                 geom = geom_by_id.get(zid_i)
@@ -1789,7 +2079,7 @@ def build_hotspots_frames(
 
                 r = int(rating)
                 bucket, fill = bucket_and_color_from_rating(r)
-                shadow_props = shadow_by_key.get((zid_i, int(dow_m), int(bin_start_min)), {})
+                shadow_props = shadow_by_key.get((zid_i, key), {})
                 geometry_area_sq_miles = None
                 if zid_i in zone_geometry_by_id:
                     geometry_area_sq_miles = zone_geometry_by_id[zid_i].get("zone_area_sq_miles")
@@ -2114,11 +2404,20 @@ def build_hotspots_frames(
 
         flush_frame()
 
+        timeline = [str(entry.get("frame_time")) for entry in timeline_entries]
+        timeline_payload = {
+            "timeline": timeline,
+            "entries": timeline_entries,
+            "count": len(timeline),
+            "bin_minutes": int(bin_minutes),
+            "timeline_mode": "exact_historical",
+            "frame_time_model": "exact_local_20min",
+            "synthetic_week_enabled": False,
+        }
         (stage_dir / "timeline.json").write_text(
-            json.dumps({"timeline": timeline, "count": len(timeline)}, separators=(",", ":")),
+            json.dumps(timeline_payload, separators=(",", ":")),
             encoding="utf-8"
         )
-        timeline_payload = {"timeline": timeline, "count": len(timeline)}
         # Keep timeline.json on volume for compatibility while mirroring metadata copy in DB.
         save_generated_artifact("timeline", timeline_payload, compress=False)
 
@@ -2547,6 +2846,8 @@ def build_hotspots_frames(
         build_result = {
             "ok": True,
             "count": len(timeline),
+            "first_frame_datetime": timeline[0] if timeline else None,
+            "last_frame_datetime": timeline[-1] if timeline else None,
             "frames_dir": str(out_dir),
             "rows": total_rows,
             "assistant_outlook": {

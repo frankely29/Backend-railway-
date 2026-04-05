@@ -74,8 +74,6 @@ def build_zone_earnings_shadow_sql(
     available_columns: Optional[Set[str]] = None,
 ) -> str:
     parquet_sql = ", ".join("'" + p.replace("'", "''") + "'" for p in parquet_files)
-    bins_per_day = int(1440 // bin_minutes)
-    bins_per_week = 7 * bins_per_day
 
     cols = {c.lower() for c in (available_columns or set())}
     has_request_datetime = "request_datetime" in cols if cols else True
@@ -190,9 +188,7 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
       SELECT
         PULocationID,
         DOLocationID,
-        CAST(EXTRACT('dow' FROM pickup_datetime) AS INTEGER) AS dow_i,
-        CAST(EXTRACT('hour' FROM pickup_datetime) AS INTEGER) AS hour_i,
-        CAST(EXTRACT('minute' FROM pickup_datetime) AS INTEGER) AS minute_i,
+        timezone('America/New_York', CAST(pickup_datetime AS TIMESTAMPTZ)) AS pickup_local_ts,
         driver_pay,
         trip_time,
         trip_miles,
@@ -211,8 +207,11 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
       SELECT
         PULocationID,
         DOLocationID,
-        CASE WHEN dow_i = 0 THEN 6 ELSE dow_i - 1 END AS dow_m,
-        CAST(FLOOR((hour_i * 60 + minute_i) / {bin_minutes}) * {bin_minutes} AS INTEGER) AS bin_start_min,
+        CAST(FLOOR(EXTRACT(EPOCH FROM pickup_local_ts) / ({bin_minutes} * 60)) * ({bin_minutes} * 60) AS BIGINT) AS exact_bin_unix_utc,
+        to_timestamp(CAST(FLOOR(EXTRACT(EPOCH FROM pickup_local_ts) / ({bin_minutes} * 60)) * ({bin_minutes} * 60) AS BIGINT)) AS exact_bin_local_ts,
+        CAST(to_timestamp(CAST(FLOOR(EXTRACT(EPOCH FROM pickup_local_ts) / ({bin_minutes} * 60)) * ({bin_minutes} * 60) AS BIGINT)) AS DATE) AS exact_bin_date_local,
+        strftime(to_timestamp(CAST(FLOOR(EXTRACT(EPOCH FROM pickup_local_ts) / ({bin_minutes} * 60)) * ({bin_minutes} * 60) AS BIGINT)), '%a') AS exact_weekday_name_local,
+        strftime(to_timestamp(CAST(FLOOR(EXTRACT(EPOCH FROM pickup_local_ts) / ({bin_minutes} * 60)) * ({bin_minutes} * 60) AS BIGINT)), '%H:%M') AS exact_bin_time_label_local,
         driver_pay,
         trip_time,
         trip_miles,
@@ -281,8 +280,11 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
     zone_bin_raw AS (
       SELECT
         PULocationID,
-        dow_m,
-        bin_start_min,
+        exact_bin_local_ts,
+        exact_bin_date_local,
+        exact_weekday_name_local,
+        exact_bin_time_label_local,
+        exact_bin_unix_utc,
         COUNT(*) AS pickups_now,
         MEDIAN(driver_pay) AS median_driver_pay,
         MEDIAN(pay_per_min) AS median_pay_per_min,
@@ -299,24 +301,26 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
         AVG(is_short_external_exit_8mi_40min * 1.0) AS short_external_exit_share_8mi_40min,
         AVG(is_good_long_external_exit * 1.0) AS good_long_external_exit_share
       FROM binned
-      GROUP BY 1,2,3
+      GROUP BY 1,2,3,4,5,6
       HAVING COUNT(*) >= {min_trips_per_window}
     ),
     with_next AS (
       SELECT
         z.*,
-        LEAD(pickups_now) OVER (PARTITION BY PULocationID, dow_m ORDER BY bin_start_min) AS pickups_next_same_day
+        LEAD(pickups_now) OVER (PARTITION BY PULocationID ORDER BY exact_bin_local_ts) AS pickups_next_same_day
       FROM zone_bin_raw z
     ),
     zone_bin AS (
       SELECT
         PULocationID,
-        dow_m,
-        bin_start_min,
+        exact_bin_local_ts,
+        exact_bin_date_local,
+        exact_weekday_name_local,
+        exact_bin_time_label_local,
+        exact_bin_unix_utc,
         pickups_now,
         COALESCE(
           pickups_next_same_day,
-          FIRST_VALUE(pickups_now) OVER (PARTITION BY PULocationID, dow_m ORDER BY bin_start_min),
           pickups_now
         ) AS pickups_next,
         median_driver_pay,
@@ -333,47 +337,56 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
         COALESCE(short_external_exit_share_6mi_30min, 0.0) AS short_external_exit_share_6mi_30min,
         COALESCE(short_external_exit_share_8mi_40min, 0.0) AS short_external_exit_share_8mi_40min,
         COALESCE(good_long_external_exit_share, 0.0) AS good_long_external_exit_share,
-        (dow_m * {bins_per_day} + CAST(bin_start_min / {bin_minutes} AS INTEGER)) AS bin_index
+        exact_bin_unix_utc AS bin_index
       FROM with_next
     ),
     dest_edges AS (
       SELECT
         PULocationID,
         DOLocationID,
-        dow_m,
-        bin_start_min,
+        exact_bin_local_ts,
+        exact_bin_date_local,
+        exact_weekday_name_local,
+        exact_bin_time_label_local,
+        exact_bin_unix_utc,
         COUNT(*) AS edge_trips
       FROM binned
       WHERE DOLocationID IS NOT NULL
         AND DOLocationID IN (
           SELECT PULocationID FROM zone_metadata WHERE airport_excluded = FALSE
         )
-      GROUP BY 1,2,3,4
+      GROUP BY 1,2,3,4,5,6,7
     ),
     dest_edges_norm AS (
       SELECT
         e.*,
-        SUM(edge_trips) OVER (PARTITION BY PULocationID, dow_m, bin_start_min) AS edge_total,
-        (dow_m * {bins_per_day} + CAST(bin_start_min / {bin_minutes} AS INTEGER)) AS src_index,
-        ((dow_m * {bins_per_day} + CAST(bin_start_min / {bin_minutes} AS INTEGER) + 1) % {bins_per_week}) AS dst_index
+        SUM(edge_trips) OVER (PARTITION BY PULocationID, exact_bin_local_ts) AS edge_total,
+        exact_bin_unix_utc AS src_index,
+        LEAD(exact_bin_unix_utc) OVER (PARTITION BY PULocationID ORDER BY exact_bin_local_ts) AS dst_index
       FROM dest_edges e
     ),
     zone_bin_by_index AS (
       SELECT
         PULocationID,
-        dow_m,
-        bin_start_min,
+        exact_bin_local_ts,
+        exact_bin_date_local,
+        exact_weekday_name_local,
+        exact_bin_time_label_local,
+        exact_bin_unix_utc,
         pickups_now,
         median_driver_pay,
         median_pay_per_min,
-        (dow_m * {bins_per_day} + CAST(bin_start_min / {bin_minutes} AS INTEGER)) AS idx
+        exact_bin_unix_utc AS idx
       FROM zone_bin
     ),
     downstream_scores AS (
       SELECT
         d.PULocationID,
-        d.dow_m,
-        d.bin_start_min,
+        d.exact_bin_local_ts,
+        d.exact_bin_date_local,
+        d.exact_weekday_name_local,
+        d.exact_bin_time_label_local,
+        d.exact_bin_unix_utc,
         SUM(
           {safe_div_sql('d.edge_trips', 'd.edge_total')} *
           {nullable_weighted_average_sql([
@@ -387,13 +400,16 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
       LEFT JOIN zone_bin_by_index z
         ON z.PULocationID = d.DOLocationID
        AND z.idx = d.dst_index
-      GROUP BY 1,2,3
+      GROUP BY 1,2,3,4,5,6
     ),
     joined AS (
       SELECT
         z.PULocationID,
-        z.dow_m,
-        z.bin_start_min,
+        z.exact_bin_local_ts,
+        z.exact_bin_date_local,
+        z.exact_weekday_name_local,
+        z.exact_bin_time_label_local,
+        z.exact_bin_unix_utc,
         z.pickups_now,
         z.pickups_next,
         z.median_driver_pay,
@@ -426,8 +442,7 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
       FROM zone_bin z
       LEFT JOIN downstream_scores d
         ON d.PULocationID = z.PULocationID
-       AND d.dow_m = z.dow_m
-       AND d.bin_start_min = z.bin_start_min
+       AND d.exact_bin_local_ts = z.exact_bin_local_ts
       LEFT JOIN zone_geometry_metrics g
         ON g.PULocationID = z.PULocationID
       LEFT JOIN zone_metadata m
@@ -436,42 +451,45 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
     ranked AS (
       SELECT
         *,
-        {percentile_rank_expr('LN(1 + pickups_now)', 'dow_m, bin_start_min', 'demand_now')},
-        {percentile_rank_expr('LN(1 + pickups_next)', 'dow_m, bin_start_min', 'demand_next')},
-        {nullable_percentile_rank_expr('median_driver_pay', 'dow_m, bin_start_min', 'pay')},
-        {nullable_percentile_rank_expr('median_pay_per_min', 'dow_m, bin_start_min', 'pay_per_min')},
-        {nullable_percentile_rank_expr('median_pay_per_mile', 'dow_m, bin_start_min', 'pay_per_mile')},
-        {percentile_rank_expr('median_request_to_pickup_min', 'dow_m, bin_start_min', 'pickup_friction_penalty')},
-        {percentile_rank_expr('short_trip_share_3mi_12min', 'dow_m, bin_start_min', 'short_trip_penalty')},
-        {percentile_rank_expr('shared_ride_share', 'dow_m, bin_start_min', 'shared_ride_penalty')},
-        {percentile_rank_expr('downstream_next_value_raw', 'dow_m, bin_start_min', 'downstream_value')},
-        ROW_NUMBER() OVER (PARTITION BY dow_m, bin_start_min ORDER BY pickups_per_sq_mile_now) AS demand_density_now_rn,
-        COUNT(pickups_per_sq_mile_now) OVER (PARTITION BY dow_m, bin_start_min) AS demand_density_now_n,
-        ROW_NUMBER() OVER (PARTITION BY dow_m, bin_start_min ORDER BY pickups_per_sq_mile_next) AS demand_density_next_rn,
-        COUNT(pickups_per_sq_mile_next) OVER (PARTITION BY dow_m, bin_start_min) AS demand_density_next_n,
-        ROW_NUMBER() OVER (PARTITION BY dow_m, bin_start_min ORDER BY long_trip_share_20plus) AS long_trip_share_20plus_rn,
-        COUNT(long_trip_share_20plus) OVER (PARTITION BY dow_m, bin_start_min) AS long_trip_share_20plus_n,
-        ROW_NUMBER() OVER (PARTITION BY dow_m, bin_start_min ORDER BY balanced_trip_share) AS balanced_trip_share_rn,
-        COUNT(balanced_trip_share) OVER (PARTITION BY dow_m, bin_start_min) AS balanced_trip_share_n,
-        ROW_NUMBER() OVER (PARTITION BY dow_m, bin_start_min ORDER BY same_zone_dropoff_share) AS same_zone_retention_penalty_rn,
-        COUNT(same_zone_dropoff_share) OVER (PARTITION BY dow_m, bin_start_min) AS same_zone_retention_penalty_n,
-        ROW_NUMBER() OVER (PARTITION BY dow_m, bin_start_min ORDER BY airport_exit_share) AS airport_exit_share_rn,
-        COUNT(airport_exit_share) OVER (PARTITION BY dow_m, bin_start_min) AS airport_exit_share_n,
-        ROW_NUMBER() OVER (PARTITION BY dow_m, bin_start_min ORDER BY out_of_scored_network_exit_share) AS out_of_scored_network_exit_share_rn,
-        COUNT(out_of_scored_network_exit_share) OVER (PARTITION BY dow_m, bin_start_min) AS out_of_scored_network_exit_share_n,
-        ROW_NUMBER() OVER (PARTITION BY dow_m, bin_start_min ORDER BY short_external_exit_share_6mi_30min) AS short_external_exit_share_6mi_30min_rn,
-        COUNT(short_external_exit_share_6mi_30min) OVER (PARTITION BY dow_m, bin_start_min) AS short_external_exit_share_6mi_30min_n,
-        ROW_NUMBER() OVER (PARTITION BY dow_m, bin_start_min ORDER BY short_external_exit_share_8mi_40min) AS short_external_exit_share_8mi_40min_rn,
-        COUNT(short_external_exit_share_8mi_40min) OVER (PARTITION BY dow_m, bin_start_min) AS short_external_exit_share_8mi_40min_n,
-        ROW_NUMBER() OVER (PARTITION BY dow_m, bin_start_min ORDER BY good_long_external_exit_share) AS good_long_external_exit_share_rn,
-        COUNT(good_long_external_exit_share) OVER (PARTITION BY dow_m, bin_start_min) AS good_long_external_exit_share_n
+        {percentile_rank_expr('LN(1 + pickups_now)', 'exact_bin_local_ts', 'demand_now')},
+        {percentile_rank_expr('LN(1 + pickups_next)', 'exact_bin_local_ts', 'demand_next')},
+        {nullable_percentile_rank_expr('median_driver_pay', 'exact_bin_local_ts', 'pay')},
+        {nullable_percentile_rank_expr('median_pay_per_min', 'exact_bin_local_ts', 'pay_per_min')},
+        {nullable_percentile_rank_expr('median_pay_per_mile', 'exact_bin_local_ts', 'pay_per_mile')},
+        {percentile_rank_expr('median_request_to_pickup_min', 'exact_bin_local_ts', 'pickup_friction_penalty')},
+        {percentile_rank_expr('short_trip_share_3mi_12min', 'exact_bin_local_ts', 'short_trip_penalty')},
+        {percentile_rank_expr('shared_ride_share', 'exact_bin_local_ts', 'shared_ride_penalty')},
+        {percentile_rank_expr('downstream_next_value_raw', 'exact_bin_local_ts', 'downstream_value')},
+        ROW_NUMBER() OVER (PARTITION BY exact_bin_local_ts ORDER BY pickups_per_sq_mile_now) AS demand_density_now_rn,
+        COUNT(pickups_per_sq_mile_now) OVER (PARTITION BY exact_bin_local_ts) AS demand_density_now_n,
+        ROW_NUMBER() OVER (PARTITION BY exact_bin_local_ts ORDER BY pickups_per_sq_mile_next) AS demand_density_next_rn,
+        COUNT(pickups_per_sq_mile_next) OVER (PARTITION BY exact_bin_local_ts) AS demand_density_next_n,
+        ROW_NUMBER() OVER (PARTITION BY exact_bin_local_ts ORDER BY long_trip_share_20plus) AS long_trip_share_20plus_rn,
+        COUNT(long_trip_share_20plus) OVER (PARTITION BY exact_bin_local_ts) AS long_trip_share_20plus_n,
+        ROW_NUMBER() OVER (PARTITION BY exact_bin_local_ts ORDER BY balanced_trip_share) AS balanced_trip_share_rn,
+        COUNT(balanced_trip_share) OVER (PARTITION BY exact_bin_local_ts) AS balanced_trip_share_n,
+        ROW_NUMBER() OVER (PARTITION BY exact_bin_local_ts ORDER BY same_zone_dropoff_share) AS same_zone_retention_penalty_rn,
+        COUNT(same_zone_dropoff_share) OVER (PARTITION BY exact_bin_local_ts) AS same_zone_retention_penalty_n,
+        ROW_NUMBER() OVER (PARTITION BY exact_bin_local_ts ORDER BY airport_exit_share) AS airport_exit_share_rn,
+        COUNT(airport_exit_share) OVER (PARTITION BY exact_bin_local_ts) AS airport_exit_share_n,
+        ROW_NUMBER() OVER (PARTITION BY exact_bin_local_ts ORDER BY out_of_scored_network_exit_share) AS out_of_scored_network_exit_share_rn,
+        COUNT(out_of_scored_network_exit_share) OVER (PARTITION BY exact_bin_local_ts) AS out_of_scored_network_exit_share_n,
+        ROW_NUMBER() OVER (PARTITION BY exact_bin_local_ts ORDER BY short_external_exit_share_6mi_30min) AS short_external_exit_share_6mi_30min_rn,
+        COUNT(short_external_exit_share_6mi_30min) OVER (PARTITION BY exact_bin_local_ts) AS short_external_exit_share_6mi_30min_n,
+        ROW_NUMBER() OVER (PARTITION BY exact_bin_local_ts ORDER BY short_external_exit_share_8mi_40min) AS short_external_exit_share_8mi_40min_rn,
+        COUNT(short_external_exit_share_8mi_40min) OVER (PARTITION BY exact_bin_local_ts) AS short_external_exit_share_8mi_40min_n,
+        ROW_NUMBER() OVER (PARTITION BY exact_bin_local_ts ORDER BY good_long_external_exit_share) AS good_long_external_exit_share_rn,
+        COUNT(good_long_external_exit_share) OVER (PARTITION BY exact_bin_local_ts) AS good_long_external_exit_share_n
       FROM joined
     ),
     normalized AS (
       SELECT
         PULocationID,
-        dow_m,
-        bin_start_min,
+        exact_bin_local_ts,
+        exact_bin_date_local,
+        exact_weekday_name_local,
+        exact_bin_time_label_local,
+        exact_bin_unix_utc,
         pickups_now,
         pickups_next,
         median_driver_pay,
@@ -1185,8 +1203,11 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
     )
     SELECT
       PULocationID,
-      dow_m,
-      bin_start_min,
+      exact_bin_local_ts,
+      exact_bin_date_local,
+      exact_weekday_name_local,
+      exact_bin_time_label_local,
+      exact_bin_unix_utc,
       pickups_now,
       pickups_next,
       median_driver_pay,
@@ -1648,5 +1669,5 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
       earnings_shadow_delta_brooklyn_v3_trap_candidate,
       earnings_shadow_delta_staten_island_v3_trap_candidate
     FROM candidate_trap_adjusted
-    ORDER BY dow_m, bin_start_min, PULocationID
+    ORDER BY exact_bin_local_ts, PULocationID
     """
