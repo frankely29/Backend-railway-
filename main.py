@@ -4749,11 +4749,24 @@ async def upload_parquet(file: UploadFile = File(...)):
     }
 
 
+class AdminParquetDeletePayload(BaseModel):
+    filename: str
+
+
+@app.get("/admin/parquet/list")
+def admin_list_parquets(admin: sqlite3.Row = Depends(require_admin)):
+    _ = admin
+    return {
+        "ok": True,
+        "parquets": [p.name for p in _list_parquets()],
+    }
+
+
 @app.post("/admin/parquet/delete")
-def admin_delete_parquet(filename: str, admin: sqlite3.Row = Depends(require_admin)):
+def admin_delete_parquet(payload: AdminParquetDeletePayload, admin: sqlite3.Row = Depends(require_admin)):
     _ = admin
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    filename = _safe_admin_filename(filename)
+    filename = _safe_admin_filename(payload.filename)
     if not filename.lower().endswith(".parquet"):
         raise HTTPException(status_code=400, detail="Only .parquet files can be deleted")
 
