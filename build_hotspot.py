@@ -1684,10 +1684,7 @@ def build_hotspots_frames(
         store_verified = published_store_path.exists() and published_store_path.is_file() and published_store_path.stat().st_size > 0
         timeline_verified = published_timeline_path.exists() and published_timeline_path.is_file() and published_timeline_path.stat().st_size > 0
         if not store_verified or not timeline_verified:
-            raise RuntimeError(
-                "monthly publish verification failed: required files missing/empty "
-                f"(exact_shadow.duckdb={store_verified}, timeline.json={timeline_verified})"
-            )
+            raise RuntimeError(f"Monthly publish verification failed for {month_key}")
         logger.info("monthly_partition_publish_verified month_key=%s", month_key)
         logger.info("monthly_partition_publish_done month_key=%s", month_key)
 
