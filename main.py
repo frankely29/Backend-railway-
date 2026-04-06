@@ -16,6 +16,7 @@ import time
 import traceback
 import uuid
 from collections import defaultdict, deque
+from decimal import Decimal
 from datetime import datetime, date, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -1039,6 +1040,14 @@ def _build_json_bytes(payload: Any) -> bytes:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
+def _frame_cache_json_default(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        if value == value.to_integral_value():
+            return int(value)
+        return float(value)
+    raise TypeError(f"Object of type {value.__class__.__name__} is not JSON serializable")
+
+
 def _log_artifact_response(path: str, status_code: int, gzip_requested: bool, body_length: int, content_length: Optional[str]) -> None:
     print(
         f"[artifact-response] path={path} status={status_code} gzip_requested={str(gzip_requested).lower()} "
@@ -1204,7 +1213,11 @@ def _frame_build_worker(month_key: str, idx: int, frame_time: str, run_token: st
         payload = _build_single_frame_for_month(month_key=month_key, frame_time=frame_time)
         cache_file = _month_frame_cache_file(month_key, idx, frame_time)
         temp_file = cache_file.with_suffix(f"{cache_file.suffix}.tmp")
-        encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        encoded = json.dumps(
+            payload,
+            separators=(",", ":"),
+            default=_frame_cache_json_default,
+        ).encode("utf-8")
         with temp_file.open("wb") as handle:
             handle.write(encoded)
             handle.flush()
@@ -1227,6 +1240,11 @@ def _frame_build_worker(month_key: str, idx: int, frame_time: str, run_token: st
                 _frame_cache.pop(evicted_idx, None)
         print(f"frame_cache_build_done month_key={month_key} idx={idx} frame_time={frame_time} file={cache_file}")
     except Exception as exc:
+        if isinstance(exc, TypeError) and "not JSON serializable" in str(exc):
+            print(
+                f"frame_cache_build_failed_json month_key={month_key} idx={idx} "
+                f"frame_time={frame_time} error={exc}"
+            )
         print(f"frame_cache_build_failed month_key={month_key} idx={idx} frame_time={frame_time} error={exc}")
         traceback.print_exc()
         if temp_file is not None:
