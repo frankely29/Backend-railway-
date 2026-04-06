@@ -1658,13 +1658,9 @@ def build_hotspots_frames(
                     generated.unlink()
                 except Exception:
                     pass
-        try:
-            if resolved_timeline_output_path.exists() and resolved_timeline_output_path.is_file():
-                resolved_timeline_output_path.unlink()
-        except Exception:
-            pass
         if resolved_exact_history_backup_dir.exists():
             shutil.rmtree(resolved_exact_history_backup_dir, ignore_errors=True)
+        logger.info("monthly_partition_publish_begin month_key=%s", month_key)
         try:
             if resolved_exact_history_dir.exists():
                 resolved_exact_history_dir.rename(resolved_exact_history_backup_dir)
@@ -1678,8 +1674,21 @@ def build_hotspots_frames(
                 resolved_exact_history_backup_dir.rename(resolved_exact_history_dir)
             raise
 
-        resolved_timeline_output_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(staged_timeline), str(resolved_timeline_output_path))
+        final_month_timeline_path = resolved_exact_history_dir / "timeline.json"
+        if resolved_timeline_output_path.resolve() != final_month_timeline_path.resolve():
+            resolved_timeline_output_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(final_month_timeline_path), str(resolved_timeline_output_path))
+
+        published_store_path = resolved_exact_history_dir / "exact_shadow.duckdb"
+        published_timeline_path = resolved_exact_history_dir / "timeline.json"
+        store_verified = published_store_path.exists() and published_store_path.is_file() and published_store_path.stat().st_size > 0
+        timeline_verified = published_timeline_path.exists() and published_timeline_path.is_file() and published_timeline_path.stat().st_size > 0
+        if not store_verified or not timeline_verified:
+            raise RuntimeError(
+                "monthly publish verification failed: required files missing/empty "
+                f"(exact_shadow.duckdb={store_verified}, timeline.json={timeline_verified})"
+            )
+        logger.info("monthly_partition_publish_verified month_key=%s", month_key)
         logger.info("monthly_partition_publish_done month_key=%s", month_key)
 
         build_result = {
