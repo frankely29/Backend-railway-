@@ -614,7 +614,15 @@ def _prune_stale_month_backup_dirs(min_age_sec: int = MONTH_BUILD_STALE_DIR_MAX_
 
 
 def _legacy_frame_files() -> List[Path]:
-    return sorted(list(FRAMES_DIR.glob("frame_*.json")) + [TIMELINE_PATH])
+    return sorted(
+        list(FRAMES_DIR.glob("frame_*.json"))
+        + [
+            TIMELINE_PATH,
+            ASSISTANT_OUTLOOK_PATH,
+            FRAMES_DIR / "scoring_shadow_manifest.json",
+            DAY_TENDENCY_MODEL_PATH,
+        ]
+    )
 
 
 def _legacy_frame_file_count() -> int:
@@ -628,19 +636,22 @@ def _monthly_mode_ready_for_legacy_cleanup() -> bool:
         return False
     if not (MONTH_MANIFEST_PATH.exists() and MONTH_MANIFEST_PATH.is_file() and MONTH_MANIFEST_PATH.stat().st_size > 0):
         return False
-    for mk in available_month_keys:
-        timeline_path = _month_timeline_path(mk)
-        store_path = _month_store_path(mk)
-        if (
-            timeline_path.exists()
-            and timeline_path.is_file()
-            and timeline_path.stat().st_size > 0
-            and store_path.exists()
-            and store_path.is_file()
-            and store_path.stat().st_size > 0
-        ):
-            return True
-    return False
+    active_month_key = resolve_active_month_key(datetime.now(timezone.utc).astimezone(NYC_TZ), available_month_keys)
+    if not active_month_key:
+        return False
+    timeline_path = _month_timeline_path(active_month_key)
+    store_path = _month_store_path(active_month_key)
+    core_month_ready = bool(
+        timeline_path.exists()
+        and timeline_path.is_file()
+        and timeline_path.stat().st_size > 0
+        and store_path.exists()
+        and store_path.is_file()
+        and store_path.stat().st_size > 0
+    )
+    if not core_month_ready:
+        return False
+    return bool(generated_artifact_present("scoring_shadow_manifest"))
 
 
 def _prune_legacy_frame_files_after_monthly_ready() -> Dict[str, Any]:
@@ -2700,6 +2711,7 @@ def _generate_worker(
 
     global _last_failed_month_key, _last_failed_at_unix, _last_failed_error
     start = time.time()
+    failed_month_key_candidate = str(month_key).strip() if month_key else None
     _set_state(
         state="running",
         bin_minutes=bin_minutes,
@@ -2752,6 +2764,8 @@ def _generate_worker(
             if not resolved:
                 raise RuntimeError("Unable to resolve active month_key from available parquet files.")
             build_month_keys = [resolved]
+        if build_month_keys:
+            failed_month_key_candidate = str(build_month_keys[0]).strip()
         months_manifest: Dict[str, Dict[str, Any]] = dict((_load_month_manifest().get("months") or {}))
         build_results: Dict[str, Any] = {}
         for mk in build_month_keys:
@@ -2851,9 +2865,10 @@ def _generate_worker(
             duration_sec=round(end - start, 2),
             result=result,
         )
-        _last_failed_month_key = None
-        _last_failed_at_unix = None
-        _last_failed_error = None
+        if _last_failed_month_key and str(_last_failed_month_key).strip() in {str(k).strip() for k in build_month_keys}:
+            _last_failed_month_key = None
+            _last_failed_at_unix = None
+            _last_failed_error = None
         _prune_stale_month_build_dirs()
         _prune_stale_month_backup_dirs()
 
@@ -2878,7 +2893,7 @@ def _generate_worker(
                 "storage_report": storage_report,
             },
         )
-        _last_failed_month_key = str(month_key).strip() if month_key else None
+        _last_failed_month_key = str(failed_month_key_candidate).strip() if failed_month_key_candidate else None
         _last_failed_at_unix = int(end)
         _last_failed_error = str(error_text)
     finally:
@@ -4581,83 +4596,68 @@ def startup():
     except Exception:
         traceback.print_exc()
 
-    # Auto-fill generate state and self-heal stale artifacts/day tendency.
+    # Startup auto-prepare: single target month only, core-only build mode.
     try:
-        frames_ready = _has_frames()
-        assistant_outlook_ready = _has_assistant_outlook()
-        day_tendency_ready = _day_tendency_model_is_current()
-        zones_ok = (DATA_DIR / "taxi_zones.geojson").exists()
-        parquets_ok = len(_list_parquets()) > 0
-
-        if not zones_ok or not parquets_ok:
-            _set_state(state="idle")
-            _log_runtime_integrity_summary()
-            return
-
-        freshness = evaluate_artifact_freshness(
-            repo_root=Path(__file__).resolve().parent,
-            data_dir=DATA_DIR,
-            frames_dir=FRAMES_DIR,
-            bin_minutes=DEFAULT_BIN_MINUTES,
-            min_trips_per_window=DEFAULT_MIN_TRIPS_PER_WINDOW,
+        source_month_keys = _available_source_month_keys()
+        target_month_key_candidate = resolve_active_month_key(
+            datetime.now(timezone.utc).astimezone(NYC_TZ),
+            source_month_keys,
         )
-        reason_codes = freshness.get("reason_codes") or []
+        zones_ok = (DATA_DIR / "taxi_zones.geojson").exists()
+        monthly_mode_active = True
+        target_ready = bool(target_month_key_candidate and _month_partition_ready(target_month_key_candidate))
+        thread_alive = _generate_thread_alive()
+        state_name = str(_get_state().get("state") or "")
+        generate_running = bool(thread_alive or state_name in {"started", "running"})
+        backoff_remaining = (
+            _recent_month_failure_backoff_remaining(target_month_key_candidate)
+            if target_month_key_candidate
+            else 0
+        )
 
-        if frames_ready and freshness.get("fresh"):
-            print(f"[artifact-freshness] fresh reason_codes={reason_codes}")
-            _ = assistant_outlook_ready
-            _prune_legacy_assistant_outlook_artifact_if_present()
-            if not day_tendency_ready:
-                print("[warn] day tendency model missing or stale; rebuilding at startup")
-                try:
-                    _build_day_tendency_only(DEFAULT_BIN_MINUTES)
-                except Exception:
-                    print("[warn] startup day tendency backfill failed")
-                    print(traceback.format_exc())
-            try:
-                tl = (_read_timeline_cached() or {}).get("data") or {}
-                _set_state(
-                    state="done",
-                    bin_minutes=DEFAULT_BIN_MINUTES,
-                    min_trips_per_window=DEFAULT_MIN_TRIPS_PER_WINDOW,
-                    result={
-                        "ok": True,
-                        "count": tl.get("count"),
-                        "day_tendency": {"ok": _has_day_tendency_model(), "built_at_startup": not day_tendency_ready},
-                    },
-                )
-            except Exception:
-                _set_state(
-                    state="done",
-                    bin_minutes=DEFAULT_BIN_MINUTES,
-                    min_trips_per_window=DEFAULT_MIN_TRIPS_PER_WINDOW,
-                    result={
-                        "ok": True,
-                        "day_tendency": {"ok": _has_day_tendency_model(), "built_at_startup": not day_tendency_ready},
-                    },
-                )
-            _log_runtime_integrity_summary()
-            return
+        startup_skip_reason = None
+        if not monthly_mode_active:
+            startup_skip_reason = "monthly_mode_inactive"
+        elif not zones_ok:
+            startup_skip_reason = "zones_missing"
+        elif not source_month_keys:
+            startup_skip_reason = "no_source_month_keys"
+        elif not target_month_key_candidate:
+            startup_skip_reason = "no_target_month_candidate"
+        elif target_ready:
+            startup_skip_reason = "target_month_already_ready"
+        elif generate_running:
+            startup_skip_reason = "generate_already_running"
+        elif backoff_remaining > 0:
+            startup_skip_reason = f"recent_failure_backoff_{backoff_remaining}s"
 
-        if AUTO_GENERATE_ON_STARTUP:
-            print(f"[artifact-freshness] stale -> regenerating reason_codes={reason_codes}")
-            start_generate(DEFAULT_BIN_MINUTES, DEFAULT_MIN_TRIPS_PER_WINDOW)
-        else:
-            print(
-                f"[warn] artifact-freshness stale at startup; auto-generate disabled "
-                f"(AUTO_GENERATE_ON_STARTUP=0). reason_codes={reason_codes}. "
-                "Request-time monthly auto-generation will rebuild on demand."
-            )
+        if startup_skip_reason:
+            print(f"startup_auto_prepare_month_skipped reason={startup_skip_reason}")
             _set_state(
                 state="idle",
                 bin_minutes=DEFAULT_BIN_MINUTES,
                 min_trips_per_window=DEFAULT_MIN_TRIPS_PER_WINDOW,
                 result={
-                    "ok": False,
-                    "reason": "stale_artifacts_waiting_for_request_time_monthly_auto_generation",
-                    "reason_codes": reason_codes,
+                    "ok": bool(target_ready),
+                    "reason": startup_skip_reason,
+                    "target_month_key": target_month_key_candidate,
+                    "source_month_keys": source_month_keys,
+                    "auto_prepare_mode": "single_target_month_core_only",
                 },
             )
+            _log_runtime_integrity_summary()
+            return
+
+        print(f"startup_auto_prepare_month_start month_key={target_month_key_candidate}")
+        start_generate(
+            DEFAULT_BIN_MINUTES,
+            DEFAULT_MIN_TRIPS_PER_WINDOW,
+            force_clear_lock=False,
+            include_day_tendency=False,
+            month_key=target_month_key_candidate,
+            build_all_months=False,
+            build_review_artifacts=False,
+        )
     except Exception:
         _set_state(state="idle")
     _log_runtime_integrity_summary()
