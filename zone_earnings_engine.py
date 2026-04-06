@@ -59,6 +59,8 @@ def build_zone_earnings_shadow_sql(
     *,
     bin_minutes: int,
     min_trips_per_window: int,
+    pickup_utc_start: Optional[str] = None,
+    pickup_utc_end: Optional[str] = None,
     profile: ZoneScoreProfileWeights,
     citywide_v3_profile: Optional[ZoneScoreProfileWeights] = None,
     manhattan_profile: Optional[ZoneScoreProfileWeights] = None,
@@ -165,6 +167,18 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
             ELSE 0.0
           END
         )"""
+    pickup_bounds_filter_sql = ""
+    if pickup_utc_start:
+        start_escaped = str(pickup_utc_start).replace("'", "''")
+        pickup_bounds_filter_sql += (
+            f"\n        AND CAST(pickup_datetime AS TIMESTAMPTZ) >= CAST('{start_escaped}' AS TIMESTAMPTZ)"
+        )
+    if pickup_utc_end:
+        end_escaped = str(pickup_utc_end).replace("'", "''")
+        pickup_bounds_filter_sql += (
+            f"\n        AND CAST(pickup_datetime AS TIMESTAMPTZ) < CAST('{end_escaped}' AS TIMESTAMPTZ)"
+        )
+
     return f"""
     WITH base AS (
       SELECT
@@ -183,6 +197,7 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
           SELECT PULocationID FROM zone_metadata WHERE airport_excluded = FALSE
         )
         AND pickup_datetime IS NOT NULL
+        {pickup_bounds_filter_sql}
     ),
     prepared AS (
       SELECT

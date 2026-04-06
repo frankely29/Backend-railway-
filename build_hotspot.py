@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import List, Dict, Any, Tuple
-from datetime import datetime
+from datetime import datetime, timedelta, time as dt_time, date as dt_date
 import calendar
 import json
 import math
@@ -13,6 +13,7 @@ import shutil
 import tempfile
 import zipfile
 import duckdb
+from zoneinfo import ZoneInfo
 
 from zone_earnings_engine import build_zone_earnings_shadow_sql
 from zone_geometry_metrics import build_zone_geometry_metrics_rows
@@ -26,6 +27,8 @@ from exact_history_feature_builder import (
 )
 
 logger = logging.getLogger(__name__)
+UTC_TZ = ZoneInfo("UTC")
+NYC_TZ = ZoneInfo("America/New_York")
 
 def ensure_zones_geojson(data_dir: Path, force: bool = False) -> Path:
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -1044,7 +1047,7 @@ def build_hotspots_frames(
             connection.execute("PRAGMA enable_progress_bar=false")
             connection.execute("PRAGMA threads=1")
             connection.execute(f"PRAGMA temp_directory='{duckdb_tmp_dir.as_posix()}'")
-            memory_limit = str(os.environ.get("DUCKDB_MEMORY_LIMIT", "512MB")).strip() or "512MB"
+            memory_limit = str(os.environ.get("DUCKDB_MEMORY_LIMIT", "256MB")).strip() or "256MB"
             connection.execute(f"PRAGMA memory_limit='{memory_limit}'")
             connection.execute(
                 "CREATE TEMP TABLE zone_geometry_metrics (PULocationID INTEGER, zone_area_sq_miles DOUBLE, centroid_latitude DOUBLE)"
@@ -1070,59 +1073,131 @@ def build_hotspots_frames(
             )
             return connection
 
-        rows_total_in_shadow = 0
-        for parquet_index, parquet_path in enumerate(sorted_parquet_files):
-            logger.info("exact_history_append_start filename=%s", Path(parquet_path).name)
-            if con is not None:
-                con.close()
-            con = _open_incremental_connection()
-            parquet_single_sql = "'" + parquet_path.replace("'", "''") + "'"
-            schema_rows = con.execute(f"DESCRIBE SELECT * FROM read_parquet([{parquet_single_sql}])").fetchall()
+        if not month_key:
+            raise RuntimeError("month_key is required for monthly exact-history sliced build.")
+
+        schema_probe_con = _open_incremental_connection()
+        try:
+            parquet_sql = ", ".join("'" + p.replace("'", "''") + "'" for p in sorted_parquet_files)
+            schema_rows = schema_probe_con.execute(
+                f"DESCRIBE SELECT * FROM read_parquet([{parquet_sql}])"
+            ).fetchall()
             available_columns = {str(row[0]) for row in schema_rows}
-            shadow_sql = build_zone_earnings_shadow_sql(
-                [parquet_path],
-                bin_minutes=int(bin_minutes),
-                min_trips_per_window=int(min_trips_per_window),
-                profile=ZONE_MODE_PROFILES["citywide_v2"],
-                citywide_v3_profile=ZONE_MODE_PROFILES["citywide_v3"],
-                manhattan_profile=ZONE_MODE_PROFILES["manhattan_v2"],
-                bronx_wash_heights_profile=ZONE_MODE_PROFILES["bronx_wash_heights_v2"],
-                queens_profile=ZONE_MODE_PROFILES["queens_v2"],
-                brooklyn_profile=ZONE_MODE_PROFILES["brooklyn_v2"],
-                staten_island_profile=ZONE_MODE_PROFILES["staten_island_v2"],
-                manhattan_v3_profile=ZONE_MODE_PROFILES["manhattan_v3"],
-                bronx_wash_heights_v3_profile=ZONE_MODE_PROFILES["bronx_wash_heights_v3"],
-                queens_v3_profile=ZONE_MODE_PROFILES["queens_v3"],
-                brooklyn_v3_profile=ZONE_MODE_PROFILES["brooklyn_v3"],
-                staten_island_v3_profile=ZONE_MODE_PROFILES["staten_island_v3"],
-                available_columns=available_columns,
-            )
-            if parquet_index == 0:
-                con.execute(
-                    f"""
-                    CREATE OR REPLACE TABLE exact_shadow_rows AS
-                    {shadow_sql}
-                    """
+        finally:
+            schema_probe_con.close()
+
+        def _is_memory_error(exc: Exception) -> bool:
+            text = str(exc or "").lower()
+            return any(token in text for token in ("out of memory", "oom", "memory limit", "cannot allocate memory"))
+
+        def _utc_iso(local_dt: datetime) -> str:
+            return local_dt.astimezone(UTC_TZ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+        year, month = (int(month_key[0:4]), int(month_key[5:7]))
+        month_days = int(calendar.monthrange(year, month)[1])
+        month_local_dates: List[dt_date] = [dt_date(year, month, day) for day in range(1, month_days + 1)]
+
+        rows_total_in_shadow = 0
+        has_materialized_shadow_rows = False
+
+        def _append_shadow_slice(*, utc_start: str, utc_end: str, create_table: bool) -> int:
+            connection = _open_incremental_connection()
+            try:
+                shadow_sql = build_zone_earnings_shadow_sql(
+                    sorted_parquet_files,
+                    bin_minutes=int(bin_minutes),
+                    min_trips_per_window=int(min_trips_per_window),
+                    pickup_utc_start=utc_start,
+                    pickup_utc_end=utc_end,
+                    profile=ZONE_MODE_PROFILES["citywide_v2"],
+                    citywide_v3_profile=ZONE_MODE_PROFILES["citywide_v3"],
+                    manhattan_profile=ZONE_MODE_PROFILES["manhattan_v2"],
+                    bronx_wash_heights_profile=ZONE_MODE_PROFILES["bronx_wash_heights_v2"],
+                    queens_profile=ZONE_MODE_PROFILES["queens_v2"],
+                    brooklyn_profile=ZONE_MODE_PROFILES["brooklyn_v2"],
+                    staten_island_profile=ZONE_MODE_PROFILES["staten_island_v2"],
+                    manhattan_v3_profile=ZONE_MODE_PROFILES["manhattan_v3"],
+                    bronx_wash_heights_v3_profile=ZONE_MODE_PROFILES["bronx_wash_heights_v3"],
+                    queens_v3_profile=ZONE_MODE_PROFILES["queens_v3"],
+                    brooklyn_v3_profile=ZONE_MODE_PROFILES["brooklyn_v3"],
+                    staten_island_v3_profile=ZONE_MODE_PROFILES["staten_island_v3"],
+                    available_columns=available_columns,
                 )
-            else:
-                con.execute(
-                    f"""
-                    INSERT INTO exact_shadow_rows
-                    {shadow_sql}
-                    """
+                if create_table:
+                    connection.execute(
+                        f"""
+                        CREATE OR REPLACE TABLE exact_shadow_rows AS
+                        {shadow_sql}
+                        """
+                    )
+                else:
+                    connection.execute(
+                        f"""
+                        INSERT INTO exact_shadow_rows
+                        {shadow_sql}
+                        """
+                    )
+                rows_total = int(connection.execute("SELECT COUNT(*) FROM exact_shadow_rows").fetchone()[0] or 0)
+                connection.execute("CHECKPOINT")
+                return rows_total
+            finally:
+                connection.close()
+
+        for local_date in month_local_dates:
+            local_start = datetime.combine(local_date, dt_time.min, tzinfo=NYC_TZ)
+            local_end = local_start + timedelta(days=1)
+            try:
+                rows_total_in_shadow = _append_shadow_slice(
+                    utc_start=_utc_iso(local_start),
+                    utc_end=_utc_iso(local_end),
+                    create_table=not has_materialized_shadow_rows,
                 )
-            rows_total_in_shadow = int(
-                con.execute("SELECT COUNT(*) FROM exact_shadow_rows").fetchone()[0] or 0
-            )
-            con.execute("CHECKPOINT")
+                has_materialized_shadow_rows = True
+            except Exception as day_exc:
+                if not _is_memory_error(day_exc):
+                    raise
+                logger.warning(
+                    "exact_history_day_slice_oom_retry month_key=%s local_date=%s error=%s",
+                    month_key,
+                    local_date.isoformat(),
+                    str(day_exc),
+                )
+                sub_slice_failed = False
+                for hour_start in (0, 6, 12, 18):
+                    sub_local_start = local_start + timedelta(hours=hour_start)
+                    sub_local_end = min(local_end, sub_local_start + timedelta(hours=6))
+                    try:
+                        rows_total_in_shadow = _append_shadow_slice(
+                            utc_start=_utc_iso(sub_local_start),
+                            utc_end=_utc_iso(sub_local_end),
+                            create_table=not has_materialized_shadow_rows,
+                        )
+                        has_materialized_shadow_rows = True
+                    except Exception as sub_exc:
+                        sub_slice_failed = True
+                        logger.exception(
+                            "exact_history_day_subslice_failed month_key=%s local_date=%s hour_start=%d error=%s",
+                            month_key,
+                            local_date.isoformat(),
+                            hour_start,
+                            str(sub_exc),
+                        )
+                        break
+                if sub_slice_failed:
+                    raise RuntimeError(
+                        f"Failed to build exact-history daily slice for local_date={local_date.isoformat()} after 6-hour retries"
+                    ) from day_exc
             logger.info(
-                "exact_history_append_done filename=%s rows_total=%d",
-                Path(parquet_path).name,
+                "exact_history_day_append_done month_key=%s local_date=%s rows_total=%d",
+                month_key,
+                local_date.isoformat(),
                 rows_total_in_shadow,
             )
 
-        if con is None:
+        if not has_materialized_shadow_rows:
             raise RuntimeError("No parquet files available for exact-history append.")
+
+        con = _open_incremental_connection()
 
         con.execute(
             """
