@@ -133,6 +133,8 @@ def _build_shadow_props_from_row(row_map: Dict[str, Any]) -> Dict[str, Any]:
     shadow_props["short_trip_penalty_n_shadow"] = None if row_map.get("short_trip_penalty_n") is None else float(row_map.get("short_trip_penalty_n"))
     shadow_props["shared_ride_penalty_n_shadow"] = None if row_map.get("shared_ride_penalty_n") is None else float(row_map.get("shared_ride_penalty_n"))
     shadow_props["downstream_value_n_shadow"] = None if row_map.get("downstream_value_n") is None else float(row_map.get("downstream_value_n"))
+    shadow_props["window_trip_count_shadow"] = None if row_map.get("window_trip_count_shadow") is None else int(row_map.get("window_trip_count_shadow"))
+    shadow_props["sample_support_strength_shadow"] = None if row_map.get("sample_support_strength_shadow") is None else float(row_map.get("sample_support_strength_shadow"))
     return shadow_props
 
 
