@@ -30,8 +30,6 @@ from pyproj import Transformer
 from shapely.geometry import MultiPolygon, Point, Polygon, mapping, shape
 from shapely.ops import transform, unary_union
 from starlette.middleware.base import BaseHTTPMiddleware
-from exact_history_feature_builder import build_feature_properties_from_shadow_row
-
 from hotspot_experiments import (
     log_micro_bins,
     log_zone_bins,
@@ -270,6 +268,8 @@ _assistant_outlook_legacy_artifact_pruned = False
 _frame_cache: Dict[Tuple[str, int], Dict[str, Any]] = {}
 _frame_cache_order: deque[Tuple[str, int]] = deque()
 _frame_cache_lock = threading.Lock()
+_frame_builds_in_progress: Dict[Tuple[str, str], Dict[str, Any]] = {}
+_frame_builds_in_progress_lock = threading.Lock()
 FRAME_CACHE_MAX = 8
 ARTIFACT_CACHE_CONTROL = "public, max-age=60"
 PICKUP_RECENT_CACHE_TTL_SECONDS = float(os.environ.get("PICKUP_RECENT_CACHE_TTL_SECONDS", "5"))
@@ -555,6 +555,16 @@ def _month_store_path(month_key: str) -> Path:
     return _month_dir(month_key) / "exact_shadow.duckdb"
 
 
+def _month_frame_cache_dir(month_key: str) -> Path:
+    return _month_dir(month_key) / "frame_cache"
+
+
+def _month_frame_cache_file(month_key: str, frame_index: int, frame_time: str) -> Path:
+    safe_time = re.sub(r"[^0-9A-Za-z]+", "_", str(frame_time or "").strip()).strip("_")
+    suffix = safe_time[:64] if safe_time else "unknown"
+    return _month_frame_cache_dir(month_key) / f"frame_{int(frame_index):05d}_{suffix}.json"
+
+
 def _dir_is_stale(path: Path, now_unix: float, min_age_sec: int) -> bool:
     try:
         if not path.exists() or not path.is_dir():
@@ -640,18 +650,14 @@ def _monthly_mode_ready_for_legacy_cleanup() -> bool:
     if not active_month_key:
         return False
     timeline_path = _month_timeline_path(active_month_key)
-    store_path = _month_store_path(active_month_key)
     core_month_ready = bool(
         timeline_path.exists()
         and timeline_path.is_file()
         and timeline_path.stat().st_size > 0
-        and store_path.exists()
-        and store_path.is_file()
-        and store_path.stat().st_size > 0
     )
     if not core_month_ready:
         return False
-    return bool(generated_artifact_present("scoring_shadow_manifest"))
+    return True
 
 
 def _prune_legacy_frame_files_after_monthly_ready() -> Dict[str, Any]:
@@ -760,12 +766,28 @@ def _resolve_active_month_key(month_key: Optional[str] = None, target_dt_nyc: Op
     return resolved, manifest
 
 
-def _month_partition_ready(month_key: str) -> bool:
+def _source_parquets_for_month(month_key: str) -> List[Path]:
+    grouped = _group_parquets_by_month(_list_parquets())
+    return list(grouped.get(str(month_key).strip()) or [])
+
+
+def _month_bootstrap_ready(month_key: str) -> bool:
     timeline_path = _month_timeline_path(month_key)
-    store_path = _month_store_path(month_key)
-    timeline_ok = timeline_path.exists() and timeline_path.is_file() and timeline_path.stat().st_size > 0
-    store_ok = store_path.exists() and store_path.is_file() and store_path.stat().st_size > 0
-    return bool(timeline_ok and store_ok)
+    frame_cache_dir = _month_frame_cache_dir(month_key)
+    return bool(
+        MONTH_MANIFEST_PATH.exists()
+        and MONTH_MANIFEST_PATH.is_file()
+        and MONTH_MANIFEST_PATH.stat().st_size > 0
+        and timeline_path.exists()
+        and timeline_path.is_file()
+        and timeline_path.stat().st_size > 0
+        and frame_cache_dir.exists()
+        and frame_cache_dir.is_dir()
+    )
+
+
+def _month_partition_ready(month_key: str) -> bool:
+    return _month_bootstrap_ready(month_key)
 
 
 def _build_preparing_month_payload(
@@ -1006,6 +1028,7 @@ def _read_frame_cached(idx: int, month_key: Optional[str] = None) -> Dict[str, A
     active_month_key = str(timeline_payload.get("active_month_key") or month_key or "")
     timeline_etag = str((timeline_cached or {}).get("etag") or "")
     cache_idx = (active_month_key, int(idx))
+    cache_file = _month_frame_cache_file(active_month_key, idx, frame_time)
     etag = f'W/"frame-{active_month_key}-{idx}-{abs(hash((frame_time, timeline_etag))) & 0xffffffff:x}"'
     with _frame_cache_lock:
         cached = _frame_cache.get(cache_idx)
@@ -1018,8 +1041,12 @@ def _read_frame_cached(idx: int, month_key: Optional[str] = None) -> Dict[str, A
             _frame_cache_order.append(cache_idx)
             return cached
 
-        _record_perf_metric("frame.cache_miss")
-        data = _build_frame_payload_on_demand(frame_time, month_key=active_month_key)
+        if cache_file.exists() and cache_file.stat().st_size > 0:
+            _record_perf_metric("frame.cache_hit")
+            data = _read_json(cache_file)
+        else:
+            _record_perf_metric("frame.cache_miss")
+            raise FileNotFoundError(f"Frame cache miss for month_key={active_month_key} idx={idx} frame_time={frame_time}")
         _frame_cache[cache_idx] = {"data": data, "etag": etag, "frame_time": frame_time}
         try:
             _frame_cache_order.remove(cache_idx)
@@ -1032,72 +1059,55 @@ def _read_frame_cached(idx: int, month_key: Optional[str] = None) -> Dict[str, A
         return _frame_cache[cache_idx]
 
 
-def _build_frame_payload_on_demand(frame_time: str, month_key: Optional[str] = None) -> Dict[str, Any]:
-    from build_hotspot import _recalibrate_visible_v3_fields
+def _build_single_frame_for_month(month_key: str, frame_time: str) -> Dict[str, Any]:
+    from build_hotspot import build_single_frame_for_month, ensure_zones_geojson
 
-    resolved_month_key = str(month_key).strip() if month_key else ""
-    if resolved_month_key:
-        if not _safe_parse_month_key(resolved_month_key):
-            raise HTTPException(status_code=404, detail=f"month_key not available: {resolved_month_key}")
-    else:
-        resolved_month_key, _ = _resolve_active_month_key(month_key=month_key)
-    store_path = _month_store_path(resolved_month_key)
-    if not store_path.exists() or store_path.stat().st_size <= 0:
-        raise HTTPException(status_code=503, detail="exact history store not ready for requested month")
-    zone_geoms = _load_pickup_zone_geometries()
-    if not zone_geoms:
-        raise HTTPException(status_code=503, detail="taxi_zones.geojson unavailable")
-    con = duckdb.connect(database=str(store_path), read_only=True)
+    parquets = _source_parquets_for_month(month_key)
+    if not parquets:
+        raise RuntimeError(f"No source parquet files for month_key={month_key}")
+    zones_path = ensure_zones_geojson(DATA_DIR, force=False)
+    return build_single_frame_for_month(
+        parquet_files=parquets,
+        zones_geojson_path=zones_path,
+        frame_time=str(frame_time),
+        bin_minutes=int(DEFAULT_BIN_MINUTES),
+        min_trips_per_window=int(DEFAULT_MIN_TRIPS_PER_WINDOW),
+    )
+
+
+def _frame_build_worker(month_key: str, idx: int, frame_time: str, run_token: str) -> None:
+    key = (month_key, frame_time)
     try:
-        cursor = con.execute(
-            """
-            SELECT *
-            FROM exact_shadow_rows
-            WHERE exact_bin_local_ts = ?
-            ORDER BY PULocationID
-            """,
-            [str(frame_time)],
-        )
-        rows = cursor.fetchall()
-        columns = [str(desc[0]) for desc in (cursor.description or [])]
+        payload = _build_single_frame_for_month(month_key=month_key, frame_time=frame_time)
+        cache_file = _month_frame_cache_file(month_key, idx, frame_time)
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        cache_file.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+    except Exception:
+        traceback.print_exc()
     finally:
-        con.close()
-    if not rows:
-        raise HTTPException(status_code=404, detail=f"frame not found for time: {frame_time}")
+        with _frame_builds_in_progress_lock:
+            marker = _frame_builds_in_progress.get(key)
+            if marker and str(marker.get("run_token")) == run_token:
+                _frame_builds_in_progress.pop(key, None)
 
-    features: List[Dict[str, Any]] = []
-    for row in rows:
-        row_map = {columns[idx]: row[idx] for idx in range(len(columns))}
-        try:
-            zid = int(row_map.get("PULocationID"))
-        except Exception:
-            continue
-        zone_meta = zone_geoms.get(zid) or {}
-        geom = zone_meta.get("geometry")
-        if geom is None:
-            continue
-        properties = build_feature_properties_from_shadow_row(
-            row_map=row_map,
-            zone_name=str(zone_meta.get("zone_name") or ""),
-            borough=str(zone_meta.get("borough") or ""),
-            geometry_area_sq_miles=None,
-        )
-        features.append(
-            {
-                "type": "Feature",
-                "geometry": mapping(geom),
-                "properties": properties,
-            }
-        )
 
-    _recalibrate_visible_v3_fields(features)
-    return {
-        "time": str(frame_time),
-        "polygons": {
-            "type": "FeatureCollection",
-            "features": features,
-        },
-    }
+def _ensure_frame_build_in_progress(month_key: str, idx: int, frame_time: str) -> bool:
+    key = (str(month_key).strip(), str(frame_time).strip())
+    with _frame_builds_in_progress_lock:
+        if key in _frame_builds_in_progress:
+            return False
+        run_token = uuid.uuid4().hex
+        _frame_builds_in_progress[key] = {
+            "started_at_unix": int(time.time()),
+            "run_token": run_token,
+        }
+    thread = threading.Thread(
+        target=_frame_build_worker,
+        args=(key[0], int(idx), key[1], run_token),
+        daemon=True,
+    )
+    thread.start()
+    return True
 
 
 def _geometry_bounds_from_coordinates(coords: Any) -> Optional[Tuple[float, float, float, float]]:
@@ -1481,7 +1491,7 @@ def _artifact_runtime_policy_snapshot() -> Dict[str, Any]:
             "taxi_zones.geojson",
             "exact_history/month_manifest.json",
             "exact_history/months/<month_key>/timeline.json",
-            "exact_history/months/<month_key>/exact_shadow.duckdb",
+            "exact_history/months/<month_key>/frame_cache/",
         ],
         "db_required": [
             "scoring_shadow_manifest",
@@ -1506,6 +1516,7 @@ def _artifact_runtime_integrity_report() -> Dict[str, Any]:
     active_month_key = resolve_active_month_key(datetime.now(timezone.utc).astimezone(NYC_TZ), available_month_keys)
     month_manifest_present = MONTH_MANIFEST_PATH.exists() and MONTH_MANIFEST_PATH.is_file() and MONTH_MANIFEST_PATH.stat().st_size > 0
     timeline_present = bool(active_month_key and _month_timeline_path(active_month_key).exists() and _month_timeline_path(active_month_key).is_file())
+    frame_cache_dir_present = bool(active_month_key and _month_frame_cache_dir(active_month_key).exists() and _month_frame_cache_dir(active_month_key).is_dir())
     exact_store_present = bool(active_month_key and _month_store_path(active_month_key).exists() and _month_store_path(active_month_key).is_file() and _month_store_path(active_month_key).stat().st_size > 0)
     timeline_count = 0
     if timeline_present and active_month_key:
@@ -1514,7 +1525,7 @@ def _artifact_runtime_integrity_report() -> Dict[str, Any]:
             timeline_count = int(timeline_payload.get("count") or len(timeline_payload.get("timeline") or []))
         except Exception:
             timeline_count = 0
-    required_volume_ok = parquet_count > 0 and timeline_count > 0 and zones_present and month_manifest_present and timeline_present and exact_store_present
+    required_volume_ok = parquet_count > 0 and timeline_count > 0 and zones_present and month_manifest_present and timeline_present and frame_cache_dir_present
 
     required_db_keys = ["scoring_shadow_manifest"]
     missing_required_db_artifacts = [key for key in required_db_keys if not generated_artifact_present(key)]
@@ -1541,10 +1552,10 @@ def _artifact_runtime_integrity_report() -> Dict[str, Any]:
         missing_required_volume.append("exact_history/month_manifest.json")
     if not timeline_present:
         missing_required_volume.append("exact_history/months/<active_month_key>/timeline.json")
-    if not exact_store_present:
-        missing_required_volume.append("exact_history/months/<active_month_key>/exact_shadow.duckdb")
+    if not frame_cache_dir_present:
+        missing_required_volume.append("exact_history/months/<active_month_key>/frame_cache/")
 
-    core_map_ready = required_volume_ok and required_db_ok
+    core_map_ready = required_volume_ok
     ok = core_map_ready and not redundant_file_copies_present
     return {
         "ok": ok,
@@ -1565,6 +1576,8 @@ def _artifact_runtime_integrity_report() -> Dict[str, Any]:
         "monthly_partition_count": len(available_month_keys),
         "active_month_store_present": exact_store_present,
         "active_month_timeline_present": timeline_present,
+        "active_month_frame_cache_dir_present": frame_cache_dir_present,
+        "active_month_bootstrap_ready": bool(month_manifest_present and timeline_present and frame_cache_dir_present),
     }
 
 
@@ -2625,66 +2638,65 @@ def _generate_lock_snapshot() -> Dict[str, Any]:
     }
 
 
+def _bootstrap_month_partition(month_key: str, bin_minutes: int = DEFAULT_BIN_MINUTES) -> Dict[str, Any]:
+    from build_hotspot import build_month_timeline_bootstrap, ensure_zones_geojson
+
+    requested = str(month_key or "").strip()
+    if not _safe_parse_month_key(requested):
+        raise RuntimeError(f"Invalid month_key for bootstrap: {requested}")
+    parquets = _source_parquets_for_month(requested)
+    if not parquets:
+        raise RuntimeError(f"No source parquet files found for month_key={requested}")
+    ensure_zones_geojson(DATA_DIR, force=False)
+    month_dir = _month_dir(requested)
+    month_dir.mkdir(parents=True, exist_ok=True)
+    timeline_payload = build_month_timeline_bootstrap(requested, bin_minutes=int(bin_minutes))
+    timeline_path = _month_timeline_path(requested)
+    timeline_path.write_text(json.dumps(timeline_payload, separators=(",", ":")), encoding="utf-8")
+    _month_frame_cache_dir(requested).mkdir(parents=True, exist_ok=True)
+
+    months_manifest: Dict[str, Dict[str, Any]] = dict((_load_month_manifest().get("months") or {}))
+    timeline = list(timeline_payload.get("timeline") or [])
+    months_manifest[requested] = {
+        "month_key": requested,
+        "source_parquet_filenames": [p.name for p in parquets],
+        "store_exists": (_month_store_path(requested).exists()),
+        "timeline_exists": timeline_path.exists(),
+        "frame_cache_dir_present": _month_frame_cache_dir(requested).exists(),
+        "first_frame_datetime": timeline[0] if timeline else None,
+        "last_frame_datetime": timeline[-1] if timeline else None,
+        "frame_count": int(len(timeline)),
+        "bootstrapped_at_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+    }
+    _persist_month_manifest(months_manifest)
+    _prune_legacy_frame_files_after_monthly_ready()
+    return {
+        "ok": True,
+        "month_key": requested,
+        "timeline_count": int(len(timeline)),
+        "frame_cache_dir": str(_month_frame_cache_dir(requested)),
+    }
+
+
 def _ensure_requested_month_available_or_start_generate(
     *,
     month_key: str,
     request_kind: str,
     retry_after_sec: int = 3,
 ) -> Optional[JSONResponse]:
-    if _month_partition_ready(month_key):
+    if _month_bootstrap_ready(month_key):
         return None
-    remaining_backoff = _recent_month_failure_backoff_remaining(month_key)
-    if remaining_backoff > 0:
-        return _preparing_month_response(
-            month_key=month_key,
-            request_kind=request_kind,
-            generate_started=False,
-            retry_after_sec=max(int(retry_after_sec), int(remaining_backoff)),
-        )
-
-    state = _get_state()
-    thread_alive = _generate_thread_alive()
-    state_name = str(state.get("state") or "")
-    running_month_key = str(state.get("month_key") or "").strip() or None
-    running_build_all = bool(state.get("build_all_months"))
-
-    if state_name in {"started", "running"} and running_month_key == month_key and not running_build_all:
+    try:
+        _bootstrap_month_partition(month_key=month_key, bin_minutes=DEFAULT_BIN_MINUTES)
+        return None
+    except Exception:
+        traceback.print_exc()
         return _preparing_month_response(
             month_key=month_key,
             request_kind=request_kind,
             generate_started=False,
             retry_after_sec=retry_after_sec,
         )
-    if state_name == "error" and thread_alive and running_month_key == month_key:
-        return _preparing_month_response(
-            month_key=month_key,
-            request_kind=request_kind,
-            generate_started=False,
-            retry_after_sec=retry_after_sec,
-        )
-    if thread_alive:
-        return _preparing_month_response(
-            month_key=month_key,
-            request_kind=request_kind,
-            generate_started=False,
-            retry_after_sec=retry_after_sec,
-        )
-
-    start_generate(
-        DEFAULT_BIN_MINUTES,
-        DEFAULT_MIN_TRIPS_PER_WINDOW,
-        force_clear_lock=False,
-        include_day_tendency=False,
-        build_review_artifacts=False,
-        month_key=month_key,
-        build_all_months=False,
-    )
-    return _preparing_month_response(
-        month_key=month_key,
-        request_kind=request_kind,
-        generate_started=True,
-        retry_after_sec=retry_after_sec,
-    )
 
 
 def _set_state(**kwargs):
@@ -4603,33 +4615,16 @@ def startup():
             datetime.now(timezone.utc).astimezone(NYC_TZ),
             source_month_keys,
         )
-        zones_ok = (DATA_DIR / "taxi_zones.geojson").exists()
-        monthly_mode_active = True
-        target_ready = bool(target_month_key_candidate and _month_partition_ready(target_month_key_candidate))
-        thread_alive = _generate_thread_alive()
-        state_name = str(_get_state().get("state") or "")
-        generate_running = bool(thread_alive or state_name in {"started", "running"})
-        backoff_remaining = (
-            _recent_month_failure_backoff_remaining(target_month_key_candidate)
-            if target_month_key_candidate
-            else 0
-        )
-
+        target_ready = bool(target_month_key_candidate and _month_bootstrap_ready(target_month_key_candidate))
         startup_skip_reason = None
-        if not monthly_mode_active:
-            startup_skip_reason = "monthly_mode_inactive"
-        elif not zones_ok:
+        if not (DATA_DIR / "taxi_zones.geojson").exists():
             startup_skip_reason = "zones_missing"
         elif not source_month_keys:
             startup_skip_reason = "no_source_month_keys"
         elif not target_month_key_candidate:
             startup_skip_reason = "no_target_month_candidate"
-        elif target_ready:
+        elif _month_bootstrap_ready(target_month_key_candidate):
             startup_skip_reason = "target_month_already_ready"
-        elif generate_running:
-            startup_skip_reason = "generate_already_running"
-        elif backoff_remaining > 0:
-            startup_skip_reason = f"recent_failure_backoff_{backoff_remaining}s"
 
         if startup_skip_reason:
             print(f"startup_auto_prepare_month_skipped reason={startup_skip_reason}")
@@ -4649,15 +4644,7 @@ def startup():
             return
 
         print(f"startup_auto_prepare_month_start month_key={target_month_key_candidate}")
-        start_generate(
-            DEFAULT_BIN_MINUTES,
-            DEFAULT_MIN_TRIPS_PER_WINDOW,
-            force_clear_lock=False,
-            include_day_tendency=False,
-            month_key=target_month_key_candidate,
-            build_all_months=False,
-            build_review_artifacts=False,
-        )
+        _bootstrap_month_partition(target_month_key_candidate, bin_minutes=DEFAULT_BIN_MINUTES)
     except Exception:
         _set_state(state="idle")
     _log_runtime_integrity_summary()
@@ -4728,7 +4715,10 @@ def status():
     active_month_key = resolve_active_month_key(datetime.now(timezone.utc).astimezone(NYC_TZ), available_month_keys) or target_month_key_candidate
     active_timeline_path = _month_timeline_path(active_month_key) if active_month_key else None
     active_store_path = _month_store_path(active_month_key) if active_month_key else None
+    active_frame_cache_dir = _month_frame_cache_dir(active_month_key) if active_month_key else None
     timeline_file_present = bool(active_timeline_path and active_timeline_path.exists() and active_timeline_path.stat().st_size > 0)
+    frame_cache_dir_present = bool(active_frame_cache_dir and active_frame_cache_dir.exists() and active_frame_cache_dir.is_dir())
+    frame_cache_file_count = len(list(active_frame_cache_dir.glob("frame_*.json"))) if frame_cache_dir_present and active_frame_cache_dir else 0
     exact_history_store_present = bool(active_store_path and active_store_path.exists() and active_store_path.stat().st_size > 0)
     exact_history_store_bytes = int(active_store_path.stat().st_size) if active_store_path and active_store_path.exists() and active_store_path.is_file() else 0
     timeline_present = timeline_artifact_in_db or timeline_file_present
@@ -4758,8 +4748,7 @@ def status():
         MONTH_MANIFEST_PATH.exists()
         and month_manifest.get("months", {}).get(active_month_key)
         and timeline_file_present
-        and exact_history_store_present
-        and generated_artifact_present("scoring_shadow_manifest")
+        and frame_cache_dir_present
     )
     build_review_artifacts_in_progress = bool(
         state_name in {"started", "running"} and bool(generate_state.get("build_review_artifacts"))
@@ -4833,6 +4822,12 @@ def status():
         "monthly_partition_count": len(available_month_keys),
         "active_month_store_present": exact_history_store_present,
         "active_month_timeline_present": timeline_file_present,
+        "active_month_timeline_ready": timeline_file_present,
+        "active_month_frame_cache_dir_present": frame_cache_dir_present,
+        "active_month_frame_cache_ready": frame_cache_dir_present,
+        "active_month_store_cache_present": exact_history_store_present,
+        "active_month_bootstrap_ready": bool(MONTH_MANIFEST_PATH.exists() and timeline_file_present and frame_cache_dir_present),
+        "frame_cache_file_count": int(frame_cache_file_count),
         "pending_month_key": pending_month_key,
         "pending_month_label": pending_month_label,
         "last_failed_month_key": last_failed_month_key,
@@ -4845,7 +4840,7 @@ def status():
         "generated_artifact_store_report": generated_artifact_report(),
         "artifact_runtime_policy": _artifact_runtime_policy_snapshot(),
         "artifact_runtime_integrity": artifact_runtime_integrity,
-        "core_map_ready": bool(artifact_runtime_integrity.get("core_map_ready")),
+        "core_map_ready": bool(MONTH_MANIFEST_PATH.exists() and timeline_file_present and frame_cache_dir_present),
         "active_month_core_ready": active_month_core_ready,
         "build_review_artifacts_in_progress": build_review_artifacts_in_progress,
         "optional_artifacts_missing": list(artifact_runtime_integrity.get("optional_artifacts_missing") or []),
@@ -5549,6 +5544,27 @@ def frame(idx: int, request: Request, month_key: Optional[str] = None):
     )
     if preparing_response is not None:
         return preparing_response
+    timeline_cached = _read_timeline_cached(month_key=target_month_key)
+    timeline_payload = (timeline_cached or {}).get("data") or {}
+    timeline = timeline_payload.get("timeline") or []
+    if idx < 0 or idx >= len(timeline):
+        raise HTTPException(status_code=404, detail=f"frame not found: {idx}")
+    frame_time = str(timeline[idx])
+    cache_file = _month_frame_cache_file(target_month_key, idx, frame_time)
+    if not (cache_file.exists() and cache_file.stat().st_size > 0):
+        started = _ensure_frame_build_in_progress(target_month_key, idx, frame_time)
+        return JSONResponse(
+            status_code=202,
+            content={
+                "ok": False,
+                "status": "preparing_frame",
+                "target_month_key": target_month_key,
+                "frame_time": frame_time,
+                "retry_after_sec": 2,
+                "generate_started": bool(started),
+            },
+            headers={"Retry-After": "2", "Cache-Control": "no-store"},
+        )
     cached = _read_frame_cached(idx, month_key=target_month_key)
     return _json_cached_response(request, cached["data"], etag=cached.get("etag"))
 
@@ -5571,6 +5587,27 @@ def frame_viewport(
     )
     if preparing_response is not None:
         return preparing_response
+    timeline_cached = _read_timeline_cached(month_key=target_month_key)
+    timeline_payload = (timeline_cached or {}).get("data") or {}
+    timeline = timeline_payload.get("timeline") or []
+    if idx < 0 or idx >= len(timeline):
+        raise HTTPException(status_code=404, detail=f"frame not found: {idx}")
+    frame_time = str(timeline[idx])
+    cache_file = _month_frame_cache_file(target_month_key, idx, frame_time)
+    if not (cache_file.exists() and cache_file.stat().st_size > 0):
+        started = _ensure_frame_build_in_progress(target_month_key, idx, frame_time)
+        return JSONResponse(
+            status_code=202,
+            content={
+                "ok": False,
+                "status": "preparing_frame",
+                "target_month_key": target_month_key,
+                "frame_time": frame_time,
+                "retry_after_sec": 2,
+                "generate_started": bool(started),
+            },
+            headers={"Retry-After": "2", "Cache-Control": "no-store"},
+        )
     cached = _read_frame_cached(idx, month_key=target_month_key)
     payload = _frame_payload_viewport_subset(
         cached["data"],

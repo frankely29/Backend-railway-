@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import List, Dict, Any, Tuple
 from datetime import datetime
+import calendar
 import json
 import math
 import statistics
@@ -800,6 +801,135 @@ def _validate_rating_bucket_color_consistency(features: List[Dict[str, Any]], fr
         raise RuntimeError(
             f"Rating/bucket/color consistency validation failed ({len(failures)}): {sample}"
         )
+
+
+def build_month_timeline_bootstrap(month_key: str, bin_minutes: int = 20) -> Dict[str, Any]:
+    year_text, month_text = str(month_key).strip().split("-", 1)
+    year = int(year_text)
+    month = int(month_text)
+    if month < 1 or month > 12:
+        raise ValueError(f"Invalid month_key: {month_key}")
+    _, month_days = calendar.monthrange(year, month)
+    entries: List[Dict[str, Any]] = []
+    for day in range(1, month_days + 1):
+        frame_date = datetime(year=year, month=month, day=day)
+        for minute in range(0, 24 * 60, int(bin_minutes)):
+            frame_time = frame_date.replace(hour=(minute // 60), minute=(minute % 60), second=0, microsecond=0)
+            entries.append(
+                {
+                    "frame_time": frame_time.isoformat(),
+                    "frame_date": frame_date.date().isoformat(),
+                    "frame_weekday_name": frame_date.strftime("%A"),
+                    "frame_time_label": frame_time.strftime("%I:%M %p"),
+                    "bin_minutes": int(bin_minutes),
+                }
+            )
+    timeline = [str(entry.get("frame_time")) for entry in entries]
+    return {
+        "timeline": timeline,
+        "entries": entries,
+        "count": len(timeline),
+        "bin_minutes": int(bin_minutes),
+        "timeline_mode": "exact_historical",
+        "frame_time_model": "exact_local_20min",
+        "synthetic_week_enabled": False,
+    }
+
+
+def build_single_frame_for_month(
+    parquet_files: List[Path],
+    zones_geojson_path: Path,
+    frame_time: str,
+    bin_minutes: int = 20,
+    min_trips_per_window: int = 25,
+) -> Dict[str, Any]:
+    validate_zone_mode_profiles_for_live_engine()
+    zones = json.loads(zones_geojson_path.read_text(encoding="utf-8"))
+    geom_by_id: Dict[int, Any] = {}
+    name_by_id: Dict[int, str] = {}
+    borough_by_id: Dict[int, str] = {}
+    for feature in zones.get("features", []):
+        props = feature.get("properties") or {}
+        try:
+            zid = int(props.get("LocationID"))
+        except Exception:
+            continue
+        geom = feature.get("geometry")
+        if geom:
+            geom_by_id[zid] = geom
+        name_by_id[zid] = str(props.get("zone") or props.get("Zone") or props.get("name") or props.get("Name") or "")
+        borough_by_id[zid] = str(props.get("borough") or props.get("Borough") or props.get("boro") or props.get("Boro") or "")
+
+    if not geom_by_id:
+        raise RuntimeError("taxi_zones.geojson missing usable properties.LocationID geometry.")
+    if not parquet_files:
+        raise RuntimeError("No parquet files provided for frame build.")
+
+    parquet_sql_files = [str(path) for path in parquet_files]
+    first_parquet_sql = "'" + parquet_sql_files[0].replace("'", "''") + "'"
+    con = duckdb.connect(database=":memory:")
+    try:
+        schema_rows = con.execute(f"DESCRIBE SELECT * FROM read_parquet([{first_parquet_sql}])").fetchall()
+        available_columns = {str(row[0]) for row in schema_rows}
+        shadow_sql = build_zone_earnings_shadow_sql(
+            parquet_sql_files,
+            bin_minutes=int(bin_minutes),
+            min_trips_per_window=int(min_trips_per_window),
+            profile=ZONE_MODE_PROFILES["citywide_v2"],
+            citywide_v3_profile=ZONE_MODE_PROFILES["citywide_v3"],
+            manhattan_profile=ZONE_MODE_PROFILES["manhattan_v2"],
+            bronx_wash_heights_profile=ZONE_MODE_PROFILES["bronx_wash_heights_v2"],
+            queens_profile=ZONE_MODE_PROFILES["queens_v2"],
+            brooklyn_profile=ZONE_MODE_PROFILES["brooklyn_v2"],
+            staten_island_profile=ZONE_MODE_PROFILES["staten_island_v2"],
+            manhattan_v3_profile=ZONE_MODE_PROFILES["manhattan_v3"],
+            bronx_wash_heights_v3_profile=ZONE_MODE_PROFILES["bronx_wash_heights_v3"],
+            queens_v3_profile=ZONE_MODE_PROFILES["queens_v3"],
+            brooklyn_v3_profile=ZONE_MODE_PROFILES["brooklyn_v3"],
+            staten_island_v3_profile=ZONE_MODE_PROFILES["staten_island_v3"],
+            available_columns=available_columns,
+        )
+        cursor = con.execute(
+            f"""
+            WITH exact_shadow_rows AS (
+                {shadow_sql}
+            )
+            SELECT *
+            FROM exact_shadow_rows
+            WHERE exact_bin_local_ts = ?
+            ORDER BY PULocationID
+            """,
+            [str(frame_time)],
+        )
+        rows = cursor.fetchall()
+        columns = [str(desc[0]) for desc in (cursor.description or [])]
+    finally:
+        con.close()
+
+    features: List[Dict[str, Any]] = []
+    for row in rows:
+        row_map = {columns[idx]: row[idx] for idx in range(len(columns))}
+        try:
+            zid = int(row_map.get("PULocationID"))
+        except Exception:
+            continue
+        geom = geom_by_id.get(zid)
+        if not geom:
+            continue
+        features.append(
+            {
+                "type": "Feature",
+                "geometry": geom,
+                "properties": build_feature_properties_from_shadow_row(
+                    row_map=row_map,
+                    zone_name=str(name_by_id.get(zid) or ""),
+                    borough=str(borough_by_id.get(zid) or ""),
+                    geometry_area_sq_miles=None,
+                ),
+            }
+        )
+    _recalibrate_visible_v3_fields(features)
+    return {"time": str(frame_time), "polygons": {"type": "FeatureCollection", "features": features}}
 
 
 def build_hotspots_frames(
