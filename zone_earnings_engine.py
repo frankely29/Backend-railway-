@@ -292,7 +292,43 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
       FROM prepared
       WHERE PULocationID IS NOT NULL
     ),
-    zone_bin_raw AS (
+    frame_bins AS (
+      SELECT DISTINCT
+        exact_bin_local_ts,
+        exact_bin_date_local,
+        exact_weekday_name_local,
+        exact_bin_time_label_local,
+        exact_bin_unix_utc
+      FROM binned
+    ),
+    eligible_zones AS (
+      SELECT
+        zm.PULocationID,
+        zm.zone_name,
+        zm.borough_name,
+        zg.zone_area_sq_miles,
+        zg.centroid_latitude
+      FROM zone_metadata zm
+      LEFT JOIN zone_geometry_metrics zg
+        ON zg.PULocationID = zm.PULocationID
+      WHERE zm.airport_excluded = FALSE
+    ),
+    zone_bin_grid AS (
+      SELECT
+        ez.PULocationID,
+        ez.zone_name,
+        ez.borough_name,
+        ez.zone_area_sq_miles,
+        ez.centroid_latitude,
+        fb.exact_bin_local_ts,
+        fb.exact_bin_date_local,
+        fb.exact_weekday_name_local,
+        fb.exact_bin_time_label_local,
+        fb.exact_bin_unix_utc
+      FROM eligible_zones ez
+      CROSS JOIN frame_bins fb
+    ),
+    zone_bin_actual AS (
       SELECT
         PULocationID,
         exact_bin_local_ts,
@@ -317,43 +353,49 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
         AVG(is_good_long_external_exit * 1.0) AS good_long_external_exit_share
       FROM binned
       GROUP BY 1,2,3,4,5,6
-      HAVING COUNT(*) >= {min_trips_per_window}
     ),
     with_next AS (
       SELECT
         z.*,
         LEAD(pickups_now) OVER (PARTITION BY PULocationID ORDER BY exact_bin_local_ts) AS pickups_next_same_day
-      FROM zone_bin_raw z
+      FROM zone_bin_actual z
     ),
     zone_bin AS (
       SELECT
-        PULocationID,
-        exact_bin_local_ts,
-        exact_bin_date_local,
-        exact_weekday_name_local,
-        exact_bin_time_label_local,
-        exact_bin_unix_utc,
-        pickups_now,
+        g.PULocationID,
+        g.exact_bin_local_ts,
+        g.exact_bin_date_local,
+        g.exact_weekday_name_local,
+        g.exact_bin_time_label_local,
+        g.exact_bin_unix_utc,
+        COALESCE(w.pickups_now, 0) AS pickups_now,
         COALESCE(
-          pickups_next_same_day,
-          pickups_now
+          w.pickups_next_same_day,
+          w.pickups_now,
+          0
         ) AS pickups_next,
-        median_driver_pay,
-        median_pay_per_min,
-        median_pay_per_mile,
-        COALESCE(median_request_to_pickup_min, 0.0) AS median_request_to_pickup_min,
-        COALESCE(short_trip_share_3mi_12min, 0.0) AS short_trip_share_3mi_12min,
-        COALESCE(shared_ride_share, 0.0) AS shared_ride_share,
-        COALESCE(long_trip_share_20plus, 0.0) AS long_trip_share_20plus,
-        COALESCE(balanced_trip_share, 0.0) AS balanced_trip_share,
-        COALESCE(same_zone_dropoff_share, 0.0) AS same_zone_dropoff_share,
-        COALESCE(airport_exit_share, 0.0) AS airport_exit_share,
-        COALESCE(out_of_scored_network_exit_share, 0.0) AS out_of_scored_network_exit_share,
-        COALESCE(short_external_exit_share_6mi_30min, 0.0) AS short_external_exit_share_6mi_30min,
-        COALESCE(short_external_exit_share_8mi_40min, 0.0) AS short_external_exit_share_8mi_40min,
-        COALESCE(good_long_external_exit_share, 0.0) AS good_long_external_exit_share,
-        exact_bin_unix_utc AS bin_index
-      FROM with_next
+        w.median_driver_pay,
+        w.median_pay_per_min,
+        w.median_pay_per_mile,
+        w.median_request_to_pickup_min,
+        COALESCE(w.short_trip_share_3mi_12min, 0.0) AS short_trip_share_3mi_12min,
+        COALESCE(w.shared_ride_share, 0.0) AS shared_ride_share,
+        COALESCE(w.long_trip_share_20plus, 0.0) AS long_trip_share_20plus,
+        COALESCE(w.balanced_trip_share, 0.0) AS balanced_trip_share,
+        COALESCE(w.same_zone_dropoff_share, 0.0) AS same_zone_dropoff_share,
+        COALESCE(w.airport_exit_share, 0.0) AS airport_exit_share,
+        COALESCE(w.out_of_scored_network_exit_share, 0.0) AS out_of_scored_network_exit_share,
+        COALESCE(w.short_external_exit_share_6mi_30min, 0.0) AS short_external_exit_share_6mi_30min,
+        COALESCE(w.short_external_exit_share_8mi_40min, 0.0) AS short_external_exit_share_8mi_40min,
+        COALESCE(w.good_long_external_exit_share, 0.0) AS good_long_external_exit_share,
+        g.zone_area_sq_miles,
+        g.centroid_latitude,
+        g.borough_name,
+        g.exact_bin_unix_utc AS bin_index
+      FROM zone_bin_grid g
+      LEFT JOIN with_next w
+        ON w.PULocationID = g.PULocationID
+       AND w.exact_bin_local_ts = g.exact_bin_local_ts
     ),
     dest_edges AS (
       SELECT
@@ -443,25 +485,21 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
         z.good_long_external_exit_share,
         COALESCE(d.downstream_next_value_raw, 0.0) AS downstream_next_value_raw,
         COALESCE(d.downstream_coverage, 0.0) AS downstream_coverage,
-        g.zone_area_sq_miles,
-        g.centroid_latitude,
-        m.borough_name,
+        z.zone_area_sq_miles,
+        z.centroid_latitude,
+        z.borough_name,
         CASE
-          WHEN g.zone_area_sq_miles > 0 THEN z.pickups_now * 1.0 / g.zone_area_sq_miles
+          WHEN z.zone_area_sq_miles > 0 THEN z.pickups_now * 1.0 / z.zone_area_sq_miles
           ELSE NULL
         END AS pickups_per_sq_mile_now,
         CASE
-          WHEN g.zone_area_sq_miles > 0 THEN z.pickups_next * 1.0 / g.zone_area_sq_miles
+          WHEN z.zone_area_sq_miles > 0 THEN z.pickups_next * 1.0 / z.zone_area_sq_miles
           ELSE NULL
         END AS pickups_per_sq_mile_next
       FROM zone_bin z
       LEFT JOIN downstream_scores d
         ON d.PULocationID = z.PULocationID
        AND d.exact_bin_local_ts = z.exact_bin_local_ts
-      LEFT JOIN zone_geometry_metrics g
-        ON g.PULocationID = z.PULocationID
-      LEFT JOIN zone_metadata m
-        ON m.PULocationID = z.PULocationID
     ),
     ranked AS (
       SELECT
@@ -527,8 +565,16 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
         pickups_per_sq_mile_now,
         pickups_per_sq_mile_next,
         downstream_next_value_raw,
-        CASE WHEN demand_now_n <= 1 THEN 0.0 ELSE (demand_now_rn - 1) * 1.0 / (demand_now_n - 1) END AS demand_now_n,
-        CASE WHEN demand_next_n <= 1 THEN 0.0 ELSE (demand_next_rn - 1) * 1.0 / (demand_next_n - 1) END AS demand_next_n,
+        CASE
+          WHEN pickups_now <= 0 THEN 0.0
+          WHEN demand_now_n <= 1 THEN 0.0
+          ELSE (demand_now_rn - 1) * 1.0 / (demand_now_n - 1)
+        END AS demand_now_n,
+        CASE
+          WHEN pickups_next <= 0 THEN 0.0
+          WHEN demand_next_n <= 1 THEN 0.0
+          ELSE (demand_next_rn - 1) * 1.0 / (demand_next_n - 1)
+        END AS demand_next_n,
         CASE
           WHEN median_driver_pay IS NULL THEN NULL
           WHEN pay_n <= 1 THEN 0.0
@@ -549,12 +595,14 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
         CASE WHEN shared_ride_penalty_n <= 1 THEN 0.0 ELSE (shared_ride_penalty_rn - 1) * 1.0 / (shared_ride_penalty_n - 1) END AS shared_ride_penalty_n,
         CASE WHEN downstream_value_n <= 1 THEN 0.0 ELSE (downstream_value_rn - 1) * 1.0 / (downstream_value_n - 1) END AS downstream_value_n,
         CASE
-          WHEN pickups_per_sq_mile_now IS NULL THEN NULL
+          WHEN pickups_now <= 0 THEN 0.0
+          WHEN pickups_per_sq_mile_now IS NULL THEN 0.0
           WHEN demand_density_now_n <= 1 THEN 0.0
           ELSE (demand_density_now_rn - 1) * 1.0 / (demand_density_now_n - 1)
         END AS demand_density_now_n,
         CASE
-          WHEN pickups_per_sq_mile_next IS NULL THEN NULL
+          WHEN pickups_next <= 0 THEN 0.0
+          WHEN pickups_per_sq_mile_next IS NULL THEN 0.0
           WHEN demand_density_next_n <= 1 THEN 0.0
           ELSE (demand_density_next_rn - 1) * 1.0 / (demand_density_next_n - 1)
         END AS demand_density_next_n,
@@ -598,7 +646,12 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
           WHEN good_long_external_exit_share_n <= 1 THEN 0.0
           ELSE (good_long_external_exit_share_rn - 1) * 1.0 / (good_long_external_exit_share_n - 1)
         END AS good_long_external_exit_share_n,
-        downstream_coverage
+        downstream_coverage,
+        pickups_now AS window_trip_count_shadow,
+        LEAST(
+          GREATEST(pickups_now * 1.0 / {min_trips_per_window}, 0.0),
+          1.0
+        ) AS sample_support_strength_shadow
       FROM ranked
     ),
     normalized_support AS (
@@ -959,7 +1012,7 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
           {sw3.shared_ride_penalty_weight:.8f} * shared_ride_penalty_n +
           {sw3.market_saturation_penalty_weight:.8f} * COALESCE(market_saturation_penalty_n, 0.0)
         ) AS negative_score_staten_island_v3,
-        LEAST(1.0, pickups_now / 40.0) * (0.70 + 0.30 * downstream_coverage) AS earnings_shadow_confidence_citywide_v2
+        LEAST(1.0, pickups_now / 40.0) * (0.70 + 0.30 * downstream_coverage) AS earnings_shadow_confidence_citywide_v2_base
       FROM trap_exit_shadow
     ),
     scored AS (
@@ -1023,30 +1076,31 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
         {clip01('positive_score_queens_v3 - negative_score_queens_v3')} AS shadow_score_raw_queens_v3,
         {clip01('positive_score_brooklyn_v3 - negative_score_brooklyn_v3')} AS shadow_score_raw_brooklyn_v3,
         {clip01('positive_score_staten_island_v3 - negative_score_staten_island_v3')} AS shadow_score_raw_staten_island_v3,
-        {clip01(f"{clip01('positive_score - negative_score')} * earnings_shadow_confidence_citywide_v2")} AS earnings_shadow_score_citywide_v2,
-        earnings_shadow_confidence_citywide_v2 AS earnings_shadow_confidence_manhattan_v2,
-        {clip01(f"{clip01('positive_score_manhattan_v2 - negative_score_manhattan_v2')} * earnings_shadow_confidence_citywide_v2")} AS earnings_shadow_score_manhattan_v2,
-        earnings_shadow_confidence_citywide_v2 AS earnings_shadow_confidence_bronx_wash_heights_v2,
-        {clip01(f"{clip01('positive_score_bronx_wash_heights_v2 - negative_score_bronx_wash_heights_v2')} * earnings_shadow_confidence_citywide_v2")} AS earnings_shadow_score_bronx_wash_heights_v2,
-        earnings_shadow_confidence_citywide_v2 AS earnings_shadow_confidence_queens_v2,
-        {clip01(f"{clip01('positive_score_queens_v2 - negative_score_queens_v2')} * earnings_shadow_confidence_citywide_v2")} AS earnings_shadow_score_queens_v2,
-        earnings_shadow_confidence_citywide_v2 AS earnings_shadow_confidence_brooklyn_v2,
-        {clip01(f"{clip01('positive_score_brooklyn_v2 - negative_score_brooklyn_v2')} * earnings_shadow_confidence_citywide_v2")} AS earnings_shadow_score_brooklyn_v2,
-        earnings_shadow_confidence_citywide_v2 AS earnings_shadow_confidence_staten_island_v2,
-        {clip01(f"{clip01('positive_score_staten_island_v2 - negative_score_staten_island_v2')} * earnings_shadow_confidence_citywide_v2")} AS earnings_shadow_score_staten_island_v2,
-        {clip01('0.75 * earnings_shadow_confidence_citywide_v2 + 0.25 * COALESCE(balanced_trip_share_n, 0.0)')} AS earnings_shadow_confidence_manhattan_v3,
-        {clip01(f"{clip01('positive_score_manhattan_v3 - negative_score_manhattan_v3')} * {clip01('0.75 * earnings_shadow_confidence_citywide_v2 + 0.25 * COALESCE(balanced_trip_share_n, 0.0)')}")} AS earnings_shadow_score_manhattan_v3,
-        {clip01('0.85 * earnings_shadow_confidence_citywide_v2 + 0.15 * demand_support_n')} AS earnings_shadow_confidence_bronx_wash_heights_v3,
-        {clip01(f"{clip01('positive_score_bronx_wash_heights_v3 - negative_score_bronx_wash_heights_v3')} * {clip01('0.85 * earnings_shadow_confidence_citywide_v2 + 0.15 * demand_support_n')}")} AS earnings_shadow_score_bronx_wash_heights_v3,
-        {clip01('0.85 * earnings_shadow_confidence_citywide_v2 + 0.15 * demand_support_n')} AS earnings_shadow_confidence_queens_v3,
-        {clip01(f"{clip01('positive_score_queens_v3 - negative_score_queens_v3')} * {clip01('0.85 * earnings_shadow_confidence_citywide_v2 + 0.15 * demand_support_n')}")} AS earnings_shadow_score_queens_v3,
-        {clip01('0.85 * earnings_shadow_confidence_citywide_v2 + 0.15 * demand_support_n')} AS earnings_shadow_confidence_brooklyn_v3,
-        {clip01(f"{clip01('positive_score_brooklyn_v3 - negative_score_brooklyn_v3')} * {clip01('0.85 * earnings_shadow_confidence_citywide_v2 + 0.15 * demand_support_n')}")} AS earnings_shadow_score_brooklyn_v3,
-        {clip01('0.80 * earnings_shadow_confidence_citywide_v2 + 0.20 * COALESCE(balanced_trip_share_n, 0.0)')} AS earnings_shadow_confidence_staten_island_v3,
-        {clip01(f"{clip01('positive_score_staten_island_v3 - negative_score_staten_island_v3')} * {clip01('0.80 * earnings_shadow_confidence_citywide_v2 + 0.20 * COALESCE(balanced_trip_share_n, 0.0)')}")} AS earnings_shadow_score_staten_island_v3,
-        {clip01('0.85 * earnings_shadow_confidence_citywide_v2 + 0.15 * demand_support_n')} AS earnings_shadow_confidence_citywide_v3,
+        earnings_shadow_confidence_citywide_v2_base * sample_support_strength_shadow AS earnings_shadow_confidence_citywide_v2,
+        {clip01(f"{clip01('positive_score - negative_score')} * (earnings_shadow_confidence_citywide_v2_base * sample_support_strength_shadow)")} AS earnings_shadow_score_citywide_v2,
+        earnings_shadow_confidence_citywide_v2_base * sample_support_strength_shadow AS earnings_shadow_confidence_manhattan_v2,
+        {clip01(f"{clip01('positive_score_manhattan_v2 - negative_score_manhattan_v2')} * (earnings_shadow_confidence_citywide_v2_base * sample_support_strength_shadow)")} AS earnings_shadow_score_manhattan_v2,
+        earnings_shadow_confidence_citywide_v2_base * sample_support_strength_shadow AS earnings_shadow_confidence_bronx_wash_heights_v2,
+        {clip01(f"{clip01('positive_score_bronx_wash_heights_v2 - negative_score_bronx_wash_heights_v2')} * (earnings_shadow_confidence_citywide_v2_base * sample_support_strength_shadow)")} AS earnings_shadow_score_bronx_wash_heights_v2,
+        earnings_shadow_confidence_citywide_v2_base * sample_support_strength_shadow AS earnings_shadow_confidence_queens_v2,
+        {clip01(f"{clip01('positive_score_queens_v2 - negative_score_queens_v2')} * (earnings_shadow_confidence_citywide_v2_base * sample_support_strength_shadow)")} AS earnings_shadow_score_queens_v2,
+        earnings_shadow_confidence_citywide_v2_base * sample_support_strength_shadow AS earnings_shadow_confidence_brooklyn_v2,
+        {clip01(f"{clip01('positive_score_brooklyn_v2 - negative_score_brooklyn_v2')} * (earnings_shadow_confidence_citywide_v2_base * sample_support_strength_shadow)")} AS earnings_shadow_score_brooklyn_v2,
+        earnings_shadow_confidence_citywide_v2_base * sample_support_strength_shadow AS earnings_shadow_confidence_staten_island_v2,
+        {clip01(f"{clip01('positive_score_staten_island_v2 - negative_score_staten_island_v2')} * (earnings_shadow_confidence_citywide_v2_base * sample_support_strength_shadow)")} AS earnings_shadow_score_staten_island_v2,
+        {clip01('0.75 * earnings_shadow_confidence_citywide_v2_base + 0.25 * COALESCE(balanced_trip_share_n, 0.0)')} * sample_support_strength_shadow AS earnings_shadow_confidence_manhattan_v3,
+        {clip01(f"{clip01('positive_score_manhattan_v3 - negative_score_manhattan_v3')} * ({clip01('0.75 * earnings_shadow_confidence_citywide_v2_base + 0.25 * COALESCE(balanced_trip_share_n, 0.0)')} * sample_support_strength_shadow)")} AS earnings_shadow_score_manhattan_v3,
+        {clip01('0.85 * earnings_shadow_confidence_citywide_v2_base + 0.15 * demand_support_n')} * sample_support_strength_shadow AS earnings_shadow_confidence_bronx_wash_heights_v3,
+        {clip01(f"{clip01('positive_score_bronx_wash_heights_v3 - negative_score_bronx_wash_heights_v3')} * ({clip01('0.85 * earnings_shadow_confidence_citywide_v2_base + 0.15 * demand_support_n')} * sample_support_strength_shadow)")} AS earnings_shadow_score_bronx_wash_heights_v3,
+        {clip01('0.85 * earnings_shadow_confidence_citywide_v2_base + 0.15 * demand_support_n')} * sample_support_strength_shadow AS earnings_shadow_confidence_queens_v3,
+        {clip01(f"{clip01('positive_score_queens_v3 - negative_score_queens_v3')} * ({clip01('0.85 * earnings_shadow_confidence_citywide_v2_base + 0.15 * demand_support_n')} * sample_support_strength_shadow)")} AS earnings_shadow_score_queens_v3,
+        {clip01('0.85 * earnings_shadow_confidence_citywide_v2_base + 0.15 * demand_support_n')} * sample_support_strength_shadow AS earnings_shadow_confidence_brooklyn_v3,
+        {clip01(f"{clip01('positive_score_brooklyn_v3 - negative_score_brooklyn_v3')} * ({clip01('0.85 * earnings_shadow_confidence_citywide_v2_base + 0.15 * demand_support_n')} * sample_support_strength_shadow)")} AS earnings_shadow_score_brooklyn_v3,
+        {clip01('0.80 * earnings_shadow_confidence_citywide_v2_base + 0.20 * COALESCE(balanced_trip_share_n, 0.0)')} * sample_support_strength_shadow AS earnings_shadow_confidence_staten_island_v3,
+        {clip01(f"{clip01('positive_score_staten_island_v3 - negative_score_staten_island_v3')} * ({clip01('0.80 * earnings_shadow_confidence_citywide_v2_base + 0.20 * COALESCE(balanced_trip_share_n, 0.0)')} * sample_support_strength_shadow)")} AS earnings_shadow_score_staten_island_v3,
+        {clip01('0.85 * earnings_shadow_confidence_citywide_v2_base + 0.15 * demand_support_n')} * sample_support_strength_shadow AS earnings_shadow_confidence_citywide_v3,
         {clip01('shadow_score_raw_citywide_v3 * citywide_manhattan_saturation_discount_factor_n')} AS earnings_shadow_score_citywide_v3_anchor_shadow,
-        {clip01(f"shadow_score_raw_citywide_v3 * {clip01('0.85 * earnings_shadow_confidence_citywide_v2 + 0.15 * demand_support_n')} * citywide_manhattan_saturation_discount_factor_n")} AS earnings_shadow_score_citywide_v3
+        {clip01(f"shadow_score_raw_citywide_v3 * ({clip01('0.85 * earnings_shadow_confidence_citywide_v2_base + 0.15 * demand_support_n')} * sample_support_strength_shadow) * citywide_manhattan_saturation_discount_factor_n")} AS earnings_shadow_score_citywide_v3
       FROM scored
     ),
     candidate_trap_adjusted AS (
@@ -1187,12 +1241,12 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
           {clip01('earnings_shadow_score_queens_v3 * queens_trap_adjustment_factor')} AS earnings_shadow_score_queens_v3_trap_candidate,
           {clip01('earnings_shadow_score_brooklyn_v3 * brooklyn_trap_adjustment_factor')} AS earnings_shadow_score_brooklyn_v3_trap_candidate,
           {clip01('earnings_shadow_score_staten_island_v3 * staten_island_trap_adjustment_factor')} AS earnings_shadow_score_staten_island_v3_trap_candidate,
-          {clip01('0.82 * earnings_shadow_confidence_citywide_v3 + 0.18 * (1.0 - safe_return_risk + safe_escape_quality) / 2.0')} AS earnings_shadow_confidence_citywide_v3_trap_candidate,
-          {clip01('0.82 * earnings_shadow_confidence_manhattan_v3 + 0.18 * (1.0 - safe_return_risk + safe_escape_quality) / 2.0')} AS earnings_shadow_confidence_manhattan_v3_trap_candidate,
-          {clip01('0.82 * earnings_shadow_confidence_bronx_wash_heights_v3 + 0.18 * (1.0 - safe_return_risk + safe_escape_quality) / 2.0')} AS earnings_shadow_confidence_bronx_wash_heights_v3_trap_candidate,
-          {clip01('0.82 * earnings_shadow_confidence_queens_v3 + 0.18 * (1.0 - safe_return_risk + safe_escape_quality) / 2.0')} AS earnings_shadow_confidence_queens_v3_trap_candidate,
-          {clip01('0.82 * earnings_shadow_confidence_brooklyn_v3 + 0.18 * (1.0 - safe_return_risk + safe_escape_quality) / 2.0')} AS earnings_shadow_confidence_brooklyn_v3_trap_candidate,
-          {clip01('0.82 * earnings_shadow_confidence_staten_island_v3 + 0.18 * (1.0 - safe_return_risk + safe_escape_quality) / 2.0')} AS earnings_shadow_confidence_staten_island_v3_trap_candidate,
+          {clip01('0.82 * earnings_shadow_confidence_citywide_v3 + 0.18 * (1.0 - safe_return_risk + safe_escape_quality) / 2.0')} * sample_support_strength_shadow AS earnings_shadow_confidence_citywide_v3_trap_candidate,
+          {clip01('0.82 * earnings_shadow_confidence_manhattan_v3 + 0.18 * (1.0 - safe_return_risk + safe_escape_quality) / 2.0')} * sample_support_strength_shadow AS earnings_shadow_confidence_manhattan_v3_trap_candidate,
+          {clip01('0.82 * earnings_shadow_confidence_bronx_wash_heights_v3 + 0.18 * (1.0 - safe_return_risk + safe_escape_quality) / 2.0')} * sample_support_strength_shadow AS earnings_shadow_confidence_bronx_wash_heights_v3_trap_candidate,
+          {clip01('0.82 * earnings_shadow_confidence_queens_v3 + 0.18 * (1.0 - safe_return_risk + safe_escape_quality) / 2.0')} * sample_support_strength_shadow AS earnings_shadow_confidence_queens_v3_trap_candidate,
+          {clip01('0.82 * earnings_shadow_confidence_brooklyn_v3 + 0.18 * (1.0 - safe_return_risk + safe_escape_quality) / 2.0')} * sample_support_strength_shadow AS earnings_shadow_confidence_brooklyn_v3_trap_candidate,
+          {clip01('0.82 * earnings_shadow_confidence_staten_island_v3 + 0.18 * (1.0 - safe_return_risk + safe_escape_quality) / 2.0')} * sample_support_strength_shadow AS earnings_shadow_confidence_staten_island_v3_trap_candidate,
           ({clip01('earnings_shadow_score_citywide_v3 * citywide_trap_adjustment_factor')} - earnings_shadow_score_citywide_v3) AS earnings_shadow_delta_citywide_v3_trap_candidate,
           ({clip01('earnings_shadow_score_manhattan_v3 * manhattan_trap_adjustment_factor')} - earnings_shadow_score_manhattan_v3) AS earnings_shadow_delta_manhattan_v3_trap_candidate,
           ({clip01('earnings_shadow_score_bronx_wash_heights_v3 * bronx_wash_heights_trap_adjustment_factor')} - earnings_shadow_score_bronx_wash_heights_v3) AS earnings_shadow_delta_bronx_wash_heights_v3_trap_candidate,
@@ -1253,6 +1307,8 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
       demand_density_now_n,
       demand_density_next_n,
       demand_support_n AS demand_support_n_shadow,
+      window_trip_count_shadow,
+      sample_support_strength_shadow,
       density_support_n AS density_support_n_shadow,
       effective_demand_density_now_n AS effective_demand_density_now_n_shadow,
       effective_demand_density_next_n AS effective_demand_density_next_n_shadow,
