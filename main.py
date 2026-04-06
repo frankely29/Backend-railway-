@@ -630,7 +630,6 @@ def _legacy_frame_files() -> List[Path]:
             TIMELINE_PATH,
             ASSISTANT_OUTLOOK_PATH,
             FRAMES_DIR / "scoring_shadow_manifest.json",
-            DAY_TENDENCY_MODEL_PATH,
         ]
     )
 
@@ -1464,7 +1463,6 @@ def _prune_redundant_db_backed_artifact_files() -> Dict[str, Any]:
         removed_paths.append(str(ASSISTANT_OUTLOOK_PATH))
         bytes_freed_estimate += int(assistant_outlook_pruned_bytes)
     prune_targets = [
-        (DAY_TENDENCY_MODEL_PATH, "day_tendency_model"),
         (FRAMES_DIR / "scoring_shadow_manifest.json", "scoring_shadow_manifest"),
     ]
     for target_path, artifact_key in prune_targets:
@@ -1512,7 +1510,6 @@ def _artifact_runtime_policy_snapshot() -> Dict[str, Any]:
         "db_mirrored_optional": ["timeline"],
         "must_not_remain_on_volume": [
             "frames/assistant_outlook.json",
-            "day_tendency/model.json",
             "frames/scoring_shadow_manifest.json",
         ],
     }
@@ -2513,12 +2510,11 @@ def _build_day_tendency_only(bin_minutes: int = DEFAULT_BIN_MINUTES) -> Dict[str
         out_dir=DAY_TENDENCY_DIR,
         zones_geojson_path=zones_path,
         bin_minutes=bin_minutes,
-        persist_file=False,
+        persist_file=True,
     )
     try:
         model_payload = ((result or {}).get("payload") if isinstance(result, dict) else None) or _read_day_tendency_model()
         save_generated_artifact("day_tendency_model", model_payload, compress=False)
-        DAY_TENDENCY_MODEL_PATH.unlink(missing_ok=True)
         _prune_redundant_db_backed_artifact_files()
     except Exception:
         print("[warn] unable to persist day tendency model into generated_artifact_store")
@@ -2752,7 +2748,6 @@ def _generate_worker(
     month_key: Optional[str] = None,
     build_all_months: bool = False,
 ) -> None:
-    from build_day_tendency import build_day_tendency_model
     from build_hotspot import ensure_zones_geojson, build_hotspots_frames
 
     global _last_failed_month_key, _last_failed_at_unix, _last_failed_error
@@ -2850,6 +2845,23 @@ def _generate_worker(
             build_results[mk] = month_result
         manifest_payload = _persist_month_manifest(months_manifest)
         _prune_legacy_frame_files_after_monthly_ready()
+        rebuilt_day_tendency_result: Dict[str, Any] = {
+            "ok": False,
+            "skipped": True,
+            "warning": None,
+        }
+        try:
+            rebuilt_day_tendency_result = _build_day_tendency_only(bin_minutes)
+            if isinstance(rebuilt_day_tendency_result, dict):
+                rebuilt_day_tendency_result.setdefault("skipped", False)
+        except Exception as day_tendency_exc:
+            print("[warn] automatic day_tendency rebuild after monthly publish failed")
+            print(traceback.format_exc())
+            rebuilt_day_tendency_result = {
+                "ok": False,
+                "skipped": False,
+                "warning": f"post_publish_day_tendency_failed: {str(day_tendency_exc)}",
+            }
         active_month_key = resolve_active_month_key(
             datetime.now(timezone.utc).astimezone(NYC_TZ),
             list(manifest_payload.get("available_month_keys") or []),
@@ -2862,36 +2874,10 @@ def _generate_worker(
             "available_month_keys": list(manifest_payload.get("available_month_keys") or []),
             "month_results": build_results,
         }
-        day_tendency_result: Dict[str, Any] = {
-            "ok": False,
-            "skipped": not include_day_tendency,
-            "warning": None,
-        }
+        day_tendency_result: Dict[str, Any] = dict(rebuilt_day_tendency_result or {})
+        day_tendency_result["trigger"] = "post_month_publish"
         if include_day_tendency:
-            try:
-                day_tendency_result = build_day_tendency_model(
-                    parquet_files=parquets,
-                    out_dir=DAY_TENDENCY_DIR,
-                    zones_geojson_path=zones_path,
-                    bin_minutes=bin_minutes,
-                    persist_file=False,
-                )
-                try:
-                    model_payload = ((day_tendency_result or {}).get("payload") if isinstance(day_tendency_result, dict) else None) or _read_day_tendency_model()
-                    save_generated_artifact("day_tendency_model", model_payload, compress=False)
-                    DAY_TENDENCY_MODEL_PATH.unlink(missing_ok=True)
-                    _prune_redundant_db_backed_artifact_files()
-                except Exception:
-                    print("[warn] unable to persist day tendency model into generated_artifact_store")
-                    print(traceback.format_exc())
-            except Exception as day_tendency_exc:
-                print("[warn] optional day_tendency build failed")
-                print(traceback.format_exc())
-                day_tendency_result = {
-                    "ok": False,
-                    "warning": f"optional_day_tendency_failed: {str(day_tendency_exc)}",
-                    "skipped": False,
-                }
+            day_tendency_result["requested_include_day_tendency"] = True
         result = {
             "frames": frames_result,
             "day_tendency": day_tendency_result,

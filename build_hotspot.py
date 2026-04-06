@@ -965,8 +965,6 @@ def build_hotspots_frames(
     temp_root.mkdir(parents=True, exist_ok=True)
     temp_run_dir_ctx = tempfile.TemporaryDirectory(prefix="build_", dir=str(temp_root))
     temp_run_dir = Path(temp_run_dir_ctx.name)
-    duckdb_tmp_dir = temp_run_dir / "duckdb_tmp"
-    duckdb_tmp_dir.mkdir(parents=True, exist_ok=True)
     resolved_exact_history_dir = Path(exact_history_dir) if exact_history_dir is not None else (out_dir.parent / "exact_history")
     resolved_exact_history_stage_dir = (
         Path(exact_history_stage_dir)
@@ -982,6 +980,8 @@ def build_hotspots_frames(
     if resolved_exact_history_stage_dir.exists():
         shutil.rmtree(resolved_exact_history_stage_dir, ignore_errors=True)
     resolved_exact_history_stage_dir.mkdir(parents=True, exist_ok=True)
+    duckdb_tmp_dir = stage_dir / ".duckdb_tmp"
+    duckdb_tmp_dir.mkdir(parents=True, exist_ok=True)
     exact_history_db_path = resolved_exact_history_dir / "exact_shadow.duckdb"
     staged_exact_history_db_path = resolved_exact_history_stage_dir / "exact_shadow.duckdb"
     resolved_timeline_output_path = Path(timeline_output_path) if timeline_output_path is not None else (out_dir / "timeline.json")
@@ -1047,7 +1047,7 @@ def build_hotspots_frames(
             connection.execute("PRAGMA enable_progress_bar=false")
             connection.execute("PRAGMA threads=1")
             connection.execute(f"PRAGMA temp_directory='{duckdb_tmp_dir.as_posix()}'")
-            memory_limit = str(os.environ.get("DUCKDB_MEMORY_LIMIT", "256MB")).strip() or "256MB"
+            memory_limit = str(os.environ.get("DUCKDB_MEMORY_LIMIT", "192MB")).strip() or "192MB"
             connection.execute(f"PRAGMA memory_limit='{memory_limit}'")
             connection.execute(
                 "CREATE TEMP TABLE zone_geometry_metrics (PULocationID INTEGER, zone_area_sq_miles DOUBLE, centroid_latitude DOUBLE)"
@@ -1127,16 +1127,15 @@ def build_hotspots_frames(
                     connection.execute(
                         f"""
                         CREATE OR REPLACE TABLE exact_shadow_rows AS
-                        {shadow_sql}
+                        SELECT * FROM ({shadow_sql}) WHERE 1=0
                         """
                     )
-                else:
-                    connection.execute(
-                        f"""
-                        INSERT INTO exact_shadow_rows
-                        {shadow_sql}
-                        """
-                    )
+                connection.execute(
+                    f"""
+                    INSERT INTO exact_shadow_rows
+                    {shadow_sql}
+                    """
+                )
                 rows_total = int(connection.execute("SELECT COUNT(*) FROM exact_shadow_rows").fetchone()[0] or 0)
                 connection.execute("CHECKPOINT")
                 return rows_total
@@ -1144,55 +1143,61 @@ def build_hotspots_frames(
                 connection.close()
 
         for local_date in month_local_dates:
-            local_start = datetime.combine(local_date, dt_time.min, tzinfo=NYC_TZ)
-            local_end = local_start + timedelta(days=1)
-            try:
-                rows_total_in_shadow = _append_shadow_slice(
-                    utc_start=_utc_iso(local_start),
-                    utc_end=_utc_iso(local_end),
-                    create_table=not has_materialized_shadow_rows,
-                )
-                has_materialized_shadow_rows = True
-            except Exception as day_exc:
-                if not _is_memory_error(day_exc):
-                    raise
-                logger.warning(
-                    "exact_history_day_slice_oom_retry month_key=%s local_date=%s error=%s",
-                    month_key,
-                    local_date.isoformat(),
-                    str(day_exc),
-                )
-                sub_slice_failed = False
-                for hour_start in (0, 6, 12, 18):
-                    sub_local_start = local_start + timedelta(hours=hour_start)
-                    sub_local_end = min(local_end, sub_local_start + timedelta(hours=6))
-                    try:
-                        rows_total_in_shadow = _append_shadow_slice(
-                            utc_start=_utc_iso(sub_local_start),
-                            utc_end=_utc_iso(sub_local_end),
-                            create_table=not has_materialized_shadow_rows,
-                        )
-                        has_materialized_shadow_rows = True
-                    except Exception as sub_exc:
-                        sub_slice_failed = True
-                        logger.exception(
-                            "exact_history_day_subslice_failed month_key=%s local_date=%s hour_start=%d error=%s",
+            local_day_start = datetime.combine(local_date, dt_time.min, tzinfo=NYC_TZ)
+            for window_start_hour in (0, 6, 12, 18):
+                window_local_start = local_day_start + timedelta(hours=window_start_hour)
+                window_local_end = window_local_start + timedelta(hours=6)
+                local_window_label = f"{window_start_hour:02d}:00-{(window_start_hour + 6):02d}:00"
+                try:
+                    rows_total_in_shadow = _append_shadow_slice(
+                        utc_start=_utc_iso(window_local_start),
+                        utc_end=_utc_iso(window_local_end),
+                        create_table=not has_materialized_shadow_rows,
+                    )
+                    has_materialized_shadow_rows = True
+                except Exception as slice_exc:
+                    if not _is_memory_error(slice_exc):
+                        raise
+                    logger.warning(
+                        "exact_history_slice_oom_retry month_key=%s local_date=%s local_window=%s error=%s",
+                        month_key,
+                        local_date.isoformat(),
+                        local_window_label,
+                        str(slice_exc),
+                    )
+                    for sub_hour in range(window_start_hour, window_start_hour + 6):
+                        sub_local_start = local_day_start + timedelta(hours=sub_hour)
+                        sub_local_end = sub_local_start + timedelta(hours=1)
+                        sub_window_label = f"{sub_hour:02d}:00-{(sub_hour + 1):02d}:00"
+                        try:
+                            rows_total_in_shadow = _append_shadow_slice(
+                                utc_start=_utc_iso(sub_local_start),
+                                utc_end=_utc_iso(sub_local_end),
+                                create_table=not has_materialized_shadow_rows,
+                            )
+                            has_materialized_shadow_rows = True
+                        except Exception as sub_exc:
+                            if _is_memory_error(sub_exc):
+                                raise RuntimeError(
+                                    f"Failed to build exact-history month slice month_key={month_key} local_date={local_date.isoformat()} local_window={sub_window_label}"
+                                ) from sub_exc
+                            raise
+                        logger.info(
+                            "exact_history_slice_append_done month_key=%s local_date=%s local_window=%s rows_total=%d",
                             month_key,
                             local_date.isoformat(),
-                            hour_start,
-                            str(sub_exc),
+                            sub_window_label,
+                            rows_total_in_shadow,
                         )
-                        break
-                if sub_slice_failed:
-                    raise RuntimeError(
-                        f"Failed to build exact-history daily slice for local_date={local_date.isoformat()} after 6-hour retries"
-                    ) from day_exc
-            logger.info(
-                "exact_history_day_append_done month_key=%s local_date=%s rows_total=%d",
-                month_key,
-                local_date.isoformat(),
-                rows_total_in_shadow,
-            )
+                    continue
+
+                logger.info(
+                    "exact_history_slice_append_done month_key=%s local_date=%s local_window=%s rows_total=%d",
+                    month_key,
+                    local_date.isoformat(),
+                    local_window_label,
+                    rows_total_in_shadow,
+                )
 
         if not has_materialized_shadow_rows:
             raise RuntimeError("No parquet files available for exact-history append.")
