@@ -2833,11 +2833,16 @@ def _generate_worker(
             timeline = timeline_payload.get("timeline") or []
             print(f"monthly_partition_build_done month_key={mk} frame_count={len(timeline)}")
             print(f"monthly_partition_publish_done month_key={mk}")
+            store_path = month_dir / "exact_shadow.duckdb"
+            store_exists = bool(store_path.exists() and store_path.is_file() and store_path.stat().st_size > 0)
+            timeline_exists = bool(timeline_path.exists() and timeline_path.is_file() and timeline_path.stat().st_size > 0)
+            if not store_exists or not timeline_exists:
+                raise RuntimeError(f"Monthly publish verification failed for {mk}")
             months_manifest[mk] = {
                 "month_key": mk,
                 "source_parquet_filenames": [p.name for p in (grouped_parquets.get(mk) or [])],
-                "store_exists": (month_dir / "exact_shadow.duckdb").exists(),
-                "timeline_exists": timeline_path.exists(),
+                "store_exists": store_exists,
+                "timeline_exists": timeline_exists,
                 "first_frame_datetime": timeline[0] if timeline else None,
                 "last_frame_datetime": timeline[-1] if timeline else None,
                 "frame_count": int(len(timeline)),
