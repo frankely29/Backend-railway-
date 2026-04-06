@@ -169,6 +169,8 @@ PRESENCE_SNAPSHOT_MAX_LIMIT = int(os.environ.get("PRESENCE_SNAPSHOT_MAX_LIMIT", 
 AVATAR_THUMB_IMMUTABLE_CACHE_SECONDS = int(os.environ.get("AVATAR_THUMB_IMMUTABLE_CACHE_SECONDS", str(30 * 24 * 3600)))
 AVATAR_BACKFILL_BATCH_SIZE = int(os.environ.get("AVATAR_BACKFILL_BATCH_SIZE", "25"))
 STORAGE_CLEANUP_INTERVAL_SECONDS = int(os.environ.get("STORAGE_CLEANUP_INTERVAL_SECONDS", "21600"))
+MONTH_BUILD_STALE_DIR_MAX_AGE_SEC = int(os.environ.get("MONTH_BUILD_STALE_DIR_MAX_AGE_SEC", "1800"))
+MONTH_BUILD_FAILURE_BACKOFF_SEC = int(os.environ.get("MONTH_BUILD_FAILURE_BACKOFF_SEC", "30"))
 
 TRAP_CANDIDATE_PROMOTION_READINESS_CONFIG: Dict[str, Dict[str, Any]] = {
     "citywide_v3_trap_candidate": {
@@ -303,6 +305,9 @@ _cleanup_last_periodic_freed_bytes_estimate = 0
 _cleanup_last_periodic_ran_at_unix = 0
 _reconcile_last_periodic_deleted_paths: List[str] = []
 _reconcile_last_periodic_ran_at_unix = 0
+_last_failed_month_key: Optional[str] = None
+_last_failed_at_unix: Optional[int] = None
+_last_failed_error: Optional[str] = None
 _to_3857 = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
 _to_4326 = Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
 
@@ -550,6 +555,111 @@ def _month_store_path(month_key: str) -> Path:
     return _month_dir(month_key) / "exact_shadow.duckdb"
 
 
+def _dir_is_stale(path: Path, now_unix: float, min_age_sec: int) -> bool:
+    try:
+        if not path.exists() or not path.is_dir():
+            return False
+        return (now_unix - float(path.stat().st_mtime)) >= float(min_age_sec)
+    except Exception:
+        return False
+
+
+def _count_stale_subdirs(root_dir: Path, min_age_sec: int = MONTH_BUILD_STALE_DIR_MAX_AGE_SEC) -> int:
+    if not root_dir.exists() or not root_dir.is_dir():
+        return 0
+    now_unix = time.time()
+    count = 0
+    for child in root_dir.iterdir():
+        if not child.is_dir():
+            continue
+        if _dir_is_stale(child, now_unix, int(min_age_sec)):
+            count += 1
+    return int(count)
+
+
+def _prune_stale_month_build_dirs(min_age_sec: int = MONTH_BUILD_STALE_DIR_MAX_AGE_SEC) -> Dict[str, Any]:
+    removed_paths: List[str] = []
+    now_unix = time.time()
+    EXACT_HISTORY_MONTHS_BUILDING_DIR.mkdir(parents=True, exist_ok=True)
+    for child in EXACT_HISTORY_MONTHS_BUILDING_DIR.iterdir():
+        if not child.is_dir():
+            continue
+        if not _dir_is_stale(child, now_unix, int(min_age_sec)):
+            continue
+        try:
+            shutil.rmtree(child, ignore_errors=False)
+            removed_paths.append(str(child))
+        except Exception:
+            traceback.print_exc()
+    print(f"stale_month_build_cleanup_done removed_count={len(removed_paths)}")
+    return {"removed_paths": removed_paths, "removed_count": len(removed_paths)}
+
+
+def _prune_stale_month_backup_dirs(min_age_sec: int = MONTH_BUILD_STALE_DIR_MAX_AGE_SEC) -> Dict[str, Any]:
+    removed_paths: List[str] = []
+    now_unix = time.time()
+    EXACT_HISTORY_MONTHS_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    for child in EXACT_HISTORY_MONTHS_BACKUP_DIR.iterdir():
+        if not child.is_dir():
+            continue
+        if not _dir_is_stale(child, now_unix, int(min_age_sec)):
+            continue
+        try:
+            shutil.rmtree(child, ignore_errors=False)
+            removed_paths.append(str(child))
+        except Exception:
+            traceback.print_exc()
+    print(f"stale_month_backup_cleanup_done removed_count={len(removed_paths)}")
+    return {"removed_paths": removed_paths, "removed_count": len(removed_paths)}
+
+
+def _legacy_frame_files() -> List[Path]:
+    return sorted(list(FRAMES_DIR.glob("frame_*.json")) + [TIMELINE_PATH])
+
+
+def _legacy_frame_file_count() -> int:
+    return sum(1 for p in _legacy_frame_files() if p.exists() and p.is_file())
+
+
+def _monthly_mode_ready_for_legacy_cleanup() -> bool:
+    manifest = _load_month_manifest()
+    available_month_keys = list(manifest.get("available_month_keys") or [])
+    if not available_month_keys:
+        return False
+    if not (MONTH_MANIFEST_PATH.exists() and MONTH_MANIFEST_PATH.is_file() and MONTH_MANIFEST_PATH.stat().st_size > 0):
+        return False
+    for mk in available_month_keys:
+        timeline_path = _month_timeline_path(mk)
+        store_path = _month_store_path(mk)
+        if (
+            timeline_path.exists()
+            and timeline_path.is_file()
+            and timeline_path.stat().st_size > 0
+            and store_path.exists()
+            and store_path.is_file()
+            and store_path.stat().st_size > 0
+        ):
+            return True
+    return False
+
+
+def _prune_legacy_frame_files_after_monthly_ready() -> Dict[str, Any]:
+    if not _monthly_mode_ready_for_legacy_cleanup():
+        return {"removed_paths": [], "removed_count": 0}
+    removed_paths: List[str] = []
+    for target in _legacy_frame_files():
+        try:
+            if not target.exists() or not target.is_file():
+                continue
+            target.unlink(missing_ok=True)
+            if not target.exists():
+                removed_paths.append(str(target))
+        except Exception:
+            traceback.print_exc()
+    print(f"legacy_frame_cleanup_done removed_count={len(removed_paths)}")
+    return {"removed_paths": removed_paths, "removed_count": len(removed_paths)}
+
+
 def _available_source_month_keys() -> List[str]:
     grouped = _group_parquets_by_month(_list_parquets())
     return sorted(grouped.keys())
@@ -687,6 +797,18 @@ def _preparing_month_response(
             "Cache-Control": "no-store",
         },
     )
+
+
+def _recent_month_failure_backoff_remaining(month_key: str, now_unix: Optional[int] = None) -> int:
+    now_val = int(now_unix if now_unix is not None else time.time())
+    if str(month_key or "").strip() != str(_last_failed_month_key or "").strip():
+        return 0
+    failed_at = int(_last_failed_at_unix or 0)
+    if failed_at <= 0:
+        return 0
+    elapsed = max(0, now_val - failed_at)
+    remaining = int(MONTH_BUILD_FAILURE_BACKOFF_SEC) - int(elapsed)
+    return max(0, int(remaining))
 
 
 def _artifact_freshness_snapshot() -> Dict[str, Any]:
@@ -1330,6 +1452,10 @@ def _prune_redundant_db_backed_artifact_files() -> Dict[str, Any]:
                 bytes_freed_estimate += size
         except Exception:
             continue
+    legacy_prune_result = _prune_legacy_frame_files_after_monthly_ready()
+    for legacy_path in legacy_prune_result.get("removed_paths") or []:
+        if legacy_path not in removed_paths:
+            removed_paths.append(legacy_path)
     return {
         "removed_paths": removed_paths,
         "removed_count": len(removed_paths),
@@ -1471,7 +1597,13 @@ def _start_storage_cleanup_sweeper() -> None:
                 time.sleep(max(60, int(STORAGE_CLEANUP_INTERVAL_SECONDS)))
                 cleanup_result = cleanup_artifact_storage(DATA_DIR, FRAMES_DIR)
                 prune_result = _prune_redundant_db_backed_artifact_files()
+                stale_build_prune = _prune_stale_month_build_dirs()
+                stale_backup_prune = _prune_stale_month_backup_dirs()
+                legacy_prune = _prune_legacy_frame_files_after_monthly_ready()
                 removed_count = int(cleanup_result.get("removed_count") or 0) + int(prune_result.get("removed_count") or 0)
+                removed_count += int(stale_build_prune.get("removed_count") or 0)
+                removed_count += int(stale_backup_prune.get("removed_count") or 0)
+                removed_count += int(legacy_prune.get("removed_count") or 0)
                 bytes_freed = int(cleanup_result.get("bytes_freed_estimate") or 0) + int(prune_result.get("bytes_freed_estimate") or 0)
                 _cleanup_last_periodic_removed_count = removed_count
                 _cleanup_last_periodic_freed_bytes_estimate = bytes_freed
@@ -2490,6 +2622,14 @@ def _ensure_requested_month_available_or_start_generate(
 ) -> Optional[JSONResponse]:
     if _month_partition_ready(month_key):
         return None
+    remaining_backoff = _recent_month_failure_backoff_remaining(month_key)
+    if remaining_backoff > 0:
+        return _preparing_month_response(
+            month_key=month_key,
+            request_kind=request_kind,
+            generate_started=False,
+            retry_after_sec=max(int(retry_after_sec), int(remaining_backoff)),
+        )
 
     state = _get_state()
     thread_alive = _generate_thread_alive()
@@ -2558,6 +2698,7 @@ def _generate_worker(
     from build_day_tendency import build_day_tendency_model
     from build_hotspot import ensure_zones_geojson, build_hotspots_frames
 
+    global _last_failed_month_key, _last_failed_at_unix, _last_failed_error
     start = time.time()
     _set_state(
         state="running",
@@ -2579,6 +2720,8 @@ def _generate_worker(
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         FRAMES_DIR.mkdir(parents=True, exist_ok=True)
+        _prune_stale_month_build_dirs()
+        _prune_stale_month_backup_dirs()
 
         zones_path = ensure_zones_geojson(DATA_DIR, force=False)
 
@@ -2646,6 +2789,7 @@ def _generate_worker(
             }
             build_results[mk] = month_result
         manifest_payload = _persist_month_manifest(months_manifest)
+        _prune_legacy_frame_files_after_monthly_ready()
         active_month_key = resolve_active_month_key(
             datetime.now(timezone.utc).astimezone(NYC_TZ),
             list(manifest_payload.get("available_month_keys") or []),
@@ -2707,6 +2851,11 @@ def _generate_worker(
             duration_sec=round(end - start, 2),
             result=result,
         )
+        _last_failed_month_key = None
+        _last_failed_at_unix = None
+        _last_failed_error = None
+        _prune_stale_month_build_dirs()
+        _prune_stale_month_backup_dirs()
 
     except Exception as e:
         end = time.time()
@@ -2729,6 +2878,9 @@ def _generate_worker(
                 "storage_report": storage_report,
             },
         )
+        _last_failed_month_key = str(month_key).strip() if month_key else None
+        _last_failed_at_unix = int(end)
+        _last_failed_error = str(error_text)
     finally:
         _clear_lock(expected_token=run_token)
         global _generate_thread
@@ -2782,6 +2934,8 @@ def start_generate(
         lock_present = _lock_is_present()
         if not thread_alive:
             cleanup_result = cleanup_artifact_storage(DATA_DIR, FRAMES_DIR)
+            _prune_stale_month_build_dirs()
+            _prune_stale_month_backup_dirs()
             if force_clear_lock and lock_present:
                 _clear_lock()
                 lock_cleared = True
@@ -4407,7 +4561,13 @@ def startup():
         # Safety guard: never auto-delete source parquet files, frame_*.json, or taxi_zones.geojson.
         cleanup_result = cleanup_artifact_storage(DATA_DIR, FRAMES_DIR)
         prune_result = _prune_redundant_db_backed_artifact_files()
+        stale_build_prune = _prune_stale_month_build_dirs()
+        stale_backup_prune = _prune_stale_month_backup_dirs()
+        legacy_prune = _prune_legacy_frame_files_after_monthly_ready()
         removed_count = int(cleanup_result.get("removed_count") or 0) + int(prune_result.get("removed_count") or 0)
+        removed_count += int(stale_build_prune.get("removed_count") or 0)
+        removed_count += int(stale_backup_prune.get("removed_count") or 0)
+        removed_count += int(legacy_prune.get("removed_count") or 0)
         bytes_freed = int(cleanup_result.get("bytes_freed_estimate") or 0) + int(prune_result.get("bytes_freed_estimate") or 0)
         _cleanup_last_startup_removed_count = removed_count
         _cleanup_last_startup_freed_bytes_estimate = bytes_freed
@@ -4589,6 +4749,11 @@ def status():
     pending_month_key = str(generate_state.get("month_key") or "").strip() if state_name in {"started", "running"} else ""
     pending_month_key = pending_month_key or None
     pending_month_label = _format_month_key_label(pending_month_key) if pending_month_key else None
+    last_failed_month_key = str(_last_failed_month_key or "").strip() or None
+    last_failed_month_label = _format_month_key_label(last_failed_month_key) if last_failed_month_key else None
+    stale_month_build_dirs_count = _count_stale_subdirs(EXACT_HISTORY_MONTHS_BUILDING_DIR)
+    stale_month_backup_dirs_count = _count_stale_subdirs(EXACT_HISTORY_MONTHS_BACKUP_DIR)
+    legacy_frame_file_count = _legacy_frame_file_count()
     active_month_core_ready = bool(
         MONTH_MANIFEST_PATH.exists()
         and month_manifest.get("months", {}).get(active_month_key)
@@ -4670,6 +4835,13 @@ def status():
         "active_month_timeline_present": timeline_file_present,
         "pending_month_key": pending_month_key,
         "pending_month_label": pending_month_label,
+        "last_failed_month_key": last_failed_month_key,
+        "last_failed_month_label": last_failed_month_label,
+        "last_failed_at_unix": _last_failed_at_unix,
+        "last_failed_error": _last_failed_error,
+        "stale_month_build_dirs_count": stale_month_build_dirs_count,
+        "stale_month_backup_dirs_count": stale_month_backup_dirs_count,
+        "legacy_frame_file_count": legacy_frame_file_count,
         "generated_artifact_store_report": generated_artifact_report(),
         "artifact_runtime_policy": _artifact_runtime_policy_snapshot(),
         "artifact_runtime_integrity": artifact_runtime_integrity,
