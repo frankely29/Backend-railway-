@@ -1333,7 +1333,7 @@ def build_hotspots_frames(
                             raise RuntimeError(
                                 "Failed to build exact-history month slice "
                                 f"month_key={month_key} local_date={local_date.isoformat()} "
-                                f"local_window={sub_window_label}"
+                                f"local_window={sub_window_label} cause={sub_exc}"
                             ) from sub_exc
                         logger.info(
                             "exact_history_slice_append_done month_key=%s local_date=%s local_window=%s rows_total=%d",
@@ -2084,6 +2084,7 @@ def build_hotspots_frames(
         if not store_verified or not timeline_verified:
             raise RuntimeError(f"Monthly publish verification failed for {month_key}")
         published_build_meta_path = resolved_exact_history_dir / "build_meta.json"
+        published_build_meta_tmp_path = resolved_exact_history_dir / "build_meta.json.tmp"
         build_meta_payload = {
             "month_key": str(month_key or "").strip() or None,
             "built_at_unix": int(datetime.now().timestamp()),
@@ -2097,10 +2098,16 @@ def build_hotspots_frames(
             "first_frame_datetime": timeline[0] if timeline else None,
             "last_frame_datetime": timeline[-1] if timeline else None,
         }
-        published_build_meta_path.write_text(
+        published_build_meta_tmp_path.write_text(
             json.dumps(build_meta_payload, separators=(",", ":")),
             encoding="utf-8",
         )
+        try:
+            with published_build_meta_tmp_path.open("rb") as tmp_reader:
+                os.fsync(tmp_reader.fileno())
+        except Exception:
+            pass
+        published_build_meta_tmp_path.replace(published_build_meta_path)
         logger.info("monthly_partition_publish_verified month_key=%s", month_key)
         logger.info("monthly_partition_publish_done month_key=%s", month_key)
 
