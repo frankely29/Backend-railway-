@@ -410,6 +410,7 @@ def evaluate_artifact_freshness(
         month_dir = data_dir / "exact_history" / "months" / active_month_key if active_month_key else None
         month_timeline_path = month_dir / "timeline.json" if month_dir else None
         month_store_path = month_dir / "exact_shadow.duckdb" if month_dir else None
+        month_build_meta_path = month_dir / "build_meta.json" if month_dir else None
         month_timeline_present = bool(
             month_timeline_path
             and month_timeline_path.exists()
@@ -422,18 +423,39 @@ def evaluate_artifact_freshness(
             and month_store_path.is_file()
             and month_store_path.stat().st_size > 0
         )
+        month_build_meta: Dict[str, Any] | None = None
+        if month_build_meta_path and month_build_meta_path.exists() and month_build_meta_path.is_file() and month_build_meta_path.stat().st_size > 0:
+            try:
+                payload = json.loads(month_build_meta_path.read_text(encoding="utf-8"))
+                if isinstance(payload, dict):
+                    month_build_meta = payload
+            except Exception:
+                month_build_meta = None
+        month_build_meta_present = bool(month_build_meta)
         if not month_timeline_present:
             reason_codes.append("active_month_timeline_missing")
         if not month_store_present:
             reason_codes.append("active_month_store_missing")
+        if not month_build_meta_present:
+            reason_codes.append("active_month_build_meta_missing")
         if active_month_key and not month_manifest_entry:
             reason_codes.append("active_month_manifest_entry_missing")
+        if month_build_meta_present:
+            if month_build_meta.get("code_dependency_hash") != expected.get("code_dependency_hash"):
+                reason_codes.append("active_month_code_dependency_hash_mismatch")
+            if month_build_meta.get("source_data_hash") != expected.get("source_data_hash"):
+                reason_codes.append("active_month_source_data_hash_mismatch")
+            if month_build_meta.get("artifact_signature") != expected.get("artifact_signature"):
+                reason_codes.append("active_month_artifact_signature_mismatch")
         sampled = {
             "mode": "monthly_exact_historical",
             "active_month_key": active_month_key or None,
             "month_manifest_present": month_manifest_present,
             "active_month_timeline_present": month_timeline_present,
             "active_month_store_present": month_store_present,
+            "active_month_build_meta_present": month_build_meta_present,
+            "active_month_build_meta_artifact_signature": (month_build_meta or {}).get("artifact_signature"),
+            "active_month_expected_artifact_signature": expected.get("artifact_signature"),
             "legacy_frame_file_sampling_skipped": True,
         }
     else:
