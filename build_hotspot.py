@@ -848,6 +848,22 @@ def build_single_frame_for_month(
     min_trips_per_window: int = 25,
 ) -> Dict[str, Any]:
     validate_zone_mode_profiles_for_live_engine()
+    requested_frame_time = to_frontend_local_iso(frame_time)
+    try:
+        frame_local_dt = datetime.fromisoformat(str(requested_frame_time))
+    except Exception as exc:
+        raise ValueError(f"Invalid frame_time for single frame build: {frame_time}") from exc
+    if frame_local_dt.tzinfo is None:
+        frame_local_dt = frame_local_dt.replace(tzinfo=NYC_TZ)
+    else:
+        frame_local_dt = frame_local_dt.astimezone(NYC_TZ)
+    window_padding_minutes = max(int(bin_minutes), 20)
+    pickup_utc_start = (
+        frame_local_dt - timedelta(minutes=(window_padding_minutes * 3))
+    ).astimezone(UTC_TZ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    pickup_utc_end = (
+        frame_local_dt + timedelta(minutes=(window_padding_minutes * 3))
+    ).astimezone(UTC_TZ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     zones = json.loads(zones_geojson_path.read_text(encoding="utf-8"))
     geom_by_id: Dict[int, Any] = {}
     name_by_id: Dict[int, str] = {}
@@ -879,6 +895,8 @@ def build_single_frame_for_month(
             parquet_sql_files,
             bin_minutes=int(bin_minutes),
             min_trips_per_window=int(min_trips_per_window),
+            pickup_utc_start=pickup_utc_start,
+            pickup_utc_end=pickup_utc_end,
             profile=ZONE_MODE_PROFILES["citywide_v2"],
             citywide_v3_profile=ZONE_MODE_PROFILES["citywide_v3"],
             manhattan_profile=ZONE_MODE_PROFILES["manhattan_v2"],
@@ -903,7 +921,7 @@ def build_single_frame_for_month(
             WHERE exact_bin_local_ts = ?
             ORDER BY PULocationID
             """,
-            [to_frontend_local_iso(frame_time)],
+            [requested_frame_time],
         )
         rows = cursor.fetchall()
         columns = [str(desc[0]) for desc in (cursor.description or [])]
@@ -933,7 +951,7 @@ def build_single_frame_for_month(
             }
         )
     _recalibrate_visible_v3_fields(features)
-    return {"time": to_frontend_local_iso(frame_time), "polygons": {"type": "FeatureCollection", "features": features}}
+    return {"time": requested_frame_time, "polygons": {"type": "FeatureCollection", "features": features}}
 
 
 def build_hotspots_frames(

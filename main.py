@@ -1195,13 +1195,43 @@ def _build_single_frame_for_month(month_key: str, frame_time: str) -> Dict[str, 
 
 def _frame_build_worker(month_key: str, idx: int, frame_time: str, run_token: str) -> None:
     key = (month_key, frame_time)
+    cache_file: Optional[Path] = None
+    temp_file: Optional[Path] = None
     try:
+        print(f"frame_cache_build_start month_key={month_key} idx={idx} frame_time={frame_time}")
         payload = _build_single_frame_for_month(month_key=month_key, frame_time=frame_time)
         cache_file = _month_frame_cache_file(month_key, idx, frame_time)
-        cache_file.parent.mkdir(parents=True, exist_ok=True)
-        cache_file.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
-    except Exception:
+        cache_dir = _month_frame_cache_dir(month_key)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        temp_file = cache_dir / f"{cache_file.name}.tmp-{uuid.uuid4().hex}"
+        encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        with temp_file.open("wb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_file, cache_file)
+        with _frame_cache_lock:
+            cache_idx = (month_key, int(idx))
+            etag = f'W/"frame-{month_key}-{idx}-{abs(hash((frame_time, len(encoded)))) & 0xffffffff:x}"'
+            _frame_cache[cache_idx] = {"data": payload, "etag": etag, "frame_time": frame_time}
+            try:
+                _frame_cache_order.remove(cache_idx)
+            except ValueError:
+                pass
+            _frame_cache_order.append(cache_idx)
+            while len(_frame_cache_order) > FRAME_CACHE_MAX:
+                evicted_idx = _frame_cache_order.popleft()
+                _frame_cache.pop(evicted_idx, None)
+        print(f"frame_cache_build_done month_key={month_key} idx={idx} frame_time={frame_time} file={cache_file}")
+    except Exception as exc:
+        print(f"frame_cache_build_failed month_key={month_key} idx={idx} frame_time={frame_time} error={exc}")
         traceback.print_exc()
+        if temp_file is not None:
+            try:
+                if temp_file.exists():
+                    temp_file.unlink()
+            except Exception:
+                pass
     finally:
         with _frame_builds_in_progress_lock:
             marker = _frame_builds_in_progress.get(key)
@@ -2738,6 +2768,17 @@ def _clear_stale_lock(max_age_sec: int = 7200) -> bool:
     return True
 
 
+def _clear_orphaned_generate_lock() -> bool:
+    if _lock_is_present() and not _generate_thread_alive():
+        _clear_lock()
+        state_now = _get_state()
+        if str(state_now.get("state") or "") == "running":
+            _set_state(state="idle")
+        print("generate_lock_orphaned_cleared")
+        return True
+    return False
+
+
 def _generate_thread_alive() -> bool:
     return bool(_generate_thread and _generate_thread.is_alive())
 
@@ -2798,6 +2839,7 @@ def _ensure_requested_month_available_or_start_generate(
     request_kind: str,
     retry_after_sec: int = 3,
 ) -> Optional[JSONResponse]:
+    _clear_orphaned_generate_lock()
     if _month_bootstrap_ready(month_key):
         return None
 
@@ -4696,6 +4738,7 @@ def startup():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     FRAMES_DIR.mkdir(parents=True, exist_ok=True)
     EXACT_HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+    _clear_orphaned_generate_lock()
     _db_init()
     ensure_generated_artifact_store_schema()
     _prune_redundant_db_backed_artifact_files()
