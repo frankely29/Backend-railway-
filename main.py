@@ -1198,12 +1198,12 @@ def _frame_build_worker(month_key: str, idx: int, frame_time: str, run_token: st
     cache_file: Optional[Path] = None
     temp_file: Optional[Path] = None
     try:
+        cache_dir = _month_frame_cache_dir(month_key)
+        cache_dir.mkdir(parents=True, exist_ok=True)
         print(f"frame_cache_build_start month_key={month_key} idx={idx} frame_time={frame_time}")
         payload = _build_single_frame_for_month(month_key=month_key, frame_time=frame_time)
         cache_file = _month_frame_cache_file(month_key, idx, frame_time)
-        cache_dir = _month_frame_cache_dir(month_key)
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        temp_file = cache_dir / f"{cache_file.name}.tmp-{uuid.uuid4().hex}"
+        temp_file = cache_file.with_suffix(f"{cache_file.suffix}.tmp")
         encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         with temp_file.open("wb") as handle:
             handle.write(encoded)
@@ -2779,6 +2779,10 @@ def _clear_orphaned_generate_lock() -> bool:
     return False
 
 
+def _clear_stale_generate_lock_if_orphaned() -> bool:
+    return _clear_orphaned_generate_lock()
+
+
 def _generate_thread_alive() -> bool:
     return bool(_generate_thread and _generate_thread.is_alive())
 
@@ -2839,7 +2843,7 @@ def _ensure_requested_month_available_or_start_generate(
     request_kind: str,
     retry_after_sec: int = 3,
 ) -> Optional[JSONResponse]:
-    _clear_orphaned_generate_lock()
+    _clear_stale_generate_lock_if_orphaned()
     if _month_bootstrap_ready(month_key):
         return None
 
@@ -4738,7 +4742,7 @@ def startup():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     FRAMES_DIR.mkdir(parents=True, exist_ok=True)
     EXACT_HISTORY_DIR.mkdir(parents=True, exist_ok=True)
-    _clear_orphaned_generate_lock()
+    _clear_stale_generate_lock_if_orphaned()
     _db_init()
     ensure_generated_artifact_store_schema()
     _prune_redundant_db_backed_artifact_files()

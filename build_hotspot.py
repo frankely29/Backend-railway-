@@ -31,6 +31,50 @@ logger = logging.getLogger(__name__)
 UTC_TZ = ZoneInfo("UTC")
 NYC_TZ = ZoneInfo("America/New_York")
 
+
+def _open_shadow_sql_connection(
+    *,
+    database_path: str,
+    zone_geometry_rows: list[dict],
+    zone_metadata_rows: list[tuple],
+    temp_directory: Path | None = None,
+    memory_limit: str | None = None,
+    read_only: bool = False,
+) -> duckdb.DuckDBPyConnection:
+    connection = duckdb.connect(database=str(database_path), read_only=bool(read_only))
+    connection.execute("PRAGMA enable_progress_bar=false")
+    connection.execute("PRAGMA threads=1")
+    if temp_directory is not None:
+        connection.execute(f"PRAGMA temp_directory='{temp_directory.as_posix()}'")
+    if memory_limit is not None:
+        memory_limit_value = str(memory_limit).strip()
+        if memory_limit_value:
+            connection.execute(f"PRAGMA memory_limit='{memory_limit_value}'")
+    connection.execute(
+        "CREATE TEMP TABLE zone_geometry_metrics (PULocationID INTEGER, zone_area_sq_miles DOUBLE, centroid_latitude DOUBLE)"
+    )
+    if zone_geometry_rows:
+        connection.executemany(
+            "INSERT INTO zone_geometry_metrics (PULocationID, zone_area_sq_miles, centroid_latitude) VALUES (?, ?, ?)",
+            [
+                (
+                    int(row["PULocationID"]),
+                    None if row["zone_area_sq_miles"] is None else float(row["zone_area_sq_miles"]),
+                    None if row.get("centroid_latitude") is None else float(row["centroid_latitude"]),
+                )
+                for row in zone_geometry_rows
+            ],
+        )
+    connection.execute(
+        "CREATE TEMP TABLE zone_metadata (PULocationID INTEGER, zone_name VARCHAR, borough_name VARCHAR, airport_excluded BOOLEAN)"
+    )
+    if zone_metadata_rows:
+        connection.executemany(
+            "INSERT INTO zone_metadata (PULocationID, zone_name, borough_name, airport_excluded) VALUES (?, ?, ?, ?)",
+            zone_metadata_rows,
+        )
+    return connection
+
 def ensure_zones_geojson(data_dir: Path, force: bool = False) -> Path:
     data_dir.mkdir(parents=True, exist_ok=True)
     geojson_path = data_dir / "taxi_zones.geojson"
@@ -884,10 +928,24 @@ def build_single_frame_for_month(
         raise RuntimeError("taxi_zones.geojson missing usable properties.LocationID geometry.")
     if not parquet_files:
         raise RuntimeError("No parquet files provided for frame build.")
+    zone_geometry_rows = build_zone_geometry_metrics_rows(zones_geojson_path)
+    zone_metadata_rows = [
+        (
+            int(zid),
+            str(name_by_id.get(zid, "") or ""),
+            str(borough_by_id.get(zid, "") or ""),
+            bool(is_airport_zone(zid, name_by_id.get(zid, ""), borough_by_id.get(zid, ""))),
+        )
+        for zid in sorted(name_by_id.keys())
+    ]
 
     parquet_sql_files = [str(path) for path in parquet_files]
     first_parquet_sql = "'" + parquet_sql_files[0].replace("'", "''") + "'"
-    con = duckdb.connect(database=":memory:")
+    con = _open_shadow_sql_connection(
+        database_path=":memory:",
+        zone_geometry_rows=zone_geometry_rows,
+        zone_metadata_rows=zone_metadata_rows,
+    )
     try:
         schema_rows = con.execute(f"DESCRIBE SELECT * FROM read_parquet([{first_parquet_sql}])").fetchall()
         available_columns = {str(row[0]) for row in schema_rows}
@@ -1062,35 +1120,14 @@ def build_hotspots_frames(
         ]
 
         def _open_incremental_connection() -> duckdb.DuckDBPyConnection:
-            connection = duckdb.connect(database=str(staged_exact_history_db_path))
-            connection.execute("PRAGMA enable_progress_bar=false")
-            connection.execute("PRAGMA threads=1")
-            connection.execute(f"PRAGMA temp_directory='{duckdb_tmp_dir.as_posix()}'")
             memory_limit = str(os.environ.get("DUCKDB_MEMORY_LIMIT", "192MB")).strip() or "192MB"
-            connection.execute(f"PRAGMA memory_limit='{memory_limit}'")
-            connection.execute(
-                "CREATE TEMP TABLE zone_geometry_metrics (PULocationID INTEGER, zone_area_sq_miles DOUBLE, centroid_latitude DOUBLE)"
+            return _open_shadow_sql_connection(
+                database_path=str(staged_exact_history_db_path),
+                zone_geometry_rows=zone_geometry_rows,
+                zone_metadata_rows=zone_metadata_rows,
+                temp_directory=duckdb_tmp_dir,
+                memory_limit=memory_limit,
             )
-            if zone_geometry_rows:
-                connection.executemany(
-                    "INSERT INTO zone_geometry_metrics (PULocationID, zone_area_sq_miles, centroid_latitude) VALUES (?, ?, ?)",
-                    [
-                        (
-                            int(row["PULocationID"]),
-                            None if row["zone_area_sq_miles"] is None else float(row["zone_area_sq_miles"]),
-                            None if row.get("centroid_latitude") is None else float(row["centroid_latitude"]),
-                        )
-                        for row in zone_geometry_rows
-                    ],
-                )
-            connection.execute(
-                "CREATE TEMP TABLE zone_metadata (PULocationID INTEGER, zone_name VARCHAR, borough_name VARCHAR, airport_excluded BOOLEAN)"
-            )
-            connection.executemany(
-                "INSERT INTO zone_metadata (PULocationID, zone_name, borough_name, airport_excluded) VALUES (?, ?, ?, ?)",
-                zone_metadata_rows,
-            )
-            return connection
 
         if not month_key:
             raise RuntimeError("month_key is required for monthly exact-history sliced build.")
