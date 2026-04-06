@@ -20,6 +20,7 @@ from datetime import datetime, date, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
+from timeline_time_utils import to_frontend_local_iso
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Depends, Response
 from fastapi.responses import JSONResponse
@@ -565,6 +566,103 @@ def _month_frame_cache_file(month_key: str, frame_index: int, frame_time: str) -
     return _month_frame_cache_dir(month_key) / f"frame_{int(frame_index):05d}_{suffix}.json"
 
 
+def _to_frontend_local_iso(value: Any) -> str:
+    return to_frontend_local_iso(value)
+
+
+def _timeline_entries_need_iso_rewrite(timeline_payload: Any) -> bool:
+    if not isinstance(timeline_payload, dict):
+        return False
+    timeline_items = timeline_payload.get("timeline") if isinstance(timeline_payload.get("timeline"), list) else []
+    for entry in timeline_items:
+        if str(entry or "").strip():
+            return "T" not in str(entry)
+    entries = timeline_payload.get("entries") if isinstance(timeline_payload.get("entries"), list) else []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        frame_time = str(entry.get("frame_time") or "").strip()
+        if frame_time:
+            return "T" not in frame_time
+    return False
+
+
+def _rewrite_month_timeline_from_store(month_key: str) -> None:
+    store_path = _month_store_path(month_key)
+    timeline_path = _month_timeline_path(month_key)
+    if not (store_path.exists() and store_path.is_file() and store_path.stat().st_size > 0):
+        return
+    if not (timeline_path.exists() and timeline_path.is_file() and timeline_path.stat().st_size > 0):
+        return
+
+    con = duckdb.connect(database=str(store_path), read_only=True)
+    try:
+        rows = con.execute(
+            """
+            SELECT DISTINCT
+                exact_bin_local_ts,
+                exact_bin_date_local,
+                exact_weekday_name_local,
+                exact_bin_time_label_local
+            FROM exact_shadow_rows
+            ORDER BY exact_bin_local_ts
+            """
+        ).fetchall()
+    finally:
+        con.close()
+
+    timeline_entries: List[Dict[str, Any]] = []
+    for row in rows:
+        normalized_frame_time = _to_frontend_local_iso(row[0])
+        timeline_entries.append(
+            {
+                "frame_time": normalized_frame_time,
+                "frame_date": None if row[1] is None else str(row[1]),
+                "frame_weekday_name": None if row[2] is None else str(row[2]),
+                "frame_time_label": None if row[3] is None else str(row[3]),
+                "bin_minutes": int(DEFAULT_BIN_MINUTES),
+            }
+        )
+    timeline = [entry["frame_time"] for entry in timeline_entries]
+    rebuilt_payload = {
+        "timeline": timeline,
+        "entries": timeline_entries,
+        "count": len(timeline),
+        "bin_minutes": int(DEFAULT_BIN_MINUTES),
+        "timeline_mode": "exact_historical",
+        "frame_time_model": "exact_local_20min",
+        "synthetic_week_enabled": False,
+    }
+    temp_path = timeline_path.with_suffix(".json.tmp")
+    temp_path.write_text(json.dumps(rebuilt_payload, separators=(",", ":")), encoding="utf-8")
+    temp_path.replace(timeline_path)
+
+    with _timeline_cache_lock:
+        _timeline_cache_entry.pop(str(month_key).strip(), None)
+
+
+def _maybe_repair_month_timeline_iso(month_key: str) -> bool:
+    timeline_path = _month_timeline_path(month_key)
+    store_path = _month_store_path(month_key)
+    if not (
+        timeline_path.exists()
+        and timeline_path.is_file()
+        and timeline_path.stat().st_size > 0
+        and store_path.exists()
+        and store_path.is_file()
+        and store_path.stat().st_size > 0
+    ):
+        return False
+    try:
+        payload = _read_json(timeline_path)
+    except Exception:
+        return False
+    if not _timeline_entries_need_iso_rewrite(payload):
+        return False
+    _rewrite_month_timeline_from_store(month_key)
+    return True
+
+
 def _dir_is_stale(path: Path, now_unix: float, min_age_sec: int) -> bool:
     try:
         if not path.exists() or not path.is_dir():
@@ -979,6 +1077,7 @@ def _read_timeline_cached(month_key: Optional[str] = None) -> Dict[str, Any]:
         manifest = _load_month_manifest()
     else:
         resolved_month_key, manifest = _resolve_active_month_key(month_key=month_key)
+    _maybe_repair_month_timeline_iso(resolved_month_key)
     timeline_path = _month_timeline_path(resolved_month_key)
     if timeline_path.exists() and timeline_path.stat().st_size > 0:
         stat_result = timeline_path.stat()
@@ -993,6 +1092,16 @@ def _read_timeline_cached(month_key: Optional[str] = None) -> Dict[str, Any]:
                 return dict(cached)
             _record_perf_metric("timeline.cache_miss")
             data = _read_json(timeline_path)
+            data["timeline"] = [_to_frontend_local_iso(item) for item in (data.get("timeline") or [])]
+            if isinstance(data.get("entries"), list):
+                normalized_entries: List[Dict[str, Any]] = []
+                for entry in data.get("entries") or []:
+                    if not isinstance(entry, dict):
+                        continue
+                    entry_copy = dict(entry)
+                    entry_copy["frame_time"] = _to_frontend_local_iso(entry_copy.get("frame_time"))
+                    normalized_entries.append(entry_copy)
+                data["entries"] = normalized_entries
             data["active_month_key"] = resolved_month_key
             data["available_month_keys"] = list(manifest.get("available_month_keys") or [])
             data["timeline_scope"] = "monthly_exact_historical"
@@ -1033,7 +1142,7 @@ def _read_frame_cached(idx: int, month_key: Optional[str] = None) -> Dict[str, A
     timeline = timeline_payload.get("timeline") or []
     if idx < 0 or idx >= len(timeline):
         raise HTTPException(status_code=404, detail=f"frame not found: {idx}")
-    frame_time = str(timeline[idx])
+    frame_time = _to_frontend_local_iso(timeline[idx])
     active_month_key = str(timeline_payload.get("active_month_key") or month_key or "")
     timeline_etag = str((timeline_cached or {}).get("etag") or "")
     cache_idx = (active_month_key, int(idx))
@@ -1362,7 +1471,7 @@ def _build_assistant_outlook_frame_bucket_cached(
 ) -> Dict[str, Any]:
     timeline_payload = (timeline_cached or {}).get("data") or {}
     timeline_etag = str((timeline_cached or {}).get("etag") or "")
-    frame_key = str(frame_time or "").strip()
+    frame_key = _to_frontend_local_iso(frame_time)
     if not frame_key:
         raise KeyError("frame_time is required")
     bin_minutes = int(timeline_payload.get("bin_minutes") or DEFAULT_BIN_MINUTES)
@@ -1393,7 +1502,7 @@ def _build_assistant_outlook_frame_bucket_cached(
     )
     frame_bucket = bucket_payload.get("bucket") or {}
     cached_entry = {
-        "frame_time": str(bucket_payload.get("frame_time") or frame_key),
+        "frame_time": _to_frontend_local_iso(bucket_payload.get("frame_time") or frame_key),
         "horizon_bins": int(bucket_payload.get("horizon_bins") or horizon_bins),
         "bin_minutes": int(bucket_payload.get("bin_minutes") or bin_minutes),
         "timeline_etag": timeline_etag,
@@ -4632,6 +4741,12 @@ def startup():
         _start_storage_cleanup_sweeper()
     except Exception:
         traceback.print_exc()
+    try:
+        manifest = _load_month_manifest()
+        for built_month_key in list(manifest.get("available_month_keys") or []):
+            _maybe_repair_month_timeline_iso(str(built_month_key))
+    except Exception:
+        traceback.print_exc()
 
     # Startup auto-prepare: single target month only, core-only build mode.
     try:
@@ -5558,7 +5673,7 @@ def assistant_outlook(
     except Exception:
         raise HTTPException(status_code=503, detail="assistant outlook unavailable: timeline not ready")
 
-    frame_key = str(frame_time or "").strip()
+    frame_key = _to_frontend_local_iso(frame_time)
 
     try:
         cached_bucket = _build_assistant_outlook_frame_bucket_cached(
@@ -5609,7 +5724,7 @@ def frame(idx: int, request: Request, month_key: Optional[str] = None):
     timeline = timeline_payload.get("timeline") or []
     if idx < 0 or idx >= len(timeline):
         raise HTTPException(status_code=404, detail=f"frame not found: {idx}")
-    frame_time = str(timeline[idx])
+    frame_time = _to_frontend_local_iso(timeline[idx])
     cache_file = _month_frame_cache_file(target_month_key, idx, frame_time)
     if not (cache_file.exists() and cache_file.stat().st_size > 0):
         started = _ensure_frame_build_in_progress(target_month_key, idx, frame_time)
@@ -5652,7 +5767,7 @@ def frame_viewport(
     timeline = timeline_payload.get("timeline") or []
     if idx < 0 or idx >= len(timeline):
         raise HTTPException(status_code=404, detail=f"frame not found: {idx}")
-    frame_time = str(timeline[idx])
+    frame_time = _to_frontend_local_iso(timeline[idx])
     cache_file = _month_frame_cache_file(target_month_key, idx, frame_time)
     if not (cache_file.exists() and cache_file.stat().st_size > 0):
         started = _ensure_frame_build_in_progress(target_month_key, idx, frame_time)

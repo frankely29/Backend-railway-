@@ -207,6 +207,38 @@ def _frame_features(frame_payload: Any) -> list[Dict[str, Any]]:
     return []
 
 
+def _load_month_manifest(data_dir: Path) -> dict | None:
+    manifest_path = data_dir / "exact_history" / "month_manifest.json"
+    try:
+        if not manifest_path.exists() or not manifest_path.is_file() or manifest_path.stat().st_size <= 0:
+            return None
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if isinstance(payload, dict):
+            return payload
+    except Exception:
+        return None
+    return None
+
+
+def _resolve_monthly_mode_context(data_dir: Path) -> dict:
+    manifest = _load_month_manifest(data_dir)
+    months = manifest.get("months") if isinstance(manifest, dict) and isinstance(manifest.get("months"), dict) else {}
+    available_month_keys = sorted([key for key in months.keys() if str(key).strip()])
+    active_month_key = available_month_keys[-1] if available_month_keys else None
+    timeline_scope = str(manifest.get("timeline_scope") or "").strip().lower() if isinstance(manifest, dict) else ""
+    monthly_mode = bool(
+        timeline_scope == "monthly_exact_historical"
+        or (data_dir / "exact_history" / "months").exists()
+        or available_month_keys
+    )
+    return {
+        "monthly_mode": monthly_mode,
+        "manifest": manifest,
+        "available_month_keys": available_month_keys,
+        "active_month_key": active_month_key,
+    }
+
+
 def sample_frame_integrity(frames_dir: Path) -> dict:
     from build_hotspot import bucket_and_color_from_rating
 
@@ -361,27 +393,70 @@ def evaluate_artifact_freshness(
     current_manifest = load_existing_artifact_manifest(frames_dir)
 
     reason_codes: list[str] = []
+    monthly_context = _resolve_monthly_mode_context(data_dir)
+    monthly_mode = bool(monthly_context.get("monthly_mode"))
 
-    timeline_path = frames_dir / "timeline.json"
-    if not timeline_path.exists() or timeline_path.stat().st_size <= 0:
-        reason_codes.append("timeline_missing")
+    sampled: dict[str, Any]
+    if monthly_mode:
+        active_month_key = str(monthly_context.get("active_month_key") or "").strip()
+        manifest = monthly_context.get("manifest")
+        months = manifest.get("months") if isinstance(manifest, dict) and isinstance(manifest.get("months"), dict) else {}
+        month_manifest_entry = months.get(active_month_key) if active_month_key else None
+        month_manifest_present = bool(manifest and isinstance(manifest, dict))
+        if not month_manifest_present:
+            reason_codes.append("month_manifest_missing")
+        if not active_month_key:
+            reason_codes.append("active_month_missing")
+        month_dir = data_dir / "exact_history" / "months" / active_month_key if active_month_key else None
+        month_timeline_path = month_dir / "timeline.json" if month_dir else None
+        month_store_path = month_dir / "exact_shadow.duckdb" if month_dir else None
+        month_timeline_present = bool(
+            month_timeline_path
+            and month_timeline_path.exists()
+            and month_timeline_path.is_file()
+            and month_timeline_path.stat().st_size > 0
+        )
+        month_store_present = bool(
+            month_store_path
+            and month_store_path.exists()
+            and month_store_path.is_file()
+            and month_store_path.stat().st_size > 0
+        )
+        if not month_timeline_present:
+            reason_codes.append("active_month_timeline_missing")
+        if not month_store_present:
+            reason_codes.append("active_month_store_missing")
+        if active_month_key and not month_manifest_entry:
+            reason_codes.append("active_month_manifest_entry_missing")
+        sampled = {
+            "mode": "monthly_exact_historical",
+            "active_month_key": active_month_key or None,
+            "month_manifest_present": month_manifest_present,
+            "active_month_timeline_present": month_timeline_present,
+            "active_month_store_present": month_store_present,
+            "legacy_frame_file_sampling_skipped": True,
+        }
+    else:
+        timeline_path = frames_dir / "timeline.json"
+        if not timeline_path.exists() or timeline_path.stat().st_size <= 0:
+            reason_codes.append("timeline_missing")
 
-    timeline_items = _timeline_items(frames_dir)
-    frame_glob_files = sorted(frames_dir.glob("frame_*.json")) if frames_dir.exists() else []
-    if not timeline_items or not frame_glob_files:
-        reason_codes.append("frame_files_missing")
+        timeline_items = _timeline_items(frames_dir)
+        frame_glob_files = sorted(frames_dir.glob("frame_*.json")) if frames_dir.exists() else []
+        if not timeline_items or not frame_glob_files:
+            reason_codes.append("frame_files_missing")
 
-    sampled = sample_frame_integrity(frames_dir)
-    if not sampled.get("frame_has_citywide_v3") or not sampled.get("frame_has_borough_v3_fields"):
-        reason_codes.append("sampled_frames_missing_v3_fields")
-    if not sampled.get("frame_has_density_fields"):
-        reason_codes.append("sampled_frames_missing_density_fields")
-    if not sampled.get("frame_has_trap_fields"):
-        reason_codes.append("sampled_frames_missing_trap_fields")
-    if not sampled.get("frame_has_popup_metric_fields"):
-        reason_codes.append("sampled_frames_missing_popup_metric_fields")
-    if not sampled.get("frame_has_rating_bucket_color_consistency"):
-        reason_codes.append("sampled_frames_bucket_color_mismatch")
+        sampled = sample_frame_integrity(frames_dir)
+        if not sampled.get("frame_has_citywide_v3") or not sampled.get("frame_has_borough_v3_fields"):
+            reason_codes.append("sampled_frames_missing_v3_fields")
+        if not sampled.get("frame_has_density_fields"):
+            reason_codes.append("sampled_frames_missing_density_fields")
+        if not sampled.get("frame_has_trap_fields"):
+            reason_codes.append("sampled_frames_missing_trap_fields")
+        if not sampled.get("frame_has_popup_metric_fields"):
+            reason_codes.append("sampled_frames_missing_popup_metric_fields")
+        if not sampled.get("frame_has_rating_bucket_color_consistency"):
+            reason_codes.append("sampled_frames_bucket_color_mismatch")
 
     if current_manifest is None:
         reason_codes.append("manifest_missing")
@@ -409,6 +484,7 @@ def evaluate_artifact_freshness(
         "fresh": fresh,
         "summary": summary,
         "reason_codes": reason_codes,
+        "mode": "monthly_exact_historical" if monthly_mode else "legacy_frames",
         "expected": expected,
         "current_manifest": current_manifest,
         "sampled_frame_integrity": sampled,
