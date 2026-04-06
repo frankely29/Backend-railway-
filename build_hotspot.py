@@ -25,6 +25,7 @@ from exact_history_feature_builder import (
     _build_shadow_props_from_row,
     build_feature_properties_from_shadow_row,
 )
+from timeline_time_utils import to_frontend_local_iso
 
 logger = logging.getLogger(__name__)
 UTC_TZ = ZoneInfo("UTC")
@@ -820,14 +821,14 @@ def build_month_timeline_bootstrap(month_key: str, bin_minutes: int = 20) -> Dic
             frame_time = frame_date.replace(hour=(minute // 60), minute=(minute % 60), second=0, microsecond=0)
             entries.append(
                 {
-                    "frame_time": frame_time.isoformat(),
+                    "frame_time": to_frontend_local_iso(frame_time),
                     "frame_date": frame_date.date().isoformat(),
                     "frame_weekday_name": frame_date.strftime("%A"),
                     "frame_time_label": frame_time.strftime("%I:%M %p"),
                     "bin_minutes": int(bin_minutes),
                 }
             )
-    timeline = [str(entry.get("frame_time")) for entry in entries]
+    timeline = [to_frontend_local_iso(entry.get("frame_time")) for entry in entries]
     return {
         "timeline": timeline,
         "entries": entries,
@@ -902,7 +903,7 @@ def build_single_frame_for_month(
             WHERE exact_bin_local_ts = ?
             ORDER BY PULocationID
             """,
-            [str(frame_time)],
+            [to_frontend_local_iso(frame_time)],
         )
         rows = cursor.fetchall()
         columns = [str(desc[0]) for desc in (cursor.description or [])]
@@ -932,7 +933,7 @@ def build_single_frame_for_month(
             }
         )
     _recalibrate_visible_v3_fields(features)
-    return {"time": str(frame_time), "polygons": {"type": "FeatureCollection", "features": features}}
+    return {"time": to_frontend_local_iso(frame_time), "polygons": {"type": "FeatureCollection", "features": features}}
 
 
 def build_hotspots_frames(
@@ -1472,7 +1473,7 @@ def build_hotspots_frames(
         ).fetchall()
         timeline_entries = [
             {
-                "frame_time": str(row[0]),
+                "frame_time": to_frontend_local_iso(row[0]),
                 "frame_date": None if row[1] is None else str(row[1]),
                 "frame_weekday_name": None if row[2] is None else str(row[2]),
                 "frame_time_label": None if row[3] is None else str(row[3]),
@@ -1480,7 +1481,7 @@ def build_hotspots_frames(
             }
             for row in timeline_rows
         ]
-        timeline = [str(entry.get("frame_time")) for entry in timeline_entries]
+        timeline = [to_frontend_local_iso(entry.get("frame_time")) for entry in timeline_entries]
         timeline_payload = {
             "timeline": timeline,
             "entries": timeline_entries,
