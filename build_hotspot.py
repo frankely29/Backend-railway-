@@ -23,6 +23,7 @@ from artifact_db_store import save_generated_artifact
 from exact_history_feature_builder import (
     bucket_and_color_from_rating,
     _build_shadow_props_from_row,
+    _resolve_popup_metrics,
     build_feature_properties_from_shadow_row,
 )
 from timeline_time_utils import to_frontend_local_iso
@@ -674,6 +675,98 @@ def _popup_failure_diagnostics_payload(
         },
         "fallback_resolution_attempted": bool(fallback_resolution_attempted),
     }
+
+
+def _resolve_popup_metrics_with_guaranteed_fallback(
+    *,
+    raw_shadow_props: Dict[str, Any],
+    visible_pickups: int,
+    geometry_area_sq_miles: float | None,
+    location_id: int,
+    zone_name: str,
+    borough: str,
+    frame_time: str | None,
+) -> Tuple[Dict[str, float], bool, str]:
+    fallback_used = False
+    status = "normal"
+    try:
+        resolved = _resolve_popup_metrics(
+            raw_shadow_props=raw_shadow_props,
+            visible_pickups=int(visible_pickups),
+            geometry_area_sq_miles=geometry_area_sq_miles,
+        )
+    except Exception:
+        resolved = {}
+
+    def _coerce_non_negative(value: Any, default: float) -> float:
+        parsed = _as_finite_number(value)
+        if parsed is None:
+            parsed = default
+        return max(float(parsed), 0.0)
+
+    def _is_usable(metrics: Dict[str, Any]) -> bool:
+        pickups_now = _as_finite_number(metrics.get("pickups_now_shadow"))
+        pickups_next = _as_finite_number(metrics.get("next_pickups_shadow"))
+        zone_area = _as_finite_number(metrics.get("zone_area_sq_miles_shadow"))
+        density_now = _as_finite_number(metrics.get("pickups_per_sq_mile_now_shadow"))
+        density_next = _as_finite_number(metrics.get("pickups_per_sq_mile_next_shadow"))
+        return bool(
+            pickups_now is not None and pickups_now >= 0
+            and pickups_next is not None and pickups_next >= 0
+            and zone_area is not None and zone_area > 0
+            and density_now is not None and density_now >= 0
+            and density_next is not None and density_next >= 0
+        )
+
+    if not _is_usable(resolved):
+        fallback_used = True
+        status = "fallback"
+        pickups_now = max(float(int(visible_pickups)), 0.0)
+        next_pickups_shadow = _as_finite_number(raw_shadow_props.get("next_pickups_shadow"))
+        pickups_next = pickups_now if next_pickups_shadow is None else max(float(next_pickups_shadow), 0.0)
+        zone_area = _as_finite_number(geometry_area_sq_miles)
+        if zone_area is None or zone_area <= 0:
+            zone_area = _as_finite_number(raw_shadow_props.get("zone_area_sq_miles_shadow"))
+        if zone_area is None or zone_area <= 0:
+            zone_area = 1.0
+        zone_area = max(float(zone_area), 0.01)
+        resolved = {
+            "pickups_now_shadow": pickups_now,
+            "next_pickups_shadow": pickups_next,
+            "zone_area_sq_miles_shadow": zone_area,
+            "pickups_per_sq_mile_now_shadow": pickups_now / max(zone_area, 0.01),
+            "pickups_per_sq_mile_next_shadow": pickups_next / max(zone_area, 0.01),
+        }
+
+    sanitized = {
+        "pickups_now_shadow": _coerce_non_negative(resolved.get("pickups_now_shadow"), max(float(int(visible_pickups)), 0.0)),
+        "next_pickups_shadow": _coerce_non_negative(
+            resolved.get("next_pickups_shadow"),
+            _coerce_non_negative(resolved.get("pickups_now_shadow"), max(float(int(visible_pickups)), 0.0)),
+        ),
+        "zone_area_sq_miles_shadow": max(
+            _coerce_non_negative(
+                resolved.get("zone_area_sq_miles_shadow"),
+                max(_as_finite_number(geometry_area_sq_miles) or 1.0, 0.01),
+            ),
+            0.01,
+        ),
+    }
+    sanitized["pickups_per_sq_mile_now_shadow"] = _coerce_non_negative(
+        resolved.get("pickups_per_sq_mile_now_shadow"),
+        sanitized["pickups_now_shadow"] / max(sanitized["zone_area_sq_miles_shadow"], 0.01),
+    )
+    sanitized["pickups_per_sq_mile_next_shadow"] = _coerce_non_negative(
+        resolved.get("pickups_per_sq_mile_next_shadow"),
+        sanitized["next_pickups_shadow"] / max(sanitized["zone_area_sq_miles_shadow"], 0.01),
+    )
+
+    if not _is_usable(sanitized):
+        raise RuntimeError(
+            "Popup metric resolution produced unusable values "
+            f"LocationID={location_id} zone_name={zone_name!r} borough={borough!r} frame_time={frame_time}"
+        )
+    return sanitized, fallback_used, status
 
 
 def _validate_popup_metric_consistency(
@@ -1417,21 +1510,54 @@ def build_hotspots_frames(
                     geometry_area_sq_miles = None
                     if zid_i in zone_geometry_by_id:
                         geometry_area_sq_miles = zone_geometry_by_id[zid_i].get("zone_area_sq_miles")
+                    zone_name = name_by_id.get(zid_i, "")
+                    borough_name = borough_by_id.get(zid_i, "")
+                    is_airport = bool(is_airport_zone(zid_i, zone_name, borough_name))
                     fallback_resolution_attempted = False
+                    popup_metric_fallback_used = False
+                    popup_metric_resolution_status = "normal"
                     try:
-                        fallback_resolution_attempted = True
                         feature_properties = build_feature_properties_from_shadow_row(
                             row_map=row_map,
-                            zone_name=name_by_id.get(zid_i, ""),
-                            borough=borough_by_id.get(zid_i, ""),
+                            zone_name=zone_name,
+                            borough=borough_name,
                             geometry_area_sq_miles=geometry_area_sq_miles,
                         )
-                    except Exception as exc:
-                        if not bool(is_airport_zone(zid_i, name_by_id.get(zid_i, ""), borough_by_id.get(zid_i, ""))):
+                        popup_metrics, popup_metric_fallback_used, popup_metric_resolution_status = _resolve_popup_metrics_with_guaranteed_fallback(
+                            raw_shadow_props=shadow_props,
+                            visible_pickups=int(pickups),
+                            geometry_area_sq_miles=geometry_area_sq_miles,
+                            location_id=zid_i,
+                            zone_name=zone_name,
+                            borough=borough_name,
+                            frame_time=current_time_iso,
+                        )
+                        fallback_resolution_attempted = True
+                        feature_properties.update(popup_metrics)
+                        feature_properties["popup_metric_fallback_used"] = bool(popup_metric_fallback_used)
+                        feature_properties["popup_metric_resolution_status"] = str(popup_metric_resolution_status)
+                        if popup_metric_fallback_used and not is_airport:
                             popup_diagnostics = _popup_failure_diagnostics_payload(
                                 location_id=zid_i,
-                                zone_name=name_by_id.get(zid_i, ""),
-                                borough=borough_by_id.get(zid_i, ""),
+                                zone_name=zone_name,
+                                borough=borough_name,
+                                frame_time=current_time_iso,
+                                shadow_props=shadow_props,
+                                zone_geometry_by_id=zone_geometry_by_id,
+                                geometry_area_sq_miles=geometry_area_sq_miles,
+                                visible_pickups=int(pickups),
+                                fallback_resolution_attempted=True,
+                            )
+                            logger.warning(
+                                "non_airport_popup_metric_resolution_fallback %s",
+                                json.dumps(popup_diagnostics, sort_keys=True),
+                            )
+                    except Exception as exc:
+                        if not is_airport:
+                            popup_diagnostics = _popup_failure_diagnostics_payload(
+                                location_id=zid_i,
+                                zone_name=zone_name,
+                                borough=borough_name,
                                 frame_time=current_time_iso,
                                 shadow_props=shadow_props,
                                 zone_geometry_by_id=zone_geometry_by_id,
@@ -1445,13 +1571,15 @@ def build_hotspots_frames(
                             )
                             raise RuntimeError(
                                 "Popup metric resolution failed for non-airport zone "
-                                f"LocationID={zid_i} zone_name={name_by_id.get(zid_i, '')!r} frame_time={current_time_iso}"
+                                f"LocationID={zid_i} zone_name={zone_name!r} frame_time={current_time_iso}"
                             ) from exc
                         raise
 
-                    if not bool(is_airport_zone(zid_i, name_by_id.get(zid_i, ""), borough_by_id.get(zid_i, ""))):
+                    if not is_airport:
                         current_popup_metric_diagnostics_by_location_id[zid_i] = {
                             "fallback_resolution_attempted": fallback_resolution_attempted,
+                            "popup_metric_fallback_used": bool(popup_metric_fallback_used),
+                            "popup_metric_resolution_status": str(popup_metric_resolution_status),
                             "geometry_area_row_exists": bool(
                                 zid_i in zone_geometry_by_id
                                 and _as_finite_number(zone_geometry_by_id[zid_i].get("zone_area_sq_miles")) is not None
