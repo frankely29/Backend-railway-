@@ -74,8 +74,8 @@ def build_code_dependency_signature(repo_root: Path) -> dict:
         "zone_earnings_engine.py",
         "zone_mode_profiles.py",
         "zone_geometry_metrics.py",
-        "build_day_tendency.py",
-        "main.py",
+        "exact_history_feature_builder.py",
+        "timeline_time_utils.py",
     ]
     dependency_files: list[dict[str, Any]] = []
     for name in dependency_names:
