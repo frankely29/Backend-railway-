@@ -126,9 +126,9 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
         {nullable_weighted_average_sql([
           (f"{c3_busy_now_weight:.8f}", "busy_now_base_n"),
           (f"{c3_busy_next_weight:.8f}", "busy_next_base_n"),
-          (f"{c3w.pay_weight:.8f}", "pay_n"),
-          (f"{c3w.pay_per_min_weight:.8f}", "pay_per_min_n"),
-          (f"{c3w.pay_per_mile_weight:.8f}", "pay_per_mile_n"),
+          (f"{c3w.pay_weight:.8f}", "pay_n_safe"),
+          (f"{c3w.pay_per_min_weight:.8f}", "pay_per_min_n_safe"),
+          (f"{c3w.pay_per_mile_weight:.8f}", "pay_per_mile_n_safe"),
           (f"{c3w.balanced_trip_share_weight:.8f}", "COALESCE(balanced_trip_share_n, 0.0)"),
           (f"{c3w.long_trip_share_20plus_weight:.8f}", "COALESCE(long_trip_share_20plus_n, 0.0)"),
           (f"{c3w.downstream_weight:.8f}", "downstream_value_n"),
@@ -759,6 +759,9 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
     trap_exit_shadow AS (
       SELECT
         *,
+        COALESCE(pay_n, 0.5) AS pay_n_safe,
+        COALESCE(pay_per_min_n, 0.5) AS pay_per_min_n_safe,
+        COALESCE(pay_per_mile_n, 0.5) AS pay_per_mile_n_safe,
         LEAST(GREATEST(
           0.24 * short_trip_penalty_n +
           0.20 * COALESCE(same_zone_retention_penalty_n, 0.0) +
@@ -791,9 +794,9 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
         {nullable_weighted_average_sql([
           (f"{w.demand_now_weight:.8f}", "demand_now_n"),
           (f"{w.demand_next_weight:.8f}", "demand_next_n"),
-          (f"{w.pay_weight:.8f}", "pay_n"),
-          (f"{w.pay_per_min_weight:.8f}", "pay_per_min_n"),
-          (f"{w.pay_per_mile_weight:.8f}", "pay_per_mile_n"),
+          (f"{w.pay_weight:.8f}", "pay_n_safe"),
+          (f"{w.pay_per_min_weight:.8f}", "pay_per_min_n_safe"),
+          (f"{w.pay_per_mile_weight:.8f}", "pay_per_mile_n_safe"),
           (f"{w.downstream_weight:.8f}", "downstream_value_n"),
         ])} AS positive_score,
         (
@@ -804,9 +807,9 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
         {nullable_weighted_average_sql([
           (f"{mw.demand_now_weight:.8f}", "demand_now_n"),
           (f"{mw.demand_next_weight:.8f}", "demand_next_n"),
-          (f"{mw.pay_weight:.8f}", "pay_n"),
-          (f"{mw.pay_per_min_weight:.8f}", "pay_per_min_n"),
-          (f"{mw.pay_per_mile_weight:.8f}", "pay_per_mile_n"),
+          (f"{mw.pay_weight:.8f}", "pay_n_safe"),
+          (f"{mw.pay_per_min_weight:.8f}", "pay_per_min_n_safe"),
+          (f"{mw.pay_per_mile_weight:.8f}", "pay_per_mile_n_safe"),
           (f"{mw.downstream_weight:.8f}", "downstream_value_n"),
         ])} AS positive_score_manhattan_v2,
         (
@@ -817,9 +820,9 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
         {nullable_weighted_average_sql([
           (f"{bw.demand_now_weight:.8f}", "demand_now_n"),
           (f"{bw.demand_next_weight:.8f}", "demand_next_n"),
-          (f"{bw.pay_weight:.8f}", "pay_n"),
-          (f"{bw.pay_per_min_weight:.8f}", "pay_per_min_n"),
-          (f"{bw.pay_per_mile_weight:.8f}", "pay_per_mile_n"),
+          (f"{bw.pay_weight:.8f}", "pay_n_safe"),
+          (f"{bw.pay_per_min_weight:.8f}", "pay_per_min_n_safe"),
+          (f"{bw.pay_per_mile_weight:.8f}", "pay_per_mile_n_safe"),
           (f"{bw.downstream_weight:.8f}", "downstream_value_n"),
         ])} AS positive_score_bronx_wash_heights_v2,
         (
@@ -830,9 +833,9 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
         {nullable_weighted_average_sql([
           (f"{qw.demand_now_weight:.8f}", "demand_now_n"),
           (f"{qw.demand_next_weight:.8f}", "demand_next_n"),
-          (f"{qw.pay_weight:.8f}", "pay_n"),
-          (f"{qw.pay_per_min_weight:.8f}", "pay_per_min_n"),
-          (f"{qw.pay_per_mile_weight:.8f}", "pay_per_mile_n"),
+          (f"{qw.pay_weight:.8f}", "pay_n_safe"),
+          (f"{qw.pay_per_min_weight:.8f}", "pay_per_min_n_safe"),
+          (f"{qw.pay_per_mile_weight:.8f}", "pay_per_mile_n_safe"),
           (f"{qw.downstream_weight:.8f}", "downstream_value_n"),
         ])} AS positive_score_queens_v2,
         (
@@ -843,9 +846,9 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
         {nullable_weighted_average_sql([
           (f"{bkw.demand_now_weight:.8f}", "demand_now_n"),
           (f"{bkw.demand_next_weight:.8f}", "demand_next_n"),
-          (f"{bkw.pay_weight:.8f}", "pay_n"),
-          (f"{bkw.pay_per_min_weight:.8f}", "pay_per_min_n"),
-          (f"{bkw.pay_per_mile_weight:.8f}", "pay_per_mile_n"),
+          (f"{bkw.pay_weight:.8f}", "pay_n_safe"),
+          (f"{bkw.pay_per_min_weight:.8f}", "pay_per_min_n_safe"),
+          (f"{bkw.pay_per_mile_weight:.8f}", "pay_per_mile_n_safe"),
           (f"{bkw.downstream_weight:.8f}", "downstream_value_n"),
         ])} AS positive_score_brooklyn_v2,
         (
@@ -856,9 +859,9 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
         {nullable_weighted_average_sql([
           (f"{sw.demand_now_weight:.8f}", "demand_now_n"),
           (f"{sw.demand_next_weight:.8f}", "demand_next_n"),
-          (f"{sw.pay_weight:.8f}", "pay_n"),
-          (f"{sw.pay_per_min_weight:.8f}", "pay_per_min_n"),
-          (f"{sw.pay_per_mile_weight:.8f}", "pay_per_mile_n"),
+          (f"{sw.pay_weight:.8f}", "pay_n_safe"),
+          (f"{sw.pay_per_min_weight:.8f}", "pay_per_min_n_safe"),
+          (f"{sw.pay_per_mile_weight:.8f}", "pay_per_mile_n_safe"),
           (f"{sw.downstream_weight:.8f}", "downstream_value_n"),
         ])} AS positive_score_staten_island_v2,
         (
@@ -873,9 +876,9 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
         {nullable_weighted_average_sql([
           (f"{mw3_busy_now_weight:.8f}", "busy_now_base_n"),
           (f"{mw3_busy_next_weight:.8f}", "busy_next_base_n"),
-          (f"{mw3.pay_weight:.8f}", "pay_n"),
-          (f"{mw3.pay_per_min_weight:.8f}", "pay_per_min_n"),
-          (f"{mw3.pay_per_mile_weight:.8f}", "pay_per_mile_n"),
+          (f"{mw3.pay_weight:.8f}", "pay_n_safe"),
+          (f"{mw3.pay_per_min_weight:.8f}", "pay_per_min_n_safe"),
+          (f"{mw3.pay_per_mile_weight:.8f}", "pay_per_mile_n_safe"),
           (f"{mw3.balanced_trip_share_weight:.8f}", "COALESCE(balanced_trip_share_n, 0.0)"),
           (f"{mw3.long_trip_share_20plus_weight:.8f}", "COALESCE(long_trip_share_20plus_n, 0.0)"),
           (f"{mw3.downstream_weight:.8f}", "downstream_value_n"),
@@ -891,9 +894,9 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
         {nullable_weighted_average_sql([
           (f"{bw3_busy_now_weight:.8f}", "busy_now_base_n"),
           (f"{bw3_busy_next_weight:.8f}", "busy_next_base_n"),
-          (f"{bw3.pay_weight:.8f}", "pay_n"),
-          (f"{bw3.pay_per_min_weight:.8f}", "pay_per_min_n"),
-          (f"{bw3.pay_per_mile_weight:.8f}", "pay_per_mile_n"),
+          (f"{bw3.pay_weight:.8f}", "pay_n_safe"),
+          (f"{bw3.pay_per_min_weight:.8f}", "pay_per_min_n_safe"),
+          (f"{bw3.pay_per_mile_weight:.8f}", "pay_per_mile_n_safe"),
           (f"{bw3.balanced_trip_share_weight:.8f}", "COALESCE(balanced_trip_share_n, 0.0)"),
           (f"{bw3.long_trip_share_20plus_weight:.8f}", "COALESCE(long_trip_share_20plus_n, 0.0)"),
           (f"{bw3.downstream_weight:.8f}", "downstream_value_n"),
@@ -908,9 +911,9 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
         {nullable_weighted_average_sql([
           (f"{qw3_busy_now_weight:.8f}", "busy_now_base_n"),
           (f"{qw3_busy_next_weight:.8f}", "busy_next_base_n"),
-          (f"{qw3.pay_weight:.8f}", "pay_n"),
-          (f"{qw3.pay_per_min_weight:.8f}", "pay_per_min_n"),
-          (f"{qw3.pay_per_mile_weight:.8f}", "pay_per_mile_n"),
+          (f"{qw3.pay_weight:.8f}", "pay_n_safe"),
+          (f"{qw3.pay_per_min_weight:.8f}", "pay_per_min_n_safe"),
+          (f"{qw3.pay_per_mile_weight:.8f}", "pay_per_mile_n_safe"),
           (f"{qw3.balanced_trip_share_weight:.8f}", "COALESCE(balanced_trip_share_n, 0.0)"),
           (f"{qw3.long_trip_share_20plus_weight:.8f}", "COALESCE(long_trip_share_20plus_n, 0.0)"),
           (f"{qw3.downstream_weight:.8f}", "downstream_value_n"),
@@ -925,9 +928,9 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
         {nullable_weighted_average_sql([
           (f"{bkw3_busy_now_weight:.8f}", "busy_now_base_n"),
           (f"{bkw3_busy_next_weight:.8f}", "busy_next_base_n"),
-          (f"{bkw3.pay_weight:.8f}", "pay_n"),
-          (f"{bkw3.pay_per_min_weight:.8f}", "pay_per_min_n"),
-          (f"{bkw3.pay_per_mile_weight:.8f}", "pay_per_mile_n"),
+          (f"{bkw3.pay_weight:.8f}", "pay_n_safe"),
+          (f"{bkw3.pay_per_min_weight:.8f}", "pay_per_min_n_safe"),
+          (f"{bkw3.pay_per_mile_weight:.8f}", "pay_per_mile_n_safe"),
           (f"{bkw3.balanced_trip_share_weight:.8f}", "COALESCE(balanced_trip_share_n, 0.0)"),
           (f"{bkw3.long_trip_share_20plus_weight:.8f}", "COALESCE(long_trip_share_20plus_n, 0.0)"),
           (f"{bkw3.downstream_weight:.8f}", "downstream_value_n"),
@@ -942,9 +945,9 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
         {nullable_weighted_average_sql([
           (f"{sw3_busy_now_weight:.8f}", "busy_now_base_n"),
           (f"{sw3_busy_next_weight:.8f}", "busy_next_base_n"),
-          (f"{sw3.pay_weight:.8f}", "pay_n"),
-          (f"{sw3.pay_per_min_weight:.8f}", "pay_per_min_n"),
-          (f"{sw3.pay_per_mile_weight:.8f}", "pay_per_mile_n"),
+          (f"{sw3.pay_weight:.8f}", "pay_n_safe"),
+          (f"{sw3.pay_per_min_weight:.8f}", "pay_per_min_n_safe"),
+          (f"{sw3.pay_per_mile_weight:.8f}", "pay_per_mile_n_safe"),
           (f"{sw3.balanced_trip_share_weight:.8f}", "COALESCE(balanced_trip_share_n, 0.0)"),
           (f"{sw3.long_trip_share_20plus_weight:.8f}", "COALESCE(long_trip_share_20plus_n, 0.0)"),
           (f"{sw3.downstream_weight:.8f}", "downstream_value_n"),
@@ -965,9 +968,9 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
         {nullable_weighted_average_sql([
           (f"{c3_busy_now_weight:.8f}", "busy_now_base_n"),
           (f"{c3_busy_next_weight:.8f}", "busy_next_base_n"),
-          (f"{c3w.pay_weight:.8f}", "pay_n"),
-          (f"{c3w.pay_per_min_weight:.8f}", "pay_per_min_n"),
-          (f"{c3w.pay_per_mile_weight:.8f}", "pay_per_mile_n"),
+          (f"{c3w.pay_weight:.8f}", "pay_n_safe"),
+          (f"{c3w.pay_per_min_weight:.8f}", "pay_per_min_n_safe"),
+          (f"{c3w.pay_per_mile_weight:.8f}", "pay_per_mile_n_safe"),
           ("citywide_v3_effective_balanced_trip_weight", "COALESCE(balanced_trip_share_n, 0.0)"),
           ("citywide_v3_effective_long_trip_weight", "COALESCE(long_trip_share_20plus_n, 0.0)"),
           (f"{c3w.downstream_weight:.8f}", "downstream_value_n"),
@@ -1281,7 +1284,7 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
       shadow_score_raw_brooklyn_v3 AS earnings_shadow_score_raw_brooklyn_v3,
       shadow_score_raw_staten_island_v3 AS earnings_shadow_score_raw_staten_island_v3,
       ({c3_busy_now_weight:.8f} * busy_now_base_n + {c3_busy_next_weight:.8f} * busy_next_base_n) AS earnings_shadow_busy_size_positive_citywide_v3,
-      ({c3w.pay_weight:.8f} * pay_n + {c3w.pay_per_min_weight:.8f} * pay_per_min_n + {c3w.pay_per_mile_weight:.8f} * pay_per_mile_n) AS earnings_shadow_pay_quality_positive_citywide_v3,
+      ({c3w.pay_weight:.8f} * pay_n_safe + {c3w.pay_per_min_weight:.8f} * pay_per_min_n_safe + {c3w.pay_per_mile_weight:.8f} * pay_per_mile_n_safe) AS earnings_shadow_pay_quality_positive_citywide_v3,
       (citywide_v3_effective_balanced_trip_weight * COALESCE(balanced_trip_share_n, 0.0) + citywide_v3_effective_long_trip_weight * COALESCE(long_trip_share_20plus_n, 0.0)) +
       CASE
         WHEN {manhattan_core_citywide_guard_sql}
@@ -1301,7 +1304,7 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
         ELSE 0.0
       END AS earnings_shadow_saturation_penalty_citywide_v3,
       ({mw3_busy_now_weight:.8f} * busy_now_base_n + {mw3_busy_next_weight:.8f} * busy_next_base_n) AS earnings_shadow_busy_size_positive_manhattan_v3,
-      ({mw3.pay_weight:.8f} * pay_n + {mw3.pay_per_min_weight:.8f} * pay_per_min_n + {mw3.pay_per_mile_weight:.8f} * pay_per_mile_n) AS earnings_shadow_pay_quality_positive_manhattan_v3,
+      ({mw3.pay_weight:.8f} * pay_n_safe + {mw3.pay_per_min_weight:.8f} * pay_per_min_n_safe + {mw3.pay_per_mile_weight:.8f} * pay_per_mile_n_safe) AS earnings_shadow_pay_quality_positive_manhattan_v3,
       ({mw3.balanced_trip_share_weight:.8f} * COALESCE(balanced_trip_share_n, 0.0) + {mw3.long_trip_share_20plus_weight:.8f} * COALESCE(long_trip_share_20plus_n, 0.0)) AS earnings_shadow_trip_mix_positive_manhattan_v3,
       ({mw3.downstream_weight:.8f} * downstream_value_n) AS earnings_shadow_continuation_positive_manhattan_v3,
       ({mw3.short_trip_penalty_weight:.8f} * short_trip_penalty_n) AS earnings_shadow_short_trip_penalty_manhattan_v3,
@@ -1309,7 +1312,7 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
       ({mw3.pickup_friction_penalty_weight:.8f} * pickup_friction_penalty_n + {mw3.shared_ride_penalty_weight:.8f} * shared_ride_penalty_n) AS earnings_shadow_friction_penalty_manhattan_v3,
       ({mw3.market_saturation_penalty_weight:.8f} * market_saturation_penalty_n + 0.10 * manhattan_core_saturation_penalty_n) AS earnings_shadow_saturation_penalty_manhattan_v3,
       ({bw3_busy_now_weight:.8f} * busy_now_base_n + {bw3_busy_next_weight:.8f} * busy_next_base_n) AS earnings_shadow_busy_size_positive_bronx_wash_heights_v3,
-      ({bw3.pay_weight:.8f} * pay_n + {bw3.pay_per_min_weight:.8f} * pay_per_min_n + {bw3.pay_per_mile_weight:.8f} * pay_per_mile_n) AS earnings_shadow_pay_quality_positive_bronx_wash_heights_v3,
+      ({bw3.pay_weight:.8f} * pay_n_safe + {bw3.pay_per_min_weight:.8f} * pay_per_min_n_safe + {bw3.pay_per_mile_weight:.8f} * pay_per_mile_n_safe) AS earnings_shadow_pay_quality_positive_bronx_wash_heights_v3,
       ({bw3.balanced_trip_share_weight:.8f} * COALESCE(balanced_trip_share_n, 0.0) + {bw3.long_trip_share_20plus_weight:.8f} * COALESCE(long_trip_share_20plus_n, 0.0)) AS earnings_shadow_trip_mix_positive_bronx_wash_heights_v3,
       ({bw3.downstream_weight:.8f} * downstream_value_n) AS earnings_shadow_continuation_positive_bronx_wash_heights_v3,
       ({bw3.short_trip_penalty_weight:.8f} * short_trip_penalty_n) AS earnings_shadow_short_trip_penalty_bronx_wash_heights_v3,
@@ -1317,7 +1320,7 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
       ({bw3.pickup_friction_penalty_weight:.8f} * pickup_friction_penalty_n + {bw3.shared_ride_penalty_weight:.8f} * shared_ride_penalty_n) AS earnings_shadow_friction_penalty_bronx_wash_heights_v3,
       ({bw3.market_saturation_penalty_weight:.8f} * market_saturation_penalty_n) AS earnings_shadow_saturation_penalty_bronx_wash_heights_v3,
       ({qw3_busy_now_weight:.8f} * busy_now_base_n + {qw3_busy_next_weight:.8f} * busy_next_base_n) AS earnings_shadow_busy_size_positive_queens_v3,
-      ({qw3.pay_weight:.8f} * pay_n + {qw3.pay_per_min_weight:.8f} * pay_per_min_n + {qw3.pay_per_mile_weight:.8f} * pay_per_mile_n) AS earnings_shadow_pay_quality_positive_queens_v3,
+      ({qw3.pay_weight:.8f} * pay_n_safe + {qw3.pay_per_min_weight:.8f} * pay_per_min_n_safe + {qw3.pay_per_mile_weight:.8f} * pay_per_mile_n_safe) AS earnings_shadow_pay_quality_positive_queens_v3,
       ({qw3.balanced_trip_share_weight:.8f} * COALESCE(balanced_trip_share_n, 0.0) + {qw3.long_trip_share_20plus_weight:.8f} * COALESCE(long_trip_share_20plus_n, 0.0)) AS earnings_shadow_trip_mix_positive_queens_v3,
       ({qw3.downstream_weight:.8f} * downstream_value_n) AS earnings_shadow_continuation_positive_queens_v3,
       ({qw3.short_trip_penalty_weight:.8f} * short_trip_penalty_n) AS earnings_shadow_short_trip_penalty_queens_v3,
@@ -1325,7 +1328,7 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
       ({qw3.pickup_friction_penalty_weight:.8f} * pickup_friction_penalty_n + {qw3.shared_ride_penalty_weight:.8f} * shared_ride_penalty_n) AS earnings_shadow_friction_penalty_queens_v3,
       ({qw3.market_saturation_penalty_weight:.8f} * market_saturation_penalty_n) AS earnings_shadow_saturation_penalty_queens_v3,
       ({bkw3_busy_now_weight:.8f} * busy_now_base_n + {bkw3_busy_next_weight:.8f} * busy_next_base_n) AS earnings_shadow_busy_size_positive_brooklyn_v3,
-      ({bkw3.pay_weight:.8f} * pay_n + {bkw3.pay_per_min_weight:.8f} * pay_per_min_n + {bkw3.pay_per_mile_weight:.8f} * pay_per_mile_n) AS earnings_shadow_pay_quality_positive_brooklyn_v3,
+      ({bkw3.pay_weight:.8f} * pay_n_safe + {bkw3.pay_per_min_weight:.8f} * pay_per_min_n_safe + {bkw3.pay_per_mile_weight:.8f} * pay_per_mile_n_safe) AS earnings_shadow_pay_quality_positive_brooklyn_v3,
       ({bkw3.balanced_trip_share_weight:.8f} * COALESCE(balanced_trip_share_n, 0.0) + {bkw3.long_trip_share_20plus_weight:.8f} * COALESCE(long_trip_share_20plus_n, 0.0)) AS earnings_shadow_trip_mix_positive_brooklyn_v3,
       ({bkw3.downstream_weight:.8f} * downstream_value_n) AS earnings_shadow_continuation_positive_brooklyn_v3,
       ({bkw3.short_trip_penalty_weight:.8f} * short_trip_penalty_n) AS earnings_shadow_short_trip_penalty_brooklyn_v3,
@@ -1333,7 +1336,7 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
       ({bkw3.pickup_friction_penalty_weight:.8f} * pickup_friction_penalty_n + {bkw3.shared_ride_penalty_weight:.8f} * shared_ride_penalty_n) AS earnings_shadow_friction_penalty_brooklyn_v3,
       ({bkw3.market_saturation_penalty_weight:.8f} * market_saturation_penalty_n) AS earnings_shadow_saturation_penalty_brooklyn_v3,
       ({sw3_busy_now_weight:.8f} * busy_now_base_n + {sw3_busy_next_weight:.8f} * busy_next_base_n) AS earnings_shadow_busy_size_positive_staten_island_v3,
-      ({sw3.pay_weight:.8f} * pay_n + {sw3.pay_per_min_weight:.8f} * pay_per_min_n + {sw3.pay_per_mile_weight:.8f} * pay_per_mile_n) AS earnings_shadow_pay_quality_positive_staten_island_v3,
+      ({sw3.pay_weight:.8f} * pay_n_safe + {sw3.pay_per_min_weight:.8f} * pay_per_min_n_safe + {sw3.pay_per_mile_weight:.8f} * pay_per_mile_n_safe) AS earnings_shadow_pay_quality_positive_staten_island_v3,
       ({sw3.balanced_trip_share_weight:.8f} * COALESCE(balanced_trip_share_n, 0.0) + {sw3.long_trip_share_20plus_weight:.8f} * COALESCE(long_trip_share_20plus_n, 0.0)) AS earnings_shadow_trip_mix_positive_staten_island_v3,
       ({sw3.downstream_weight:.8f} * downstream_value_n) AS earnings_shadow_continuation_positive_staten_island_v3,
       ({sw3.short_trip_penalty_weight:.8f} * short_trip_penalty_n) AS earnings_shadow_short_trip_penalty_staten_island_v3,
