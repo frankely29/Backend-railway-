@@ -650,10 +650,14 @@ def _monthly_mode_ready_for_legacy_cleanup() -> bool:
     if not active_month_key:
         return False
     timeline_path = _month_timeline_path(active_month_key)
+    store_path = _month_store_path(active_month_key)
     core_month_ready = bool(
         timeline_path.exists()
         and timeline_path.is_file()
         and timeline_path.stat().st_size > 0
+        and store_path.exists()
+        and store_path.is_file()
+        and store_path.stat().st_size > 0
     )
     if not core_month_ready:
         return False
@@ -773,16 +777,22 @@ def _source_parquets_for_month(month_key: str) -> List[Path]:
 
 def _month_bootstrap_ready(month_key: str) -> bool:
     timeline_path = _month_timeline_path(month_key)
-    frame_cache_dir = _month_frame_cache_dir(month_key)
+    store_path = _month_store_path(month_key)
+    manifest = _load_month_manifest()
+    month_entry = (manifest.get("months") or {}).get(month_key) or {}
     return bool(
         MONTH_MANIFEST_PATH.exists()
         and MONTH_MANIFEST_PATH.is_file()
         and MONTH_MANIFEST_PATH.stat().st_size > 0
+        and bool(month_entry)
+        and bool(month_entry.get("store_exists"))
+        and bool(month_entry.get("timeline_exists"))
+        and store_path.exists()
+        and store_path.is_file()
+        and store_path.stat().st_size > 0
         and timeline_path.exists()
         and timeline_path.is_file()
         and timeline_path.stat().st_size > 0
-        and frame_cache_dir.exists()
-        and frame_cache_dir.is_dir()
     )
 
 
@@ -1490,8 +1500,8 @@ def _artifact_runtime_policy_snapshot() -> Dict[str, Any]:
             "*.parquet",
             "taxi_zones.geojson",
             "exact_history/month_manifest.json",
+            "exact_history/months/<month_key>/exact_shadow.duckdb",
             "exact_history/months/<month_key>/timeline.json",
-            "exact_history/months/<month_key>/frame_cache/",
         ],
         "db_required": [
             "scoring_shadow_manifest",
@@ -1516,7 +1526,6 @@ def _artifact_runtime_integrity_report() -> Dict[str, Any]:
     active_month_key = resolve_active_month_key(datetime.now(timezone.utc).astimezone(NYC_TZ), available_month_keys)
     month_manifest_present = MONTH_MANIFEST_PATH.exists() and MONTH_MANIFEST_PATH.is_file() and MONTH_MANIFEST_PATH.stat().st_size > 0
     timeline_present = bool(active_month_key and _month_timeline_path(active_month_key).exists() and _month_timeline_path(active_month_key).is_file())
-    frame_cache_dir_present = bool(active_month_key and _month_frame_cache_dir(active_month_key).exists() and _month_frame_cache_dir(active_month_key).is_dir())
     exact_store_present = bool(active_month_key and _month_store_path(active_month_key).exists() and _month_store_path(active_month_key).is_file() and _month_store_path(active_month_key).stat().st_size > 0)
     timeline_count = 0
     if timeline_present and active_month_key:
@@ -1525,7 +1534,7 @@ def _artifact_runtime_integrity_report() -> Dict[str, Any]:
             timeline_count = int(timeline_payload.get("count") or len(timeline_payload.get("timeline") or []))
         except Exception:
             timeline_count = 0
-    required_volume_ok = parquet_count > 0 and timeline_count > 0 and zones_present and month_manifest_present and timeline_present and frame_cache_dir_present
+    required_volume_ok = parquet_count > 0 and timeline_count > 0 and zones_present and month_manifest_present and timeline_present and exact_store_present
 
     required_db_keys = ["scoring_shadow_manifest"]
     missing_required_db_artifacts = [key for key in required_db_keys if not generated_artifact_present(key)]
@@ -1552,8 +1561,8 @@ def _artifact_runtime_integrity_report() -> Dict[str, Any]:
         missing_required_volume.append("exact_history/month_manifest.json")
     if not timeline_present:
         missing_required_volume.append("exact_history/months/<active_month_key>/timeline.json")
-    if not frame_cache_dir_present:
-        missing_required_volume.append("exact_history/months/<active_month_key>/frame_cache/")
+    if not exact_store_present:
+        missing_required_volume.append("exact_history/months/<active_month_key>/exact_shadow.duckdb")
 
     core_map_ready = required_volume_ok
     ok = core_map_ready and not redundant_file_copies_present
@@ -1576,8 +1585,8 @@ def _artifact_runtime_integrity_report() -> Dict[str, Any]:
         "monthly_partition_count": len(available_month_keys),
         "active_month_store_present": exact_store_present,
         "active_month_timeline_present": timeline_present,
-        "active_month_frame_cache_dir_present": frame_cache_dir_present,
-        "active_month_bootstrap_ready": bool(month_manifest_present and timeline_present and frame_cache_dir_present),
+        "active_month_frame_cache_dir_present": bool(active_month_key and _month_frame_cache_dir(active_month_key).exists() and _month_frame_cache_dir(active_month_key).is_dir()),
+        "active_month_bootstrap_ready": bool(month_manifest_present and timeline_present and exact_store_present),
     }
 
 
@@ -2686,17 +2695,42 @@ def _ensure_requested_month_available_or_start_generate(
 ) -> Optional[JSONResponse]:
     if _month_bootstrap_ready(month_key):
         return None
-    try:
-        _bootstrap_month_partition(month_key=month_key, bin_minutes=DEFAULT_BIN_MINUTES)
-        return None
-    except Exception:
-        traceback.print_exc()
+
+    now_unix = int(time.time())
+    in_failure_backoff = bool(
+        _last_failed_month_key
+        and str(_last_failed_month_key).strip() == str(month_key).strip()
+        and _last_failed_at_unix is not None
+        and (now_unix - int(_last_failed_at_unix)) < int(MONTH_BUILD_FAILURE_BACKOFF_SEC)
+    )
+    if in_failure_backoff:
         return _preparing_month_response(
             month_key=month_key,
             request_kind=request_kind,
             generate_started=False,
-            retry_after_sec=retry_after_sec,
+            retry_after_sec=max(retry_after_sec, int(MONTH_BUILD_FAILURE_BACKOFF_SEC)),
         )
+
+    generate_started = False
+    try:
+        started = start_generate(
+            bin_minutes=DEFAULT_BIN_MINUTES,
+            min_trips_per_window=DEFAULT_MIN_TRIPS_PER_WINDOW,
+            include_day_tendency=False,
+            build_review_artifacts=False,
+            month_key=month_key,
+            build_all_months=False,
+        )
+        generate_started = str(started.get("state") or "") in {"started", "running"}
+    except Exception:
+        traceback.print_exc()
+        generate_started = False
+    return _preparing_month_response(
+        month_key=month_key,
+        request_kind=request_kind,
+        generate_started=generate_started,
+        retry_after_sec=retry_after_sec,
+    )
 
 
 def _set_state(**kwargs):
@@ -4643,8 +4677,43 @@ def startup():
             _log_runtime_integrity_summary()
             return
 
+        now_unix = int(time.time())
+        startup_in_failure_backoff = bool(
+            _last_failed_month_key
+            and str(_last_failed_month_key).strip() == str(target_month_key_candidate).strip()
+            and _last_failed_at_unix is not None
+            and (now_unix - int(_last_failed_at_unix)) < int(MONTH_BUILD_FAILURE_BACKOFF_SEC)
+        )
+        if startup_in_failure_backoff:
+            print(
+                "startup_auto_prepare_month_skipped "
+                f"reason=failure_backoff month_key={target_month_key_candidate} "
+                f"backoff_sec={MONTH_BUILD_FAILURE_BACKOFF_SEC}"
+            )
+            _set_state(
+                state="idle",
+                bin_minutes=DEFAULT_BIN_MINUTES,
+                min_trips_per_window=DEFAULT_MIN_TRIPS_PER_WINDOW,
+                result={
+                    "ok": False,
+                    "reason": "failure_backoff",
+                    "target_month_key": target_month_key_candidate,
+                    "source_month_keys": source_month_keys,
+                    "auto_prepare_mode": "single_target_month_core_only",
+                },
+            )
+            _log_runtime_integrity_summary()
+            return
+
         print(f"startup_auto_prepare_month_start month_key={target_month_key_candidate}")
-        _bootstrap_month_partition(target_month_key_candidate, bin_minutes=DEFAULT_BIN_MINUTES)
+        start_generate(
+            bin_minutes=DEFAULT_BIN_MINUTES,
+            min_trips_per_window=DEFAULT_MIN_TRIPS_PER_WINDOW,
+            include_day_tendency=False,
+            build_review_artifacts=False,
+            month_key=target_month_key_candidate,
+            build_all_months=False,
+        )
     except Exception:
         _set_state(state="idle")
     _log_runtime_integrity_summary()
@@ -4748,7 +4817,7 @@ def status():
         MONTH_MANIFEST_PATH.exists()
         and month_manifest.get("months", {}).get(active_month_key)
         and timeline_file_present
-        and frame_cache_dir_present
+        and exact_history_store_present
     )
     build_review_artifacts_in_progress = bool(
         state_name in {"started", "running"} and bool(generate_state.get("build_review_artifacts"))
@@ -4826,7 +4895,7 @@ def status():
         "active_month_frame_cache_dir_present": frame_cache_dir_present,
         "active_month_frame_cache_ready": frame_cache_dir_present,
         "active_month_store_cache_present": exact_history_store_present,
-        "active_month_bootstrap_ready": bool(MONTH_MANIFEST_PATH.exists() and timeline_file_present and frame_cache_dir_present),
+        "active_month_bootstrap_ready": bool(MONTH_MANIFEST_PATH.exists() and timeline_file_present and exact_history_store_present),
         "frame_cache_file_count": int(frame_cache_file_count),
         "pending_month_key": pending_month_key,
         "pending_month_label": pending_month_label,
@@ -4840,7 +4909,7 @@ def status():
         "generated_artifact_store_report": generated_artifact_report(),
         "artifact_runtime_policy": _artifact_runtime_policy_snapshot(),
         "artifact_runtime_integrity": artifact_runtime_integrity,
-        "core_map_ready": bool(MONTH_MANIFEST_PATH.exists() and timeline_file_present and frame_cache_dir_present),
+        "core_map_ready": bool(MONTH_MANIFEST_PATH.exists() and timeline_file_present and exact_history_store_present),
         "active_month_core_ready": active_month_core_ready,
         "build_review_artifacts_in_progress": build_review_artifacts_in_progress,
         "optional_artifacts_missing": list(artifact_runtime_integrity.get("optional_artifacts_missing") or []),
