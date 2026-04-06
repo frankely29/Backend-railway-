@@ -2083,6 +2083,24 @@ def build_hotspots_frames(
         timeline_verified = published_timeline_path.exists() and published_timeline_path.is_file() and published_timeline_path.stat().st_size > 0
         if not store_verified or not timeline_verified:
             raise RuntimeError(f"Monthly publish verification failed for {month_key}")
+        published_build_meta_path = resolved_exact_history_dir / "build_meta.json"
+        build_meta_payload = {
+            "month_key": str(month_key or "").strip() or None,
+            "built_at_unix": int(datetime.now().timestamp()),
+            "bin_minutes": int(bin_minutes),
+            "min_trips_per_window": int(min_trips_per_window),
+            "source_parquet_files": [Path(p).name for p in (parquet_files or [])],
+            "code_dependency_hash": expected_freshness.get("code_dependency_hash"),
+            "source_data_hash": expected_freshness.get("source_data_hash"),
+            "artifact_signature": expected_freshness.get("artifact_signature"),
+            "frame_count": int(len(timeline)),
+            "first_frame_datetime": timeline[0] if timeline else None,
+            "last_frame_datetime": timeline[-1] if timeline else None,
+        }
+        published_build_meta_path.write_text(
+            json.dumps(build_meta_payload, separators=(",", ":")),
+            encoding="utf-8",
+        )
         logger.info("monthly_partition_publish_verified month_key=%s", month_key)
         logger.info("monthly_partition_publish_done month_key=%s", month_key)
 

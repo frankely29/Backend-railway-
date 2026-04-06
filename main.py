@@ -10,6 +10,7 @@ import errno
 import copy
 import duckdb
 import re
+import shutil
 import sqlite3
 import threading
 import time
@@ -55,6 +56,10 @@ from assistant_outlook_engine import (
 from hotspot_models import MicroHotspotScoreResult
 from hotspot_scoring import score_zones
 from artifact_freshness import evaluate_artifact_freshness
+from exact_history_freshness import (
+    active_month_freshness_report,
+    load_month_build_meta,
+)
 from artifact_storage_service import cleanup_artifact_storage, get_artifact_storage_report
 from artifact_db_store import (
     delete_generated_artifact,
@@ -567,6 +572,47 @@ def _month_frame_cache_file(month_key: str, frame_index: int, frame_time: str) -
     return _month_frame_cache_dir(month_key) / f"frame_{int(frame_index):05d}_{suffix}.json"
 
 
+def _month_build_meta_path(month_key: str) -> Path:
+    return _month_dir(month_key) / "build_meta.json"
+
+
+def _active_month_freshness(month_key: str) -> Dict[str, Any]:
+    return active_month_freshness_report(
+        month_key=month_key,
+        exact_history_months_dir=EXACT_HISTORY_MONTHS_DIR,
+        repo_root=Path(__file__).resolve().parent,
+        data_dir=DATA_DIR,
+        frames_dir=FRAMES_DIR,
+        bin_minutes=int(DEFAULT_BIN_MINUTES),
+        min_trips_per_window=int(DEFAULT_MIN_TRIPS_PER_WINDOW),
+    )
+
+
+def _purge_month_frame_cache(month_key: str) -> int:
+    mk = str(month_key or "").strip()
+    if not mk:
+        return 0
+    removed = 0
+    cache_dir = _month_frame_cache_dir(mk)
+    if cache_dir.exists() and cache_dir.is_dir():
+        for candidate in cache_dir.glob("frame_*.json"):
+            try:
+                candidate.unlink(missing_ok=True)
+                removed += 1
+            except Exception:
+                traceback.print_exc()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    with _frame_cache_lock:
+        stale_keys = [key for key in list(_frame_cache.keys()) if str(key[0]).strip() == mk]
+        for key in stale_keys:
+            _frame_cache.pop(key, None)
+        if stale_keys:
+            _frame_cache_order_filtered = deque([k for k in _frame_cache_order if str(k[0]).strip() != mk])
+            _frame_cache_order.clear()
+            _frame_cache_order.extend(_frame_cache_order_filtered)
+    return int(removed)
+
+
 def _to_frontend_local_iso(value: Any) -> str:
     return to_frontend_local_iso(value)
 
@@ -756,6 +802,7 @@ def _monthly_mode_ready_for_legacy_cleanup() -> bool:
         and store_path.exists()
         and store_path.is_file()
         and store_path.stat().st_size > 0
+        and _month_bootstrap_ready(active_month_key)
     )
     if not core_month_ready:
         return False
@@ -878,6 +925,10 @@ def _month_bootstrap_ready(month_key: str) -> bool:
     store_path = _month_store_path(month_key)
     manifest = _load_month_manifest()
     month_entry = (manifest.get("months") or {}).get(month_key) or {}
+    freshness = _active_month_freshness(month_key)
+    signature_match = bool(freshness.get("signature_match"))
+    if not signature_match:
+        _purge_month_frame_cache(month_key)
     return bool(
         MONTH_MANIFEST_PATH.exists()
         and MONTH_MANIFEST_PATH.is_file()
@@ -885,12 +936,15 @@ def _month_bootstrap_ready(month_key: str) -> bool:
         and bool(month_entry)
         and bool(month_entry.get("store_exists"))
         and bool(month_entry.get("timeline_exists"))
+        and bool(month_entry.get("build_meta_present"))
+        and bool(month_entry.get("artifact_signature_matches"))
         and store_path.exists()
         and store_path.is_file()
         and store_path.stat().st_size > 0
         and timeline_path.exists()
         and timeline_path.is_file()
         and timeline_path.stat().st_size > 0
+        and signature_match
     )
 
 
@@ -1116,6 +1170,11 @@ def _read_timeline_cached(month_key: Optional[str] = None) -> Dict[str, Any]:
             data["timeline_scope"] = "monthly_exact_historical"
             _timeline_cache_entry[cache_key] = {"data": data, "mtime": mtime, "size": size, "etag": etag}
             return dict(_timeline_cache_entry[cache_key])
+
+    if resolved_month_key:
+        raise FileNotFoundError(
+            f"Missing monthly timeline on volume for month_key={resolved_month_key}: {timeline_path}"
+        )
 
     artifact = load_generated_artifact("timeline")
     if artifact:
@@ -1606,6 +1665,23 @@ def _day_tendency_model_is_current() -> bool:
             return False
         if "global_baseline" not in model:
             return False
+        freshness = _active_month_freshness(
+            resolve_active_month_key(
+                datetime.now(timezone.utc).astimezone(NYC_TZ),
+                _available_source_month_keys(),
+            )
+            or ""
+        )
+        expected = freshness.get("expected") or {}
+        expected_code = expected.get("code_dependency_hash")
+        expected_source = expected.get("source_data_hash")
+        expected_artifact = expected.get("artifact_signature")
+        if expected_code and model.get("code_dependency_hash") != expected_code:
+            return False
+        if expected_source and model.get("source_data_hash") != expected_source:
+            return False
+        if expected_artifact and model.get("artifact_signature") != expected_artifact:
+            return False
         return True
     except Exception:
         return False
@@ -1684,6 +1760,8 @@ def _artifact_runtime_integrity_report() -> Dict[str, Any]:
     month_manifest_present = MONTH_MANIFEST_PATH.exists() and MONTH_MANIFEST_PATH.is_file() and MONTH_MANIFEST_PATH.stat().st_size > 0
     timeline_present = bool(active_month_key and _month_timeline_path(active_month_key).exists() and _month_timeline_path(active_month_key).is_file())
     exact_store_present = bool(active_month_key and _month_store_path(active_month_key).exists() and _month_store_path(active_month_key).is_file() and _month_store_path(active_month_key).stat().st_size > 0)
+    month_freshness = _active_month_freshness(active_month_key) if active_month_key else {}
+    signature_match = bool(month_freshness.get("signature_match"))
     timeline_count = 0
     if timeline_present and active_month_key:
         try:
@@ -1691,7 +1769,7 @@ def _artifact_runtime_integrity_report() -> Dict[str, Any]:
             timeline_count = int(timeline_payload.get("count") or len(timeline_payload.get("timeline") or []))
         except Exception:
             timeline_count = 0
-    required_volume_ok = parquet_count > 0 and timeline_count > 0 and zones_present and month_manifest_present and timeline_present and exact_store_present
+    required_volume_ok = parquet_count > 0 and timeline_count > 0 and zones_present and month_manifest_present and timeline_present and exact_store_present and signature_match
 
     required_db_keys = ["scoring_shadow_manifest"]
     missing_required_db_artifacts = [key for key in required_db_keys if not generated_artifact_present(key)]
@@ -1704,7 +1782,6 @@ def _artifact_runtime_integrity_report() -> Dict[str, Any]:
 
     redundant_targets = [
         ASSISTANT_OUTLOOK_PATH,
-        DAY_TENDENCY_MODEL_PATH,
         FRAMES_DIR / "scoring_shadow_manifest.json",
     ]
     redundant_file_copies_present = [str(path) for path in redundant_targets if path.exists() and path.is_file()]
@@ -1743,7 +1820,11 @@ def _artifact_runtime_integrity_report() -> Dict[str, Any]:
         "active_month_store_present": exact_store_present,
         "active_month_timeline_present": timeline_present,
         "active_month_frame_cache_dir_present": bool(active_month_key and _month_frame_cache_dir(active_month_key).exists() and _month_frame_cache_dir(active_month_key).is_dir()),
-        "active_month_bootstrap_ready": bool(month_manifest_present and timeline_present and exact_store_present),
+        "active_month_bootstrap_ready": bool(month_manifest_present and timeline_present and exact_store_present and signature_match),
+        "active_month_build_meta_present": bool(month_freshness.get("build_meta_present")),
+        "active_month_signature_matches_code": bool(month_freshness.get("code_dependency_hash_match")),
+        "active_month_signature_matches_source": bool(month_freshness.get("source_data_hash_match")),
+        "active_month_artifact_signature_matches": bool(month_freshness.get("artifact_signature_match")),
     }
 
 
@@ -1759,7 +1840,8 @@ def _reconcile_artifact_runtime_state() -> Dict[str, Any]:
         repaired_flags["assistant_outlook_legacy_pruned"] = True
 
     day_tendency_missing = not generated_artifact_present("day_tendency_model")
-    if day_tendency_missing and len(_list_parquets()) > 0 and (DATA_DIR / "taxi_zones.geojson").exists():
+    day_tendency_stale = not _day_tendency_model_is_current()
+    if (day_tendency_missing or day_tendency_stale) and len(_list_parquets()) > 0 and (DATA_DIR / "taxi_zones.geojson").exists():
         try:
             _build_day_tendency_only(DEFAULT_BIN_MINUTES)
             repaired_flags["day_tendency_rebuilt"] = True
@@ -2674,6 +2756,24 @@ def _build_day_tendency_only(bin_minutes: int = DEFAULT_BIN_MINUTES) -> Dict[str
     )
     try:
         model_payload = ((result or {}).get("payload") if isinstance(result, dict) else None) or _read_day_tendency_model()
+        freshness = active_month_freshness_report(
+            month_key=resolve_active_month_key(
+                datetime.now(timezone.utc).astimezone(NYC_TZ),
+                _available_source_month_keys(),
+            )
+            or "",
+            exact_history_months_dir=EXACT_HISTORY_MONTHS_DIR,
+            repo_root=Path(__file__).resolve().parent,
+            data_dir=DATA_DIR,
+            frames_dir=FRAMES_DIR,
+            bin_minutes=int(DEFAULT_BIN_MINUTES),
+            min_trips_per_window=int(DEFAULT_MIN_TRIPS_PER_WINDOW),
+        )
+        expected = freshness.get("expected") or {}
+        if isinstance(model_payload, dict):
+            model_payload["code_dependency_hash"] = expected.get("code_dependency_hash")
+            model_payload["source_data_hash"] = expected.get("source_data_hash")
+            model_payload["artifact_signature"] = expected.get("artifact_signature")
         save_generated_artifact("day_tendency_model", model_payload, compress=False)
         _prune_redundant_db_backed_artifact_files()
     except Exception:
@@ -2837,6 +2937,9 @@ def _bootstrap_month_partition(month_key: str, bin_minutes: int = DEFAULT_BIN_MI
 
     months_manifest: Dict[str, Dict[str, Any]] = dict((_load_month_manifest().get("months") or {}))
     timeline = list(timeline_payload.get("timeline") or [])
+    freshness = _active_month_freshness(requested)
+    build_meta = freshness.get("build_meta") or {}
+    expected = freshness.get("expected") or {}
     months_manifest[requested] = {
         "month_key": requested,
         "source_parquet_filenames": [p.name for p in parquets],
@@ -2846,6 +2949,13 @@ def _bootstrap_month_partition(month_key: str, bin_minutes: int = DEFAULT_BIN_MI
         "first_frame_datetime": timeline[0] if timeline else None,
         "last_frame_datetime": timeline[-1] if timeline else None,
         "frame_count": int(len(timeline)),
+        "built_at_unix": build_meta.get("built_at_unix"),
+        "build_meta_present": bool(freshness.get("build_meta_present")),
+        "code_dependency_hash": build_meta.get("code_dependency_hash"),
+        "source_data_hash": build_meta.get("source_data_hash"),
+        "artifact_signature": build_meta.get("artifact_signature"),
+        "expected_artifact_signature": expected.get("artifact_signature"),
+        "artifact_signature_matches": bool(freshness.get("artifact_signature_match")),
         "bootstrapped_at_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
     }
     _persist_month_manifest(months_manifest)
@@ -3014,6 +3124,9 @@ def _generate_worker(
             timeline_exists = bool(timeline_path.exists() and timeline_path.is_file() and timeline_path.stat().st_size > 0)
             if not store_exists or not timeline_exists:
                 raise RuntimeError(f"Monthly publish verification failed for {mk}")
+            build_meta = load_month_build_meta(EXACT_HISTORY_MONTHS_DIR, mk) or {}
+            freshness = _active_month_freshness(mk)
+            expected = freshness.get("expected") or {}
             months_manifest[mk] = {
                 "month_key": mk,
                 "source_parquet_filenames": [p.name for p in (grouped_parquets.get(mk) or [])],
@@ -3022,6 +3135,13 @@ def _generate_worker(
                 "first_frame_datetime": timeline[0] if timeline else None,
                 "last_frame_datetime": timeline[-1] if timeline else None,
                 "frame_count": int(len(timeline)),
+                "built_at_unix": build_meta.get("built_at_unix"),
+                "build_meta_present": bool(freshness.get("build_meta_present")),
+                "code_dependency_hash": build_meta.get("code_dependency_hash"),
+                "source_data_hash": build_meta.get("source_data_hash"),
+                "artifact_signature": build_meta.get("artifact_signature"),
+                "expected_artifact_signature": expected.get("artifact_signature"),
+                "artifact_signature_matches": bool(freshness.get("artifact_signature_match")),
             }
             build_results[mk] = month_result
         manifest_payload = _persist_month_manifest(months_manifest)
@@ -4987,12 +5107,38 @@ def status():
     stale_month_build_dirs_count = _count_stale_subdirs(EXACT_HISTORY_MONTHS_BUILDING_DIR)
     stale_month_backup_dirs_count = _count_stale_subdirs(EXACT_HISTORY_MONTHS_BACKUP_DIR)
     legacy_frame_file_count = _legacy_frame_file_count()
+    month_freshness = _active_month_freshness(active_month_key) if active_month_key else {}
+    month_expected = month_freshness.get("expected") or {}
+    month_build_meta = month_freshness.get("build_meta") or {}
+    active_month_signature_matches_code = bool(month_freshness.get("code_dependency_hash_match"))
+    active_month_signature_matches_source = bool(month_freshness.get("source_data_hash_match"))
+    active_month_artifact_signature_matches = bool(month_freshness.get("artifact_signature_match"))
+    active_month_build_meta_present = bool(month_freshness.get("build_meta_present"))
+    active_month_signature_matches_expected = bool(month_freshness.get("signature_match"))
+    stale_frame_cache_file_count_removed = 0
+    if active_month_key and not active_month_signature_matches_expected:
+        stale_frame_cache_file_count_removed = _purge_month_frame_cache(active_month_key)
     active_month_core_ready = bool(
         MONTH_MANIFEST_PATH.exists()
         and month_manifest.get("months", {}).get(active_month_key)
         and timeline_file_present
         and exact_history_store_present
+        and active_month_build_meta_present
+        and active_month_signature_matches_expected
     )
+    active_month_rebuild_required = bool(active_month_key and not active_month_core_ready)
+    if active_month_rebuild_required and state_name not in {"started", "running"}:
+        try:
+            start_generate(
+                bin_minutes=DEFAULT_BIN_MINUTES,
+                min_trips_per_window=DEFAULT_MIN_TRIPS_PER_WINDOW,
+                include_day_tendency=False,
+                build_review_artifacts=False,
+                month_key=active_month_key,
+                build_all_months=False,
+            )
+        except Exception:
+            traceback.print_exc()
     build_review_artifacts_in_progress = bool(
         state_name in {"started", "running"} and bool(generate_state.get("build_review_artifacts"))
     )
@@ -5069,8 +5215,21 @@ def status():
         "active_month_frame_cache_dir_present": frame_cache_dir_present,
         "active_month_frame_cache_ready": frame_cache_dir_present,
         "active_month_store_cache_present": exact_history_store_present,
-        "active_month_bootstrap_ready": bool(MONTH_MANIFEST_PATH.exists() and timeline_file_present and exact_history_store_present),
+        "active_month_bootstrap_ready": bool(
+            MONTH_MANIFEST_PATH.exists()
+            and timeline_file_present
+            and exact_history_store_present
+            and active_month_signature_matches_expected
+        ),
         "frame_cache_file_count": int(frame_cache_file_count),
+        "active_month_build_meta_present": active_month_build_meta_present,
+        "active_month_signature_matches_code": active_month_signature_matches_code,
+        "active_month_signature_matches_source": active_month_signature_matches_source,
+        "active_month_artifact_signature_matches": active_month_artifact_signature_matches,
+        "active_month_rebuild_required": active_month_rebuild_required,
+        "stale_frame_cache_file_count_removed": int(stale_frame_cache_file_count_removed),
+        "active_month_build_meta_artifact_signature": month_build_meta.get("artifact_signature"),
+        "active_month_expected_artifact_signature": month_expected.get("artifact_signature"),
         "pending_month_key": pending_month_key,
         "pending_month_label": pending_month_label,
         "last_failed_month_key": last_failed_month_key,
@@ -5083,7 +5242,12 @@ def status():
         "generated_artifact_store_report": generated_artifact_report(),
         "artifact_runtime_policy": _artifact_runtime_policy_snapshot(),
         "artifact_runtime_integrity": artifact_runtime_integrity,
-        "core_map_ready": bool(MONTH_MANIFEST_PATH.exists() and timeline_file_present and exact_history_store_present),
+        "core_map_ready": bool(
+            MONTH_MANIFEST_PATH.exists()
+            and timeline_file_present
+            and exact_history_store_present
+            and active_month_signature_matches_expected
+        ),
         "active_month_core_ready": active_month_core_ready,
         "build_review_artifacts_in_progress": build_review_artifacts_in_progress,
         "optional_artifacts_missing": list(artifact_runtime_integrity.get("optional_artifacts_missing") or []),
