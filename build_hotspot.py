@@ -1177,11 +1177,11 @@ def build_hotspots_frames(
                             )
                             has_materialized_shadow_rows = True
                         except Exception as sub_exc:
-                            if _is_memory_error(sub_exc):
-                                raise RuntimeError(
-                                    f"Failed to build exact-history month slice month_key={month_key} local_date={local_date.isoformat()} local_window={sub_window_label}"
-                                ) from sub_exc
-                            raise
+                            raise RuntimeError(
+                                "Failed to build exact-history month slice "
+                                f"month_key={month_key} local_date={local_date.isoformat()} "
+                                f"local_window={sub_window_label}"
+                            ) from sub_exc
                         logger.info(
                             "exact_history_slice_append_done month_key=%s local_date=%s local_window=%s rows_total=%d",
                             month_key,
