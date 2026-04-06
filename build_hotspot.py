@@ -1295,6 +1295,13 @@ def build_hotspots_frames(
             finally:
                 connection.close()
 
+        def _raise_slice_failure(*, local_date: dt_date, local_window: str, exc: Exception) -> None:
+            raise RuntimeError(
+                "Failed to build exact-history month slice "
+                f"month_key={month_key} local_date={local_date.isoformat()} "
+                f"local_window={local_window} cause={exc}"
+            ) from exc
+
         for local_date in month_local_dates:
             local_day_start = datetime.combine(local_date, dt_time.min, tzinfo=NYC_TZ)
             for window_start_hour in (0, 6, 12, 18):
@@ -1310,7 +1317,7 @@ def build_hotspots_frames(
                     has_materialized_shadow_rows = True
                 except Exception as slice_exc:
                     if not _is_memory_error(slice_exc):
-                        raise
+                        _raise_slice_failure(local_date=local_date, local_window=local_window_label, exc=slice_exc)
                     logger.warning(
                         "exact_history_slice_oom_retry month_key=%s local_date=%s local_window=%s error=%s",
                         month_key,
@@ -1330,11 +1337,36 @@ def build_hotspots_frames(
                             )
                             has_materialized_shadow_rows = True
                         except Exception as sub_exc:
-                            raise RuntimeError(
-                                "Failed to build exact-history month slice "
-                                f"month_key={month_key} local_date={local_date.isoformat()} "
-                                f"local_window={sub_window_label} cause={sub_exc}"
-                            ) from sub_exc
+                            if not _is_memory_error(sub_exc):
+                                _raise_slice_failure(local_date=local_date, local_window=sub_window_label, exc=sub_exc)
+                            logger.warning(
+                                "exact_history_slice_oom_retry_20m month_key=%s local_date=%s local_window=%s error=%s",
+                                month_key,
+                                local_date.isoformat(),
+                                sub_window_label,
+                                str(sub_exc),
+                            )
+                            for sub_minute in (0, 20, 40):
+                                tiny_local_start = sub_local_start + timedelta(minutes=sub_minute)
+                                tiny_local_end = tiny_local_start + timedelta(minutes=20)
+                                tiny_window_label = f"{tiny_local_start.strftime('%H:%M')}-{tiny_local_end.strftime('%H:%M')}"
+                                try:
+                                    rows_total_in_shadow = _append_shadow_slice(
+                                        utc_start=_utc_iso(tiny_local_start),
+                                        utc_end=_utc_iso(tiny_local_end),
+                                        create_table=not has_materialized_shadow_rows,
+                                    )
+                                    has_materialized_shadow_rows = True
+                                except Exception as tiny_exc:
+                                    _raise_slice_failure(local_date=local_date, local_window=tiny_window_label, exc=tiny_exc)
+                                logger.info(
+                                    "exact_history_slice_append_done month_key=%s local_date=%s local_window=%s rows_total=%d",
+                                    month_key,
+                                    local_date.isoformat(),
+                                    tiny_window_label,
+                                    rows_total_in_shadow,
+                                )
+                            continue
                         logger.info(
                             "exact_history_slice_append_done month_key=%s local_date=%s local_window=%s rows_total=%d",
                             month_key,
@@ -2098,16 +2130,29 @@ def build_hotspots_frames(
             "first_frame_datetime": timeline[0] if timeline else None,
             "last_frame_datetime": timeline[-1] if timeline else None,
         }
-        published_build_meta_tmp_path.write_text(
-            json.dumps(build_meta_payload, separators=(",", ":")),
-            encoding="utf-8",
-        )
         try:
-            with published_build_meta_tmp_path.open("rb") as tmp_reader:
-                os.fsync(tmp_reader.fileno())
-        except Exception:
-            pass
-        published_build_meta_tmp_path.replace(published_build_meta_path)
+            with published_build_meta_tmp_path.open("w", encoding="utf-8") as tmp_writer:
+                tmp_writer.write(json.dumps(build_meta_payload, separators=(",", ":")))
+                tmp_writer.flush()
+                try:
+                    os.fsync(tmp_writer.fileno())
+                except Exception:
+                    pass
+            published_build_meta_tmp_path.replace(published_build_meta_path)
+            try:
+                month_dir_fd = os.open(str(resolved_exact_history_dir), os.O_RDONLY)
+                try:
+                    os.fsync(month_dir_fd)
+                finally:
+                    os.close(month_dir_fd)
+            except Exception:
+                pass
+        finally:
+            if published_build_meta_tmp_path.exists():
+                try:
+                    published_build_meta_tmp_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
         logger.info("monthly_partition_publish_verified month_key=%s", month_key)
         logger.info("monthly_partition_publish_done month_key=%s", month_key)
 

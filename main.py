@@ -3142,6 +3142,10 @@ def _generate_worker(
             failed_month_key_candidate = str(build_month_keys[0]).strip()
         months_manifest: Dict[str, Dict[str, Any]] = dict((_load_month_manifest().get("months") or {}))
         build_results: Dict[str, Any] = {}
+        source_target_month_key = resolve_active_month_key(
+            datetime.now(timezone.utc).astimezone(NYC_TZ),
+            sorted(grouped_parquets.keys()),
+        )
         for mk in build_month_keys:
             print(f"monthly_partition_build_start month_key={mk}")
             month_dir = _month_dir(mk)
@@ -3171,9 +3175,17 @@ def _generate_worker(
             timeline_exists = bool(timeline_path.exists() and timeline_path.is_file() and timeline_path.stat().st_size > 0)
             if not store_exists or not timeline_exists:
                 raise RuntimeError(f"Monthly publish verification failed for {mk}")
-            build_meta = load_month_build_meta(EXACT_HISTORY_MONTHS_DIR, mk) or {}
+            build_meta = load_month_build_meta(EXACT_HISTORY_MONTHS_DIR, mk)
+            if not isinstance(build_meta, dict):
+                raise RuntimeError(
+                    f"Monthly publish contract failed for {mk}: build_meta.json missing after successful publish verification."
+                )
             freshness = _active_month_freshness(mk)
             expected = freshness.get("expected") or {}
+            if not bool(freshness.get("build_meta_present")):
+                raise RuntimeError(
+                    f"Monthly publish contract failed for {mk}: freshness gate did not detect build_meta.json."
+                )
             months_manifest[mk] = {
                 "month_key": mk,
                 "source_parquet_filenames": [p.name for p in (grouped_parquets.get(mk) or [])],
@@ -3190,6 +3202,9 @@ def _generate_worker(
                 "expected_artifact_signature": expected.get("artifact_signature"),
                 "artifact_signature_matches": bool(freshness.get("artifact_signature_match")),
             }
+            if str(mk).strip() == str(source_target_month_key or "").strip() and bool(freshness.get("signature_match")):
+                stale_removed = _purge_month_frame_cache(mk)
+                print(f"monthly_partition_frame_cache_purged month_key={mk} removed={stale_removed}")
             build_results[mk] = month_result
         manifest_payload = _persist_month_manifest(months_manifest)
         _prune_legacy_frame_files_after_monthly_ready()
