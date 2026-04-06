@@ -41,15 +41,18 @@ def _open_shadow_sql_connection(
     memory_limit: str | None = None,
     read_only: bool = False,
 ) -> duckdb.DuckDBPyConnection:
+    def _escape_pragma_literal(value: str) -> str:
+        return str(value).replace("'", "''")
+
     connection = duckdb.connect(database=str(database_path), read_only=bool(read_only))
     connection.execute("PRAGMA enable_progress_bar=false")
     connection.execute("PRAGMA threads=1")
     if temp_directory is not None:
-        connection.execute(f"PRAGMA temp_directory='{temp_directory.as_posix()}'")
+        connection.execute(f"PRAGMA temp_directory='{_escape_pragma_literal(temp_directory.as_posix())}'")
     if memory_limit is not None:
         memory_limit_value = str(memory_limit).strip()
         if memory_limit_value:
-            connection.execute(f"PRAGMA memory_limit='{memory_limit_value}'")
+            connection.execute(f"PRAGMA memory_limit='{_escape_pragma_literal(memory_limit_value)}'")
     connection.execute(
         "CREATE TEMP TABLE zone_geometry_metrics (PULocationID INTEGER, zone_area_sq_miles DOUBLE, centroid_latitude DOUBLE)"
     )
@@ -74,6 +77,7 @@ def _open_shadow_sql_connection(
             zone_metadata_rows,
         )
     return connection
+
 
 def ensure_zones_geojson(data_dir: Path, force: bool = False) -> Path:
     data_dir.mkdir(parents=True, exist_ok=True)

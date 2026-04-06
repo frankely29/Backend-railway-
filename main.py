@@ -1208,7 +1208,10 @@ def _frame_build_worker(month_key: str, idx: int, frame_time: str, run_token: st
         with temp_file.open("wb") as handle:
             handle.write(encoded)
             handle.flush()
-            os.fsync(handle.fileno())
+            try:
+                os.fsync(handle.fileno())
+            except OSError:
+                pass
         os.replace(temp_file, cache_file)
         with _frame_cache_lock:
             cache_idx = (month_key, int(idx))
