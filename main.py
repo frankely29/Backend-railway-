@@ -315,6 +315,8 @@ _reconcile_last_periodic_ran_at_unix = 0
 _last_failed_month_key: Optional[str] = None
 _last_failed_at_unix: Optional[int] = None
 _last_failed_error: Optional[str] = None
+_last_attestation_run_unix_by_month: Dict[str, int] = {}
+_last_attestation_report_by_month: Dict[str, Dict[str, Any]] = {}
 _to_3857 = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
 _to_4326 = Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
 
@@ -574,6 +576,230 @@ def _month_frame_cache_file(month_key: str, frame_index: int, frame_time: str) -
 
 def _month_build_meta_path(month_key: str) -> Path:
     return _month_dir(month_key) / "build_meta.json"
+
+
+def _ensure_month_manifest_entry(month_key: str) -> None:
+    mk = str(month_key or "").strip()
+    if not _safe_parse_month_key(mk):
+        return
+    manifest = _load_month_manifest()
+    months_manifest: Dict[str, Dict[str, Any]] = dict((manifest.get("months") or {}))
+    existing = dict(months_manifest.get(mk) or {})
+    timeline_path = _month_timeline_path(mk)
+    frame_cache_dir = _month_frame_cache_dir(mk)
+    freshness = _active_month_freshness(mk)
+    build_meta = freshness.get("build_meta") or {}
+    expected = freshness.get("expected") or {}
+    timeline: List[str] = []
+    if timeline_path.exists() and timeline_path.is_file() and timeline_path.stat().st_size > 0:
+        try:
+            timeline_payload = _read_json(timeline_path)
+            timeline = list(timeline_payload.get("timeline") or [])
+        except Exception:
+            timeline = []
+    existing.update(
+        {
+            "month_key": mk,
+            "source_parquet_filenames": [p.name for p in _source_parquets_for_month(mk)],
+            "store_exists": bool(_month_store_path(mk).exists()),
+            "timeline_exists": bool(timeline_path.exists() and timeline_path.is_file() and timeline_path.stat().st_size > 0),
+            "frame_cache_dir_present": bool(frame_cache_dir.exists() and frame_cache_dir.is_dir()),
+            "first_frame_datetime": build_meta.get("first_frame_datetime") or (timeline[0] if timeline else existing.get("first_frame_datetime")),
+            "last_frame_datetime": build_meta.get("last_frame_datetime") or (timeline[-1] if timeline else existing.get("last_frame_datetime")),
+            "frame_count": int(build_meta.get("frame_count") or len(timeline) or existing.get("frame_count") or 0),
+            "built_at_unix": build_meta.get("built_at_unix") or existing.get("built_at_unix"),
+            "build_meta_present": bool(freshness.get("build_meta_present")),
+            "code_dependency_hash": build_meta.get("code_dependency_hash"),
+            "source_data_hash": build_meta.get("source_data_hash"),
+            "artifact_signature": build_meta.get("artifact_signature"),
+            "expected_artifact_signature": expected.get("artifact_signature"),
+            "artifact_signature_matches": bool(freshness.get("artifact_signature_match")),
+            "bootstrapped_at_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+        }
+    )
+    months_manifest[mk] = existing
+    _persist_month_manifest(months_manifest)
+
+
+def _ensure_month_live_bootstrap(month_key: str, *, force_timeline_bootstrap: bool = False) -> Dict[str, Any]:
+    mk = str(month_key or "").strip()
+    if not _safe_parse_month_key(mk):
+        return {"ok": False, "reason": "invalid_month_key", "month_key": mk}
+    source_parquets = _source_parquets_for_month(mk)
+    source_parquet_exists = bool(source_parquets)
+    timeline_path = _month_timeline_path(mk)
+    timeline_exists = bool(timeline_path.exists() and timeline_path.is_file() and timeline_path.stat().st_size > 0)
+    bootstrapped = False
+    if source_parquet_exists and (force_timeline_bootstrap or not timeline_exists):
+        _bootstrap_month_partition(mk, bin_minutes=int(DEFAULT_BIN_MINUTES))
+        timeline_exists = bool(timeline_path.exists() and timeline_path.is_file() and timeline_path.stat().st_size > 0)
+        bootstrapped = True
+    frame_cache_dir = _month_frame_cache_dir(mk)
+    frame_cache_dir.mkdir(parents=True, exist_ok=True)
+    _ensure_month_manifest_entry(mk)
+    return {
+        "ok": bool(source_parquet_exists and timeline_exists and frame_cache_dir.exists()),
+        "month_key": mk,
+        "source_parquet_exists": source_parquet_exists,
+        "timeline_exists": timeline_exists,
+        "frame_cache_dir_exists": bool(frame_cache_dir.exists() and frame_cache_dir.is_dir()),
+        "bootstrapped_timeline": bootstrapped,
+    }
+
+
+def _build_single_frame_from_exact_store(month_key: str, frame_time: str) -> Dict[str, Any]:
+    from build_hotspot import build_single_frame_from_exact_store, ensure_zones_geojson
+
+    zones_path = ensure_zones_geojson(DATA_DIR, force=False)
+    return build_single_frame_from_exact_store(
+        exact_store_path=_month_store_path(month_key),
+        zones_geojson_path=zones_path,
+        frame_time=str(frame_time),
+        bin_minutes=int(DEFAULT_BIN_MINUTES),
+    )
+
+
+def _normalize_frame_payload_for_compare(frame_payload: Dict[str, Any]) -> Dict[int, Dict[str, Any]]:
+    rows: Dict[int, Dict[str, Any]] = {}
+    features = (((frame_payload or {}).get("polygons") or {}).get("features") or [])
+    for feature in features:
+        props = (feature or {}).get("properties") if isinstance(feature, dict) else {}
+        if not isinstance(props, dict):
+            continue
+        try:
+            location_id = int(props.get("LocationID"))
+        except Exception:
+            continue
+        style = props.get("style") if isinstance(props.get("style"), dict) else {}
+        normalized: Dict[str, Any] = {
+            "rating": props.get("rating"),
+            "bucket": props.get("bucket"),
+            "style.fillColor": style.get("fillColor"),
+            "earnings_shadow_rating_citywide_v3": props.get("earnings_shadow_rating_citywide_v3"),
+            "earnings_shadow_bucket_citywide_v3": props.get("earnings_shadow_bucket_citywide_v3"),
+            "earnings_shadow_color_citywide_v3": props.get("earnings_shadow_color_citywide_v3"),
+        }
+        for key, value in props.items():
+            if not isinstance(key, str):
+                continue
+            if key.startswith("earnings_shadow_rating_") or key.startswith("earnings_shadow_bucket_") or key.startswith("earnings_shadow_color_"):
+                if "_v3" in key:
+                    normalized[key] = value
+        rows[location_id] = normalized
+    return rows
+
+
+def _attestation_sample_frame_times(timeline: List[str], active_frame_time: Optional[str]) -> List[str]:
+    if not timeline:
+        return []
+    indexes = [0, int((len(timeline) - 1) * 0.25), int((len(timeline) - 1) * 0.5), int((len(timeline) - 1) * 0.75), len(timeline) - 1]
+    sampled: List[str] = []
+    seen: set[str] = set()
+    for idx in indexes:
+        frame_time = _to_frontend_local_iso(timeline[max(0, min(idx, len(timeline) - 1))])
+        if frame_time and frame_time not in seen:
+            seen.add(frame_time)
+            sampled.append(frame_time)
+    visible = _to_frontend_local_iso(active_frame_time) if active_frame_time else ""
+    if visible and visible in set(timeline) and visible not in seen:
+        sampled.append(visible)
+    return sampled
+
+
+def attest_existing_month_store_against_current_code(month_key: str, active_frame_time: Optional[str] = None) -> Dict[str, Any]:
+    mk = str(month_key or "").strip()
+    timeline_path = _month_timeline_path(mk)
+    store_path = _month_store_path(mk)
+    build_meta_path = _month_build_meta_path(mk)
+    if not (
+        store_path.exists()
+        and store_path.is_file()
+        and store_path.stat().st_size > 0
+        and timeline_path.exists()
+        and timeline_path.is_file()
+        and timeline_path.stat().st_size > 0
+        and (not build_meta_path.exists() or build_meta_path.stat().st_size <= 0)
+    ):
+        return {"ok": False, "month_key": mk, "attested": False, "reason": "preconditions_not_met"}
+    timeline_payload = _read_json(timeline_path)
+    timeline = [_to_frontend_local_iso(item) for item in (timeline_payload.get("timeline") or [])]
+    sample_times = _attestation_sample_frame_times(timeline, active_frame_time)
+    mismatches: List[Dict[str, Any]] = []
+    for frame_time in sample_times:
+        parquet_frame = _build_single_frame_for_month(mk, frame_time)
+        store_frame = _build_single_frame_from_exact_store(mk, frame_time)
+        left = _normalize_frame_payload_for_compare(parquet_frame)
+        right = _normalize_frame_payload_for_compare(store_frame)
+        if left != right:
+            mismatches.append(
+                {
+                    "frame_time": frame_time,
+                    "left_zone_count": len(left),
+                    "right_zone_count": len(right),
+                    "example_location_ids": sorted(list(set(left.keys()) ^ set(right.keys())))[:10],
+                }
+            )
+    if mismatches:
+        report = {
+            "ok": False,
+            "month_key": mk,
+            "attested": False,
+            "reason": "sample_mismatch",
+            "sample_frame_times": sample_times,
+            "mismatches": mismatches,
+        }
+        _last_attestation_report_by_month[mk] = report
+        return report
+
+    freshness = _active_month_freshness(mk)
+    expected = freshness.get("expected") or {}
+    now_utc = datetime.now(timezone.utc).replace(microsecond=0)
+    build_meta_payload = {
+        "month_key": mk,
+        "built_at_utc": now_utc.isoformat(),
+        "built_at_unix": int(now_utc.timestamp()),
+        "first_frame_datetime": timeline[0] if timeline else None,
+        "last_frame_datetime": timeline[-1] if timeline else None,
+        "frame_count": len(timeline),
+        "code_dependency_hash": expected.get("code_dependency_hash"),
+        "source_data_hash": expected.get("source_data_hash"),
+        "artifact_signature": expected.get("artifact_signature"),
+        "attested_from_existing_store": True,
+        "attestation_sample_frame_times": sample_times,
+    }
+    build_meta_path.write_text(json.dumps(build_meta_payload, separators=(",", ":")), encoding="utf-8")
+    _ensure_month_manifest_entry(mk)
+    removed = _purge_month_frame_cache(mk)
+    report = {
+        "ok": True,
+        "month_key": mk,
+        "attested": True,
+        "build_meta_written": str(build_meta_path),
+        "frame_cache_files_removed": int(removed),
+        "sample_frame_times": sample_times,
+    }
+    _last_attestation_report_by_month[mk] = report
+    return report
+
+
+def _maybe_attest_month_store(month_key: Optional[str]) -> Dict[str, Any]:
+    mk = str(month_key or "").strip()
+    if not _safe_parse_month_key(mk):
+        return {"ok": False, "month_key": mk or None, "reason": "invalid_month_key"}
+    state = _month_bootstrap_state(mk)
+    if not bool(state.get("store_exists") and state.get("timeline_exists") and not state.get("build_meta_present")):
+        return {"ok": False, "month_key": mk, "reason": "not_pending"}
+    now_unix = int(time.time())
+    last_run = int(_last_attestation_run_unix_by_month.get(mk) or 0)
+    if (now_unix - last_run) < 30:
+        return {"ok": False, "month_key": mk, "reason": "throttled", "report": _last_attestation_report_by_month.get(mk)}
+    _last_attestation_run_unix_by_month[mk] = now_unix
+    try:
+        report = attest_existing_month_store_against_current_code(mk)
+    except Exception as exc:
+        report = {"ok": False, "month_key": mk, "reason": "exception", "error": str(exc)}
+    _last_attestation_report_by_month[mk] = report
+    return report
 
 
 def _active_month_freshness(month_key: str) -> Dict[str, Any]:
@@ -926,17 +1152,16 @@ def _month_bootstrap_ready(month_key: str) -> bool:
 
 
 def _month_bootstrap_state(month_key: str) -> Dict[str, Any]:
-    timeline_path = _month_timeline_path(month_key)
-    store_path = _month_store_path(month_key)
+    mk = str(month_key or "").strip()
+    timeline_path = _month_timeline_path(mk)
+    store_path = _month_store_path(mk)
+    frame_cache_dir = _month_frame_cache_dir(mk)
     manifest = _load_month_manifest()
-    month_entry = (manifest.get("months") or {}).get(month_key) or {}
-    freshness = _active_month_freshness(month_key)
+    month_entry = (manifest.get("months") or {}).get(mk) or {}
+    freshness = _active_month_freshness(mk) if mk else {}
     build_meta_present = bool(freshness.get("build_meta_present"))
     signature_match = bool(freshness.get("signature_match"))
-    target_month_key_candidate = resolve_active_month_key(
-        datetime.now(timezone.utc).astimezone(NYC_TZ),
-        _available_source_month_keys(),
-    )
+    source_parquet_exists = bool(mk and _source_parquets_for_month(mk))
     month_manifest_present = bool(
         MONTH_MANIFEST_PATH.exists()
         and MONTH_MANIFEST_PATH.is_file()
@@ -944,7 +1169,8 @@ def _month_bootstrap_state(month_key: str) -> Dict[str, Any]:
     )
     timeline_exists = bool(timeline_path.exists() and timeline_path.is_file() and timeline_path.stat().st_size > 0)
     store_exists = bool(store_path.exists() and store_path.is_file() and store_path.stat().st_size > 0)
-    strict_ready = bool(
+    frame_cache_dir_present = bool(frame_cache_dir.exists() and frame_cache_dir.is_dir())
+    exact_store_fresh = bool(
         month_manifest_present
         and bool(month_entry)
         and bool(month_entry.get("store_exists"))
@@ -955,28 +1181,47 @@ def _month_bootstrap_state(month_key: str) -> Dict[str, Any]:
         and timeline_exists
         and signature_match
     )
+    live_ready = bool(
+        source_parquet_exists
+        and timeline_exists
+        and frame_cache_dir_present
+    )
     legacy_ready_without_build_meta = bool(
-        month_manifest_present
-        and bool(month_entry)
+        source_parquet_exists
         and timeline_exists
         and store_exists
         and not build_meta_present
-        and str(month_key).strip() == str(target_month_key_candidate or "").strip()
     )
-    build_meta_backfill_pending = bool(legacy_ready_without_build_meta and not build_meta_present)
-    bootstrap_ready = bool(strict_ready or legacy_ready_without_build_meta)
-    if not signature_match and not legacy_ready_without_build_meta:
-        _purge_month_frame_cache(month_key)
+    build_meta_backfill_pending = bool(store_exists and timeline_exists and not build_meta_present)
+    bootstrap_ready = bool(live_ready or exact_store_fresh or legacy_ready_without_build_meta)
+    serving_mode = "rebuild_required"
+    if exact_store_fresh:
+        serving_mode = "exact_store_fresh"
+    elif live_ready and build_meta_present:
+        serving_mode = "parquet_live_attested"
+    elif live_ready and legacy_ready_without_build_meta:
+        serving_mode = "legacy_store_attestation_pending"
+    elif live_ready:
+        serving_mode = "parquet_live_bootstrap"
+    if not signature_match and not live_ready:
+        _purge_month_frame_cache(mk)
     return {
         "month_manifest_present": month_manifest_present,
         "month_entry_present": bool(month_entry),
+        "source_parquet_exists": source_parquet_exists,
         "timeline_exists": timeline_exists,
         "store_exists": store_exists,
+        "frame_cache_dir_present": frame_cache_dir_present,
         "build_meta_present": build_meta_present,
         "signature_match": signature_match,
+        "live_ready": live_ready,
+        "exact_store_fresh": exact_store_fresh,
+        "active_month_live_ready": live_ready,
+        "active_month_exact_store_fresh": exact_store_fresh,
+        "serving_mode": serving_mode,
         "legacy_ready_without_build_meta": legacy_ready_without_build_meta,
         "build_meta_backfill_pending": build_meta_backfill_pending,
-        "strict_ready": strict_ready,
+        "strict_ready": exact_store_fresh,
         "bootstrap_ready": bootstrap_ready,
     }
 
@@ -1173,6 +1418,7 @@ def _read_timeline_cached(month_key: Optional[str] = None) -> Dict[str, Any]:
         manifest = _load_month_manifest()
     else:
         resolved_month_key, manifest = _resolve_active_month_key(month_key=month_key)
+    _ensure_month_live_bootstrap(resolved_month_key)
     _maybe_repair_month_timeline_iso(resolved_month_key)
     timeline_path = _month_timeline_path(resolved_month_key)
     if timeline_path.exists() and timeline_path.stat().st_size > 0:
@@ -1794,11 +2040,13 @@ def _artifact_runtime_integrity_report() -> Dict[str, Any]:
     timeline_present = bool(active_month_key and _month_timeline_path(active_month_key).exists() and _month_timeline_path(active_month_key).is_file())
     exact_store_present = bool(active_month_key and _month_store_path(active_month_key).exists() and _month_store_path(active_month_key).is_file() and _month_store_path(active_month_key).stat().st_size > 0)
     month_freshness = _active_month_freshness(active_month_key) if active_month_key else {}
-    signature_match = bool(month_freshness.get("signature_match"))
-    build_meta_present = bool(month_freshness.get("build_meta_present"))
     active_bootstrap_state = _month_bootstrap_state(active_month_key) if active_month_key else {}
+    signature_match = bool(active_bootstrap_state.get("signature_match"))
+    build_meta_present = bool(active_bootstrap_state.get("build_meta_present"))
     legacy_ready_without_build_meta = bool(active_bootstrap_state.get("legacy_ready_without_build_meta"))
     build_meta_backfill_pending = bool(active_bootstrap_state.get("build_meta_backfill_pending"))
+    active_month_live_ready = bool(active_bootstrap_state.get("live_ready"))
+    active_month_exact_store_fresh = bool(active_bootstrap_state.get("exact_store_fresh"))
     timeline_count = 0
     if timeline_present and active_month_key:
         try:
@@ -1812,8 +2060,7 @@ def _artifact_runtime_integrity_report() -> Dict[str, Any]:
         and zones_present
         and month_manifest_present
         and timeline_present
-        and exact_store_present
-        and (signature_match or legacy_ready_without_build_meta)
+        and active_month_live_ready
     )
 
     required_db_keys = ["scoring_shadow_manifest"]
@@ -1840,8 +2087,8 @@ def _artifact_runtime_integrity_report() -> Dict[str, Any]:
         missing_required_volume.append("exact_history/month_manifest.json")
     if not timeline_present:
         missing_required_volume.append("exact_history/months/<active_month_key>/timeline.json")
-    if not exact_store_present:
-        missing_required_volume.append("exact_history/months/<active_month_key>/exact_shadow.duckdb")
+    if not active_month_live_ready:
+        missing_required_volume.append("exact_history/months/<active_month_key>/timeline.json+frame_cache")
 
     core_map_ready = required_volume_ok
     ok = core_map_ready and not redundant_file_copies_present
@@ -1865,7 +2112,10 @@ def _artifact_runtime_integrity_report() -> Dict[str, Any]:
         "active_month_store_present": exact_store_present,
         "active_month_timeline_present": timeline_present,
         "active_month_frame_cache_dir_present": bool(active_month_key and _month_frame_cache_dir(active_month_key).exists() and _month_frame_cache_dir(active_month_key).is_dir()),
-        "active_month_bootstrap_ready": bool(month_manifest_present and timeline_present and exact_store_present and (signature_match or legacy_ready_without_build_meta)),
+        "active_month_bootstrap_ready": bool(active_month_live_ready or active_month_exact_store_fresh or legacy_ready_without_build_meta),
+        "active_month_live_ready": active_month_live_ready,
+        "active_month_exact_store_fresh": active_month_exact_store_fresh,
+        "active_month_serving_mode": active_bootstrap_state.get("serving_mode") or "rebuild_required",
         "active_month_build_meta_present": build_meta_present,
         "active_month_signature_matches_code": bool(month_freshness.get("code_dependency_hash_match")),
         "active_month_signature_matches_source": bool(month_freshness.get("source_data_hash_match")),
@@ -3022,38 +3272,11 @@ def _ensure_requested_month_available_or_start_generate(
     retry_after_sec: int = 3,
 ) -> Optional[JSONResponse]:
     _clear_stale_generate_lock_if_orphaned()
-    if _month_bootstrap_ready(month_key):
+    live_bootstrap = _ensure_month_live_bootstrap(month_key)
+    state = _month_bootstrap_state(month_key)
+    if bool(state.get("live_ready") or state.get("exact_store_fresh") or state.get("legacy_ready_without_build_meta")):
         return None
-
-    now_unix = int(time.time())
-    in_failure_backoff = bool(
-        _last_failed_month_key
-        and str(_last_failed_month_key).strip() == str(month_key).strip()
-        and _last_failed_at_unix is not None
-        and (now_unix - int(_last_failed_at_unix)) < int(MONTH_BUILD_FAILURE_BACKOFF_SEC)
-    )
-    if in_failure_backoff:
-        return _preparing_month_response(
-            month_key=month_key,
-            request_kind=request_kind,
-            generate_started=False,
-            retry_after_sec=max(retry_after_sec, int(MONTH_BUILD_FAILURE_BACKOFF_SEC)),
-        )
-
-    generate_started = False
-    try:
-        started = start_generate(
-            bin_minutes=DEFAULT_BIN_MINUTES,
-            min_trips_per_window=DEFAULT_MIN_TRIPS_PER_WINDOW,
-            include_day_tendency=False,
-            build_review_artifacts=False,
-            month_key=month_key,
-            build_all_months=False,
-        )
-        generate_started = str(started.get("state") or "") in {"started", "running"}
-    except Exception:
-        traceback.print_exc()
-        generate_started = False
+    generate_started = False if live_bootstrap.get("source_parquet_exists") else False
     return _preparing_month_response(
         month_key=month_key,
         request_kind=request_kind,
@@ -5178,10 +5401,24 @@ def status():
     active_month_build_meta_present = bool(month_freshness.get("build_meta_present"))
     active_month_signature_matches_expected = bool(month_freshness.get("signature_match"))
     active_bootstrap_state = _month_bootstrap_state(active_month_key) if active_month_key else {}
+    active_month_live_ready = bool(active_bootstrap_state.get("live_ready"))
+    active_month_exact_store_fresh = bool(active_bootstrap_state.get("exact_store_fresh"))
+    active_month_serving_mode = str(active_bootstrap_state.get("serving_mode") or "rebuild_required")
     active_month_legacy_ready_without_build_meta = bool(active_bootstrap_state.get("legacy_ready_without_build_meta"))
     active_month_build_meta_backfill_pending = bool(active_bootstrap_state.get("build_meta_backfill_pending"))
+    attestation_report = _maybe_attest_month_store(active_month_key) if active_month_key else {}
+    if bool(attestation_report.get("ok")):
+        month_freshness = _active_month_freshness(active_month_key) if active_month_key else {}
+        active_bootstrap_state = _month_bootstrap_state(active_month_key) if active_month_key else {}
+        active_month_live_ready = bool(active_bootstrap_state.get("live_ready"))
+        active_month_exact_store_fresh = bool(active_bootstrap_state.get("exact_store_fresh"))
+        active_month_serving_mode = str(active_bootstrap_state.get("serving_mode") or "rebuild_required")
+        active_month_legacy_ready_without_build_meta = bool(active_bootstrap_state.get("legacy_ready_without_build_meta"))
+        active_month_build_meta_backfill_pending = bool(active_bootstrap_state.get("build_meta_backfill_pending"))
+        active_month_build_meta_present = bool(month_freshness.get("build_meta_present"))
+        active_month_signature_matches_expected = bool(month_freshness.get("signature_match"))
     stale_frame_cache_file_count_removed = 0
-    if active_month_key and not active_month_signature_matches_expected and not active_month_legacy_ready_without_build_meta:
+    if active_month_key and not active_month_live_ready and not active_month_exact_store_fresh:
         stale_frame_cache_file_count_removed = _purge_month_frame_cache(active_month_key)
     active_month_strict_ready = bool(
         MONTH_MANIFEST_PATH.exists()
@@ -5191,22 +5428,10 @@ def status():
         and active_month_build_meta_present
         and active_month_signature_matches_expected
     )
-    active_month_core_ready = bool(active_month_strict_ready or active_month_legacy_ready_without_build_meta)
+    active_month_core_ready = bool(active_month_live_ready or active_month_strict_ready or active_month_legacy_ready_without_build_meta)
     active_month_rebuild_required = bool(
-        active_month_key and (not active_month_strict_ready or active_month_build_meta_backfill_pending)
+        active_month_key and (not active_month_exact_store_fresh)
     )
-    if active_month_rebuild_required and state_name not in {"started", "running"}:
-        try:
-            start_generate(
-                bin_minutes=DEFAULT_BIN_MINUTES,
-                min_trips_per_window=DEFAULT_MIN_TRIPS_PER_WINDOW,
-                include_day_tendency=False,
-                build_review_artifacts=False,
-                month_key=active_month_key,
-                build_all_months=False,
-            )
-        except Exception:
-            traceback.print_exc()
     build_review_artifacts_in_progress = bool(
         state_name in {"started", "running"} and bool(generate_state.get("build_review_artifacts"))
     )
@@ -5283,12 +5508,10 @@ def status():
         "active_month_frame_cache_dir_present": frame_cache_dir_present,
         "active_month_frame_cache_ready": frame_cache_dir_present,
         "active_month_store_cache_present": exact_history_store_present,
-        "active_month_bootstrap_ready": bool(
-            MONTH_MANIFEST_PATH.exists()
-            and timeline_file_present
-            and exact_history_store_present
-            and (active_month_signature_matches_expected or active_month_legacy_ready_without_build_meta)
-        ),
+        "active_month_bootstrap_ready": bool(active_month_live_ready or active_month_exact_store_fresh or active_month_legacy_ready_without_build_meta),
+        "active_month_live_ready": active_month_live_ready,
+        "active_month_exact_store_fresh": active_month_exact_store_fresh,
+        "active_month_serving_mode": active_month_serving_mode,
         "frame_cache_file_count": int(frame_cache_file_count),
         "active_month_build_meta_present": active_month_build_meta_present,
         "active_month_signature_matches_code": active_month_signature_matches_code,
@@ -5297,6 +5520,7 @@ def status():
         "active_month_legacy_ready_without_build_meta": active_month_legacy_ready_without_build_meta,
         "active_month_build_meta_backfill_pending": active_month_build_meta_backfill_pending,
         "active_month_rebuild_required": active_month_rebuild_required,
+        "active_month_attestation_report": attestation_report if attestation_report else _last_attestation_report_by_month.get(str(active_month_key or "").strip()),
         "stale_frame_cache_file_count_removed": int(stale_frame_cache_file_count_removed),
         "active_month_build_meta_artifact_signature": month_build_meta.get("artifact_signature"),
         "active_month_expected_artifact_signature": month_expected.get("artifact_signature"),
@@ -5312,12 +5536,7 @@ def status():
         "generated_artifact_store_report": generated_artifact_report(),
         "artifact_runtime_policy": _artifact_runtime_policy_snapshot(),
         "artifact_runtime_integrity": artifact_runtime_integrity,
-        "core_map_ready": bool(
-            MONTH_MANIFEST_PATH.exists()
-            and timeline_file_present
-            and exact_history_store_present
-            and (active_month_signature_matches_expected or active_month_legacy_ready_without_build_meta)
-        ),
+        "core_map_ready": bool(active_month_live_ready or active_month_exact_store_fresh or active_month_legacy_ready_without_build_meta),
         "active_month_core_ready": active_month_core_ready,
         "build_review_artifacts_in_progress": build_review_artifacts_in_progress,
         "optional_artifacts_missing": list(artifact_runtime_integrity.get("optional_artifacts_missing") or []),
