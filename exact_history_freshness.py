@@ -70,20 +70,39 @@ def active_month_freshness_report(
         min_trips_per_window=min_trips_per_window,
     )
 
+    source_of_truth = str((build_meta or {}).get("source_of_truth") or "").strip() or None
     code_match = bool(build_meta) and build_meta.get("code_dependency_hash") == expected.get("code_dependency_hash")
     source_match = bool(build_meta) and build_meta.get("source_data_hash") == expected.get("source_data_hash")
     artifact_match = bool(build_meta) and build_meta.get("artifact_signature") == expected.get("artifact_signature")
-
-    signature_match = bool(store_present and timeline_present and build_meta and code_match and source_match and artifact_match)
+    common_signature_match = bool(timeline_present and build_meta and code_match and source_match and artifact_match)
+    parquet_file_presence = True
+    parquet_sources = (build_meta or {}).get("source_parquet_files")
+    if source_of_truth == "parquet_live":
+        parquet_file_presence = bool(isinstance(parquet_sources, list) and parquet_sources)
+        if parquet_file_presence:
+            parquet_file_presence = all((Path(data_dir) / str(name)).exists() for name in parquet_sources)
+    if source_of_truth == "exact_store":
+        signature_match = bool(common_signature_match and store_present)
+        authoritative_kind = "exact_store"
+    elif source_of_truth == "parquet_live":
+        signature_match = bool(common_signature_match and parquet_file_presence)
+        authoritative_kind = "parquet_live"
+    else:
+        signature_match = False
+        authoritative_kind = None
 
     return {
         "month_key": mk or None,
         "timeline_present": timeline_present,
         "store_present": store_present,
+        "source_of_truth": source_of_truth,
         "build_meta_present": bool(build_meta),
         "build_meta": build_meta,
         "expected": expected,
         "signature_match": signature_match,
+        "authoritative_fresh": signature_match,
+        "authoritative_kind": authoritative_kind,
+        "source_parquet_files_present": bool(parquet_file_presence),
         "code_dependency_hash_match": bool(code_match),
         "source_data_hash_match": bool(source_match),
         "artifact_signature_match": bool(artifact_match),
