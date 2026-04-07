@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict
+from zoneinfo import ZoneInfo
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -224,7 +226,7 @@ def _resolve_monthly_mode_context(data_dir: Path) -> dict:
     manifest = _load_month_manifest(data_dir)
     months = manifest.get("months") if isinstance(manifest, dict) and isinstance(manifest.get("months"), dict) else {}
     available_month_keys = sorted([key for key in months.keys() if str(key).strip()])
-    active_month_key = available_month_keys[-1] if available_month_keys else None
+    active_month_key = _resolve_active_month_key_for_freshness(available_month_keys)
     timeline_scope = str(manifest.get("timeline_scope") or "").strip().lower() if isinstance(manifest, dict) else ""
     monthly_mode = bool(
         timeline_scope == "monthly_exact_historical"
@@ -237,6 +239,34 @@ def _resolve_monthly_mode_context(data_dir: Path) -> dict:
         "available_month_keys": available_month_keys,
         "active_month_key": active_month_key,
     }
+
+
+def _resolve_active_month_key_for_freshness(available_month_keys: list[str]) -> str | None:
+    valid = [mk for mk in sorted(available_month_keys) if _safe_parse_month_key(mk)]
+    if not valid:
+        return None
+    target = datetime.now(timezone.utc).astimezone(ZoneInfo("America/New_York"))
+    target_key = f"{int(target.year):04d}-{int(target.month):02d}"
+    same_month = [mk for mk in valid if (_safe_parse_month_key(mk) or (0, 0))[1] == int(target.month)]
+    if target_key in same_month:
+        return target_key
+    if same_month:
+        return sorted(same_month)[-1]
+    return valid[-1]
+
+
+def _safe_parse_month_key(month_key: str) -> tuple[int, int] | None:
+    mk = str(month_key or "").strip()
+    if len(mk) != 7 or mk[4] != "-":
+        return None
+    try:
+        year = int(mk[:4])
+        month = int(mk[5:7])
+    except Exception:
+        return None
+    if year < 2000 or month < 1 or month > 12:
+        return None
+    return year, month
 
 
 def sample_frame_integrity(frames_dir: Path) -> dict:
@@ -423,6 +453,8 @@ def evaluate_artifact_freshness(
             and month_store_path.is_file()
             and month_store_path.stat().st_size > 0
         )
+        month_frame_cache_dir = month_dir / "frame_cache" if month_dir else None
+        month_frame_cache_present = bool(month_frame_cache_dir and month_frame_cache_dir.exists() and month_frame_cache_dir.is_dir())
         month_build_meta: Dict[str, Any] | None = None
         if month_build_meta_path and month_build_meta_path.exists() and month_build_meta_path.is_file() and month_build_meta_path.stat().st_size > 0:
             try:
@@ -434,26 +466,56 @@ def evaluate_artifact_freshness(
         month_build_meta_present = bool(month_build_meta)
         if not month_timeline_present:
             reason_codes.append("active_month_timeline_missing")
-        if not month_store_present:
+        source_of_truth = str((month_build_meta or {}).get("source_of_truth") or "").strip() or None
+        month_live_ready = bool(month_timeline_present and month_frame_cache_present)
+        authoritative_fresh = False
+        code_match = False
+        source_match = False
+        artifact_match = False
+        if month_build_meta_present:
+            code_match = month_build_meta.get("code_dependency_hash") == expected.get("code_dependency_hash")
+            source_match = month_build_meta.get("source_data_hash") == expected.get("source_data_hash")
+            artifact_match = month_build_meta.get("artifact_signature") == expected.get("artifact_signature")
+            authoritative_fresh = bool(month_timeline_present and code_match and source_match and artifact_match)
+            if source_of_truth == "exact_store":
+                authoritative_fresh = bool(authoritative_fresh and month_store_present)
+        if not month_store_present and source_of_truth != "parquet_live":
             reason_codes.append("active_month_store_missing")
         if not month_build_meta_present:
             reason_codes.append("active_month_build_meta_missing")
         if active_month_key and not month_manifest_entry:
             reason_codes.append("active_month_manifest_entry_missing")
-        if month_build_meta_present:
-            if month_build_meta.get("code_dependency_hash") != expected.get("code_dependency_hash"):
+        if month_build_meta_present and source_of_truth != "parquet_live":
+            if not code_match:
                 reason_codes.append("active_month_code_dependency_hash_mismatch")
-            if month_build_meta.get("source_data_hash") != expected.get("source_data_hash"):
+            if not source_match:
                 reason_codes.append("active_month_source_data_hash_mismatch")
-            if month_build_meta.get("artifact_signature") != expected.get("artifact_signature"):
+            if not artifact_match:
                 reason_codes.append("active_month_artifact_signature_mismatch")
+        parquet_live_authoritative = bool(
+            source_of_truth == "parquet_live"
+            and authoritative_fresh
+            and month_build_meta_present
+            and code_match
+            and source_match
+            and artifact_match
+            and month_timeline_present
+            and month_live_ready
+        )
         sampled = {
             "mode": "monthly_exact_historical",
             "active_month_key": active_month_key or None,
             "month_manifest_present": month_manifest_present,
             "active_month_timeline_present": month_timeline_present,
             "active_month_store_present": month_store_present,
+            "active_month_live_ready": month_live_ready,
             "active_month_build_meta_present": month_build_meta_present,
+            "active_month_source_of_truth": source_of_truth,
+            "active_month_authoritative_fresh": authoritative_fresh,
+            "active_month_signature_matches_code": code_match,
+            "active_month_signature_matches_source": source_match,
+            "active_month_artifact_signature_matches": artifact_match,
+            "active_month_parquet_live_authoritative": parquet_live_authoritative,
             "active_month_build_meta_artifact_signature": (month_build_meta or {}).get("artifact_signature"),
             "active_month_expected_artifact_signature": expected.get("artifact_signature"),
             "legacy_frame_file_sampling_skipped": True,
@@ -480,19 +542,32 @@ def evaluate_artifact_freshness(
         if not sampled.get("frame_has_rating_bucket_color_consistency"):
             reason_codes.append("sampled_frames_bucket_color_mismatch")
 
-    if current_manifest is None:
-        reason_codes.append("manifest_missing")
+    parquet_live_authoritative = bool(sampled.get("active_month_parquet_live_authoritative")) if monthly_mode else False
+    if not parquet_live_authoritative:
+        if current_manifest is None:
+            reason_codes.append("manifest_missing")
+        else:
+            if current_manifest.get("visible_profiles_live") != expected.get("expected_visible_profiles_live"):
+                reason_codes.append("visible_profiles_mismatch")
+            if current_manifest.get("default_citywide_profile") != expected.get("expected_default_citywide_profile"):
+                reason_codes.append("default_citywide_profile_mismatch")
+            if current_manifest.get("code_dependency_hash") != expected.get("code_dependency_hash"):
+                reason_codes.append("code_dependency_hash_mismatch")
+            if current_manifest.get("source_data_hash") != expected.get("source_data_hash"):
+                reason_codes.append("source_data_hash_mismatch")
+            if current_manifest.get("artifact_signature") != expected.get("artifact_signature"):
+                reason_codes.append("artifact_signature_mismatch")
     else:
-        if current_manifest.get("visible_profiles_live") != expected.get("expected_visible_profiles_live"):
-            reason_codes.append("visible_profiles_mismatch")
-        if current_manifest.get("default_citywide_profile") != expected.get("expected_default_citywide_profile"):
-            reason_codes.append("default_citywide_profile_mismatch")
-        if current_manifest.get("code_dependency_hash") != expected.get("code_dependency_hash"):
-            reason_codes.append("code_dependency_hash_mismatch")
-        if current_manifest.get("source_data_hash") != expected.get("source_data_hash"):
-            reason_codes.append("source_data_hash_mismatch")
-        if current_manifest.get("artifact_signature") != expected.get("artifact_signature"):
-            reason_codes.append("artifact_signature_mismatch")
+        reason_codes = [
+            code
+            for code in reason_codes
+            if code
+            not in {
+                "active_month_store_missing",
+                "code_dependency_hash_mismatch",
+                "artifact_signature_mismatch",
+            }
+        ]
 
     reason_codes = list(dict.fromkeys(reason_codes))
     fresh = len(reason_codes) == 0
