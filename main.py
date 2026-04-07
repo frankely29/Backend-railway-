@@ -317,6 +317,10 @@ _last_failed_at_unix: Optional[int] = None
 _last_failed_error: Optional[str] = None
 _last_attestation_run_unix_by_month: Dict[str, int] = {}
 _last_attestation_report_by_month: Dict[str, Dict[str, Any]] = {}
+_attestation_control_lock = threading.Lock()
+_attestation_thread_by_month: Dict[str, threading.Thread] = {}
+_attestation_state_by_month: Dict[str, Dict[str, Any]] = {}
+ATTESTATION_REENTRY_THROTTLE_SECONDS = int(os.environ.get("ATTESTATION_REENTRY_THROTTLE_SECONDS", "45"))
 _to_3857 = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
 _to_4326 = Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
 
@@ -601,6 +605,7 @@ def _ensure_month_manifest_entry(month_key: str) -> None:
         {
             "month_key": mk,
             "source_parquet_filenames": [p.name for p in _source_parquets_for_month(mk)],
+            "source_parquet_files": build_meta.get("source_parquet_files") or [p.name for p in _source_parquets_for_month(mk)],
             "store_exists": bool(_month_store_path(mk).exists()),
             "timeline_exists": bool(timeline_path.exists() and timeline_path.is_file() and timeline_path.stat().st_size > 0),
             "frame_cache_dir_present": bool(frame_cache_dir.exists() and frame_cache_dir.is_dir()),
@@ -609,11 +614,14 @@ def _ensure_month_manifest_entry(month_key: str) -> None:
             "frame_count": int(build_meta.get("frame_count") or len(timeline) or existing.get("frame_count") or 0),
             "built_at_unix": build_meta.get("built_at_unix") or existing.get("built_at_unix"),
             "build_meta_present": bool(freshness.get("build_meta_present")),
+            "bin_minutes": build_meta.get("bin_minutes") or int(DEFAULT_BIN_MINUTES),
+            "min_trips_per_window": build_meta.get("min_trips_per_window") or int(DEFAULT_MIN_TRIPS_PER_WINDOW),
             "code_dependency_hash": build_meta.get("code_dependency_hash"),
             "source_data_hash": build_meta.get("source_data_hash"),
             "artifact_signature": build_meta.get("artifact_signature"),
             "expected_artifact_signature": expected.get("artifact_signature"),
             "artifact_signature_matches": bool(freshness.get("artifact_signature_match")),
+            "attested_via": build_meta.get("attested_via"),
             "bootstrapped_at_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
         }
     )
@@ -657,6 +665,56 @@ def _build_single_frame_from_exact_store(month_key: str, frame_time: str) -> Dic
         frame_time=str(frame_time),
         bin_minutes=int(DEFAULT_BIN_MINUTES),
     )
+
+
+def _attestation_state_snapshot(month_key: str) -> Dict[str, Any]:
+    mk = str(month_key or "").strip()
+    with _attestation_control_lock:
+        current = dict(_attestation_state_by_month.get(mk) or {})
+        thread = _attestation_thread_by_month.get(mk)
+    in_progress = bool(current.get("attestation_in_progress"))
+    if in_progress and thread and not thread.is_alive():
+        in_progress = False
+        with _attestation_control_lock:
+            latest = dict(_attestation_state_by_month.get(mk) or {})
+            latest["attestation_in_progress"] = False
+            _attestation_state_by_month[mk] = latest
+            current = latest
+    return {
+        "month_key": mk or None,
+        "attestation_in_progress": in_progress,
+        "attestation_started_at_unix": current.get("attestation_started_at_unix"),
+        "attestation_finished_at_unix": current.get("attestation_finished_at_unix"),
+        "attestation_last_result": current.get("attestation_last_result"),
+        "attestation_last_error": current.get("attestation_last_error"),
+    }
+
+
+def _month_attestation_needed(month_key: str) -> bool:
+    state = _month_bootstrap_state(month_key)
+    return bool(
+        state.get("store_exists")
+        and state.get("timeline_exists")
+        and (not state.get("build_meta_present"))
+        and state.get("source_parquet_exists")
+    )
+
+
+def _write_month_build_meta_atomic(month_key: str, payload: Dict[str, Any]) -> Path:
+    mk = str(month_key or "").strip()
+    target = _month_build_meta_path(mk)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = target.with_suffix(".json.tmp")
+    encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    with temp_path.open("wb") as handle:
+        handle.write(encoded)
+        handle.flush()
+        try:
+            os.fsync(handle.fileno())
+        except OSError:
+            pass
+    os.replace(temp_path, target)
+    return target
 
 
 def _normalize_frame_payload_for_compare(frame_payload: Dict[str, Any]) -> Dict[int, Dict[str, Any]]:
@@ -724,6 +782,8 @@ def attest_existing_month_store_against_current_code(month_key: str, active_fram
     timeline_payload = _read_json(timeline_path)
     timeline = [_to_frontend_local_iso(item) for item in (timeline_payload.get("timeline") or [])]
     sample_times = _attestation_sample_frame_times(timeline, active_frame_time)
+    if not sample_times:
+        return {"ok": False, "month_key": mk, "attested": False, "reason": "missing_sample_frames"}
     mismatches: List[Dict[str, Any]] = []
     for frame_time in sample_times:
         parquet_frame = _build_single_frame_for_month(mk, frame_time)
@@ -731,12 +791,24 @@ def attest_existing_month_store_against_current_code(month_key: str, active_fram
         left = _normalize_frame_payload_for_compare(parquet_frame)
         right = _normalize_frame_payload_for_compare(store_frame)
         if left != right:
+            sample_location_ids = sorted(list((set(left.keys()) & set(right.keys()))))[:6]
+            sample_diffs: List[Dict[str, Any]] = []
+            for location_id in sample_location_ids:
+                if left.get(location_id) != right.get(location_id):
+                    sample_diffs.append(
+                        {
+                            "location_id": int(location_id),
+                            "parquet_props": left.get(location_id),
+                            "store_props": right.get(location_id),
+                        }
+                    )
             mismatches.append(
                 {
                     "frame_time": frame_time,
                     "left_zone_count": len(left),
                     "right_zone_count": len(right),
                     "example_location_ids": sorted(list(set(left.keys()) ^ set(right.keys())))[:10],
+                    "sample_property_mismatches": sample_diffs[:3],
                 }
             )
     if mismatches:
@@ -754,20 +826,24 @@ def attest_existing_month_store_against_current_code(month_key: str, active_fram
     freshness = _active_month_freshness(mk)
     expected = freshness.get("expected") or {}
     now_utc = datetime.now(timezone.utc).replace(microsecond=0)
+    source_parquet_files = [path.name for path in _source_parquets_for_month(mk)]
     build_meta_payload = {
         "month_key": mk,
-        "built_at_utc": now_utc.isoformat(),
         "built_at_unix": int(now_utc.timestamp()),
+        "built_at_utc": now_utc.isoformat(),
+        "bin_minutes": int(DEFAULT_BIN_MINUTES),
+        "min_trips_per_window": int(DEFAULT_MIN_TRIPS_PER_WINDOW),
+        "source_parquet_files": source_parquet_files,
         "first_frame_datetime": timeline[0] if timeline else None,
         "last_frame_datetime": timeline[-1] if timeline else None,
         "frame_count": len(timeline),
         "code_dependency_hash": expected.get("code_dependency_hash"),
         "source_data_hash": expected.get("source_data_hash"),
         "artifact_signature": expected.get("artifact_signature"),
-        "attested_from_existing_store": True,
+        "attested_via": "sampled_frame_equivalence",
         "attestation_sample_frame_times": sample_times,
     }
-    build_meta_path.write_text(json.dumps(build_meta_payload, separators=(",", ":")), encoding="utf-8")
+    _write_month_build_meta_atomic(mk, build_meta_payload)
     _ensure_month_manifest_entry(mk)
     removed = _purge_month_frame_cache(mk)
     report = {
@@ -777,29 +853,131 @@ def attest_existing_month_store_against_current_code(month_key: str, active_fram
         "build_meta_written": str(build_meta_path),
         "frame_cache_files_removed": int(removed),
         "sample_frame_times": sample_times,
+        "attested_via": "sampled_frame_equivalence",
     }
     _last_attestation_report_by_month[mk] = report
     return report
 
 
-def _maybe_attest_month_store(month_key: Optional[str]) -> Dict[str, Any]:
+def _run_active_month_attestation(month_key: str, active_frame_time: Optional[str] = None) -> Dict[str, Any]:
     mk = str(month_key or "").strip()
     if not _safe_parse_month_key(mk):
-        return {"ok": False, "month_key": mk or None, "reason": "invalid_month_key"}
-    state = _month_bootstrap_state(mk)
-    if not bool(state.get("store_exists") and state.get("timeline_exists") and not state.get("build_meta_present")):
-        return {"ok": False, "month_key": mk, "reason": "not_pending"}
-    now_unix = int(time.time())
-    last_run = int(_last_attestation_run_unix_by_month.get(mk) or 0)
-    if (now_unix - last_run) < 30:
-        return {"ok": False, "month_key": mk, "reason": "throttled", "report": _last_attestation_report_by_month.get(mk)}
-    _last_attestation_run_unix_by_month[mk] = now_unix
+        return {"ok": False, "month_key": mk or None, "reason": "invalid_month_key", "attested": False}
+    if not _month_attestation_needed(mk):
+        return {"ok": False, "month_key": mk, "reason": "not_pending", "attested": False}
+    _last_attestation_run_unix_by_month[mk] = int(time.time())
     try:
-        report = attest_existing_month_store_against_current_code(mk)
+        report = attest_existing_month_store_against_current_code(mk, active_frame_time=active_frame_time)
     except Exception as exc:
-        report = {"ok": False, "month_key": mk, "reason": "exception", "error": str(exc)}
+        report = {
+            "ok": False,
+            "month_key": mk,
+            "attested": False,
+            "reason": "exception",
+            "error": str(exc),
+            "traceback": traceback.format_exc(),
+        }
     _last_attestation_report_by_month[mk] = report
     return report
+
+
+def _attestation_worker(month_key: str, active_frame_time: Optional[str] = None) -> None:
+    mk = str(month_key or "").strip()
+    started_at = int(time.time())
+    with _attestation_control_lock:
+        state = dict(_attestation_state_by_month.get(mk) or {})
+        state.update(
+            {
+                "attestation_in_progress": True,
+                "attestation_started_at_unix": started_at,
+                "attestation_finished_at_unix": None,
+                "attestation_last_result": None,
+                "attestation_last_error": None,
+            }
+        )
+        _attestation_state_by_month[mk] = state
+    try:
+        report = _run_active_month_attestation(mk, active_frame_time=active_frame_time)
+        if report.get("ok"):
+            last_error = None
+        else:
+            last_error = report.get("error") or report.get("reason")
+    except Exception as exc:
+        report = {"ok": False, "month_key": mk, "attested": False, "reason": "exception", "error": str(exc)}
+        last_error = str(exc)
+    finished_at = int(time.time())
+    with _attestation_control_lock:
+        latest = dict(_attestation_state_by_month.get(mk) or {})
+        latest.update(
+            {
+                "attestation_in_progress": False,
+                "attestation_started_at_unix": started_at,
+                "attestation_finished_at_unix": finished_at,
+                "attestation_last_result": "success" if report.get("ok") else "failed",
+                "attestation_last_error": last_error,
+            }
+        )
+        _attestation_state_by_month[mk] = latest
+        thread = _attestation_thread_by_month.get(mk)
+        if thread is threading.current_thread():
+            _attestation_thread_by_month.pop(mk, None)
+    _last_attestation_report_by_month[mk] = report
+
+
+def _queue_active_month_attestation(month_key: Optional[str], *, active_frame_time: Optional[str] = None) -> Dict[str, Any]:
+    mk = str(month_key or "").strip()
+    if not _safe_parse_month_key(mk):
+        return {"ok": False, "month_key": mk or None, "reason": "invalid_month_key", "queued": False}
+    if not _month_attestation_needed(mk):
+        return {"ok": False, "month_key": mk, "reason": "not_pending", "queued": False}
+    now_unix = int(time.time())
+    result: Dict[str, Any]
+    with _attestation_control_lock:
+        state = dict(_attestation_state_by_month.get(mk) or {})
+        thread = _attestation_thread_by_month.get(mk)
+        in_progress = bool(state.get("attestation_in_progress") and thread and thread.is_alive())
+        if in_progress:
+            result = {"ok": False, "month_key": mk, "reason": "in_progress", "queued": False}
+            return {**result, **{
+                "attestation_in_progress": True,
+                "attestation_started_at_unix": state.get("attestation_started_at_unix"),
+                "attestation_finished_at_unix": state.get("attestation_finished_at_unix"),
+                "attestation_last_result": state.get("attestation_last_result"),
+                "attestation_last_error": state.get("attestation_last_error"),
+            }}
+        last_finished = int(state.get("attestation_finished_at_unix") or 0)
+        if last_finished and (now_unix - last_finished) < int(ATTESTATION_REENTRY_THROTTLE_SECONDS):
+            return {
+                "ok": False,
+                "month_key": mk,
+                "reason": "throttled",
+                "queued": False,
+                "retry_after_sec": int(ATTESTATION_REENTRY_THROTTLE_SECONDS - (now_unix - last_finished)),
+                "attestation_in_progress": False,
+                "attestation_started_at_unix": state.get("attestation_started_at_unix"),
+                "attestation_finished_at_unix": state.get("attestation_finished_at_unix"),
+                "attestation_last_result": state.get("attestation_last_result"),
+                "attestation_last_error": state.get("attestation_last_error"),
+            }
+        t = threading.Thread(
+            target=_attestation_worker,
+            kwargs={"month_key": mk, "active_frame_time": active_frame_time},
+            name=f"month-attestation-{mk}",
+            daemon=True,
+        )
+        _attestation_thread_by_month[mk] = t
+        state.update(
+            {
+                "attestation_in_progress": True,
+                "attestation_started_at_unix": now_unix,
+                "attestation_finished_at_unix": None,
+                "attestation_last_result": state.get("attestation_last_result"),
+                "attestation_last_error": state.get("attestation_last_error"),
+            }
+        )
+        _attestation_state_by_month[mk] = state
+        t.start()
+    return {"ok": True, "month_key": mk, "queued": True, "reason": "started", **_attestation_state_snapshot(mk)}
 
 
 def _active_month_freshness(month_key: str) -> Dict[str, Any]:
@@ -3274,6 +3452,8 @@ def _ensure_requested_month_available_or_start_generate(
     _clear_stale_generate_lock_if_orphaned()
     live_bootstrap = _ensure_month_live_bootstrap(month_key)
     state = _month_bootstrap_state(month_key)
+    if bool(state.get("live_ready")) and _month_attestation_needed(month_key):
+        _queue_active_month_attestation(month_key)
     if bool(state.get("live_ready") or state.get("exact_store_fresh") or state.get("legacy_ready_without_build_meta")):
         return None
     generate_started = False if live_bootstrap.get("source_parquet_exists") else False
@@ -5229,6 +5409,8 @@ def startup():
             source_month_keys,
         )
         target_ready = bool(target_month_key_candidate and _month_bootstrap_ready(target_month_key_candidate))
+        if target_month_key_candidate and target_ready and _month_attestation_needed(target_month_key_candidate):
+            _queue_active_month_attestation(target_month_key_candidate)
         startup_skip_reason = None
         if not (DATA_DIR / "taxi_zones.geojson").exists():
             startup_skip_reason = "zones_missing"
@@ -5406,8 +5588,10 @@ def status():
     active_month_serving_mode = str(active_bootstrap_state.get("serving_mode") or "rebuild_required")
     active_month_legacy_ready_without_build_meta = bool(active_bootstrap_state.get("legacy_ready_without_build_meta"))
     active_month_build_meta_backfill_pending = bool(active_bootstrap_state.get("build_meta_backfill_pending"))
-    attestation_report = _maybe_attest_month_store(active_month_key) if active_month_key else {}
-    if bool(attestation_report.get("ok")):
+    attestation_trigger_report = _queue_active_month_attestation(active_month_key) if active_month_key else {}
+    attestation_state = _attestation_state_snapshot(active_month_key) if active_month_key else {}
+    attestation_report = _last_attestation_report_by_month.get(str(active_month_key or "").strip()) if active_month_key else {}
+    if bool(attestation_report and attestation_report.get("ok")):
         month_freshness = _active_month_freshness(active_month_key) if active_month_key else {}
         active_bootstrap_state = _month_bootstrap_state(active_month_key) if active_month_key else {}
         active_month_live_ready = bool(active_bootstrap_state.get("live_ready"))
@@ -5416,6 +5600,9 @@ def status():
         active_month_legacy_ready_without_build_meta = bool(active_bootstrap_state.get("legacy_ready_without_build_meta"))
         active_month_build_meta_backfill_pending = bool(active_bootstrap_state.get("build_meta_backfill_pending"))
         active_month_build_meta_present = bool(month_freshness.get("build_meta_present"))
+        active_month_signature_matches_code = bool(month_freshness.get("code_dependency_hash_match"))
+        active_month_signature_matches_source = bool(month_freshness.get("source_data_hash_match"))
+        active_month_artifact_signature_matches = bool(month_freshness.get("artifact_signature_match"))
         active_month_signature_matches_expected = bool(month_freshness.get("signature_match"))
     stale_frame_cache_file_count_removed = 0
     if active_month_key and not active_month_live_ready and not active_month_exact_store_fresh:
@@ -5520,7 +5707,13 @@ def status():
         "active_month_legacy_ready_without_build_meta": active_month_legacy_ready_without_build_meta,
         "active_month_build_meta_backfill_pending": active_month_build_meta_backfill_pending,
         "active_month_rebuild_required": active_month_rebuild_required,
-        "active_month_attestation_report": attestation_report if attestation_report else _last_attestation_report_by_month.get(str(active_month_key or "").strip()),
+        "active_month_attestation_report": attestation_report,
+        "active_month_attestation_trigger_report": attestation_trigger_report,
+        "attestation_in_progress": bool(attestation_state.get("attestation_in_progress")),
+        "attestation_started_at_unix": attestation_state.get("attestation_started_at_unix"),
+        "attestation_finished_at_unix": attestation_state.get("attestation_finished_at_unix"),
+        "attestation_last_result": attestation_state.get("attestation_last_result"),
+        "attestation_last_error": attestation_state.get("attestation_last_error"),
         "stale_frame_cache_file_count_removed": int(stale_frame_cache_file_count_removed),
         "active_month_build_meta_artifact_signature": month_build_meta.get("artifact_signature"),
         "active_month_expected_artifact_signature": month_expected.get("artifact_signature"),
@@ -6156,6 +6349,7 @@ def timeline(request: Request, month_key: Optional[str] = None):
     timeline_payload["active_month_key"] = target_month_key
     timeline_payload["available_month_keys"] = list(_load_month_manifest().get("available_month_keys") or [])
     timeline_payload["timeline_scope"] = "monthly_exact_historical"
+    _queue_active_month_attestation(target_month_key)
     return _json_cached_response(request, timeline_payload, etag=cached.get("etag"))
 
 
@@ -6246,6 +6440,7 @@ def frame(idx: int, request: Request, month_key: Optional[str] = None):
     if idx < 0 or idx >= len(timeline):
         raise HTTPException(status_code=404, detail=f"frame not found: {idx}")
     frame_time = _to_frontend_local_iso(timeline[idx])
+    _queue_active_month_attestation(target_month_key, active_frame_time=frame_time)
     cache_file = _month_frame_cache_file(target_month_key, idx, frame_time)
     if not (cache_file.exists() and cache_file.stat().st_size > 0):
         started = _ensure_frame_build_in_progress(target_month_key, idx, frame_time)
@@ -6289,6 +6484,7 @@ def frame_viewport(
     if idx < 0 or idx >= len(timeline):
         raise HTTPException(status_code=404, detail=f"frame not found: {idx}")
     frame_time = _to_frontend_local_iso(timeline[idx])
+    _queue_active_month_attestation(target_month_key, active_frame_time=frame_time)
     cache_file = _month_frame_cache_file(target_month_key, idx, frame_time)
     if not (cache_file.exists() and cache_file.stat().st_size > 0):
         started = _ensure_frame_build_in_progress(target_month_key, idx, frame_time)
