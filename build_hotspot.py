@@ -1109,6 +1109,80 @@ def build_single_frame_for_month(
     return {"time": requested_frame_time, "polygons": {"type": "FeatureCollection", "features": features}}
 
 
+def build_single_frame_from_exact_store(
+    *,
+    exact_store_path: Path,
+    zones_geojson_path: Path,
+    frame_time: str,
+    bin_minutes: int = 20,
+) -> Dict[str, Any]:
+    requested_frame_time = to_frontend_local_iso(frame_time)
+    zones = json.loads(zones_geojson_path.read_text(encoding="utf-8"))
+    geom_by_id: Dict[int, Any] = {}
+    name_by_id: Dict[int, str] = {}
+    borough_by_id: Dict[int, str] = {}
+    for feature in zones.get("features", []):
+        props = feature.get("properties") or {}
+        try:
+            zid = int(props.get("LocationID"))
+        except Exception:
+            continue
+        geom = feature.get("geometry")
+        if geom:
+            geom_by_id[zid] = geom
+        name_by_id[zid] = str(props.get("zone") or props.get("Zone") or props.get("name") or props.get("Name") or "")
+        borough_by_id[zid] = str(props.get("borough") or props.get("Borough") or props.get("boro") or props.get("Boro") or "")
+    if not geom_by_id:
+        raise RuntimeError("taxi_zones.geojson missing usable properties.LocationID geometry.")
+    if not exact_store_path.exists() or not exact_store_path.is_file() or exact_store_path.stat().st_size <= 0:
+        raise RuntimeError(f"Missing exact history store for frame compare: {exact_store_path}")
+
+    con = duckdb.connect(database=str(exact_store_path), read_only=True)
+    try:
+        cursor = con.execute(
+            """
+            SELECT *
+            FROM exact_shadow_rows
+            WHERE exact_bin_local_ts = ?
+            ORDER BY PULocationID
+            """,
+            [requested_frame_time],
+        )
+        rows = cursor.fetchall()
+        columns = [str(desc[0]) for desc in (cursor.description or [])]
+    finally:
+        con.close()
+
+    features: List[Dict[str, Any]] = []
+    for row in rows:
+        row_map = {columns[idx]: row[idx] for idx in range(len(columns))}
+        try:
+            zid = int(row_map.get("PULocationID"))
+        except Exception:
+            continue
+        geom = geom_by_id.get(zid)
+        if not geom:
+            continue
+        features.append(
+            {
+                "type": "Feature",
+                "geometry": geom,
+                "properties": build_feature_properties_from_shadow_row(
+                    row_map=row_map,
+                    zone_name=str(name_by_id.get(zid) or ""),
+                    borough=str(borough_by_id.get(zid) or ""),
+                    geometry_area_sq_miles=None,
+                ),
+            }
+        )
+    _recalibrate_visible_v3_fields(features)
+    return {
+        "time": requested_frame_time,
+        "bin_minutes": int(bin_minutes),
+        "polygons": {"type": "FeatureCollection", "features": features},
+    }
+
+
 def build_hotspots_frames(
     parquet_files: List[Path],
     zones_geojson_path: Path,
