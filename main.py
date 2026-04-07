@@ -582,13 +582,9 @@ def _month_build_meta_path(month_key: str) -> Path:
     return _month_dir(month_key) / "build_meta.json"
 
 
-def _ensure_month_manifest_entry(month_key: str) -> None:
+def _month_manifest_entry_payload(month_key: str, *, existing: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     mk = str(month_key or "").strip()
-    if not _safe_parse_month_key(mk):
-        return
-    manifest = _load_month_manifest()
-    months_manifest: Dict[str, Dict[str, Any]] = dict((manifest.get("months") or {}))
-    existing = dict(months_manifest.get(mk) or {})
+    baseline = dict(existing or {})
     timeline_path = _month_timeline_path(mk)
     frame_cache_dir = _month_frame_cache_dir(mk)
     freshness = _active_month_freshness(mk)
@@ -601,18 +597,19 @@ def _ensure_month_manifest_entry(month_key: str) -> None:
             timeline = list(timeline_payload.get("timeline") or [])
         except Exception:
             timeline = []
-    existing.update(
+    baseline.update(
         {
             "month_key": mk,
             "source_parquet_filenames": [p.name for p in _source_parquets_for_month(mk)],
             "source_parquet_files": build_meta.get("source_parquet_files") or [p.name for p in _source_parquets_for_month(mk)],
+            "source_of_truth": build_meta.get("source_of_truth"),
             "store_exists": bool(_month_store_path(mk).exists()),
             "timeline_exists": bool(timeline_path.exists() and timeline_path.is_file() and timeline_path.stat().st_size > 0),
             "frame_cache_dir_present": bool(frame_cache_dir.exists() and frame_cache_dir.is_dir()),
-            "first_frame_datetime": build_meta.get("first_frame_datetime") or (timeline[0] if timeline else existing.get("first_frame_datetime")),
-            "last_frame_datetime": build_meta.get("last_frame_datetime") or (timeline[-1] if timeline else existing.get("last_frame_datetime")),
-            "frame_count": int(build_meta.get("frame_count") or len(timeline) or existing.get("frame_count") or 0),
-            "built_at_unix": build_meta.get("built_at_unix") or existing.get("built_at_unix"),
+            "first_frame_datetime": build_meta.get("first_frame_datetime") or (timeline[0] if timeline else baseline.get("first_frame_datetime")),
+            "last_frame_datetime": build_meta.get("last_frame_datetime") or (timeline[-1] if timeline else baseline.get("last_frame_datetime")),
+            "frame_count": int(build_meta.get("frame_count") or len(timeline) or baseline.get("frame_count") or 0),
+            "built_at_unix": build_meta.get("built_at_unix") or baseline.get("built_at_unix"),
             "build_meta_present": bool(freshness.get("build_meta_present")),
             "bin_minutes": build_meta.get("bin_minutes") or int(DEFAULT_BIN_MINUTES),
             "min_trips_per_window": build_meta.get("min_trips_per_window") or int(DEFAULT_MIN_TRIPS_PER_WINDOW),
@@ -622,10 +619,22 @@ def _ensure_month_manifest_entry(month_key: str) -> None:
             "expected_artifact_signature": expected.get("artifact_signature"),
             "artifact_signature_matches": bool(freshness.get("artifact_signature_match")),
             "attested_via": build_meta.get("attested_via"),
+            "exact_store_retired": bool(build_meta.get("retired_exact_store")),
+            "exact_store_retired_reason": build_meta.get("exact_store_retired_reason"),
             "bootstrapped_at_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
         }
     )
-    months_manifest[mk] = existing
+    return baseline
+
+
+def _ensure_month_manifest_entry(month_key: str) -> None:
+    mk = str(month_key or "").strip()
+    if not _safe_parse_month_key(mk):
+        return
+    manifest = _load_month_manifest()
+    months_manifest: Dict[str, Dict[str, Any]] = dict((manifest.get("months") or {}))
+    existing = dict(months_manifest.get(mk) or {})
+    months_manifest[mk] = _month_manifest_entry_payload(mk, existing=existing)
     _persist_month_manifest(months_manifest)
 
 
@@ -692,6 +701,10 @@ def _attestation_state_snapshot(month_key: str) -> Dict[str, Any]:
 
 def _month_attestation_needed(month_key: str) -> bool:
     state = _month_bootstrap_state(month_key)
+    if bool(state.get("authoritative_kind") == "parquet_live" and state.get("authoritative_fresh")):
+        return False
+    if bool(state.get("source_of_truth") == "exact_store") and not bool(state.get("authoritative_fresh")):
+        return True
     return bool(
         state.get("store_exists")
         and state.get("timeline_exists")
@@ -715,6 +728,60 @@ def _write_month_build_meta_atomic(month_key: str, payload: Dict[str, Any]) -> P
             pass
     os.replace(temp_path, target)
     return target
+
+
+def _retire_obsolete_exact_store(month_key: str, reason: str) -> Dict[str, Any]:
+    mk = str(month_key or "").strip()
+    store_path = _month_store_path(mk)
+    build_meta_path = _month_build_meta_path(mk)
+    removed_store = False
+    removed_old_build_meta = False
+    # Uploaded parquet files are the permanent source of truth for monthly history.
+    # Retirement cleanup must only remove obsolete derived artifacts for a month.
+    if store_path.exists():
+        store_path.unlink(missing_ok=True)
+        removed_store = True
+    old_meta = load_month_build_meta(EXACT_HISTORY_MONTHS_DIR, mk)
+    if build_meta_path.exists() and isinstance(old_meta, dict) and str(old_meta.get("source_of_truth") or "").strip() == "exact_store":
+        build_meta_path.unlink(missing_ok=True)
+        removed_old_build_meta = True
+    removed_frame_cache_count = _purge_month_frame_cache(mk)
+    return {
+        "removed_store": removed_store,
+        "removed_old_build_meta": removed_old_build_meta,
+        "removed_frame_cache_count": int(removed_frame_cache_count),
+        "reason": str(reason or "").strip() or "retired",
+    }
+
+
+def _write_parquet_live_build_meta(month_key: str, reason: str, extra: Optional[dict] = None) -> Dict[str, Any]:
+    mk = str(month_key or "").strip()
+    timeline_path = _month_timeline_path(mk)
+    timeline_payload = _read_json(timeline_path) if timeline_path.exists() else {}
+    timeline = [_to_frontend_local_iso(item) for item in (timeline_payload.get("timeline") or [])]
+    freshness = _active_month_freshness(mk)
+    expected = freshness.get("expected") or {}
+    now_unix = int(time.time())
+    payload: Dict[str, Any] = {
+        "month_key": mk,
+        "built_at_unix": now_unix,
+        "bin_minutes": int(DEFAULT_BIN_MINUTES),
+        "min_trips_per_window": int(DEFAULT_MIN_TRIPS_PER_WINDOW),
+        "source_parquet_files": [path.name for path in _source_parquets_for_month(mk)],
+        "code_dependency_hash": expected.get("code_dependency_hash"),
+        "source_data_hash": expected.get("source_data_hash"),
+        "artifact_signature": expected.get("artifact_signature"),
+        "frame_count": len(timeline),
+        "first_frame_datetime": timeline[0] if timeline else None,
+        "last_frame_datetime": timeline[-1] if timeline else None,
+        "source_of_truth": "parquet_live",
+        "authoritative_reason": str(reason or "").strip() or "parquet_live_authoritative",
+    }
+    if isinstance(extra, dict):
+        payload.update(extra)
+    target = _write_month_build_meta_atomic(mk, payload)
+    _ensure_month_manifest_entry(mk)
+    return {"month_key": mk, "build_meta_path": str(target), "payload": payload}
 
 
 def _normalize_frame_payload_for_compare(frame_payload: Dict[str, Any]) -> Dict[int, Dict[str, Any]]:
@@ -812,13 +879,30 @@ def attest_existing_month_store_against_current_code(month_key: str, active_fram
                 }
             )
     if mismatches:
+        retired = _retire_obsolete_exact_store(mk, reason="sample_mismatch")
+        promoted = _write_parquet_live_build_meta(
+            mk,
+            reason="sample_mismatch_auto_promotion",
+            extra={
+                "retired_exact_store": bool(retired.get("removed_store")),
+                "exact_store_retired_reason": "sample_mismatch",
+                "attested_via": "parquet_live_authoritative",
+                "sampled_mismatch_summary": {
+                    "sample_frame_times": sample_times,
+                    "mismatch_count": len(mismatches),
+                },
+            },
+        )
         report = {
             "ok": False,
             "month_key": mk,
-            "attested": False,
+            "attested": True,
             "reason": "sample_mismatch",
             "sample_frame_times": sample_times,
             "mismatches": mismatches,
+            "parquet_live_promoted": True,
+            "retirement": retired,
+            "build_meta_written": promoted.get("build_meta_path"),
         }
         _last_attestation_report_by_month[mk] = report
         return report
@@ -840,6 +924,7 @@ def attest_existing_month_store_against_current_code(month_key: str, active_fram
         "code_dependency_hash": expected.get("code_dependency_hash"),
         "source_data_hash": expected.get("source_data_hash"),
         "artifact_signature": expected.get("artifact_signature"),
+        "source_of_truth": "exact_store",
         "attested_via": "sampled_frame_equivalence",
         "attestation_sample_frame_times": sample_times,
     }
@@ -998,6 +1083,7 @@ def _purge_month_frame_cache(month_key: str) -> int:
         return 0
     removed = 0
     cache_dir = _month_frame_cache_dir(mk)
+    # Purge only derived frame cache payloads. Never delete uploaded month parquet files here.
     if cache_dir.exists() and cache_dir.is_dir():
         for candidate in cache_dir.glob("frame_*.json"):
             try:
@@ -1329,6 +1415,21 @@ def _month_bootstrap_ready(month_key: str) -> bool:
     return bool(state.get("bootstrap_ready"))
 
 
+def _maybe_promote_parquet_live_authority(month_key: str) -> Dict[str, Any]:
+    mk = str(month_key or "").strip()
+    if not _safe_parse_month_key(mk):
+        return {"promoted": False, "reason": "invalid_month_key"}
+    timeline_exists = bool(_month_timeline_path(mk).exists() and _month_timeline_path(mk).is_file() and _month_timeline_path(mk).stat().st_size > 0)
+    frame_cache_dir_present = bool(_month_frame_cache_dir(mk).exists() and _month_frame_cache_dir(mk).is_dir())
+    source_parquet_exists = bool(_source_parquets_for_month(mk))
+    store_exists = bool(_month_store_path(mk).exists() and _month_store_path(mk).is_file() and _month_store_path(mk).stat().st_size > 0)
+    build_meta = load_month_build_meta(EXACT_HISTORY_MONTHS_DIR, mk)
+    if source_parquet_exists and timeline_exists and frame_cache_dir_present and (not store_exists) and not isinstance(build_meta, dict):
+        result = _write_parquet_live_build_meta(mk, reason="bootstrap_without_exact_store")
+        return {"promoted": True, "reason": "bootstrap_without_exact_store", "build_meta_path": result.get("build_meta_path")}
+    return {"promoted": False, "reason": "not_eligible"}
+
+
 def _month_bootstrap_state(month_key: str) -> Dict[str, Any]:
     mk = str(month_key or "").strip()
     timeline_path = _month_timeline_path(mk)
@@ -1336,9 +1437,15 @@ def _month_bootstrap_state(month_key: str) -> Dict[str, Any]:
     frame_cache_dir = _month_frame_cache_dir(mk)
     manifest = _load_month_manifest()
     month_entry = (manifest.get("months") or {}).get(mk) or {}
+    _maybe_promote_parquet_live_authority(mk)
     freshness = _active_month_freshness(mk) if mk else {}
     build_meta_present = bool(freshness.get("build_meta_present"))
     signature_match = bool(freshness.get("signature_match"))
+    authoritative_fresh = bool(freshness.get("authoritative_fresh"))
+    authoritative_kind = freshness.get("authoritative_kind")
+    source_of_truth = freshness.get("source_of_truth")
+    exact_store_retired = bool((freshness.get("build_meta") or {}).get("retired_exact_store"))
+    exact_store_retired_reason = (freshness.get("build_meta") or {}).get("exact_store_retired_reason")
     source_parquet_exists = bool(mk and _source_parquets_for_month(mk))
     month_manifest_present = bool(
         MONTH_MANIFEST_PATH.exists()
@@ -1348,37 +1455,21 @@ def _month_bootstrap_state(month_key: str) -> Dict[str, Any]:
     timeline_exists = bool(timeline_path.exists() and timeline_path.is_file() and timeline_path.stat().st_size > 0)
     store_exists = bool(store_path.exists() and store_path.is_file() and store_path.stat().st_size > 0)
     frame_cache_dir_present = bool(frame_cache_dir.exists() and frame_cache_dir.is_dir())
-    exact_store_fresh = bool(
-        month_manifest_present
-        and bool(month_entry)
-        and bool(month_entry.get("store_exists"))
-        and bool(month_entry.get("timeline_exists"))
-        and bool(month_entry.get("build_meta_present"))
-        and bool(month_entry.get("artifact_signature_matches"))
-        and store_exists
-        and timeline_exists
-        and signature_match
-    )
+    exact_store_fresh = bool(authoritative_kind == "exact_store" and authoritative_fresh)
     live_ready = bool(
         source_parquet_exists
         and timeline_exists
         and frame_cache_dir_present
     )
-    legacy_ready_without_build_meta = bool(
-        source_parquet_exists
-        and timeline_exists
-        and store_exists
-        and not build_meta_present
-    )
-    build_meta_backfill_pending = bool(store_exists and timeline_exists and not build_meta_present)
-    bootstrap_ready = bool(live_ready or exact_store_fresh or legacy_ready_without_build_meta)
+    legacy_ready_without_build_meta = bool(source_parquet_exists and timeline_exists and store_exists and not build_meta_present)
+    build_meta_backfill_pending = bool(live_ready and not build_meta_present)
+    authoritative_ready = bool(authoritative_fresh and authoritative_kind in {"exact_store", "parquet_live"})
+    bootstrap_ready = bool(live_ready or exact_store_fresh or authoritative_ready or legacy_ready_without_build_meta)
     serving_mode = "rebuild_required"
     if exact_store_fresh:
         serving_mode = "exact_store_fresh"
-    elif live_ready and build_meta_present:
-        serving_mode = "parquet_live_attested"
-    elif live_ready and legacy_ready_without_build_meta:
-        serving_mode = "legacy_store_attestation_pending"
+    elif live_ready and authoritative_kind == "parquet_live" and authoritative_fresh:
+        serving_mode = "parquet_live_authoritative"
     elif live_ready:
         serving_mode = "parquet_live_bootstrap"
     if not signature_match and not live_ready:
@@ -1392,10 +1483,19 @@ def _month_bootstrap_state(month_key: str) -> Dict[str, Any]:
         "frame_cache_dir_present": frame_cache_dir_present,
         "build_meta_present": build_meta_present,
         "signature_match": signature_match,
+        "authoritative_fresh": authoritative_fresh,
+        "authoritative_kind": authoritative_kind,
+        "source_of_truth": source_of_truth,
+        "exact_store_retired": exact_store_retired,
+        "exact_store_retired_reason": exact_store_retired_reason,
         "live_ready": live_ready,
         "exact_store_fresh": exact_store_fresh,
         "active_month_live_ready": live_ready,
         "active_month_exact_store_fresh": exact_store_fresh,
+        "active_month_authoritative_fresh": authoritative_fresh,
+        "active_month_source_of_truth": source_of_truth,
+        "active_month_exact_store_retired": exact_store_retired,
+        "active_month_exact_store_retired_reason": exact_store_retired_reason,
         "serving_mode": serving_mode,
         "legacy_ready_without_build_meta": legacy_ready_without_build_meta,
         "build_meta_backfill_pending": build_meta_backfill_pending,
@@ -2191,7 +2291,6 @@ def _artifact_runtime_policy_snapshot() -> Dict[str, Any]:
             "*.parquet",
             "taxi_zones.geojson",
             "exact_history/month_manifest.json",
-            "exact_history/months/<month_key>/exact_shadow.duckdb",
             "exact_history/months/<month_key>/timeline.json",
         ],
         "db_required": [
@@ -2225,6 +2324,10 @@ def _artifact_runtime_integrity_report() -> Dict[str, Any]:
     build_meta_backfill_pending = bool(active_bootstrap_state.get("build_meta_backfill_pending"))
     active_month_live_ready = bool(active_bootstrap_state.get("live_ready"))
     active_month_exact_store_fresh = bool(active_bootstrap_state.get("exact_store_fresh"))
+    active_month_authoritative_fresh = bool(active_bootstrap_state.get("authoritative_fresh"))
+    active_month_source_of_truth = active_bootstrap_state.get("source_of_truth")
+    active_month_exact_store_retired = bool(active_bootstrap_state.get("exact_store_retired"))
+    active_month_exact_store_retired_reason = active_bootstrap_state.get("exact_store_retired_reason")
     timeline_count = 0
     if timeline_present and active_month_key:
         try:
@@ -2268,7 +2371,7 @@ def _artifact_runtime_integrity_report() -> Dict[str, Any]:
     if not active_month_live_ready:
         missing_required_volume.append("exact_history/months/<active_month_key>/timeline.json+frame_cache")
 
-    core_map_ready = required_volume_ok
+    core_map_ready = bool(required_volume_ok and (active_month_live_ready or active_month_authoritative_fresh))
     ok = core_map_ready and not redundant_file_copies_present
     return {
         "ok": ok,
@@ -2293,6 +2396,10 @@ def _artifact_runtime_integrity_report() -> Dict[str, Any]:
         "active_month_bootstrap_ready": bool(active_month_live_ready or active_month_exact_store_fresh or legacy_ready_without_build_meta),
         "active_month_live_ready": active_month_live_ready,
         "active_month_exact_store_fresh": active_month_exact_store_fresh,
+        "active_month_authoritative_fresh": active_month_authoritative_fresh,
+        "active_month_source_of_truth": active_month_source_of_truth,
+        "active_month_exact_store_retired": active_month_exact_store_retired,
+        "active_month_exact_store_retired_reason": active_month_exact_store_retired_reason,
         "active_month_serving_mode": active_bootstrap_state.get("serving_mode") or "rebuild_required",
         "active_month_build_meta_present": build_meta_present,
         "active_month_signature_matches_code": bool(month_freshness.get("code_dependency_hash_match")),
@@ -3411,28 +3518,7 @@ def _bootstrap_month_partition(month_key: str, bin_minutes: int = DEFAULT_BIN_MI
     _month_frame_cache_dir(requested).mkdir(parents=True, exist_ok=True)
 
     months_manifest: Dict[str, Dict[str, Any]] = dict((_load_month_manifest().get("months") or {}))
-    timeline = list(timeline_payload.get("timeline") or [])
-    freshness = _active_month_freshness(requested)
-    build_meta = freshness.get("build_meta") or {}
-    expected = freshness.get("expected") or {}
-    months_manifest[requested] = {
-        "month_key": requested,
-        "source_parquet_filenames": [p.name for p in parquets],
-        "store_exists": (_month_store_path(requested).exists()),
-        "timeline_exists": timeline_path.exists(),
-        "frame_cache_dir_present": _month_frame_cache_dir(requested).exists(),
-        "first_frame_datetime": build_meta.get("first_frame_datetime") or (timeline[0] if timeline else None),
-        "last_frame_datetime": build_meta.get("last_frame_datetime") or (timeline[-1] if timeline else None),
-        "frame_count": int(build_meta.get("frame_count") or len(timeline)),
-        "built_at_unix": build_meta.get("built_at_unix"),
-        "build_meta_present": bool(freshness.get("build_meta_present")),
-        "code_dependency_hash": build_meta.get("code_dependency_hash"),
-        "source_data_hash": build_meta.get("source_data_hash"),
-        "artifact_signature": build_meta.get("artifact_signature"),
-        "expected_artifact_signature": expected.get("artifact_signature"),
-        "artifact_signature_matches": bool(freshness.get("artifact_signature_match")),
-        "bootstrapped_at_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
-    }
+    months_manifest[requested] = _month_manifest_entry_payload(requested, existing={"source_parquet_filenames": [p.name for p in parquets]})
     _persist_month_manifest(months_manifest)
     _prune_legacy_frame_files_after_monthly_ready()
     return {
@@ -3584,27 +3670,14 @@ def _generate_worker(
                     f"Monthly publish contract failed for {mk}: build_meta.json missing after successful publish verification."
                 )
             freshness = _active_month_freshness(mk)
-            expected = freshness.get("expected") or {}
             if not bool(freshness.get("build_meta_present")):
                 raise RuntimeError(
                     f"Monthly publish contract failed for {mk}: freshness gate did not detect build_meta.json."
                 )
-            months_manifest[mk] = {
-                "month_key": mk,
-                "source_parquet_filenames": [p.name for p in (grouped_parquets.get(mk) or [])],
-                "store_exists": store_exists,
-                "timeline_exists": timeline_exists,
-                "first_frame_datetime": build_meta.get("first_frame_datetime") or (timeline[0] if timeline else None),
-                "last_frame_datetime": build_meta.get("last_frame_datetime") or (timeline[-1] if timeline else None),
-                "frame_count": int(build_meta.get("frame_count") or len(timeline)),
-                "built_at_unix": build_meta.get("built_at_unix"),
-                "build_meta_present": bool(freshness.get("build_meta_present")),
-                "code_dependency_hash": build_meta.get("code_dependency_hash"),
-                "source_data_hash": build_meta.get("source_data_hash"),
-                "artifact_signature": build_meta.get("artifact_signature"),
-                "expected_artifact_signature": expected.get("artifact_signature"),
-                "artifact_signature_matches": bool(freshness.get("artifact_signature_match")),
-            }
+            months_manifest[mk] = _month_manifest_entry_payload(
+                mk,
+                existing={"source_parquet_filenames": [p.name for p in (grouped_parquets.get(mk) or [])]},
+            )
             if str(mk).strip() == str(source_target_month_key or "").strip() and bool(freshness.get("signature_match")):
                 stale_removed = _purge_month_frame_cache(mk)
                 print(f"monthly_partition_frame_cache_purged month_key={mk} removed={stale_removed}")
@@ -5588,6 +5661,10 @@ def status():
     active_month_serving_mode = str(active_bootstrap_state.get("serving_mode") or "rebuild_required")
     active_month_legacy_ready_without_build_meta = bool(active_bootstrap_state.get("legacy_ready_without_build_meta"))
     active_month_build_meta_backfill_pending = bool(active_bootstrap_state.get("build_meta_backfill_pending"))
+    active_month_authoritative_fresh = bool(active_bootstrap_state.get("authoritative_fresh"))
+    active_month_source_of_truth = active_bootstrap_state.get("source_of_truth")
+    active_month_exact_store_retired = bool(active_bootstrap_state.get("exact_store_retired"))
+    active_month_exact_store_retired_reason = active_bootstrap_state.get("exact_store_retired_reason")
     attestation_trigger_report = _queue_active_month_attestation(active_month_key) if active_month_key else {}
     attestation_state = _attestation_state_snapshot(active_month_key) if active_month_key else {}
     attestation_report = _last_attestation_report_by_month.get(str(active_month_key or "").strip()) if active_month_key else {}
@@ -5599,6 +5676,10 @@ def status():
         active_month_serving_mode = str(active_bootstrap_state.get("serving_mode") or "rebuild_required")
         active_month_legacy_ready_without_build_meta = bool(active_bootstrap_state.get("legacy_ready_without_build_meta"))
         active_month_build_meta_backfill_pending = bool(active_bootstrap_state.get("build_meta_backfill_pending"))
+        active_month_authoritative_fresh = bool(active_bootstrap_state.get("authoritative_fresh"))
+        active_month_source_of_truth = active_bootstrap_state.get("source_of_truth")
+        active_month_exact_store_retired = bool(active_bootstrap_state.get("exact_store_retired"))
+        active_month_exact_store_retired_reason = active_bootstrap_state.get("exact_store_retired_reason")
         active_month_build_meta_present = bool(month_freshness.get("build_meta_present"))
         active_month_signature_matches_code = bool(month_freshness.get("code_dependency_hash_match"))
         active_month_signature_matches_source = bool(month_freshness.get("source_data_hash_match"))
@@ -5615,9 +5696,9 @@ def status():
         and active_month_build_meta_present
         and active_month_signature_matches_expected
     )
-    active_month_core_ready = bool(active_month_live_ready or active_month_strict_ready or active_month_legacy_ready_without_build_meta)
+    active_month_core_ready = bool(active_month_live_ready and (active_month_authoritative_fresh or active_month_serving_mode == "parquet_live_bootstrap" or active_month_strict_ready or active_month_legacy_ready_without_build_meta))
     active_month_rebuild_required = bool(
-        active_month_key and (not active_month_exact_store_fresh)
+        active_month_key and (active_month_serving_mode == "rebuild_required")
     )
     build_review_artifacts_in_progress = bool(
         state_name in {"started", "running"} and bool(generate_state.get("build_review_artifacts"))
@@ -5698,6 +5779,10 @@ def status():
         "active_month_bootstrap_ready": bool(active_month_live_ready or active_month_exact_store_fresh or active_month_legacy_ready_without_build_meta),
         "active_month_live_ready": active_month_live_ready,
         "active_month_exact_store_fresh": active_month_exact_store_fresh,
+        "active_month_authoritative_fresh": active_month_authoritative_fresh,
+        "active_month_source_of_truth": active_month_source_of_truth,
+        "active_month_exact_store_retired": active_month_exact_store_retired,
+        "active_month_exact_store_retired_reason": active_month_exact_store_retired_reason,
         "active_month_serving_mode": active_month_serving_mode,
         "frame_cache_file_count": int(frame_cache_file_count),
         "active_month_build_meta_present": active_month_build_meta_present,
@@ -5729,7 +5814,7 @@ def status():
         "generated_artifact_store_report": generated_artifact_report(),
         "artifact_runtime_policy": _artifact_runtime_policy_snapshot(),
         "artifact_runtime_integrity": artifact_runtime_integrity,
-        "core_map_ready": bool(active_month_live_ready or active_month_exact_store_fresh or active_month_legacy_ready_without_build_meta),
+        "core_map_ready": bool(active_month_live_ready and (active_month_authoritative_fresh or active_month_serving_mode == "parquet_live_bootstrap" or active_month_legacy_ready_without_build_meta)),
         "active_month_core_ready": active_month_core_ready,
         "build_review_artifacts_in_progress": build_review_artifacts_in_progress,
         "optional_artifacts_missing": list(artifact_runtime_integrity.get("optional_artifacts_missing") or []),
