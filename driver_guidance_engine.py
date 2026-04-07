@@ -11,6 +11,7 @@ from shapely.geometry import Point, shape
 MOVE_NEARBY_COOLDOWN_SECONDS = 11 * 60
 MICRO_REPOSITION_COOLDOWN_SECONDS = 7 * 60
 MOVE_NEARBY_MIN_IMPROVEMENT = 10.0
+MOVE_NEARBY_STRONG_IMPROVEMENT = 13.0
 RECENT_WINDOW_SECONDS = 2 * 3600
 
 _zone_geometry_cache_lock = threading.Lock()
@@ -215,9 +216,29 @@ def load_driver_activity_snapshot(
         """,
         (int(user_id), int(now_ts) - RECENT_WINDOW_SECONDS),
     )
+    recent_guidance_rows = db_query_all(
+        """
+        SELECT action, converted_to_trip, recommended_at, settled_at, moved_before_trip
+        FROM assistant_guidance_outcomes
+        WHERE user_id=?
+          AND recommended_at >= ?
+        ORDER BY recommended_at DESC, id DESC
+        LIMIT 40
+        """,
+        (int(user_id), int(now_ts) - 5400),
+    )
     state_row = db_query_one("SELECT * FROM driver_guidance_state WHERE user_id=? LIMIT 1", (int(user_id),))
 
-    tripless_minutes = max(0.0, (float(now_ts) - _safe_float((latest_trip or {}).get("created_at"), float(now_ts))) / 60.0)
+    latest_trip_created_at = (latest_trip or {}).get("created_at")
+    if latest_trip_created_at is not None:
+        tripless_minutes = max(0.0, (float(now_ts) - _safe_float(latest_trip_created_at, float(now_ts))) / 60.0)
+    else:
+        baseline_ts = _safe_float((guard_row or {}).get("movement_streak_started_at"), 0.0)
+        if baseline_ts <= 0:
+            baseline_ts = _safe_float((guard_row or {}).get("last_meaningful_motion_at"), 0.0)
+        if baseline_ts <= 0:
+            baseline_ts = _safe_float((presence_row or {}).get("updated_at"), float(now_ts))
+        tripless_minutes = max(0.0, (float(now_ts) - float(baseline_ts)) / 60.0)
     movement_started_at = (guard_row or {}).get("movement_streak_started_at")
     last_motion_at = (guard_row or {}).get("last_meaningful_motion_at")
 
@@ -245,6 +266,16 @@ def load_driver_activity_snapshot(
     recent_saved_trip_count_60m = _safe_int((counts_row or {}).get("c60"), 0)
     recent_saved_trip_count_120m = _safe_int((counts_row or {}).get("c120"), 0)
 
+    recent_guidance_move_attempts_without_trip = 0
+    for row in recent_guidance_rows:
+        action = str((row or {}).get("action") or "").strip().lower()
+        if action not in {"move_nearby", "micro_reposition"}:
+            continue
+        converted = (row or {}).get("converted_to_trip")
+        if converted in (1, True):
+            break
+        recent_guidance_move_attempts_without_trip += 1
+
     uncertainty = 0.2
     if tripless_minutes >= 25:
         uncertainty += 0.2
@@ -256,10 +287,13 @@ def load_driver_activity_snapshot(
         uncertainty += 0.15
     if recent_saved_trip_count_120m == 0:
         uncertainty += 0.1
+    if recent_guidance_move_attempts_without_trip >= 2:
+        uncertainty += 0.1
 
     presence_updated = _safe_int((presence_row or {}).get("updated_at"), 0)
     current_presence_stale = (now_ts - presence_updated) > 300 if presence_updated > 0 else True
 
+    state_attempts = _safe_int((state_row or {}).get("recent_move_attempts_without_trip"), 0)
     return {
         "tripless_minutes": round(tripless_minutes, 2),
         "stationary_minutes": round(stationary_minutes, 2),
@@ -268,7 +302,7 @@ def load_driver_activity_snapshot(
         "recent_saved_trip_count_30m": int(recent_saved_trip_count_30m),
         "recent_saved_trip_count_60m": int(recent_saved_trip_count_60m),
         "recent_saved_trip_count_120m": int(recent_saved_trip_count_120m),
-        "recent_move_attempts_without_trip": _safe_int((state_row or {}).get("recent_move_attempts_without_trip"), 0),
+        "recent_move_attempts_without_trip": max(state_attempts, recent_guidance_move_attempts_without_trip),
         "recent_recommendation_conversion_rate": round(rec_rate, 3),
         "recent_micro_conversion_rate": round(micro_rate, 3),
         "dispatch_uncertainty": min(1.0, round(uncertainty, 3)),
@@ -299,6 +333,7 @@ def build_driver_guidance(
     dispatch_uncertainty = _safe_float(activity_snapshot.get("dispatch_uncertainty"), 0.3)
     recent_move_attempts = _safe_int(activity_snapshot.get("recent_move_attempts_without_trip"), 0)
     recent_saved_60 = _safe_int(activity_snapshot.get("recent_saved_trip_count_60m"), 0)
+    moved_since_last_saved_trip = bool(activity_snapshot.get("moved_since_last_saved_trip"))
     state = activity_snapshot.get("guidance_state") or {}
 
     current_zone = zone_context.get("current_zone") or {}
@@ -309,6 +344,8 @@ def build_driver_guidance(
     current_next_rating = _safe_float(current_zone.get("next_rating"), current_rating)
     current_saturation_penalty = _safe_float(current_zone.get("market_saturation_penalty"), 0.0)
     current_continuation_raw = _safe_float(current_zone.get("continuation_raw"), 0.0)
+    current_bucket = current_zone.get("bucket")
+    current_color = current_zone.get("color")
     settling_window = tripless_minutes <= 18.0 or movement_minutes <= 12.0
 
     reason_codes: List[str] = []
@@ -335,6 +372,18 @@ def build_driver_guidance(
         message = "Hold here a bit longer — this zone still has enough continuation."
     elif (
         current_rating >= 50
+        and moved_since_last_saved_trip
+        and recent_move_attempts >= 1
+        and dispatch_uncertainty >= 0.5
+        and recent_saved_60 <= 0
+    ):
+        action = "wait_dispatch"
+        confidence = 0.7
+        reason_codes.extend(["recent_movement_no_conversion", "dispatch_bottleneck_likely", "avoid_repeat_reposition"])
+        hold_until_unix = now_ts + 8 * 60
+        message = "You already moved recently. Wait for dispatch instead of churning position again."
+    elif (
+        current_rating >= 50
         and tripless_minutes >= 20
         and stationary_minutes >= 14
         and (best_nearby is None or _safe_float(best_nearby.get("rating"), 0.0) < current_rating + MOVE_NEARBY_MIN_IMPROVEMENT)
@@ -348,10 +397,10 @@ def build_driver_guidance(
         best_nearby is not None
         and current_rating < 55
         and current_next_rating < 58
-        and _safe_float(best_nearby.get("rating"), 0.0) >= current_rating + MOVE_NEARBY_MIN_IMPROVEMENT
+        and _safe_float(best_nearby.get("rating"), 0.0) >= current_rating + MOVE_NEARBY_STRONG_IMPROVEMENT
         and not in_move_cooldown
         and recent_move_attempts < 3
-        and _safe_float(best_nearby.get("distance_miles"), 999.0) <= 3.0
+        and _safe_float(best_nearby.get("distance_miles"), 999.0) <= 2.5
     ):
         action = "move_nearby"
         confidence = 0.72
@@ -388,6 +437,8 @@ def build_driver_guidance(
             "zone_name": current_zone_name,
             "borough": current_borough,
             "rating": current_rating,
+            "bucket": current_bucket,
+            "color": current_color,
             "next_rating": current_next_rating,
             "market_saturation_penalty": current_saturation_penalty,
             "continuation_raw": current_continuation_raw,
