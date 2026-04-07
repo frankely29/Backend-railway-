@@ -654,6 +654,7 @@ def _ensure_month_live_bootstrap(month_key: str, *, force_timeline_bootstrap: bo
     frame_cache_dir = _month_frame_cache_dir(mk)
     frame_cache_dir.mkdir(parents=True, exist_ok=True)
     _ensure_month_manifest_entry(mk)
+    _maybe_promote_parquet_live_authority(mk)
     return {
         "ok": bool(source_parquet_exists and timeline_exists and frame_cache_dir.exists()),
         "month_key": mk,
@@ -776,6 +777,8 @@ def _write_parquet_live_build_meta(month_key: str, reason: str, extra: Optional[
         "last_frame_datetime": timeline[-1] if timeline else None,
         "source_of_truth": "parquet_live",
         "authoritative_reason": str(reason or "").strip() or "parquet_live_authoritative",
+        "retired_exact_store": False,
+        "exact_store_retired_reason": "no_exact_store_present",
     }
     if isinstance(extra, dict):
         payload.update(extra)
@@ -1284,15 +1287,13 @@ def _monthly_mode_ready_for_legacy_cleanup() -> bool:
     if not active_month_key:
         return False
     timeline_path = _month_timeline_path(active_month_key)
-    store_path = _month_store_path(active_month_key)
+    bootstrap_state = _month_bootstrap_state(active_month_key)
     core_month_ready = bool(
         timeline_path.exists()
         and timeline_path.is_file()
         and timeline_path.stat().st_size > 0
-        and store_path.exists()
-        and store_path.is_file()
-        and store_path.stat().st_size > 0
-        and _month_bootstrap_ready(active_month_key)
+        and bool(bootstrap_state.get("live_ready"))
+        and bool(bootstrap_state.get("authoritative_fresh"))
     )
     if not core_month_ready:
         return False
@@ -1314,6 +1315,39 @@ def _prune_legacy_frame_files_after_monthly_ready() -> Dict[str, Any]:
             traceback.print_exc()
     print(f"legacy_frame_cleanup_done removed_count={len(removed_paths)}")
     return {"removed_paths": removed_paths, "removed_count": len(removed_paths)}
+
+
+def _is_protected_source_path(path: Path) -> bool:
+    name = str(path.name or "").lower()
+    return name.endswith(".parquet") or name == "taxi_zones.geojson"
+
+
+def _prune_obsolete_month_derived_artifacts() -> Dict[str, Any]:
+    removed_paths: List[str] = []
+    removed_count = 0
+    manifest = _load_month_manifest()
+    month_keys = [mk for mk in list(manifest.get("available_month_keys") or []) if _safe_parse_month_key(str(mk))]
+    for mk in month_keys:
+        month_key = str(mk)
+        state = _month_bootstrap_state(month_key)
+        if bool(state.get("source_of_truth") == "parquet_live" and state.get("authoritative_fresh") and state.get("store_exists")):
+            retired = _retire_obsolete_exact_store(month_key, reason="parquet_live_authoritative_cleanup")
+            removed_count += int(retired.get("removed_frame_cache_count") or 0)
+            if retired.get("removed_store"):
+                removed_count += 1
+                removed_paths.append(str(_month_store_path(month_key)))
+            if retired.get("removed_old_build_meta"):
+                removed_count += 1
+                removed_paths.append(str(_month_build_meta_path(month_key)))
+        month_dir = _month_dir(month_key)
+        for temp_path in [month_dir / "build_meta.json.tmp", month_dir / "exact_shadow.duckdb.tmp"]:
+            if not temp_path.exists() or _is_protected_source_path(temp_path):
+                continue
+            _cleanup_path_quiet(temp_path)
+            if not temp_path.exists():
+                removed_count += 1
+                removed_paths.append(str(temp_path))
+    return {"removed_paths": removed_paths, "removed_count": int(removed_count)}
 
 
 def _available_source_month_keys() -> List[str]:
@@ -1354,6 +1388,7 @@ def _persist_month_manifest(month_map: Dict[str, Dict[str, Any]]) -> Dict[str, A
 
 
 def resolve_active_month_key(target_dt_nyc: datetime, available_month_keys: List[str]) -> Optional[str]:
+    # Product rule: prefer same year-month, then same calendar month from any year, else latest available month.
     valid = [mk for mk in sorted(available_month_keys) if _safe_parse_month_key(mk)]
     if not valid:
         return None
@@ -2304,6 +2339,10 @@ def _artifact_runtime_policy_snapshot() -> Dict[str, Any]:
             "frames/assistant_outlook.json",
             "frames/scoring_shadow_manifest.json",
         ],
+        "protected_source_inputs": [
+            "*.parquet",
+            "taxi_zones.geojson",
+        ],
     }
 
 
@@ -2386,6 +2425,7 @@ def _artifact_runtime_integrity_report() -> Dict[str, Any]:
         "unexpected_volume_files_present": list(redundant_file_copies_present),
         "frame_count": timeline_count,
         "parquet_count": parquet_count,
+        "protected_source_parquet_count": parquet_count,
         "monthly_partition_mode": True,
         "active_month_key": active_month_key,
         "available_month_keys": available_month_keys,
@@ -2454,10 +2494,12 @@ def _start_storage_cleanup_sweeper() -> None:
                 stale_build_prune = _prune_stale_month_build_dirs()
                 stale_backup_prune = _prune_stale_month_backup_dirs()
                 legacy_prune = _prune_legacy_frame_files_after_monthly_ready()
+                obsolete_month_prune = _prune_obsolete_month_derived_artifacts()
                 removed_count = int(cleanup_result.get("removed_count") or 0) + int(prune_result.get("removed_count") or 0)
                 removed_count += int(stale_build_prune.get("removed_count") or 0)
                 removed_count += int(stale_backup_prune.get("removed_count") or 0)
                 removed_count += int(legacy_prune.get("removed_count") or 0)
+                removed_count += int(obsolete_month_prune.get("removed_count") or 0)
                 bytes_freed = int(cleanup_result.get("bytes_freed_estimate") or 0) + int(prune_result.get("bytes_freed_estimate") or 0)
                 _cleanup_last_periodic_removed_count = removed_count
                 _cleanup_last_periodic_freed_bytes_estimate = bytes_freed
@@ -5451,10 +5493,12 @@ def startup():
         stale_build_prune = _prune_stale_month_build_dirs()
         stale_backup_prune = _prune_stale_month_backup_dirs()
         legacy_prune = _prune_legacy_frame_files_after_monthly_ready()
+        obsolete_month_prune = _prune_obsolete_month_derived_artifacts()
         removed_count = int(cleanup_result.get("removed_count") or 0) + int(prune_result.get("removed_count") or 0)
         removed_count += int(stale_build_prune.get("removed_count") or 0)
         removed_count += int(stale_backup_prune.get("removed_count") or 0)
         removed_count += int(legacy_prune.get("removed_count") or 0)
+        removed_count += int(obsolete_month_prune.get("removed_count") or 0)
         bytes_freed = int(cleanup_result.get("bytes_freed_estimate") or 0) + int(prune_result.get("bytes_freed_estimate") or 0)
         _cleanup_last_startup_removed_count = removed_count
         _cleanup_last_startup_freed_bytes_estimate = bytes_freed
@@ -5481,6 +5525,8 @@ def startup():
             datetime.now(timezone.utc).astimezone(NYC_TZ),
             source_month_keys,
         )
+        if target_month_key_candidate:
+            _ensure_month_live_bootstrap(target_month_key_candidate)
         target_ready = bool(target_month_key_candidate and _month_bootstrap_ready(target_month_key_candidate))
         if target_month_key_candidate and target_ready and _month_attestation_needed(target_month_key_candidate):
             _queue_active_month_attestation(target_month_key_candidate)
@@ -5598,6 +5644,7 @@ def root():
 @app.get("/status")
 def status():
     parquets = [p.name for p in _list_parquets()]
+    protected_source_parquet_count = len(parquets)
     source_month_keys = _available_source_month_keys()
     zones_path = DATA_DIR / "taxi_zones.geojson"
     manifest_path = FRAMES_DIR / "scoring_shadow_manifest.json"
@@ -5665,7 +5712,9 @@ def status():
     active_month_source_of_truth = active_bootstrap_state.get("source_of_truth")
     active_month_exact_store_retired = bool(active_bootstrap_state.get("exact_store_retired"))
     active_month_exact_store_retired_reason = active_bootstrap_state.get("exact_store_retired_reason")
-    attestation_trigger_report = _queue_active_month_attestation(active_month_key) if active_month_key else {}
+    attestation_trigger_report = {}
+    if active_month_key and _month_attestation_needed(active_month_key):
+        attestation_trigger_report = _queue_active_month_attestation(active_month_key)
     attestation_state = _attestation_state_snapshot(active_month_key) if active_month_key else {}
     attestation_report = _last_attestation_report_by_month.get(str(active_month_key or "").strip()) if active_month_key else {}
     if bool(attestation_report and attestation_report.get("ok")):
@@ -5713,6 +5762,7 @@ def status():
         "upload_streaming_enabled": True,
         "parquet_delete_enabled": True,
         "parquets": parquets,
+        "protected_source_parquet_count": int(protected_source_parquet_count),
         "source_month_keys": source_month_keys,
         "target_month_key_candidate": target_month_key_candidate,
         "parquet_inventory_warning_count": int(_parquet_inventory_snapshot.get("warning_count") or 0),
