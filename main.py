@@ -53,6 +53,12 @@ from assistant_outlook_engine import (
     build_assistant_outlook_frame_bucket,
     get_assistant_outlook_payload_from_frame_bucket,
 )
+from driver_guidance_engine import (
+    build_driver_guidance,
+    load_zone_centroid_lookup,
+    load_driver_activity_snapshot,
+    resolve_current_zone_from_position,
+)
 from hotspot_models import MicroHotspotScoreResult
 from hotspot_scoring import score_zones
 from artifact_freshness import evaluate_artifact_freshness
@@ -4764,6 +4770,47 @@ def _db_init() -> None:
             "CREATE INDEX IF NOT EXISTS idx_micro_recommendation_outcomes_parent_time "
             "ON micro_recommendation_outcomes(parent_hotspot_id, recommended_at DESC);"
         )
+        _db_exec(
+            """
+            CREATE TABLE IF NOT EXISTS driver_guidance_state (
+              user_id BIGINT PRIMARY KEY,
+              last_guidance_action TEXT,
+              last_guidance_generated_at BIGINT,
+              last_move_guidance_at BIGINT,
+              last_hold_guidance_at BIGINT,
+              last_target_zone_id INTEGER,
+              recent_move_attempts_without_trip INTEGER NOT NULL DEFAULT 0,
+              recent_wait_dispatch_count INTEGER NOT NULL DEFAULT 0,
+              updated_at BIGINT NOT NULL
+            );
+            """
+        )
+        _db_exec("CREATE INDEX IF NOT EXISTS idx_driver_guidance_state_updated_at ON driver_guidance_state(updated_at DESC);")
+        _db_exec(
+            """
+            CREATE TABLE IF NOT EXISTS assistant_guidance_outcomes (
+              id BIGSERIAL PRIMARY KEY,
+              user_id BIGINT NOT NULL,
+              frame_time TEXT,
+              recommended_at BIGINT NOT NULL,
+              action TEXT NOT NULL,
+              source_zone_id INTEGER,
+              target_zone_id INTEGER,
+              tripless_minutes DOUBLE PRECISION,
+              stationary_minutes DOUBLE PRECISION,
+              movement_minutes DOUBLE PRECISION,
+              current_rating DOUBLE PRECISION,
+              target_rating DOUBLE PRECISION,
+              dispatch_uncertainty DOUBLE PRECISION,
+              converted_to_trip BOOLEAN,
+              minutes_to_trip DOUBLE PRECISION,
+              settled_at BIGINT,
+              settlement_reason TEXT
+            );
+            """
+        )
+        _db_exec("CREATE INDEX IF NOT EXISTS idx_assistant_guidance_outcomes_user_time ON assistant_guidance_outcomes(user_id, recommended_at DESC);")
+        _db_exec("CREATE INDEX IF NOT EXISTS idx_assistant_guidance_outcomes_unsettled ON assistant_guidance_outcomes(user_id, converted_to_trip, recommended_at DESC);")
 
         _db_exec(
             """
@@ -5115,6 +5162,47 @@ def _db_init() -> None:
         "CREATE INDEX IF NOT EXISTS idx_micro_recommendation_outcomes_parent_time "
         "ON micro_recommendation_outcomes(parent_hotspot_id, recommended_at DESC);"
     )
+    _db_exec(
+        """
+        CREATE TABLE IF NOT EXISTS driver_guidance_state (
+          user_id INTEGER PRIMARY KEY,
+          last_guidance_action TEXT,
+          last_guidance_generated_at INTEGER,
+          last_move_guidance_at INTEGER,
+          last_hold_guidance_at INTEGER,
+          last_target_zone_id INTEGER,
+          recent_move_attempts_without_trip INTEGER NOT NULL DEFAULT 0,
+          recent_wait_dispatch_count INTEGER NOT NULL DEFAULT 0,
+          updated_at INTEGER NOT NULL
+        );
+        """
+    )
+    _db_exec("CREATE INDEX IF NOT EXISTS idx_driver_guidance_state_updated_at ON driver_guidance_state(updated_at DESC);")
+    _db_exec(
+        """
+        CREATE TABLE IF NOT EXISTS assistant_guidance_outcomes (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id INTEGER NOT NULL,
+          frame_time TEXT,
+          recommended_at INTEGER NOT NULL,
+          action TEXT NOT NULL,
+          source_zone_id INTEGER,
+          target_zone_id INTEGER,
+          tripless_minutes REAL,
+          stationary_minutes REAL,
+          movement_minutes REAL,
+          current_rating REAL,
+          target_rating REAL,
+          dispatch_uncertainty REAL,
+          converted_to_trip INTEGER,
+          minutes_to_trip REAL,
+          settled_at INTEGER,
+          settlement_reason TEXT
+        );
+        """
+    )
+    _db_exec("CREATE INDEX IF NOT EXISTS idx_assistant_guidance_outcomes_user_time ON assistant_guidance_outcomes(user_id, recommended_at DESC);")
+    _db_exec("CREATE INDEX IF NOT EXISTS idx_assistant_guidance_outcomes_unsettled ON assistant_guidance_outcomes(user_id, converted_to_trip, recommended_at DESC);")
 
     _db_exec(
         """
@@ -6558,6 +6646,305 @@ def assistant_outlook(
 
     response_etag = str((timeline_cached or {}).get("etag") or "")
     return _json_cached_response(request, payload, etag=response_etag)
+
+
+def _safe_float_value(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _safe_haversine_miles(lat1: Any, lng1: Any, lat2: Any, lng2: Any) -> float:
+    try:
+        la1 = float(lat1)
+        ln1 = float(lng1)
+        la2 = float(lat2)
+        ln2 = float(lng2)
+    except Exception:
+        return 0.0
+    radius_m = 6371000.0
+    phi1 = math.radians(la1)
+    phi2 = math.radians(la2)
+    dphi = math.radians(la2 - la1)
+    dlambda = math.radians(ln2 - ln1)
+    a = math.sin(dphi / 2.0) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2.0) ** 2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return radius_m * c * 0.000621371
+
+
+def _assistant_track_priority_from_mode_flags(mode_flags: Dict[str, bool]) -> List[str]:
+    if mode_flags.get("staten_island_mode"):
+        return ["staten_island_v3_shadow", "staten_island_shadow", "citywide_v3_shadow", "citywide_shadow"]
+    if mode_flags.get("bronx_wash_heights_mode"):
+        return ["bronx_wash_heights_v3_shadow", "bronx_wash_heights_shadow", "citywide_v3_shadow", "citywide_shadow"]
+    if mode_flags.get("queens_mode"):
+        return ["queens_v3_shadow", "queens_shadow", "citywide_v3_shadow", "citywide_shadow"]
+    if mode_flags.get("brooklyn_mode"):
+        return ["brooklyn_v3_shadow", "brooklyn_shadow", "citywide_v3_shadow", "citywide_shadow"]
+    return ["manhattan_v3_shadow", "manhattan_shadow", "citywide_v3_shadow", "citywide_shadow"]
+
+
+def _extract_zone_rating_from_point(point: Dict[str, Any], mode_flags: Dict[str, bool]) -> float:
+    tracks = (point or {}).get("tracks") or {}
+    for key in _assistant_track_priority_from_mode_flags(mode_flags):
+        entry = tracks.get(key) or {}
+        rating = entry.get("rating")
+        if rating is not None:
+            return _safe_float_value(rating, 0.0)
+    return 0.0
+
+
+def _build_guidance_zone_context(
+    *,
+    frame_bucket: Dict[str, Any],
+    current_zone_id: Optional[int],
+    current_lat: float,
+    current_lng: float,
+    mode_flags: Dict[str, bool],
+    centroid_lookup: Dict[int, Dict[str, Any]],
+) -> Dict[str, Any]:
+    current_zone_payload = None
+    if current_zone_id is not None:
+        current_zone_payload = frame_bucket.get(str(int(current_zone_id)))
+    current_points = (current_zone_payload or {}).get("points") or []
+    current_now = current_points[0] if current_points else {}
+    current_next = current_points[1] if len(current_points) > 1 else current_now
+    current_rating = _extract_zone_rating_from_point(current_now, mode_flags)
+    current_next_rating = _extract_zone_rating_from_point(current_next, mode_flags)
+
+    nearby_candidates: List[Dict[str, Any]] = []
+    for zone_id_raw, zone_payload in (frame_bucket or {}).items():
+        points = (zone_payload or {}).get("points") or []
+        if not points:
+            continue
+        first = points[0]
+        zone_id = int(zone_payload.get("location_id") or zone_id_raw)
+        centroid_row = centroid_lookup.get(zone_id) or {}
+        center_lat = centroid_row.get("centroid_lat")
+        center_lng = centroid_row.get("centroid_lng")
+        if center_lat is None or center_lng is None:
+            continue
+        if current_zone_id is not None and str(zone_id_raw) == str(current_zone_id):
+            continue
+        distance = _safe_haversine_miles(current_lat, current_lng, center_lat, center_lng)
+        if distance > 3.0:
+            continue
+        nearby_candidates.append(
+            {
+                "zone_id": int(zone_payload.get("location_id") or zone_id_raw),
+                "zone_name": zone_payload.get("zone_name"),
+                "borough": zone_payload.get("borough"),
+                "distance_miles": round(float(distance), 3),
+                "rating": round(_extract_zone_rating_from_point(first, mode_flags), 2),
+            }
+        )
+    nearby_candidates.sort(key=lambda z: (-(z.get("rating") or 0.0), z.get("distance_miles") or 999.0))
+
+    return {
+        "current_zone": {
+            "zone_id": int(current_zone_id) if current_zone_id is not None else None,
+            "rating": round(float(current_rating), 2),
+            "next_rating": round(float(current_next_rating), 2),
+            "market_saturation_penalty": _safe_float_value(current_now.get("market_saturation_penalty"), 0.0),
+            "continuation_raw": _safe_float_value(current_now.get("continuation_raw"), 0.0),
+        },
+        "nearby_candidates": nearby_candidates[:8],
+    }
+
+
+def _persist_driver_guidance_state_and_outcome(
+    *,
+    user_id: int,
+    frame_time: str,
+    now_ts: int,
+    guidance: Dict[str, Any],
+) -> None:
+    action = str(guidance.get("action") or "hold").strip().lower()
+    source_zone_id = (guidance.get("current_zone") or {}).get("zone_id")
+    target_zone_id = (guidance.get("target_zone") or {}).get("zone_id")
+    current_rating = (guidance.get("current_zone") or {}).get("rating")
+    target_rating = (guidance.get("target_zone") or {}).get("rating") if guidance.get("target_zone") else None
+    prev = _db_query_one("SELECT * FROM driver_guidance_state WHERE user_id=? LIMIT 1", (int(user_id),))
+    prev_move_attempts = int((prev or {}).get("recent_move_attempts_without_trip") or 0)
+    prev_wait_count = int((prev or {}).get("recent_wait_dispatch_count") or 0)
+
+    next_move_attempts = prev_move_attempts
+    if action in {"move_nearby", "micro_reposition"}:
+        next_move_attempts = prev_move_attempts + 1
+    elif action in {"hold", "wait_dispatch"}:
+        next_move_attempts = max(0, prev_move_attempts - 1)
+
+    next_wait_count = prev_wait_count + 1 if action == "wait_dispatch" else 0
+    _db_exec(
+        """
+        INSERT INTO assistant_guidance_outcomes(
+          user_id, frame_time, recommended_at, action,
+          source_zone_id, target_zone_id,
+          tripless_minutes, stationary_minutes, movement_minutes,
+          current_rating, target_rating, dispatch_uncertainty,
+          converted_to_trip, minutes_to_trip, settled_at, settlement_reason
+        )
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            int(user_id),
+            str(frame_time or ""),
+            int(now_ts),
+            action,
+            source_zone_id,
+            target_zone_id,
+            _safe_float_value(guidance.get("tripless_minutes"), 0.0),
+            _safe_float_value(guidance.get("stationary_minutes"), 0.0),
+            _safe_float_value(guidance.get("movement_minutes"), 0.0),
+            _safe_float_value(current_rating, 0.0),
+            _safe_float_value(target_rating, 0.0) if target_rating is not None else None,
+            _safe_float_value(guidance.get("dispatch_uncertainty"), 0.0),
+            None,
+            None,
+            None,
+            None,
+        ),
+    )
+    _db_exec(
+        """
+        INSERT INTO driver_guidance_state(
+          user_id, last_guidance_action, last_guidance_generated_at, last_move_guidance_at,
+          last_hold_guidance_at, last_target_zone_id, recent_move_attempts_without_trip,
+          recent_wait_dispatch_count, updated_at
+        )
+        VALUES(?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(user_id) DO UPDATE SET
+          last_guidance_action=excluded.last_guidance_action,
+          last_guidance_generated_at=excluded.last_guidance_generated_at,
+          last_move_guidance_at=CASE
+            WHEN excluded.last_guidance_action IN ('move_nearby', 'micro_reposition') THEN excluded.last_guidance_generated_at
+            ELSE driver_guidance_state.last_move_guidance_at
+          END,
+          last_hold_guidance_at=CASE
+            WHEN excluded.last_guidance_action IN ('hold', 'wait_dispatch') THEN excluded.last_guidance_generated_at
+            ELSE driver_guidance_state.last_hold_guidance_at
+          END,
+          last_target_zone_id=excluded.last_target_zone_id,
+          recent_move_attempts_without_trip=excluded.recent_move_attempts_without_trip,
+          recent_wait_dispatch_count=excluded.recent_wait_dispatch_count,
+          updated_at=excluded.updated_at
+        """,
+        (
+            int(user_id),
+            action,
+            int(now_ts),
+            int(now_ts) if action in {"move_nearby", "micro_reposition"} else None,
+            int(now_ts) if action in {"hold", "wait_dispatch"} else None,
+            target_zone_id,
+            int(next_move_attempts),
+            int(next_wait_count),
+            int(now_ts),
+        ),
+    )
+
+
+@app.get("/assistant/guidance")
+def assistant_guidance(
+    frame_time: str,
+    lat: Optional[float] = None,
+    lng: Optional[float] = None,
+    staten_island_mode: int = 0,
+    bronx_wash_heights_mode: int = 0,
+    queens_mode: int = 0,
+    brooklyn_mode: int = 0,
+    user: sqlite3.Row = Depends(require_user),
+):
+    now_ts = int(time.time())
+    mode_flags = {
+        "staten_island_mode": bool(int(staten_island_mode or 0)),
+        "bronx_wash_heights_mode": bool(int(bronx_wash_heights_mode or 0)),
+        "queens_mode": bool(int(queens_mode or 0)),
+        "brooklyn_mode": bool(int(brooklyn_mode or 0)),
+    }
+    presence_row = _db_query_one("SELECT lat, lng FROM presence WHERE user_id=? LIMIT 1", (int(user["id"]),))
+    current_lat = float(lat if lat is not None else (presence_row or {}).get("lat")) if (lat is not None or presence_row) else None
+    current_lng = float(lng if lng is not None else (presence_row or {}).get("lng")) if (lng is not None or presence_row) else None
+    if current_lat is None or current_lng is None:
+        raise HTTPException(status_code=400, detail="guidance requires lat/lng or a fresh presence location")
+
+    frame_key = _to_frontend_local_iso(frame_time)
+    timeline_cached = _read_timeline_cached()
+    cached_bucket = _build_assistant_outlook_frame_bucket_cached(
+        timeline_cached=timeline_cached,
+        frame_time=frame_key,
+        horizon_bins=HORIZON_BINS_DEFAULT,
+    )
+    frame_bucket = cached_bucket.get("frame_bucket") or {}
+    zone_resolution = resolve_current_zone_from_position(
+        zones_geojson_path=(DATA_DIR / "taxi_zones.geojson"),
+        lat=float(current_lat),
+        lng=float(current_lng),
+    )
+    centroid_lookup = load_zone_centroid_lookup(DATA_DIR / "taxi_zones.geojson")
+    current_zone_id = zone_resolution.get("current_zone_id")
+    current_zone_name = zone_resolution.get("current_zone_name")
+    current_borough = zone_resolution.get("current_borough")
+
+    activity_snapshot = load_driver_activity_snapshot(
+        user_id=int(user["id"]),
+        now_ts=now_ts,
+        current_lat=float(current_lat),
+        current_lng=float(current_lng),
+        db_query_one=_db_query_one,
+        db_query_all=_db_query_all,
+    )
+    zone_context = _build_guidance_zone_context(
+        frame_bucket=frame_bucket,
+        current_zone_id=current_zone_id,
+        current_lat=float(current_lat),
+        current_lng=float(current_lng),
+        mode_flags=mode_flags,
+        centroid_lookup=centroid_lookup,
+    )
+    guidance = build_driver_guidance(
+        user_id=int(user["id"]),
+        frame_time=frame_key,
+        current_lat=float(current_lat),
+        current_lng=float(current_lng),
+        current_zone_id=current_zone_id,
+        current_zone_name=current_zone_name,
+        current_borough=current_borough,
+        mode_flags=mode_flags,
+        assistant_outlook_bucket=frame_bucket,
+        activity_snapshot=activity_snapshot,
+        zone_context=zone_context,
+        now_ts=now_ts,
+    )
+    _persist_driver_guidance_state_and_outcome(
+        user_id=int(user["id"]),
+        frame_time=frame_key,
+        now_ts=now_ts,
+        guidance=guidance,
+    )
+    current_zone_debug = guidance.get("current_zone") or {}
+    return {
+        "ok": True,
+        "frame_time": frame_key,
+        "action": guidance.get("action"),
+        "confidence": guidance.get("confidence"),
+        "message": guidance.get("message"),
+        "reason_codes": guidance.get("reason_codes") or [],
+        "tripless_minutes": guidance.get("tripless_minutes"),
+        "stationary_minutes": guidance.get("stationary_minutes"),
+        "movement_minutes": guidance.get("movement_minutes"),
+        "recent_saved_trip_count": guidance.get("recent_saved_trip_count"),
+        "recent_move_attempts_without_trip": guidance.get("recent_move_attempts_without_trip"),
+        "dispatch_uncertainty": guidance.get("dispatch_uncertainty"),
+        "move_cooldown_until_unix": guidance.get("move_cooldown_until_unix"),
+        "hold_until_unix": guidance.get("hold_until_unix"),
+        "current_zone_rating": current_zone_debug.get("rating"),
+        "current_zone_next_rating": current_zone_debug.get("next_rating"),
+        "current_zone_saturation_penalty": current_zone_debug.get("market_saturation_penalty"),
+        "current_zone_continuation_raw": current_zone_debug.get("continuation_raw"),
+        "current_zone": guidance.get("current_zone"),
+        "target_zone": guidance.get("target_zone"),
+    }
 
 
 @app.get("/frame/{idx}")

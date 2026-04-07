@@ -336,6 +336,69 @@ def _settle_latest_micro_recommendation_outcome_tx(
     return {"settled": True, "used_spatial_match": True, "matched_distance_miles": float(best["_distance_miles"])}
 
 
+def _settle_latest_assistant_guidance_outcome_tx(
+    cur,
+    user_id: int,
+    pickup_zone_id: Optional[int],
+    pickup_lat: float,
+    pickup_lng: float,
+    now_ts: int,
+) -> Dict[str, Any]:
+    row = _query_one_cur(
+        cur,
+        """
+        SELECT id, recommended_at, action, source_zone_id, target_zone_id
+        FROM assistant_guidance_outcomes
+        WHERE user_id = ?
+          AND converted_to_trip IS NULL
+          AND recommended_at <= ?
+        ORDER BY recommended_at DESC, id DESC
+        LIMIT 1
+        """,
+        (int(user_id), int(now_ts)),
+    )
+    if not row:
+        return {"settled": False, "settlement_reason": None}
+
+    minutes_to_trip = max(0.0, (float(now_ts) - float(row.get("recommended_at") or now_ts)) / 60.0)
+    action = str(row.get("action") or "").strip().lower()
+    source_zone_id = row.get("source_zone_id")
+    target_zone_id = row.get("target_zone_id")
+    settlement_reason = "trip_after_guidance"
+    if action in {"move_nearby", "micro_reposition"}:
+        if pickup_zone_id is not None and target_zone_id is not None and int(pickup_zone_id) == int(target_zone_id):
+            settlement_reason = "trip_after_move_target_zone_match"
+        elif pickup_zone_id is not None and source_zone_id is not None and int(pickup_zone_id) != int(source_zone_id):
+            settlement_reason = "trip_after_move_detected"
+        else:
+            settlement_reason = "trip_without_material_move"
+    elif action in {"hold", "wait_dispatch"}:
+        if pickup_zone_id is not None and source_zone_id is not None and int(pickup_zone_id) == int(source_zone_id):
+            settlement_reason = "trip_while_holding_zone"
+        else:
+            settlement_reason = "trip_after_hold_with_relocation"
+
+    _exec_cur(
+        cur,
+        """
+        UPDATE assistant_guidance_outcomes
+        SET converted_to_trip=?, minutes_to_trip=?, settled_at=?, settlement_reason=?
+        WHERE id=?
+        """,
+        (_bool_db_value(True), float(minutes_to_trip), int(now_ts), settlement_reason, int(row["id"])),
+    )
+    _exec_cur(
+        cur,
+        """
+        UPDATE driver_guidance_state
+        SET recent_move_attempts_without_trip=0, recent_wait_dispatch_count=0, updated_at=?
+        WHERE user_id=?
+        """,
+        (int(now_ts), int(user_id)),
+    )
+    return {"settled": True, "settlement_reason": settlement_reason}
+
+
 def record_pickup_presence_heartbeat(user_id: int, lat: float, lng: float, now_ts: int) -> None:
     row = _db_query_one("SELECT * FROM pickup_guard_state WHERE user_id=? LIMIT 1", (int(user_id),))
     prev_last_seen = int(row["last_seen_at"]) if row and row["last_seen_at"] is not None else None
@@ -657,6 +720,8 @@ def create_pickup_record(payload: PickupRecordingPayload, user: Any) -> Dict[str
     settled_hotspot_recommendation_spatial = False
     settled_micro_recommendation_spatial = False
     settled_hotspot_recommendation_legacy_fallback = False
+    settled_assistant_guidance = False
+    settled_assistant_guidance_reason: Optional[str] = None
 
     with _db_lock:
         conn = _db()
@@ -731,6 +796,24 @@ def create_pickup_record(payload: PickupRecordingPayload, user: Any) -> Dict[str
                 except Exception:
                     settled_micro_recommendation = False
                     settled_micro_recommendation_spatial = False
+            try:
+                guidance_settlement = _settle_latest_assistant_guidance_outcome_tx(
+                    cur,
+                    user_id=int(user["id"]),
+                    pickup_zone_id=payload.zone_id,
+                    pickup_lat=float(payload.lat),
+                    pickup_lng=float(payload.lng),
+                    now_ts=now,
+                )
+                settled_assistant_guidance = bool(guidance_settlement.get("settled"))
+                settled_assistant_guidance_reason = (
+                    str(guidance_settlement.get("settlement_reason"))
+                    if guidance_settlement.get("settlement_reason") is not None
+                    else None
+                )
+            except Exception:
+                settled_assistant_guidance = False
+                settled_assistant_guidance_reason = None
             progression_after = get_pickup_progression_for_user(int(user["id"]), cur=cur)
             conn.commit()
             _invalidate_pickup_write_caches()
@@ -757,6 +840,8 @@ def create_pickup_record(payload: PickupRecordingPayload, user: Any) -> Dict[str
         "settled_hotspot_recommendation_spatial": bool(settled_hotspot_recommendation_spatial),
         "settled_micro_recommendation_spatial": bool(settled_micro_recommendation_spatial),
         "settled_hotspot_recommendation_legacy_fallback": bool(settled_hotspot_recommendation_legacy_fallback),
+        "settled_assistant_guidance": bool(settled_assistant_guidance),
+        "settled_assistant_guidance_reason": settled_assistant_guidance_reason,
     }
 
 
