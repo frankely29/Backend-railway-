@@ -365,11 +365,14 @@ def _settle_latest_assistant_guidance_outcome_tx(
     source_zone_id = row.get("source_zone_id")
     target_zone_id = row.get("target_zone_id")
     settlement_reason = "trip_after_guidance"
+    moved_before_trip = False
     if action in {"move_nearby", "micro_reposition"}:
         if pickup_zone_id is not None and target_zone_id is not None and int(pickup_zone_id) == int(target_zone_id):
             settlement_reason = "trip_after_move_target_zone_match"
+            moved_before_trip = True
         elif pickup_zone_id is not None and source_zone_id is not None and int(pickup_zone_id) != int(source_zone_id):
             settlement_reason = "trip_after_move_detected"
+            moved_before_trip = True
         else:
             settlement_reason = "trip_without_material_move"
     elif action in {"hold", "wait_dispatch"}:
@@ -377,15 +380,16 @@ def _settle_latest_assistant_guidance_outcome_tx(
             settlement_reason = "trip_while_holding_zone"
         else:
             settlement_reason = "trip_after_hold_with_relocation"
+            moved_before_trip = True
 
     _exec_cur(
         cur,
         """
         UPDATE assistant_guidance_outcomes
-        SET converted_to_trip=?, minutes_to_trip=?, settled_at=?, settlement_reason=?
+        SET converted_to_trip=?, moved_before_trip=?, minutes_to_trip=?, settled_at=?, settlement_reason=?
         WHERE id=?
         """,
-        (_bool_db_value(True), float(minutes_to_trip), int(now_ts), settlement_reason, int(row["id"])),
+        (_bool_db_value(True), _bool_db_value(moved_before_trip), float(minutes_to_trip), int(now_ts), settlement_reason, int(row["id"])),
     )
     _exec_cur(
         cur,

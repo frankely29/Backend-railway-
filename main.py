@@ -4803,11 +4803,16 @@ def _db_init() -> None:
               target_rating DOUBLE PRECISION,
               dispatch_uncertainty DOUBLE PRECISION,
               converted_to_trip BOOLEAN,
+              moved_before_trip BOOLEAN,
               minutes_to_trip DOUBLE PRECISION,
               settled_at BIGINT,
               settlement_reason TEXT
             );
             """
+        )
+        _try_alter(
+            "ALTER TABLE assistant_guidance_outcomes ADD COLUMN moved_before_trip BOOLEAN;",
+            "ALTER TABLE assistant_guidance_outcomes ADD COLUMN IF NOT EXISTS moved_before_trip BOOLEAN;",
         )
         _db_exec("CREATE INDEX IF NOT EXISTS idx_assistant_guidance_outcomes_user_time ON assistant_guidance_outcomes(user_id, recommended_at DESC);")
         _db_exec("CREATE INDEX IF NOT EXISTS idx_assistant_guidance_outcomes_unsettled ON assistant_guidance_outcomes(user_id, converted_to_trip, recommended_at DESC);")
@@ -5195,12 +5200,14 @@ def _db_init() -> None:
           target_rating REAL,
           dispatch_uncertainty REAL,
           converted_to_trip INTEGER,
+          moved_before_trip INTEGER,
           minutes_to_trip REAL,
           settled_at INTEGER,
           settlement_reason TEXT
         );
         """
     )
+    _try_alter("ALTER TABLE assistant_guidance_outcomes ADD COLUMN moved_before_trip INTEGER;")
     _db_exec("CREATE INDEX IF NOT EXISTS idx_assistant_guidance_outcomes_user_time ON assistant_guidance_outcomes(user_id, recommended_at DESC);")
     _db_exec("CREATE INDEX IF NOT EXISTS idx_assistant_guidance_outcomes_unsettled ON assistant_guidance_outcomes(user_id, converted_to_trip, recommended_at DESC);")
 
@@ -6695,6 +6702,22 @@ def _extract_zone_rating_from_point(point: Dict[str, Any], mode_flags: Dict[str,
     return 0.0
 
 
+def _extract_zone_track_entry_from_point(point: Dict[str, Any], mode_flags: Dict[str, bool]) -> Dict[str, Any]:
+    tracks = (point or {}).get("tracks") or {}
+    for key in _assistant_track_priority_from_mode_flags(mode_flags):
+        entry = tracks.get(key) or {}
+        rating = entry.get("rating")
+        if rating is not None:
+            bucket = entry.get("bucket")
+            bucket_value = str(bucket).strip().lower() if bucket is not None else None
+            return {
+                "rating": _safe_float_value(rating, 0.0),
+                "bucket": bucket_value,
+                "color": bucket_value,
+            }
+    return {"rating": 0.0, "bucket": None, "color": None}
+
+
 def _build_guidance_zone_context(
     *,
     frame_bucket: Dict[str, Any],
@@ -6710,8 +6733,10 @@ def _build_guidance_zone_context(
     current_points = (current_zone_payload or {}).get("points") or []
     current_now = current_points[0] if current_points else {}
     current_next = current_points[1] if len(current_points) > 1 else current_now
-    current_rating = _extract_zone_rating_from_point(current_now, mode_flags)
-    current_next_rating = _extract_zone_rating_from_point(current_next, mode_flags)
+    current_track_now = _extract_zone_track_entry_from_point(current_now, mode_flags)
+    current_track_next = _extract_zone_track_entry_from_point(current_next, mode_flags)
+    current_rating = _safe_float_value(current_track_now.get("rating"), 0.0)
+    current_next_rating = _safe_float_value(current_track_next.get("rating"), current_rating)
 
     nearby_candidates: List[Dict[str, Any]] = []
     for zone_id_raw, zone_payload in (frame_bucket or {}).items():
@@ -6745,6 +6770,8 @@ def _build_guidance_zone_context(
         "current_zone": {
             "zone_id": int(current_zone_id) if current_zone_id is not None else None,
             "rating": round(float(current_rating), 2),
+            "bucket": current_track_now.get("bucket"),
+            "color": current_track_now.get("color"),
             "next_rating": round(float(current_next_rating), 2),
             "market_saturation_penalty": _safe_float_value(current_now.get("market_saturation_penalty"), 0.0),
             "continuation_raw": _safe_float_value(current_now.get("continuation_raw"), 0.0),
@@ -6783,9 +6810,9 @@ def _persist_driver_guidance_state_and_outcome(
           source_zone_id, target_zone_id,
           tripless_minutes, stationary_minutes, movement_minutes,
           current_rating, target_rating, dispatch_uncertainty,
-          converted_to_trip, minutes_to_trip, settled_at, settlement_reason
+          converted_to_trip, moved_before_trip, minutes_to_trip, settled_at, settlement_reason
         )
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             int(user_id),
@@ -6800,6 +6827,7 @@ def _persist_driver_guidance_state_and_outcome(
             _safe_float_value(current_rating, 0.0),
             _safe_float_value(target_rating, 0.0) if target_rating is not None else None,
             _safe_float_value(guidance.get("dispatch_uncertainty"), 0.0),
+            None,
             None,
             None,
             None,
