@@ -9,19 +9,19 @@ AIRPORT_ZONE_IDS = {1, 132, 138}
 
 def bucket_and_color_from_rating(rating: int) -> tuple[str, str]:
     r = int(rating)
-    if r >= 87:
+    if r >= 83:
         return "green", "#00b050"
-    if r >= 73:
+    if r >= 75:
         return "purple", "#8000ff"
-    if r >= 60:
+    if r >= 68:
         return "indigo", "#4b3cff"
-    if r >= 48:
+    if r >= 60:
         return "blue", "#0066ff"
-    if r >= 40:
+    if r >= 50:
         return "sky", "#66ccff"
-    if r >= 33:
+    if r >= 40:
         return "yellow", "#ffd400"
-    if r >= 25:
+    if r >= 30:
         return "orange", "#ff8c00"
     return "red", "#e60000"
 
