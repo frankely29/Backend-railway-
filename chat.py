@@ -49,6 +49,7 @@ _MAX_AUDIO_BYTES = int(os.environ.get("CHAT_AUDIO_MAX_BYTES", str(6 * 1024 * 102
 _MAX_PRIVATE_PAGE_SIZE = 200
 CHAT_VOICE_MAX_MS = 120_000
 CHAT_RETENTION_SECONDS = 7 * 24 * 60 * 60
+PRIVATE_CHAT_RETENTION_SECONDS = 365 * 24 * 60 * 60
 CHAT_RETENTION_SWEEP_SECONDS = 15 * 60
 _ALLOWED_AUDIO_MIME_TYPES = {
     "audio/mpeg": ("audio/mpeg", ".mp3"),
@@ -287,8 +288,12 @@ def _validate_duration_ms(duration_ms: int | None) -> int | None:
     return min(value, CHAT_VOICE_MAX_MS)
 
 
-def _retention_cutoff_unix() -> int:
+def _public_retention_cutoff_unix() -> int:
     return int(time.time()) - CHAT_RETENTION_SECONDS
+
+
+def _private_retention_cutoff_unix() -> int:
+    return int(time.time()) - PRIVATE_CHAT_RETENTION_SECONDS
 
 
 def _public_expired_created_at_clause() -> str:
@@ -336,7 +341,7 @@ def _safe_unlink_chat_audio(relative_path: str | None) -> None:
             break
 
 
-def _collect_expired_chat_audio_rows(cutoff_unix: int) -> list[dict[str, Any]]:
+def _collect_expired_chat_audio_rows(public_cutoff_unix: int, private_cutoff_unix: int) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     public_rows = _db_query_all(
         f"""
@@ -346,7 +351,7 @@ def _collect_expired_chat_audio_rows(cutoff_unix: int) -> list[dict[str, Any]]:
           AND audio_path IS NOT NULL
           AND {_public_expired_created_at_clause()}
         """,
-        (int(cutoff_unix),),
+        (int(public_cutoff_unix),),
     )
     private_rows = _db_query_all(
         f"""
@@ -356,7 +361,7 @@ def _collect_expired_chat_audio_rows(cutoff_unix: int) -> list[dict[str, Any]]:
           AND audio_path IS NOT NULL
           AND {_private_expired_created_at_clause()}
         """,
-        (int(cutoff_unix),),
+        (int(private_cutoff_unix),),
     )
     rows.extend({"scope": "public", "id": int(row["id"]), "audio_path": row["audio_path"]} for row in public_rows)
     rows.extend({"scope": "private", "id": int(row["id"]), "audio_path": row["audio_path"]} for row in private_rows)
@@ -417,8 +422,9 @@ def _purge_expired_chat_data(force: bool = False) -> bool:
         return False
 
     try:
-        cutoff_unix = _retention_cutoff_unix()
-        expired_audio_rows = _collect_expired_chat_audio_rows(cutoff_unix)
+        public_cutoff_unix = _public_retention_cutoff_unix()
+        private_cutoff_unix = _private_retention_cutoff_unix()
+        expired_audio_rows = _collect_expired_chat_audio_rows(public_cutoff_unix, private_cutoff_unix)
         seen_paths: set[str] = set()
         for row in expired_audio_rows:
             audio_path = str(row.get("audio_path") or "").strip()
@@ -427,15 +433,16 @@ def _purge_expired_chat_data(force: bool = False) -> bool:
             seen_paths.add(audio_path)
             _safe_unlink_chat_audio(audio_path)
 
-        public_deleted = _delete_expired_public_messages(cutoff_unix)
-        private_deleted = _delete_expired_private_messages(cutoff_unix)
+        public_deleted = _delete_expired_public_messages(public_cutoff_unix)
+        private_deleted = _delete_expired_private_messages(private_cutoff_unix)
         with _retention_state_lock:
             _retention_last_run_monotonic = time.monotonic()
         if expired_audio_rows or public_deleted or private_deleted:
             _LOGGER.info(
                 "Purged expired chat data",
                 extra={
-                    "cutoff_unix": cutoff_unix,
+                    "public_cutoff_unix": public_cutoff_unix,
+                    "private_cutoff_unix": private_cutoff_unix,
                     "expired_audio_files": len(seen_paths),
                     "deleted_public_messages": public_deleted,
                     "deleted_private_messages": private_deleted,
@@ -874,6 +881,51 @@ def _user_directory_payloads(user_ids: list[int]) -> dict[int, dict[str, Any]]:
             "avatar_url": row["avatar_url"],
         }
     return payloads
+
+
+def _search_private_directory_users(me: int, q: str | None, limit: int, offset: int) -> dict[str, Any]:
+    safe_limit = max(1, min(50, int(limit)))
+    safe_offset = max(0, int(offset))
+    query_text = (q or "").strip()
+    params: list[Any] = [int(me)]
+    where_clauses = [f"u.id <> ?", _not_blocked_user_sql("u")]
+
+    if query_text:
+        if DB_BACKEND == "postgres":
+            where_clauses.append("COALESCE(u.display_name, '') ILIKE ?")
+            params.append(f"%{query_text}%")
+        else:
+            where_clauses.append("LOWER(COALESCE(u.display_name, '')) LIKE LOWER(?)")
+            params.append(f"%{query_text}%")
+
+    rows = _db_query_all(
+        f"""
+        SELECT id, display_name, avatar_url, email
+        FROM users u
+        WHERE {' AND '.join(where_clauses)}
+        ORDER BY LOWER(COALESCE(u.display_name, '')) ASC, u.id ASC
+        LIMIT ? OFFSET ?
+        """,
+        tuple(params + [safe_limit + 1, safe_offset]),
+    )
+
+    raw_items = list(rows)
+    has_more = len(raw_items) > safe_limit
+    items = [
+        {
+            "id": int(row["id"]),
+            "display_name": _clean_display_name(row["display_name"] or "", row["email"]),
+            "avatar_url": row.get("avatar_url"),
+        }
+        for row in raw_items[:safe_limit]
+    ]
+    return {
+        "items": items,
+        "limit": safe_limit,
+        "offset": safe_offset,
+        "has_more": has_more,
+        "query": query_text,
+    }
 
 
 def _fetch_private_conversation(
@@ -2142,6 +2194,17 @@ def create_dm_voice_message(
 def list_private_threads(user=Depends(require_user)):
     maybe_purge_expired_chat_data()
     return {"threads": _list_private_threads(int(user["id"]))}
+
+
+@router.get("/private/users")
+def list_private_directory_users(
+    q: str | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    user=Depends(require_user),
+):
+    maybe_purge_expired_chat_data()
+    return _search_private_directory_users(int(user["id"]), q, limit, offset)
 
 
 @router.get("/private/summary")
