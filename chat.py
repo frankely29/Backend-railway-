@@ -45,7 +45,9 @@ _rate_limit_lock = threading.Lock()
 _last_message_by_user: dict[int, float] = {}
 
 _CHAT_AUDIO_DIR = DATA_DIR / "chat_audio"
+_CHAT_IMAGE_DIR = DATA_DIR / "chat_images"
 _MAX_AUDIO_BYTES = int(os.environ.get("CHAT_AUDIO_MAX_BYTES", str(6 * 1024 * 1024)))
+_MAX_IMAGE_BYTES = 8 * 1024 * 1024
 _MAX_PRIVATE_PAGE_SIZE = 200
 CHAT_VOICE_MAX_MS = 120_000
 PUBLIC_CHAT_RETENTION_SECONDS = 7 * 24 * 60 * 60
@@ -61,6 +63,12 @@ _ALLOWED_AUDIO_MIME_TYPES = {
     "audio/ogg": ("audio/ogg", ".ogg"),
     "audio/webm": ("audio/webm", ".webm"),
 }
+_ALLOWED_IMAGE_MIME_TYPES = {
+    "image/jpeg": ("image/jpeg", ".jpg"),
+    "image/png": ("image/png", ".png"),
+    "image/webp": ("image/webp", ".webp"),
+    "image/gif": ("image/gif", ".gif"),
+}
 
 _LOGGER = logging.getLogger(__name__)
 _VOICE_NOTE_FALLBACK_TEXT = "Voice note"
@@ -68,6 +76,8 @@ _retention_state_lock = threading.Lock()
 _retention_purge_lock = threading.Lock()
 _retention_last_run_monotonic = 0.0
 _retention_sweeper_started = False
+_chat_image_columns_ready = False
+_chat_image_columns_lock = threading.Lock()
 _SSE_HEARTBEAT_SECONDS = float(os.environ.get("CHAT_SSE_HEARTBEAT_SECONDS", "15"))
 _SSE_HISTORY_LIMIT = max(50, int(os.environ.get("CHAT_SSE_HISTORY_LIMIT", "250")))
 _SSE_SUBSCRIBER_QUEUE_SIZE = max(10, int(os.environ.get("CHAT_SSE_SUBSCRIBER_QUEUE_SIZE", "100")))
@@ -170,6 +180,8 @@ class PrivateChatMessageOut(BaseModel):
     audio_url: str | None = None
     audio_duration_ms: int | None = None
     audio_mime_type: str | None = None
+    image_url: str | None = None
+    image_mime_type: str | None = None
 
 
 class PrivateChatMessagesResponse(BaseModel):
@@ -265,6 +277,11 @@ def _private_audio_subdir(a: int, b: int) -> str:
     return f"private/{low}_{high}"
 
 
+def _private_image_subdir(a: int, b: int) -> str:
+    low, high = sorted((int(a), int(b)))
+    return f"private/{low}_{high}"
+
+
 def _validate_text(text: str) -> str:
     cleaned = (text or "").strip()
     if not cleaned:
@@ -279,6 +296,13 @@ def _voice_note_text_fallback(text: str | None) -> str:
     if len(cleaned) > 600:
         raise HTTPException(status_code=400, detail="text too long (max 600)")
     return cleaned or _VOICE_NOTE_FALLBACK_TEXT
+
+
+def _image_caption_fallback(text: str | None) -> str:
+    cleaned = (text or "").strip()
+    if len(cleaned) > 600:
+        raise HTTPException(status_code=400, detail="text too long (max 600)")
+    return cleaned or "Photo"
 
 
 def _validate_duration_ms(duration_ms: int | None) -> int | None:
@@ -308,6 +332,33 @@ def _private_expired_created_at_clause() -> str:
     if DB_BACKEND == "postgres":
         return "created_at < to_timestamp(?)"
     return "CAST(strftime('%s', created_at) AS INTEGER) < ?"
+
+
+def _ensure_chat_image_columns() -> None:
+    global _chat_image_columns_ready
+    if _chat_image_columns_ready:
+        return
+    with _chat_image_columns_lock:
+        if _chat_image_columns_ready:
+            return
+        with _db_lock:
+            conn = _db()
+            try:
+                cur = conn.cursor()
+                for table_name in ("chat_messages", "private_chat_messages"):
+                    try:
+                        columns = cur.execute(_sql(f"PRAGMA table_info({table_name})")).fetchall()
+                        existing = {str(col[1]) for col in columns}
+                    except Exception:
+                        continue
+                    if "image_path" not in existing:
+                        cur.execute(_sql(f"ALTER TABLE {table_name} ADD COLUMN image_path TEXT"))
+                    if "image_mime_type" not in existing:
+                        cur.execute(_sql(f"ALTER TABLE {table_name} ADD COLUMN image_mime_type TEXT"))
+                conn.commit()
+            finally:
+                conn.close()
+        _chat_image_columns_ready = True
 
 
 def _safe_unlink_chat_audio(relative_path: str | None) -> None:
@@ -343,31 +394,71 @@ def _safe_unlink_chat_audio(relative_path: str | None) -> None:
             break
 
 
-def _collect_expired_chat_audio_rows(public_cutoff_unix: int, private_cutoff_unix: int) -> list[dict[str, Any]]:
+def _safe_unlink_chat_image(relative_path: str | None) -> None:
+    if not relative_path:
+        return
+    try:
+        target = _resolve_image_path(str(relative_path))
+    except HTTPException:
+        _LOGGER.warning("Skipping unsafe chat image purge path", extra={"image_path": relative_path})
+        return
+    try:
+        target.unlink(missing_ok=True)
+    except OSError:
+        _LOGGER.warning("Failed to unlink expired chat image", exc_info=True, extra={"image_path": relative_path})
+        return
+    allowed_cleanup_roots = {
+        (_CHAT_IMAGE_DIR / "public").resolve(),
+        (_CHAT_IMAGE_DIR / "private").resolve(),
+    }
+    for parent in target.parents:
+        resolved_parent = parent.resolve()
+        if resolved_parent == _CHAT_IMAGE_DIR.resolve():
+            break
+        if resolved_parent not in allowed_cleanup_roots and not any(
+            root == resolved_parent or root in resolved_parent.parents for root in allowed_cleanup_roots
+        ):
+            break
+        try:
+            parent.rmdir()
+        except OSError:
+            break
+
+
+def _collect_expired_chat_media_rows(public_cutoff_unix: int, private_cutoff_unix: int) -> list[dict[str, Any]]:
+    _ensure_chat_image_columns()
     rows: list[dict[str, Any]] = []
     public_rows = _db_query_all(
         f"""
-        SELECT id, audio_path
+        SELECT id, audio_path, image_path
         FROM chat_messages
-        WHERE message_type='voice'
-          AND audio_path IS NOT NULL
+        WHERE (audio_path IS NOT NULL OR image_path IS NOT NULL)
           AND {_public_expired_created_at_clause()}
         """,
         (int(public_cutoff_unix),),
     )
     private_rows = _db_query_all(
         f"""
-        SELECT id, audio_path
+        SELECT id, audio_path, image_path
         FROM private_chat_messages
-        WHERE message_type='voice'
-          AND audio_path IS NOT NULL
+        WHERE (audio_path IS NOT NULL OR image_path IS NOT NULL)
           AND {_private_expired_created_at_clause()}
         """,
         (int(private_cutoff_unix),),
     )
-    rows.extend({"scope": "public", "id": int(row["id"]), "audio_path": row["audio_path"]} for row in public_rows)
-    rows.extend({"scope": "private", "id": int(row["id"]), "audio_path": row["audio_path"]} for row in private_rows)
+    rows.extend(
+        {"scope": "public", "id": int(row["id"]), "audio_path": row.get("audio_path"), "image_path": row.get("image_path")}
+        for row in public_rows
+    )
+    rows.extend(
+        {"scope": "private", "id": int(row["id"]), "audio_path": row.get("audio_path"), "image_path": row.get("image_path")}
+        for row in private_rows
+    )
     return rows
+
+
+def _collect_expired_chat_audio_rows(public_cutoff_unix: int, private_cutoff_unix: int) -> list[dict[str, Any]]:
+    return _collect_expired_chat_media_rows(public_cutoff_unix, private_cutoff_unix)
 
 
 def _delete_expired_public_messages(cutoff_unix: int) -> int:
@@ -426,26 +517,31 @@ def _purge_expired_chat_data(force: bool = False) -> bool:
     try:
         public_cutoff_unix = _public_retention_cutoff_unix()
         private_cutoff_unix = _private_retention_cutoff_unix()
-        expired_audio_rows = _collect_expired_chat_audio_rows(public_cutoff_unix, private_cutoff_unix)
-        seen_paths: set[str] = set()
-        for row in expired_audio_rows:
+        expired_media_rows = _collect_expired_chat_media_rows(public_cutoff_unix, private_cutoff_unix)
+        seen_audio_paths: set[str] = set()
+        seen_image_paths: set[str] = set()
+        for row in expired_media_rows:
             audio_path = str(row.get("audio_path") or "").strip()
-            if not audio_path or audio_path in seen_paths:
-                continue
-            seen_paths.add(audio_path)
-            _safe_unlink_chat_audio(audio_path)
+            if audio_path and audio_path not in seen_audio_paths:
+                seen_audio_paths.add(audio_path)
+                _safe_unlink_chat_audio(audio_path)
+            image_path = str(row.get("image_path") or "").strip()
+            if image_path and image_path not in seen_image_paths:
+                seen_image_paths.add(image_path)
+                _safe_unlink_chat_image(image_path)
 
         public_deleted = _delete_expired_public_messages(public_cutoff_unix)
         private_deleted = _delete_expired_private_messages(private_cutoff_unix)
         with _retention_state_lock:
             _retention_last_run_monotonic = time.monotonic()
-        if expired_audio_rows or public_deleted or private_deleted:
+        if expired_media_rows or public_deleted or private_deleted:
             _LOGGER.info(
                 "Purged expired chat data",
                 extra={
                     "public_cutoff_unix": public_cutoff_unix,
                     "private_cutoff_unix": private_cutoff_unix,
-                    "expired_audio_files": len(seen_paths),
+                    "expired_audio_files": len(seen_audio_paths),
+                    "expired_image_files": len(seen_image_paths),
                     "deleted_public_messages": public_deleted,
                     "deleted_private_messages": private_deleted,
                 },
@@ -516,6 +612,14 @@ def _private_audio_url(message_id: int) -> str:
     return f"/chat/audio/private/{int(message_id)}"
 
 
+def _public_image_url(message_id: int) -> str:
+    return f"/chat/image/public/{int(message_id)}"
+
+
+def _private_image_url(message_id: int) -> str:
+    return f"/chat/image/private/{int(message_id)}"
+
+
 def _voice_fields(audio_url: str, row: dict) -> dict[str, Any]:
     return {
         "audio_url": audio_url,
@@ -536,9 +640,13 @@ def _serialize_public_message(row: dict) -> dict:
         "audio_url": None,
         "audio_duration_ms": None,
         "audio_mime_type": None,
+        "image_url": None,
+        "image_mime_type": row.get("image_mime_type"),
     }
     if payload["message_type"] == "voice" and row.get("audio_path"):
         payload.update(_voice_fields(_public_audio_url(payload["id"]), row))
+    if payload["message_type"] == "image" and row.get("image_path"):
+        payload["image_url"] = _public_image_url(payload["id"])
     return payload
 
 
@@ -553,9 +661,13 @@ def _serialize_private_message(row: dict, include_legacy_aliases: bool = False) 
         "audio_url": None,
         "audio_duration_ms": None,
         "audio_mime_type": None,
+        "image_url": None,
+        "image_mime_type": row.get("image_mime_type"),
     }
     if payload["message_type"] == "voice" and row.get("audio_path"):
         payload.update(_voice_fields(_private_audio_url(payload["id"]), row))
+    if payload["message_type"] == "image" and row.get("image_path"):
+        payload["image_url"] = _private_image_url(payload["id"])
     if include_legacy_aliases:
         payload["user_id"] = payload["sender_user_id"]
         payload["room"] = _dm_room_for_users(payload["sender_user_id"], payload["recipient_user_id"])
@@ -688,6 +800,8 @@ def _publish_public_message_event(message: dict[str, Any]) -> dict[str, Any]:
         "audio_url": message.get("audio_url"),
         "audio_duration_ms": message.get("audio_duration_ms"),
         "audio_mime_type": message.get("audio_mime_type"),
+        "image_url": message.get("image_url"),
+        "image_mime_type": message.get("image_mime_type"),
     }
     envelope = _live_event_broker.publish(_public_channel(room), "chat.message", payload)
     payload["event_id"] = envelope["id"]
@@ -758,6 +872,8 @@ def _build_dm_summary_event(
                 "audio_url": message.get("audio_url"),
                 "audio_duration_ms": message.get("audio_duration_ms"),
                 "audio_mime_type": message.get("audio_mime_type"),
+                "image_url": message.get("image_url"),
+                "image_mime_type": message.get("image_mime_type"),
             }
         )
     return payload
@@ -937,6 +1053,7 @@ def _fetch_private_conversation(
     limit: int,
     after_filter: _AfterFilter | None = None,
 ) -> list[dict]:
+    _ensure_chat_image_columns()
     safe_limit = max(1, min(_MAX_PRIVATE_PAGE_SIZE, int(limit)))
     where = [
         "((sender_user_id=? AND recipient_user_id=?) OR (sender_user_id=? AND recipient_user_id=?))"
@@ -957,14 +1074,14 @@ def _fetch_private_conversation(
         params.append(int(after_filter.value))
 
     select_sql = """
-        SELECT id, sender_user_id, recipient_user_id, text, created_at, message_type, audio_path, audio_mime_type, audio_duration_ms
+        SELECT id, sender_user_id, recipient_user_id, text, created_at, message_type, audio_path, audio_mime_type, audio_duration_ms, image_path, image_mime_type
         FROM private_chat_messages
         WHERE {where_clause}
     """
     if since_id is None and not (after_filter and after_filter.field):
         rows = _db_query_all(
             f"""
-            SELECT id, sender_user_id, recipient_user_id, text, created_at, message_type, audio_path, audio_mime_type, audio_duration_ms
+            SELECT id, sender_user_id, recipient_user_id, text, created_at, message_type, audio_path, audio_mime_type, audio_duration_ms, image_path, image_mime_type
             FROM (
                 {select_sql.format(where_clause=' AND '.join(where))}
                 ORDER BY created_at DESC, id DESC
@@ -1084,11 +1201,12 @@ def _list_private_threads(me: int) -> list[dict]:
 
 
 def _room_summary(room: str, after: str | None = None) -> dict[str, Any]:
+    _ensure_chat_image_columns()
     safe_room = _normalize_room(room)
     after_filter = _parse_after(after)
     latest_rows = _db_query_all(
         """
-        SELECT msg.id, msg.room, msg.user_id, msg.display_name, msg.message, msg.created_at, msg.message_type, msg.audio_path, msg.audio_mime_type, msg.audio_duration_ms
+        SELECT msg.id, msg.room, msg.user_id, msg.display_name, msg.message, msg.created_at, msg.message_type, msg.audio_path, msg.audio_mime_type, msg.audio_duration_ms, msg.image_path, msg.image_mime_type
         FROM chat_messages msg
         JOIN users u ON u.id = msg.user_id
         WHERE msg.room=?
@@ -1142,11 +1260,12 @@ def _room_summary(room: str, after: str | None = None) -> dict[str, Any]:
 
 
 def _private_thread_summary(me: int, other_user_id: int, after: str | None = None) -> dict[str, Any]:
+    _ensure_chat_image_columns()
     _ensure_dm_target_exists(int(other_user_id))
     after_filter = _parse_after(after)
     latest_rows = _db_query_all(
         """
-        SELECT id, sender_user_id, recipient_user_id, text, created_at, message_type, audio_path, audio_mime_type, audio_duration_ms
+        SELECT id, sender_user_id, recipient_user_id, text, created_at, message_type, audio_path, audio_mime_type, audio_duration_ms, image_path, image_mime_type
         FROM private_chat_messages
         WHERE (sender_user_id=? AND recipient_user_id=?) OR (sender_user_id=? AND recipient_user_id=?)
         ORDER BY created_at DESC, id DESC
@@ -1227,7 +1346,10 @@ def _insert_private_message(
     audio_path: str | None = None,
     audio_mime_type: str | None = None,
     audio_duration_ms: int | None = None,
+    image_path: str | None = None,
+    image_mime_type: str | None = None,
 ) -> dict:
+    _ensure_chat_image_columns()
     with _db_lock:
         conn = _db()
         try:
@@ -1237,10 +1359,10 @@ def _insert_private_message(
                     _sql(
                         """
                         INSERT INTO private_chat_messages(
-                            sender_user_id, recipient_user_id, text, message_type, audio_path, audio_mime_type, audio_duration_ms
+                            sender_user_id, recipient_user_id, text, message_type, audio_path, audio_mime_type, audio_duration_ms, image_path, image_mime_type
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                        RETURNING id, sender_user_id, recipient_user_id, text, created_at, message_type, audio_path, audio_mime_type, audio_duration_ms
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        RETURNING id, sender_user_id, recipient_user_id, text, created_at, message_type, audio_path, audio_mime_type, audio_duration_ms, image_path, image_mime_type
                         """
                     ),
                     (
@@ -1251,6 +1373,8 @@ def _insert_private_message(
                         audio_path,
                         audio_mime_type,
                         audio_duration_ms,
+                        image_path,
+                        image_mime_type,
                     ),
                 )
                 row = dict(cur.fetchone())
@@ -1259,9 +1383,9 @@ def _insert_private_message(
                     _sql(
                         """
                         INSERT INTO private_chat_messages(
-                            sender_user_id, recipient_user_id, text, message_type, audio_path, audio_mime_type, audio_duration_ms
+                            sender_user_id, recipient_user_id, text, message_type, audio_path, audio_mime_type, audio_duration_ms, image_path, image_mime_type
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """
                     ),
                     (
@@ -1272,13 +1396,15 @@ def _insert_private_message(
                         audio_path,
                         audio_mime_type,
                         audio_duration_ms,
+                        image_path,
+                        image_mime_type,
                     ),
                 )
                 new_id = int(cur.lastrowid)
                 cur.execute(
                     _sql(
                         """
-                        SELECT id, sender_user_id, recipient_user_id, text, created_at, message_type, audio_path, audio_mime_type, audio_duration_ms
+                        SELECT id, sender_user_id, recipient_user_id, text, created_at, message_type, audio_path, audio_mime_type, audio_duration_ms, image_path, image_mime_type
                         FROM private_chat_messages
                         WHERE id=?
                         LIMIT 1
@@ -1301,7 +1427,10 @@ def _insert_public_message(
     audio_path: str | None = None,
     audio_mime_type: str | None = None,
     audio_duration_ms: int | None = None,
+    image_path: str | None = None,
+    image_mime_type: str | None = None,
 ) -> dict:
+    _ensure_chat_image_columns()
     safe_room = _normalize_room(room)
     display_name = _clean_display_name(user["display_name"] or "", user["email"])
     user_id = int(user["id"])
@@ -1316,10 +1445,10 @@ def _insert_public_message(
                     _sql(
                         """
                         INSERT INTO chat_messages(
-                            room, user_id, display_name, message, created_at, message_type, audio_path, audio_mime_type, audio_duration_ms
+                            room, user_id, display_name, message, created_at, message_type, audio_path, audio_mime_type, audio_duration_ms, image_path, image_mime_type
                         )
-                        VALUES (?, ?, ?, ?, to_timestamp(?), ?, ?, ?, ?)
-                        RETURNING id, room, user_id, display_name, message, created_at, message_type, audio_path, audio_mime_type, audio_duration_ms
+                        VALUES (?, ?, ?, ?, to_timestamp(?), ?, ?, ?, ?, ?, ?)
+                        RETURNING id, room, user_id, display_name, message, created_at, message_type, audio_path, audio_mime_type, audio_duration_ms, image_path, image_mime_type
                         """
                     ),
                     (
@@ -1332,6 +1461,8 @@ def _insert_public_message(
                         audio_path,
                         audio_mime_type,
                         audio_duration_ms,
+                        image_path,
+                        image_mime_type,
                     ),
                 )
                 row = dict(cur.fetchone())
@@ -1340,9 +1471,9 @@ def _insert_public_message(
                     _sql(
                         """
                         INSERT INTO chat_messages(
-                            room, user_id, display_name, message, created_at, message_type, audio_path, audio_mime_type, audio_duration_ms
+                            room, user_id, display_name, message, created_at, message_type, audio_path, audio_mime_type, audio_duration_ms, image_path, image_mime_type
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """
                     ),
                     (
@@ -1355,13 +1486,15 @@ def _insert_public_message(
                         audio_path,
                         audio_mime_type,
                         audio_duration_ms,
+                        image_path,
+                        image_mime_type,
                     ),
                 )
                 new_id = int(cur.lastrowid)
                 cur.execute(
                     _sql(
                         """
-                        SELECT id, room, user_id, display_name, message, created_at, message_type, audio_path, audio_mime_type, audio_duration_ms
+                        SELECT id, room, user_id, display_name, message, created_at, message_type, audio_path, audio_mime_type, audio_duration_ms, image_path, image_mime_type
                         FROM chat_messages
                         WHERE id=?
                         LIMIT 1
@@ -1416,6 +1549,22 @@ def _resolve_voice_upload(request: Request, file: UploadFile | None, audio: Uplo
     return upload
 
 
+def _resolve_image_upload(request: Request, file: UploadFile | None, image: UploadFile | None) -> UploadFile:
+    upload = file or image
+    if upload is None:
+        _LOGGER.warning(
+            "Image upload missing multipart file",
+            extra={
+                "route": request.url.path,
+                "content_type": request.headers.get("content-type"),
+                "file_present": file is not None,
+                "image_present": image is not None,
+            },
+        )
+        raise HTTPException(status_code=422, detail="file or image required")
+    return upload
+
+
 def _normalize_audio_mime_type(raw: str | None) -> str:
     value = (raw or "").strip().lower()
     if not value:
@@ -1438,11 +1587,34 @@ def _read_upload_audio(upload: UploadFile) -> tuple[bytes, str, str]:
     return data, canonical_mime_type, extension
 
 
+def _read_upload_image(upload: UploadFile) -> tuple[bytes, str, str]:
+    raw_mime_type = upload.content_type or ""
+    normalized_mime_type = _normalize_audio_mime_type(raw_mime_type)
+    resolved = _ALLOWED_IMAGE_MIME_TYPES.get(normalized_mime_type)
+    if resolved is None:
+        raise HTTPException(status_code=400, detail="Unsupported image format")
+    canonical_mime_type, extension = resolved
+    data = upload.file.read(_MAX_IMAGE_BYTES + 1)
+    if not data:
+        raise HTTPException(status_code=400, detail="Image upload cannot be empty")
+    if len(data) > _MAX_IMAGE_BYTES:
+        raise HTTPException(status_code=400, detail="Image upload too large")
+    return data, canonical_mime_type, extension
+
+
 def _resolve_audio_path(relative_path: str) -> Path:
     target = (_CHAT_AUDIO_DIR / relative_path).resolve()
     base = _CHAT_AUDIO_DIR.resolve()
     if base != target and base not in target.parents:
         raise HTTPException(status_code=400, detail="Invalid audio path")
+    return target
+
+
+def _resolve_image_path(relative_path: str) -> Path:
+    target = (_CHAT_IMAGE_DIR / relative_path).resolve()
+    base = _CHAT_IMAGE_DIR.resolve()
+    if base != target and base not in target.parents:
+        raise HTTPException(status_code=400, detail="Invalid image path")
     return target
 
 
@@ -1469,7 +1641,31 @@ def _store_audio_file(relative_dir: str, message_id: int, user_id: int, extensio
     return relative_path
 
 
+def _store_image_file(relative_dir: str, message_id: int, user_id: int, extension: str, payload: bytes) -> str:
+    relative_path = f"{relative_dir}/user-{int(user_id)}-message-{int(message_id)}{extension}"
+    target = _resolve_image_path(relative_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    with tmp.open("wb") as fh:
+        fh.write(payload)
+        fh.flush()
+        os.fsync(fh.fileno())
+    tmp.replace(target)
+    try:
+        dir_fd = os.open(str(target.parent), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
+    if not target.exists() or not target.is_file():
+        raise RuntimeError("Image file was not persisted")
+    return relative_path
+
+
 def _persist_public_voice_message(room: str, user, upload: UploadFile, duration_ms: int | None, text: str | None) -> dict:
+    _ensure_chat_image_columns()
     _enforce_rate_limit(int(user["id"]))
     clean_text = _voice_note_text_fallback(text)
     safe_duration_ms = _validate_duration_ms(duration_ms)
@@ -1585,6 +1781,7 @@ def _persist_private_voice_message(
     duration_ms: int | None,
     text: str | None,
 ) -> dict:
+    _ensure_chat_image_columns()
     _enforce_rate_limit(int(sender_user_id))
     clean_text = _voice_note_text_fallback(text)
     safe_duration_ms = _validate_duration_ms(duration_ms)
@@ -1685,6 +1882,201 @@ def _persist_private_voice_message(
             file_exists=file_exists,
             detail="private voice persistence failed",
         )
+        if target and target.exists():
+            target.unlink(missing_ok=True)
+        raise
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def _persist_public_image_message(room: str, user, upload: UploadFile, text: str | None = None) -> dict:
+    _enforce_rate_limit(int(user["id"]))
+    _ensure_chat_image_columns()
+    clean_text = _image_caption_fallback(text)
+    payload, mime_type, extension = _read_upload_image(upload)
+    relative_dir = f"public/{_room_slug(room)}"
+    target: Path | None = None
+    conn = None
+    row: dict | None = None
+    try:
+        with _db_lock:
+            conn = _db()
+            cur = conn.cursor()
+            safe_room = _normalize_room(room)
+            display_name = _clean_display_name(user["display_name"] or "", user["email"])
+            user_id = int(user["id"])
+            now = int(time.time())
+            if DB_BACKEND == "postgres":
+                cur.execute(
+                    _sql(
+                        """
+                        INSERT INTO chat_messages(
+                            room, user_id, display_name, message, created_at, message_type, audio_path, audio_mime_type, audio_duration_ms, image_path, image_mime_type
+                        )
+                        VALUES (?, ?, ?, ?, to_timestamp(?), ?, ?, ?, ?, ?, ?)
+                        RETURNING id, room, user_id, display_name, message, created_at, message_type, audio_path, audio_mime_type, audio_duration_ms, image_path, image_mime_type
+                        """
+                    ),
+                    (safe_room, user_id, display_name, clean_text, now, "image", None, None, None, None, None),
+                )
+                row = dict(cur.fetchone())
+            else:
+                cur.execute(
+                    _sql(
+                        """
+                        INSERT INTO chat_messages(
+                            room, user_id, display_name, message, created_at, message_type, audio_path, audio_mime_type, audio_duration_ms, image_path, image_mime_type
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """
+                    ),
+                    (safe_room, user_id, display_name, clean_text, now, "image", None, None, None, None, None),
+                )
+                new_id = int(cur.lastrowid)
+                cur.execute(
+                    _sql(
+                        """
+                        SELECT id, room, user_id, display_name, message, created_at, message_type, audio_path, audio_mime_type, audio_duration_ms, image_path, image_mime_type
+                        FROM chat_messages
+                        WHERE id=?
+                        LIMIT 1
+                        """
+                    ),
+                    (new_id,),
+                )
+                row = dict(cur.fetchone())
+            relative_path = _store_image_file(relative_dir, int(row["id"]), user_id, extension, payload)
+            target = _resolve_image_path(relative_path)
+            cur.execute(
+                _sql(
+                    """
+                    UPDATE chat_messages
+                    SET image_path=?, image_mime_type=?
+                    WHERE id=?
+                    """
+                ),
+                (relative_path, mime_type, int(row["id"])),
+            )
+            cur.execute(
+                _sql(
+                    """
+                    SELECT id, room, user_id, display_name, message, created_at, message_type, audio_path, audio_mime_type, audio_duration_ms, image_path, image_mime_type
+                    FROM chat_messages
+                    WHERE id=?
+                    LIMIT 1
+                    """
+                ),
+                (int(row["id"]),),
+            )
+            row = dict(cur.fetchone())
+            conn.commit()
+        message = _serialize_public_message(row)
+        _publish_public_message_event(message)
+        return message
+    except Exception:
+        if conn is not None:
+            conn.rollback()
+            conn.close()
+            conn = None
+        if target and target.exists():
+            target.unlink(missing_ok=True)
+        raise
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def _persist_private_image_message(
+    sender_user_id: int,
+    recipient_user_id: int,
+    upload: UploadFile,
+    text: str | None = None,
+) -> dict:
+    _enforce_rate_limit(int(sender_user_id))
+    _ensure_chat_image_columns()
+    clean_text = _image_caption_fallback(text)
+    payload, mime_type, extension = _read_upload_image(upload)
+    relative_dir = _private_image_subdir(sender_user_id, recipient_user_id)
+    target: Path | None = None
+    conn = None
+    row: dict | None = None
+    try:
+        with _db_lock:
+            conn = _db()
+            cur = conn.cursor()
+            if DB_BACKEND == "postgres":
+                cur.execute(
+                    _sql(
+                        """
+                        INSERT INTO private_chat_messages(
+                            sender_user_id, recipient_user_id, text, message_type, audio_path, audio_mime_type, audio_duration_ms, image_path, image_mime_type
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        RETURNING id, sender_user_id, recipient_user_id, text, created_at, message_type, audio_path, audio_mime_type, audio_duration_ms, image_path, image_mime_type
+                        """
+                    ),
+                    (int(sender_user_id), int(recipient_user_id), clean_text, "image", None, None, None, None, None),
+                )
+                row = dict(cur.fetchone())
+            else:
+                cur.execute(
+                    _sql(
+                        """
+                        INSERT INTO private_chat_messages(
+                            sender_user_id, recipient_user_id, text, message_type, audio_path, audio_mime_type, audio_duration_ms, image_path, image_mime_type
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """
+                    ),
+                    (int(sender_user_id), int(recipient_user_id), clean_text, "image", None, None, None, None, None),
+                )
+                new_id = int(cur.lastrowid)
+                cur.execute(
+                    _sql(
+                        """
+                        SELECT id, sender_user_id, recipient_user_id, text, created_at, message_type, audio_path, audio_mime_type, audio_duration_ms, image_path, image_mime_type
+                        FROM private_chat_messages
+                        WHERE id=?
+                        LIMIT 1
+                        """
+                    ),
+                    (new_id,),
+                )
+                row = dict(cur.fetchone())
+            relative_path = _store_image_file(relative_dir, int(row["id"]), int(sender_user_id), extension, payload)
+            target = _resolve_image_path(relative_path)
+            cur.execute(
+                _sql(
+                    """
+                    UPDATE private_chat_messages
+                    SET image_path=?, image_mime_type=?
+                    WHERE id=?
+                    """
+                ),
+                (relative_path, mime_type, int(row["id"])),
+            )
+            cur.execute(
+                _sql(
+                    """
+                    SELECT id, sender_user_id, recipient_user_id, text, created_at, message_type, audio_path, audio_mime_type, audio_duration_ms, image_path, image_mime_type
+                    FROM private_chat_messages
+                    WHERE id=?
+                    LIMIT 1
+                    """
+                ),
+                (int(row["id"]),),
+            )
+            row = dict(cur.fetchone())
+            conn.commit()
+        message = _serialize_private_message(row)
+        _publish_dm_summary_events(message)
+        return message
+    except Exception:
+        if conn is not None:
+            conn.rollback()
+            conn.close()
+            conn = None
         if target and target.exists():
             target.unlink(missing_ok=True)
         raise
@@ -1825,6 +2217,54 @@ def _serve_audio(route: str, message_id: int, row: dict, request: Request) -> Re
     )
 
 
+def _fetch_public_image_row(message_id: int) -> dict:
+    _ensure_chat_image_columns()
+    rows = _db_query_all(
+        """
+        SELECT id, message_type, image_path, image_mime_type
+        FROM chat_messages
+        WHERE id=? AND message_type='image'
+        LIMIT 1
+        """,
+        (int(message_id),),
+    )
+    if not rows:
+        raise HTTPException(status_code=404, detail="Image not found")
+    return dict(rows[0])
+
+
+def _fetch_private_image_row(message_id: int) -> dict:
+    _ensure_chat_image_columns()
+    rows = _db_query_all(
+        """
+        SELECT id, sender_user_id, recipient_user_id, message_type, image_path, image_mime_type
+        FROM private_chat_messages
+        WHERE id=? AND message_type='image'
+        LIMIT 1
+        """,
+        (int(message_id),),
+    )
+    if not rows:
+        raise HTTPException(status_code=404, detail="Image not found")
+    return dict(rows[0])
+
+
+def _serve_image(route: str, message_id: int, row: dict, request: Request) -> Response:
+    _ = route
+    if request.method.upper() not in {"GET", "HEAD"}:
+        raise HTTPException(status_code=405, detail="Method not allowed")
+    if row.get("message_type") != "image" or not row.get("image_path"):
+        raise HTTPException(status_code=404, detail="Image not found")
+    target = _resolve_image_path(str(row["image_path"]))
+    if not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail="Image file missing")
+    return Response(
+        content=b"" if request.method.upper() == "HEAD" else target.read_bytes(),
+        media_type=row.get("image_mime_type") or "application/octet-stream",
+        headers={"Cache-Control": "private, max-age=300"},
+    )
+
+
 def _create_private_text_message(sender_user_id: int, recipient_user_id: int, text: str) -> dict:
     clean_text = _validate_text(text)
     _enforce_rate_limit(int(sender_user_id))
@@ -1845,6 +2285,7 @@ def _with_sender_legacy_fields(message: dict, sender_user_id: int, other_user_id
 
 
 def _list_messages_for_room(room: str, after: str | None, limit: int) -> dict:
+    _ensure_chat_image_columns()
     safe_room = _normalize_room(room)
     safe_limit = max(1, min(200, int(limit)))
     after_filter = _parse_after(after)
@@ -1863,7 +2304,7 @@ def _list_messages_for_room(room: str, after: str | None, limit: int) -> dict:
         params.append(int(after_filter.value))
 
     select_sql = """
-        SELECT msg.id, msg.room, msg.user_id, msg.display_name, msg.message, msg.created_at, msg.message_type, msg.audio_path, msg.audio_mime_type, msg.audio_duration_ms
+        SELECT msg.id, msg.room, msg.user_id, msg.display_name, msg.message, msg.created_at, msg.message_type, msg.audio_path, msg.audio_mime_type, msg.audio_duration_ms, msg.image_path, msg.image_mime_type
         FROM chat_messages msg
         JOIN users u ON u.id = msg.user_id
         WHERE {where_clause}
@@ -1874,7 +2315,7 @@ def _list_messages_for_room(room: str, after: str | None, limit: int) -> dict:
     if after_filter.field is None:
         rows = _db_query_all(
             f"""
-            SELECT id, room, user_id, display_name, message, created_at, message_type, audio_path, audio_mime_type, audio_duration_ms
+            SELECT id, room, user_id, display_name, message, created_at, message_type, audio_path, audio_mime_type, audio_duration_ms, image_path, image_mime_type
             FROM (
                 {select_sql.format(where_clause='msg.room = ?')}
                 ORDER BY id DESC
@@ -1996,6 +2437,59 @@ def _list_dm_messages_payload(
     return {"room": _dm_room_for_users(my_user_id, other_user_id), "messages": legacy_messages}
 
 
+def _list_public_images(room: str, limit: int, before_id: int | None) -> dict[str, Any]:
+    _ensure_chat_image_columns()
+    safe_room = _normalize_room(room)
+    safe_limit = max(1, min(200, int(limit)))
+    where = ["msg.room = ?", "msg.message_type = 'image'", "msg.image_path IS NOT NULL"]
+    params: list[Any] = [safe_room]
+    if before_id is not None:
+        where.append("msg.id < ?")
+        params.append(int(before_id))
+    rows = _db_query_all(
+        f"""
+        SELECT msg.id, msg.room, msg.user_id, msg.display_name, msg.message, msg.created_at, msg.message_type, msg.image_path, msg.image_mime_type
+        FROM chat_messages msg
+        JOIN users u ON u.id = msg.user_id
+        WHERE {' AND '.join(where)}
+          AND {_not_blocked_user_sql('u')}
+        ORDER BY msg.id DESC
+        LIMIT ?
+        """,
+        tuple(params + [safe_limit + 1]),
+    )
+    has_more = len(rows) > safe_limit
+    items = [_serialize_public_message(dict(row)) for row in rows[:safe_limit]]
+    return {"items": items, "limit": safe_limit, "before_id": before_id, "has_more": has_more}
+
+
+def _list_private_image_messages(me: int, other_user_id: int, limit: int, before_id: int | None) -> dict[str, Any]:
+    _ensure_chat_image_columns()
+    safe_limit = max(1, min(200, int(limit)))
+    where = [
+        "((sender_user_id=? AND recipient_user_id=?) OR (sender_user_id=? AND recipient_user_id=?))",
+        "message_type='image'",
+        "image_path IS NOT NULL",
+    ]
+    params: list[Any] = [int(me), int(other_user_id), int(other_user_id), int(me)]
+    if before_id is not None:
+        where.append("id < ?")
+        params.append(int(before_id))
+    rows = _db_query_all(
+        f"""
+        SELECT id, sender_user_id, recipient_user_id, text, created_at, message_type, image_path, image_mime_type
+        FROM private_chat_messages
+        WHERE {' AND '.join(where)}
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        tuple(params + [safe_limit + 1]),
+    )
+    has_more = len(rows) > safe_limit
+    items = [_serialize_private_message(dict(row)) for row in rows[:safe_limit]]
+    return {"items": items, "limit": safe_limit, "before_id": before_id, "has_more": has_more}
+
+
 @router.get("/rooms/{room}")
 def list_room_messages(
     room: str,
@@ -2105,6 +2599,32 @@ def create_room_voice_message(
     return _persist_public_voice_message(room, user, upload, duration_ms, text)
 
 
+@router.post("/rooms/{room}/image")
+def create_room_image_message(
+    room: str,
+    request: Request,
+    file: UploadFile | None = File(None),
+    image: UploadFile | None = File(None),
+    text: str | None = Form(default=None),
+    user=Depends(require_user),
+):
+    maybe_purge_expired_chat_data()
+    upload = _resolve_image_upload(request, file, image)
+    return _persist_public_image_message(room, user, upload, text)
+
+
+@router.get("/rooms/{room}/images")
+def list_room_images(
+    room: str,
+    limit: int = Query(default=50, ge=1, le=200),
+    before_id: int | None = Query(default=None, ge=1),
+    user=Depends(require_user),
+):
+    _ = user
+    maybe_purge_expired_chat_data()
+    return _list_public_images(room, limit, before_id)
+
+
 @router.get("/rooms/{room}/events")
 async def room_message_events(
     room: str,
@@ -2189,6 +2709,25 @@ def create_dm_voice_message(
     _ensure_dm_target_exists(int(other_user_id))
     upload = _resolve_voice_upload(request, file, audio)
     message = _persist_private_voice_message(my_user_id, int(other_user_id), upload, duration_ms, text)
+    return _with_sender_legacy_fields(message, my_user_id, int(other_user_id))
+
+
+@router.post("/dm/{other_user_id}/image")
+def create_dm_image_message(
+    other_user_id: int,
+    request: Request,
+    file: UploadFile | None = File(None),
+    image: UploadFile | None = File(None),
+    text: str | None = Form(default=None),
+    user=Depends(require_user),
+):
+    my_user_id = int(user["id"])
+    maybe_purge_expired_chat_data()
+    if int(other_user_id) == my_user_id:
+        raise HTTPException(status_code=400, detail="Cannot message yourself")
+    _ensure_dm_target_exists(int(other_user_id))
+    upload = _resolve_image_upload(request, file, image)
+    message = _persist_private_image_message(my_user_id, int(other_user_id), upload, text)
     return _with_sender_legacy_fields(message, my_user_id, int(other_user_id))
 
 
@@ -2304,6 +2843,39 @@ def create_private_voice_message(
     return _persist_private_voice_message(my_user_id, int(other_user_id), upload, duration_ms, text)
 
 
+@router.post("/private/{other_user_id}/image", response_model=PrivateChatMessageOut)
+def create_private_image_message(
+    other_user_id: int,
+    request: Request,
+    file: UploadFile | None = File(None),
+    image: UploadFile | None = File(None),
+    text: str | None = Form(default=None),
+    user=Depends(require_user),
+):
+    my_user_id = int(user["id"])
+    maybe_purge_expired_chat_data()
+    if int(other_user_id) == my_user_id:
+        raise HTTPException(status_code=400, detail="Cannot message yourself")
+    _ensure_dm_target_exists(int(other_user_id))
+    upload = _resolve_image_upload(request, file, image)
+    return _persist_private_image_message(my_user_id, int(other_user_id), upload, text)
+
+
+@router.get("/private/{other_user_id}/images")
+def list_private_images(
+    other_user_id: int,
+    limit: int = Query(default=50, ge=1, le=200),
+    before_id: int | None = Query(default=None, ge=1),
+    user=Depends(require_user),
+):
+    my_user_id = int(user["id"])
+    maybe_purge_expired_chat_data()
+    if int(other_user_id) == my_user_id:
+        raise HTTPException(status_code=400, detail="Cannot message yourself")
+    _ensure_dm_target_exists(int(other_user_id))
+    return _list_private_image_messages(my_user_id, int(other_user_id), limit, before_id)
+
+
 @router.api_route("/audio/public/{message_id}", methods=["GET", "HEAD"])
 def get_public_audio(message_id: int, request: Request, user=Depends(require_user)):
     _ = user
@@ -2318,3 +2890,19 @@ def get_private_audio(message_id: int, request: Request, user=Depends(require_us
     if my_user_id not in {int(row["sender_user_id"]), int(row["recipient_user_id"])}:
         raise HTTPException(status_code=403, detail="Not allowed")
     return _serve_audio("/chat/audio/private/{message_id}", int(message_id), row, request)
+
+
+@router.api_route("/image/public/{message_id}", methods=["GET", "HEAD"])
+def get_public_image(message_id: int, request: Request, user=Depends(require_user)):
+    _ = user
+    row = _fetch_public_image_row(message_id)
+    return _serve_image("/chat/image/public/{message_id}", int(message_id), row, request)
+
+
+@router.api_route("/image/private/{message_id}", methods=["GET", "HEAD"])
+def get_private_image(message_id: int, request: Request, user=Depends(require_user)):
+    my_user_id = int(user["id"])
+    row = _fetch_private_image_row(message_id)
+    if my_user_id not in {int(row["sender_user_id"]), int(row["recipient_user_id"])}:
+        raise HTTPException(status_code=403, detail="Not allowed")
+    return _serve_image("/chat/image/private/{message_id}", int(message_id), row, request)
