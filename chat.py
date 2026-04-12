@@ -47,8 +47,8 @@ _last_message_by_user: dict[int, float] = {}
 _CHAT_AUDIO_DIR = DATA_DIR / "chat_audio"
 _MAX_AUDIO_BYTES = int(os.environ.get("CHAT_AUDIO_MAX_BYTES", str(6 * 1024 * 1024)))
 _MAX_PRIVATE_PAGE_SIZE = 200
-CHAT_VOICE_MAX_MS = 60_000
-CHAT_RETENTION_SECONDS = 24 * 60 * 60
+CHAT_VOICE_MAX_MS = 120_000
+CHAT_RETENTION_SECONDS = 7 * 24 * 60 * 60
 CHAT_RETENTION_SWEEP_SECONDS = 15 * 60
 _ALLOWED_AUDIO_MIME_TYPES = {
     "audio/mpeg": ("audio/mpeg", ".mp3"),
