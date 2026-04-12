@@ -48,8 +48,10 @@ _CHAT_AUDIO_DIR = DATA_DIR / "chat_audio"
 _MAX_AUDIO_BYTES = int(os.environ.get("CHAT_AUDIO_MAX_BYTES", str(6 * 1024 * 1024)))
 _MAX_PRIVATE_PAGE_SIZE = 200
 CHAT_VOICE_MAX_MS = 120_000
-CHAT_RETENTION_SECONDS = 7 * 24 * 60 * 60
-PRIVATE_CHAT_RETENTION_SECONDS = 365 * 24 * 60 * 60
+PUBLIC_CHAT_RETENTION_SECONDS = 7 * 24 * 60 * 60
+PRIVATE_CHAT_RETENTION_SECONDS = 30 * 24 * 60 * 60
+# Backward-compatible alias for legacy references.
+CHAT_RETENTION_SECONDS = PUBLIC_CHAT_RETENTION_SECONDS
 CHAT_RETENTION_SWEEP_SECONDS = 15 * 60
 _ALLOWED_AUDIO_MIME_TYPES = {
     "audio/mpeg": ("audio/mpeg", ".mp3"),
@@ -289,7 +291,7 @@ def _validate_duration_ms(duration_ms: int | None) -> int | None:
 
 
 def _public_retention_cutoff_unix() -> int:
-    return int(time.time()) - CHAT_RETENTION_SECONDS
+    return int(time.time()) - PUBLIC_CHAT_RETENTION_SECONDS
 
 
 def _private_retention_cutoff_unix() -> int:
