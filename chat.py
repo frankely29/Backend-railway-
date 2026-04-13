@@ -346,11 +346,13 @@ def _ensure_chat_image_columns() -> None:
             try:
                 cur = conn.cursor()
                 for table_name in ("chat_messages", "private_chat_messages"):
-                    try:
-                        columns = cur.execute(_sql(f"PRAGMA table_info({table_name})")).fetchall()
-                        existing = {str(col[1]) for col in columns}
-                    except Exception:
+                    if DB_BACKEND == "postgres":
+                        cur.execute(_sql(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS image_path TEXT"))
+                        cur.execute(_sql(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS image_mime_type TEXT"))
                         continue
+
+                    columns = cur.execute(_sql(f"PRAGMA table_info({table_name})")).fetchall()
+                    existing = {str(col[1]) for col in columns}
                     if "image_path" not in existing:
                         cur.execute(_sql(f"ALTER TABLE {table_name} ADD COLUMN image_path TEXT"))
                     if "image_mime_type" not in existing:
@@ -556,6 +558,7 @@ def _purge_expired_chat_data(force: bool = False) -> bool:
 
 def maybe_purge_expired_chat_data() -> bool:
     try:
+        _ensure_chat_image_columns()
         return _purge_expired_chat_data(force=False)
     except Exception:
         return False
@@ -1126,6 +1129,7 @@ def _mark_private_read(me: int, other: int) -> None:
 
 
 def _list_private_threads(me: int) -> list[dict]:
+    _ensure_chat_image_columns()
     thread_rows = _db_query_all(
         """
         SELECT
