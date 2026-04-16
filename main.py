@@ -3601,6 +3601,7 @@ def _bootstrap_month_partition(month_key: str, bin_minutes: int = DEFAULT_BIN_MI
     month_dir = _month_dir(requested)
     month_dir.mkdir(parents=True, exist_ok=True)
     timeline_payload = build_month_timeline_bootstrap(requested, bin_minutes=int(bin_minutes))
+    timeline_count = int(timeline_payload.get("count") or len(timeline_payload.get("timeline") or []))
     timeline_path = _month_timeline_path(requested)
     timeline_path.write_text(json.dumps(timeline_payload, separators=(",", ":")), encoding="utf-8")
     _month_frame_cache_dir(requested).mkdir(parents=True, exist_ok=True)
@@ -3612,7 +3613,7 @@ def _bootstrap_month_partition(month_key: str, bin_minutes: int = DEFAULT_BIN_MI
     return {
         "ok": True,
         "month_key": requested,
-        "timeline_count": int(len(timeline)),
+        "timeline_count": timeline_count,
         "frame_cache_dir": str(_month_frame_cache_dir(requested)),
     }
 
