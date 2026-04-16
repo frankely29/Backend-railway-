@@ -2712,6 +2712,46 @@ def _frame_time_iso_local(dt: datetime) -> str:
     return dt.astimezone(NYC_TZ).replace(microsecond=0).isoformat()
 
 
+def _month_tendency_benchmark_path(month_key: str) -> Path:
+    return _month_dir(str(month_key).strip()) / "tendency_benchmark.json"
+
+
+def _resolve_month_key_for_tendency_benchmark(
+    *,
+    month_key: Optional[str] = None,
+    frame_time: Optional[str] = None,
+) -> Tuple[str, Optional[str]]:
+    requested = str(month_key or "").strip()
+    if requested:
+        if not _safe_parse_month_key(requested):
+            raise HTTPException(status_code=400, detail=f"Invalid month_key '{requested}'. Expected YYYY-MM.")
+        return requested, None
+
+    frame_time_raw = str(frame_time or "").strip()
+    if frame_time_raw:
+        resolved = _parse_frame_time_to_nyc(frame_time_raw).strftime("%Y-%m")
+        return resolved, None
+
+    active_month_key, _ = _resolve_active_month_key()
+    return active_month_key, active_month_key
+
+
+def _load_month_tendency_benchmark_payload(month_key: str) -> Dict[str, Any]:
+    resolved = str(month_key or "").strip()
+    benchmark_path = _month_tendency_benchmark_path(resolved)
+    if benchmark_path.exists() and benchmark_path.is_file() and benchmark_path.stat().st_size > 0:
+        payload = _read_json(benchmark_path)
+        if isinstance(payload, dict):
+            return payload
+
+    artifact = load_generated_artifact("month_tendency_benchmark")
+    artifact_payload = (artifact or {}).get("payload") if isinstance(artifact, dict) else None
+    if isinstance(artifact_payload, dict) and str(artifact_payload.get("month_key") or "").strip() == resolved:
+        return artifact_payload
+
+    raise HTTPException(status_code=404, detail=f"month tendency benchmark not available for month_key={resolved}")
+
+
 def _day_tendency_scope_kind(scope: Optional[str]) -> str:
     resolved = str(scope or "").strip()
     if not resolved:
@@ -5709,6 +5749,7 @@ def root():
             "/day_tendency/today",
             "/day_tendency/date/{ymd}",
             "/day_tendency/frame_context",
+            "/day_tendency/month_benchmark",
             "/timeline",
             "/frame/{idx}",
             "/auth/signup",
@@ -6563,6 +6604,21 @@ def day_tendency_frame_context(
         "local_context": local_context,
         "advanced_context": advanced_context,
     }
+
+
+@app.get("/day_tendency/month_benchmark")
+def day_tendency_month_benchmark(
+    month_key: Optional[str] = None,
+    frame_time: Optional[str] = None,
+):
+    resolved_month_key, active_month_key = _resolve_month_key_for_tendency_benchmark(
+        month_key=month_key,
+        frame_time=frame_time,
+    )
+    payload = dict(_load_month_tendency_benchmark_payload(resolved_month_key))
+    if active_month_key:
+        payload["active_month_key"] = active_month_key
+    return payload
 
 
 @app.get("/timeline")

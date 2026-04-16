@@ -27,6 +27,7 @@ from exact_history_feature_builder import (
     build_feature_properties_from_shadow_row,
 )
 from timeline_time_utils import to_frontend_local_iso
+from month_tendency_benchmark import build_month_tendency_benchmark
 
 logger = logging.getLogger(__name__)
 UTC_TZ = ZoneInfo("UTC")
@@ -2228,6 +2229,30 @@ def build_hotspots_frames(
                 except Exception:
                     pass
         logger.info("monthly_partition_publish_verified month_key=%s", month_key)
+        month_benchmark_payload = build_month_tendency_benchmark(
+            exact_store_path=published_store_path,
+            zones_geojson_path=zones_geojson_path,
+            month_key=str(month_key),
+            bin_minutes=int(bin_minutes),
+        )
+        tendency_benchmark_path = resolved_exact_history_dir / "tendency_benchmark.json"
+        tendency_benchmark_tmp_path = resolved_exact_history_dir / "tendency_benchmark.json.tmp"
+        try:
+            with tendency_benchmark_tmp_path.open("w", encoding="utf-8") as benchmark_writer:
+                benchmark_writer.write(json.dumps(month_benchmark_payload, separators=(",", ":")))
+                benchmark_writer.flush()
+                try:
+                    os.fsync(benchmark_writer.fileno())
+                except Exception:
+                    pass
+            tendency_benchmark_tmp_path.replace(tendency_benchmark_path)
+        finally:
+            if tendency_benchmark_tmp_path.exists():
+                try:
+                    tendency_benchmark_tmp_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+        save_generated_artifact("month_tendency_benchmark", month_benchmark_payload, compress=False)
         logger.info("monthly_partition_publish_done month_key=%s", month_key)
 
         build_result = {
