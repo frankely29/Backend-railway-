@@ -24,7 +24,7 @@ FAMILY_SPECS: List[Dict[str, str]] = [
     {
         "key": "auto_manhattan_citywide",
         "rating_expr": "COALESCE(TRY_CAST(e.earnings_shadow_rating_citywide_v3 AS DOUBLE), TRY_CAST(e.earnings_shadow_rating_citywide_v2 AS DOUBLE))",
-        "predicate": "zm.is_manhattan = TRUE AND zm.in_bronx_wash_heights_corridor = FALSE AND NOT zm.airport_excluded",
+        "predicate": "zm.is_manhattan = TRUE AND zm.in_bronx_wash_heights_corridor = FALSE AND zm.centroid_latitude IS NOT NULL AND zm.centroid_latitude < 40.795 AND NOT zm.airport_excluded",
         "rating_field_family": "citywide_visible",
     },
     {
@@ -48,7 +48,7 @@ FAMILY_SPECS: List[Dict[str, str]] = [
     {
         "key": "mode_manhattan",
         "rating_expr": "COALESCE(TRY_CAST(e.earnings_shadow_rating_manhattan_v3 AS DOUBLE), TRY_CAST(e.earnings_shadow_rating_manhattan_v2 AS DOUBLE))",
-        "predicate": "zm.is_manhattan = TRUE AND zm.in_bronx_wash_heights_corridor = FALSE AND zm.centroid_latitude IS NOT NULL AND zm.centroid_latitude <= 40.795 AND NOT zm.airport_excluded",
+        "predicate": "zm.is_manhattan = TRUE AND zm.in_bronx_wash_heights_corridor = FALSE AND zm.centroid_latitude IS NOT NULL AND zm.centroid_latitude < 40.795 AND NOT zm.airport_excluded",
         "rating_field_family": "manhattan_visible",
     },
     {
