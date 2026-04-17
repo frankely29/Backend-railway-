@@ -7055,6 +7055,30 @@ def assistant_guidance(
 
     frame_key = _to_frontend_local_iso(frame_time)
     timeline_cached = _read_timeline_cached()
+
+    active_month_for_precheck = str((timeline_cached or {}).get("data", {}).get("active_month_key") or "")
+    timeline_list_for_precheck = list((timeline_cached or {}).get("data", {}).get("timeline") or [])
+    if active_month_for_precheck and timeline_list_for_precheck:
+        try:
+            precheck_idx = timeline_list_for_precheck.index(frame_key)
+        except ValueError:
+            precheck_idx = None
+        if precheck_idx is not None:
+            precheck_path = _month_frame_cache_file(active_month_for_precheck, precheck_idx, frame_key)
+            if not (precheck_path.exists() and precheck_path.stat().st_size > 0):
+                _ensure_frame_build_in_progress(active_month_for_precheck, precheck_idx, frame_key)
+                print(
+                    f"[warn] assistant outlook deferred: frame cache miss "
+                    f"month_key={active_month_for_precheck} idx={precheck_idx} frame_time={frame_key}"
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "error": "assistant_outlook_unavailable",
+                        "message": "assistant outlook temporarily unavailable",
+                    },
+                )
+
     cached_bucket = _build_assistant_outlook_frame_bucket_cached(
         timeline_cached=timeline_cached,
         frame_time=frame_key,
