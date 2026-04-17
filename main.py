@@ -2149,12 +2149,13 @@ def _prune_invalid_assistant_outlook_file_if_needed() -> int:
 
 def _assistant_outlook_bucket_cache_key(
     *,
+    active_month_key: str,
     frame_time: str,
     horizon_bins: int,
     timeline_etag: str,
     bin_minutes: int,
 ) -> str:
-    return f"{str(frame_time).strip()}|{int(horizon_bins)}|{int(bin_minutes)}|{timeline_etag}"
+    return f"{str(active_month_key).strip()}|{str(frame_time).strip()}|{int(horizon_bins)}|{int(bin_minutes)}|{timeline_etag}"
 
 
 def _prune_legacy_assistant_outlook_artifact_if_present() -> bool:
@@ -2183,7 +2184,11 @@ def _build_assistant_outlook_frame_bucket_cached(
     if not frame_key:
         raise KeyError("frame_time is required")
     bin_minutes = int(timeline_payload.get("bin_minutes") or DEFAULT_BIN_MINUTES)
+    active_month_key = str(timeline_payload.get("active_month_key") or "").strip()
+    if not active_month_key:
+        raise RuntimeError("timeline payload missing active_month_key for assistant outlook frame loading")
     key = _assistant_outlook_bucket_cache_key(
+        active_month_key=active_month_key,
         frame_time=frame_key,
         horizon_bins=horizon_bins,
         timeline_etag=timeline_etag,
@@ -2201,10 +2206,6 @@ def _build_assistant_outlook_frame_bucket_cached(
             _assistant_outlook_frame_bucket_order.append(key)
             return cached
         _record_perf_metric("assistant_outlook.bucket_cache_miss")
-
-    active_month_key = str(timeline_payload.get("active_month_key") or "").strip()
-    if not active_month_key:
-        raise RuntimeError("timeline payload missing active_month_key for assistant outlook frame loading")
 
     def frame_loader(future_idx: int) -> List[Dict[str, Any]]:
         cached_frame = _read_frame_cached(int(future_idx), month_key=active_month_key)
@@ -3464,7 +3465,10 @@ def _build_day_tendency_only(bin_minutes: int = DEFAULT_BIN_MINUTES) -> Dict[str
         print(traceback.format_exc())
     return result
 
-
+#
+# Maintenance note: this helper is not the live /assistant/outlook request path.
+# Live requests use the monthly timeline + frame cache + loader-based bucket path.
+# Do not use this helper for request-time assistant outlook serving.
 def _build_assistant_outlook_only() -> Dict[str, Any]:
     timeline_artifact = load_generated_artifact("timeline")
     if not timeline_artifact and (not TIMELINE_PATH.exists() or TIMELINE_PATH.stat().st_size <= 0):
