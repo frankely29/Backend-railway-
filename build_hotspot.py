@@ -1292,7 +1292,9 @@ def build_hotspots_frames(
         ]
 
         def _open_incremental_connection() -> duckdb.DuckDBPyConnection:
-            memory_limit = str(os.environ.get("DUCKDB_MEMORY_LIMIT", "192MB")).strip() or "192MB"
+            # Default raised from 192MB to 1GB after real 2025-04 parquet OOM'd at ~183 MiB.
+            # DUCKDB_MEMORY_LIMIT env var still overrides this default if set.
+            memory_limit = str(os.environ.get("DUCKDB_MEMORY_LIMIT", "1GB")).strip() or "1GB"
             return _open_shadow_sql_connection(
                 database_path=str(staged_exact_history_db_path),
                 zone_geometry_rows=zone_geometry_rows,
