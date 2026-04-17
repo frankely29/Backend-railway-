@@ -50,7 +50,7 @@ from pickup_hotspot_intelligence import (
 )
 from assistant_outlook_engine import (
     HORIZON_BINS_DEFAULT,
-    build_assistant_outlook_frame_bucket,
+    build_assistant_outlook_frame_bucket_from_loader,
     get_assistant_outlook_payload_from_frame_bucket,
 )
 from driver_guidance_engine import (
@@ -2202,10 +2202,23 @@ def _build_assistant_outlook_frame_bucket_cached(
             return cached
         _record_perf_metric("assistant_outlook.bucket_cache_miss")
 
-    bucket_payload = build_assistant_outlook_frame_bucket(
+    active_month_key = str(timeline_payload.get("active_month_key") or "").strip()
+    if not active_month_key:
+        raise RuntimeError("timeline payload missing active_month_key for assistant outlook frame loading")
+
+    def frame_loader(future_idx: int) -> List[Dict[str, Any]]:
+        cached_frame = _read_frame_cached(int(future_idx), month_key=active_month_key)
+        payload = (cached_frame or {}).get("data") or {}
+        polygons = payload.get("polygons") or {}
+        features = polygons.get("features") or []
+        if not isinstance(features, list):
+            return []
+        return features
+
+    bucket_payload = build_assistant_outlook_frame_bucket_from_loader(
         timeline_payload=timeline_payload,
-        frames_dir=FRAMES_DIR,
         frame_time=frame_key,
+        frame_loader=frame_loader,
         horizon_bins=horizon_bins,
     )
     frame_bucket = bucket_payload.get("bucket") or {}

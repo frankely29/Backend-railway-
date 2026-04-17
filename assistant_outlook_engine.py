@@ -216,6 +216,63 @@ def build_zone_outlook_for_frame(
     return zone_lookup
 
 
+def build_zone_outlook_for_frame_loader(
+    frame_idx: int,
+    timeline: List[str],
+    *,
+    frame_loader,
+    horizon_bins: int = HORIZON_BINS_DEFAULT,
+) -> Dict[str, Dict[str, Any]]:
+    if not timeline:
+        return {}
+
+    total_frames = len(timeline)
+    zone_lookup: Dict[str, Dict[str, Any]] = {}
+    max_bins = max(1, int(horizon_bins))
+
+    start_idx = max(0, int(frame_idx))
+    end_exclusive = min(total_frames, start_idx + max_bins)
+
+    for future_idx in range(start_idx, end_exclusive):
+        future_time = str(timeline[future_idx])
+        for feature in frame_loader(future_idx) or []:
+            payload = extract_assistant_feature_payload(feature)
+            if payload is None:
+                continue
+            location_id = payload["location_id"]
+            zone_payload = zone_lookup.get(location_id)
+            if zone_payload is None:
+                zone_payload = {
+                    "location_id": location_id,
+                    "zone_name": payload.get("zone_name"),
+                    "borough": payload.get("borough"),
+                    "points": [],
+                }
+                zone_lookup[location_id] = zone_payload
+
+            zone_payload["points"].append(
+                {
+                    "frame_time": future_time,
+                    "location_id": location_id,
+                    "zone_name": zone_payload.get("zone_name"),
+                    "borough": zone_payload.get("borough"),
+                    "tracks": payload.get("tracks") or {},
+                    "raw": payload.get("raw") or {},
+                    "busy_now_base": payload.get("busy_now_base"),
+                    "busy_next_base": payload.get("busy_next_base"),
+                    "short_trip_penalty": payload.get("short_trip_penalty"),
+                    "long_trip_share_20plus": payload.get("long_trip_share_20plus"),
+                    "balanced_trip_share": payload.get("balanced_trip_share"),
+                    "churn_pressure": payload.get("churn_pressure"),
+                    "market_saturation_penalty": payload.get("market_saturation_penalty"),
+                    "manhattan_core_saturation_penalty": payload.get("manhattan_core_saturation_penalty"),
+                    "continuation_raw": payload.get("continuation_raw"),
+                }
+            )
+
+    return zone_lookup
+
+
 def build_assistant_outlook_index(
     timeline_payload: Dict[str, Any],
     frames_dir: Path,
@@ -285,6 +342,36 @@ def build_assistant_outlook_frame_bucket(
         frame_idx=frame_idx,
         timeline=timeline,
         frames_dir=Path(frames_dir),
+        horizon_bins=horizon_bins,
+    )
+    return {
+        "frame_time": frame_key,
+        "frame_idx": int(frame_idx),
+        "bin_minutes": int((timeline_payload or {}).get("bin_minutes") or 20),
+        "horizon_bins": int(horizon_bins),
+        "bucket": frame_bucket,
+    }
+
+
+def build_assistant_outlook_frame_bucket_from_loader(
+    timeline_payload: Dict[str, Any],
+    frame_time: str,
+    *,
+    frame_loader,
+    horizon_bins: int = HORIZON_BINS_DEFAULT,
+) -> Dict[str, Any]:
+    timeline, by_frame_time = _timeline_items_and_index(timeline_payload)
+    frame_key = str(frame_time or "").strip()
+    if not frame_key:
+        raise KeyError("frame_time is required")
+    frame_idx = by_frame_time.get(frame_key)
+    if frame_idx is None:
+        raise KeyError(f"frame_time not found: {frame_key}")
+
+    frame_bucket = build_zone_outlook_for_frame_loader(
+        frame_idx=frame_idx,
+        timeline=timeline,
+        frame_loader=frame_loader,
         horizon_bins=horizon_bins,
     )
     return {
