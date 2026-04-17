@@ -183,6 +183,14 @@ STORAGE_CLEANUP_INTERVAL_SECONDS = int(os.environ.get("STORAGE_CLEANUP_INTERVAL_
 MONTH_BUILD_STALE_DIR_MAX_AGE_SEC = int(os.environ.get("MONTH_BUILD_STALE_DIR_MAX_AGE_SEC", "1800"))
 MONTH_BUILD_FAILURE_BACKOFF_SEC = int(os.environ.get("MONTH_BUILD_FAILURE_BACKOFF_SEC", "30"))
 
+# Auto-rebuild backoff is persisted to disk so Railway redeploys during development
+# do not re-trigger the same rebuild repeatedly. Default 10 minutes; override via env.
+AUTO_RETIRED_REBUILD_BACKOFF_SEC = int(os.environ.get("AUTO_RETIRED_REBUILD_BACKOFF_SEC", "600"))
+
+# Module-level once-per-process guard. Resets naturally on each Railway deploy.
+# Prevents duplicate auto-rebuild triggers if startup ever runs twice in a single process.
+_auto_rebuild_triggered_this_boot: bool = False
+
 TRAP_CANDIDATE_PROMOTION_READINESS_CONFIG: Dict[str, Dict[str, Any]] = {
     "citywide_v3_trap_candidate": {
         "min_observations": 500,
@@ -572,6 +580,54 @@ def _month_timeline_path(month_key: str) -> Path:
 
 def _month_store_path(month_key: str) -> Path:
     return _month_dir(month_key) / "exact_shadow.duckdb"
+
+
+def _auto_rebuild_state_path(month_key: str) -> Path:
+    """Returns /data/exact_history/months/{mk}/.auto_rebuild_state.json."""
+    return _month_dir(str(month_key).strip()) / ".auto_rebuild_state.json"
+
+
+def _read_auto_rebuild_state(month_key: str) -> Dict[str, Any]:
+    """
+    Reads the persisted auto-rebuild attempt state for a given month.
+    Returns {"last_attempt_unix": int} or {} if unreadable/missing.
+    Never raises — callers treat empty dict as "no recent attempt."
+    """
+    path = _auto_rebuild_state_path(month_key)
+    try:
+        if not path.exists() or not path.is_file() or path.stat().st_size <= 0:
+            return {}
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            return {}
+        return payload
+    except Exception:
+        return {}
+
+
+def _write_auto_rebuild_state(month_key: str) -> None:
+    """
+    Writes the current timestamp to the auto-rebuild state file atomically.
+    Called JUST BEFORE triggering an auto-rebuild so that even if the process
+    dies or a new Railway deploy starts, the next startup sees the recent attempt.
+    Never raises — failure is logged but non-fatal.
+    """
+    path = _auto_rebuild_state_path(month_key)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "last_attempt_unix": int(time.time()),
+            "month_key": str(month_key).strip(),
+            "backoff_sec": int(AUTO_RETIRED_REBUILD_BACKOFF_SEC),
+        }
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        tmp_path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+        os.replace(tmp_path, path)
+    except Exception:
+        # Non-fatal: if we can't write the state file, worst case is the next
+        # startup might re-attempt. The in-process _auto_rebuild_triggered_this_boot
+        # flag still protects within this process.
+        traceback.print_exc()
 
 
 def _month_frame_cache_dir(month_key: str) -> Path:
@@ -2208,7 +2264,31 @@ def _build_assistant_outlook_frame_bucket_cached(
         _record_perf_metric("assistant_outlook.bucket_cache_miss")
 
     def frame_loader(future_idx: int) -> List[Dict[str, Any]]:
-        cached_frame = _read_frame_cached(int(future_idx), month_key=active_month_key)
+        try:
+            cached_frame = _read_frame_cached(int(future_idx), month_key=active_month_key)
+        except FileNotFoundError:
+            # Graceful degradation: one missing frame in the horizon must not 500 the whole outlook request.
+            # Queue a background build using the helper /frame/{idx} already uses, then return []
+            # so the outlook engine continues with the remaining frames in this horizon.
+            try:
+                _timeline_list_for_miss = list((timeline_payload or {}).get("timeline") or [])
+                if 0 <= int(future_idx) < len(_timeline_list_for_miss):
+                    _frame_time_for_miss = _to_frontend_local_iso(_timeline_list_for_miss[int(future_idx)])
+                    _ensure_frame_build_in_progress(active_month_key, int(future_idx), _frame_time_for_miss)
+                    print(
+                        f"[warn] assistant outlook frame_loader miss: "
+                        f"month_key={active_month_key} idx={int(future_idx)} "
+                        f"frame_time={_frame_time_for_miss} queued background build"
+                    )
+                else:
+                    print(
+                        f"[warn] assistant outlook frame_loader miss (no timeline entry): "
+                        f"month_key={active_month_key} idx={int(future_idx)}"
+                    )
+            except Exception:
+                # Never let the miss-handler itself crash the outlook builder.
+                traceback.print_exc()
+            return []
         payload = (cached_frame or {}).get("data") or {}
         polygons = payload.get("polygons") or {}
         features = polygons.get("features") or []
@@ -5760,12 +5840,80 @@ def startup():
         if target_month_key_candidate and target_ready and _month_attestation_needed(target_month_key_candidate):
             _queue_active_month_attestation(target_month_key_candidate)
         startup_skip_reason = None
+
+        # Evaluate retired-state and persisted backoff ONCE per startup for clean logging.
+        _bootstrap_state_snapshot = (
+            _month_bootstrap_state(target_month_key_candidate) if target_month_key_candidate else {}
+        )
+        _exact_store_retired_now = bool(_bootstrap_state_snapshot.get("exact_store_retired"))
+        _exact_store_retired_reason_now = str(_bootstrap_state_snapshot.get("exact_store_retired_reason") or "")
+
+        # Read the persisted auto-rebuild attempt state so backoff survives redeploys.
+        _auto_rebuild_state = (
+            _read_auto_rebuild_state(target_month_key_candidate) if target_month_key_candidate else {}
+        )
+        _last_auto_rebuild_attempt_unix = int(_auto_rebuild_state.get("last_attempt_unix") or 0)
+        _now_unix_for_auto_rebuild = int(time.time())
+        _auto_rebuild_in_persisted_backoff = bool(
+            _last_auto_rebuild_attempt_unix > 0
+            and (_now_unix_for_auto_rebuild - _last_auto_rebuild_attempt_unix) < int(AUTO_RETIRED_REBUILD_BACKOFF_SEC)
+        )
+
+        # Also respect the existing in-process failure backoff (separate, shorter gate).
+        _in_process_failure_backoff = bool(
+            _last_failed_month_key
+            and target_month_key_candidate
+            and str(_last_failed_month_key).strip() == str(target_month_key_candidate).strip()
+            and _last_failed_at_unix is not None
+            and (_now_unix_for_auto_rebuild - int(_last_failed_at_unix)) < int(MONTH_BUILD_FAILURE_BACKOFF_SEC)
+        )
+
+        # Once-per-boot guard — prevents double-triggering within the same process.
+        global _auto_rebuild_triggered_this_boot
+
         if not (DATA_DIR / "taxi_zones.geojson").exists():
             startup_skip_reason = "zones_missing"
         elif not source_month_keys:
             startup_skip_reason = "no_source_month_keys"
         elif not target_month_key_candidate:
             startup_skip_reason = "no_target_month_candidate"
+        elif _exact_store_retired_now and _auto_rebuild_triggered_this_boot:
+            # Defense in depth: this process already triggered an auto-rebuild. Do NOT trigger again.
+            startup_skip_reason = "exact_store_retired_already_triggered_this_boot"
+            print(
+                f"startup_auto_prepare_month_skipped_already_triggered_this_boot "
+                f"month_key={target_month_key_candidate} retired_reason={_exact_store_retired_reason_now}"
+            )
+        elif _exact_store_retired_now and _auto_rebuild_in_persisted_backoff:
+            # Persisted backoff — another process (usually a previous Railway deploy) tried recently.
+            # This is the key protection against rebuild-per-redeploy during active development.
+            _remaining = int(AUTO_RETIRED_REBUILD_BACKOFF_SEC) - (
+                _now_unix_for_auto_rebuild - _last_auto_rebuild_attempt_unix
+            )
+            startup_skip_reason = "exact_store_retired_in_persisted_backoff"
+            print(
+                f"startup_auto_prepare_month_skipped_persisted_backoff "
+                f"month_key={target_month_key_candidate} retired_reason={_exact_store_retired_reason_now} "
+                f"last_attempt_unix={_last_auto_rebuild_attempt_unix} remaining_sec={max(0, _remaining)}"
+            )
+        elif _exact_store_retired_now and _in_process_failure_backoff:
+            # In-process failure backoff — this process already saw a rebuild fail.
+            startup_skip_reason = "exact_store_retired_in_process_failure_backoff"
+            print(
+                f"startup_auto_prepare_month_skipped_in_process_failure_backoff "
+                f"month_key={target_month_key_candidate} retired_reason={_exact_store_retired_reason_now}"
+            )
+        elif _exact_store_retired_now:
+            # All three gates cleared — auto-rebuild IS appropriate.
+            # Write the state file FIRST so the next redeploy (even if this process dies mid-build) sees the attempt.
+            _write_auto_rebuild_state(target_month_key_candidate)
+            _auto_rebuild_triggered_this_boot = True
+            print(
+                f"startup_auto_prepare_month_rebuild_triggered "
+                f"month_key={target_month_key_candidate} retired_reason={_exact_store_retired_reason_now} "
+                f"backoff_sec={AUTO_RETIRED_REBUILD_BACKOFF_SEC}"
+            )
+            # Leave startup_skip_reason as None — fall through to the existing rebuild path below.
         elif _month_bootstrap_ready(target_month_key_candidate):
             startup_skip_reason = "target_month_already_ready"
 
