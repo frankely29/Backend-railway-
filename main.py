@@ -2781,21 +2781,22 @@ def _write_month_tendency_benchmark_payload(month_key: str, payload: Dict[str, A
     return benchmark_path
 
 
-def _build_month_tendency_benchmark_on_demand(month_key: str, *, active_month_key: str) -> Dict[str, Any]:
+def _build_and_persist_month_tendency_benchmark(month_key: str) -> Dict[str, Any]:
     resolved = str(month_key or "").strip()
-    month_partition_dir = _month_dir(resolved)
-    if not (month_partition_dir.exists() and month_partition_dir.is_dir()):
-        raise HTTPException(status_code=404, detail=f"month partition not found for month_key={resolved}")
+    if not _safe_parse_month_key(resolved):
+        raise HTTPException(status_code=400, detail=f"Invalid month_key '{resolved}'. Expected YYYY-MM.")
 
     exact_store_path = _month_store_path(resolved)
     if not (exact_store_path.exists() and exact_store_path.is_file() and exact_store_path.stat().st_size > 0):
         raise HTTPException(status_code=404, detail=f"month exact store not found for month_key={resolved}")
 
+    zones_geojson_path = DATA_DIR / "taxi_zones.geojson"
+    if not (zones_geojson_path.exists() and zones_geojson_path.is_file() and zones_geojson_path.stat().st_size > 0):
+        raise HTTPException(status_code=503, detail="month tendency benchmark generation unavailable")
+
     try:
-        from build_hotspot import ensure_zones_geojson
         from month_tendency_benchmark import build_month_tendency_benchmark
 
-        zones_geojson_path = ensure_zones_geojson(DATA_DIR, force=False)
         generated_payload = build_month_tendency_benchmark(
             exact_store_path=exact_store_path,
             zones_geojson_path=zones_geojson_path,
@@ -2803,16 +2804,17 @@ def _build_month_tendency_benchmark_on_demand(month_key: str, *, active_month_ke
             bin_minutes=int(DEFAULT_BIN_MINUTES),
         )
     except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
+        detail = str(exc)
+        if "exact store" in detail.lower():
+            raise HTTPException(status_code=404, detail=f"month exact store not found for month_key={resolved}")
+        raise HTTPException(status_code=503, detail="month tendency benchmark generation unavailable")
     except HTTPException:
         raise
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"month tendency benchmark generation unavailable: {str(exc)}")
+    except Exception:
+        raise HTTPException(status_code=503, detail="month tendency benchmark generation unavailable")
 
     validated = _validate_month_tendency_benchmark_payload(generated_payload, resolved)
     _write_month_tendency_benchmark_payload(resolved, validated)
-    if resolved == str(active_month_key or "").strip():
-        save_generated_artifact("month_tendency_benchmark", validated, compress=False)
     return validated
 
 
@@ -2827,13 +2829,16 @@ def _load_month_tendency_benchmark_payload(month_key: str, *, active_month_key: 
         return _validate_month_tendency_benchmark_payload(payload, resolved), "month_file"
 
     active_key = str(active_month_key or "").strip()
-    if resolved == active_key:
-        artifact = load_generated_artifact("month_tendency_benchmark")
-        artifact_payload = (artifact or {}).get("payload") if isinstance(artifact, dict) else None
-        if isinstance(artifact_payload, dict):
+    artifact = load_generated_artifact("month_tendency_benchmark")
+    artifact_payload = (artifact or {}).get("payload") if isinstance(artifact, dict) else None
+    if isinstance(artifact_payload, dict):
+        artifact_month_key = str(artifact_payload.get("month_key") or "").strip()
+        if artifact_month_key == resolved:
             return _validate_month_tendency_benchmark_payload(artifact_payload, resolved), "active_mirror"
 
-    payload = _build_month_tendency_benchmark_on_demand(resolved, active_month_key=active_key)
+    payload = _build_and_persist_month_tendency_benchmark(resolved)
+    if resolved == active_key:
+        save_generated_artifact("month_tendency_benchmark", payload, compress=False)
     return payload, "generated_on_demand"
 
 
