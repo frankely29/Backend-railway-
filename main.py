@@ -2750,20 +2750,91 @@ def _resolve_month_key_for_tendency_benchmark(
     return active_month_key, active_month_key
 
 
-def _load_month_tendency_benchmark_payload(month_key: str) -> Dict[str, Any]:
+def _validate_month_tendency_benchmark_payload(payload: Any, requested_month_key: str) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=503, detail="month tendency benchmark payload malformed")
+    payload_month_key = str(payload.get("month_key") or "").strip()
+    if payload_month_key != str(requested_month_key or "").strip():
+        raise HTTPException(
+            status_code=503,
+            detail=f"month tendency benchmark payload month mismatch for month_key={requested_month_key}",
+        )
+    families = payload.get("families")
+    if not isinstance(families, dict) or not families:
+        raise HTTPException(status_code=503, detail="month tendency benchmark payload malformed: families missing")
+    return payload
+
+
+def _write_month_tendency_benchmark_payload(month_key: str, payload: Dict[str, Any]) -> Path:
+    benchmark_path = _month_tendency_benchmark_path(month_key)
+    benchmark_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = benchmark_path.with_suffix(".json.tmp")
+    encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    with temp_path.open("wb") as handle:
+        handle.write(encoded)
+        handle.flush()
+        try:
+            os.fsync(handle.fileno())
+        except OSError:
+            pass
+    os.replace(temp_path, benchmark_path)
+    return benchmark_path
+
+
+def _build_month_tendency_benchmark_on_demand(month_key: str, *, active_month_key: str) -> Dict[str, Any]:
+    resolved = str(month_key or "").strip()
+    month_partition_dir = _month_dir(resolved)
+    if not (month_partition_dir.exists() and month_partition_dir.is_dir()):
+        raise HTTPException(status_code=404, detail=f"month partition not found for month_key={resolved}")
+
+    exact_store_path = _month_store_path(resolved)
+    if not (exact_store_path.exists() and exact_store_path.is_file() and exact_store_path.stat().st_size > 0):
+        raise HTTPException(status_code=404, detail=f"month exact store not found for month_key={resolved}")
+
+    try:
+        from build_hotspot import ensure_zones_geojson
+        from month_tendency_benchmark import build_month_tendency_benchmark
+
+        zones_geojson_path = ensure_zones_geojson(DATA_DIR, force=False)
+        generated_payload = build_month_tendency_benchmark(
+            exact_store_path=exact_store_path,
+            zones_geojson_path=zones_geojson_path,
+            month_key=resolved,
+            bin_minutes=int(DEFAULT_BIN_MINUTES),
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"month tendency benchmark generation unavailable: {str(exc)}")
+
+    validated = _validate_month_tendency_benchmark_payload(generated_payload, resolved)
+    _write_month_tendency_benchmark_payload(resolved, validated)
+    if resolved == str(active_month_key or "").strip():
+        save_generated_artifact("month_tendency_benchmark", validated, compress=False)
+    return validated
+
+
+def _load_month_tendency_benchmark_payload(month_key: str, *, active_month_key: str) -> Tuple[Dict[str, Any], str]:
     resolved = str(month_key or "").strip()
     benchmark_path = _month_tendency_benchmark_path(resolved)
     if benchmark_path.exists() and benchmark_path.is_file() and benchmark_path.stat().st_size > 0:
-        payload = _read_json(benchmark_path)
-        if isinstance(payload, dict):
-            return payload
+        try:
+            payload = _read_json(benchmark_path)
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail=f"month tendency benchmark file unreadable: {str(exc)}")
+        return _validate_month_tendency_benchmark_payload(payload, resolved), "month_file"
 
-    artifact = load_generated_artifact("month_tendency_benchmark")
-    artifact_payload = (artifact or {}).get("payload") if isinstance(artifact, dict) else None
-    if isinstance(artifact_payload, dict) and str(artifact_payload.get("month_key") or "").strip() == resolved:
-        return artifact_payload
+    active_key = str(active_month_key or "").strip()
+    if resolved == active_key:
+        artifact = load_generated_artifact("month_tendency_benchmark")
+        artifact_payload = (artifact or {}).get("payload") if isinstance(artifact, dict) else None
+        if isinstance(artifact_payload, dict):
+            return _validate_month_tendency_benchmark_payload(artifact_payload, resolved), "active_mirror"
 
-    raise HTTPException(status_code=404, detail=f"month tendency benchmark not available for month_key={resolved}")
+    payload = _build_month_tendency_benchmark_on_demand(resolved, active_month_key=active_key)
+    return payload, "generated_on_demand"
 
 
 def _day_tendency_scope_kind(scope: Optional[str]) -> str:
@@ -6633,9 +6704,16 @@ def day_tendency_month_benchmark(
         month_key=month_key,
         frame_time=frame_time,
     )
-    payload = dict(_load_month_tendency_benchmark_payload(resolved_month_key))
+    current_active_month_key, _ = _resolve_active_month_key()
+    payload, source = _load_month_tendency_benchmark_payload(
+        resolved_month_key,
+        active_month_key=current_active_month_key,
+    )
+    payload = dict(payload)
     if active_month_key:
         payload["active_month_key"] = active_month_key
+    payload["source"] = source
+    payload["requested_month_key"] = resolved_month_key
     return payload
 
 
