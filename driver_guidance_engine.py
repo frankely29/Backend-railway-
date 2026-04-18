@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from shapely.geometry import Point, shape
+from pickup_recording_feature import pickup_log_not_voided_sql
 
 MOVE_NEARBY_COOLDOWN_SECONDS = 11 * 60
 MICRO_REPOSITION_COOLDOWN_SECONDS = 7 * 60
@@ -169,25 +170,25 @@ def load_driver_activity_snapshot(
         (int(user_id),),
     )
     latest_trip = db_query_one(
-        """
+        f"""
         SELECT id, lat, lng, created_at
         FROM pickup_logs pl
         WHERE pl.user_id=?
-          AND COALESCE(pl.is_voided, 0) IN (0, FALSE)
+          AND {pickup_log_not_voided_sql('pl')}
         ORDER BY created_at DESC, id DESC
         LIMIT 1
         """,
         (int(user_id),),
     )
     counts_row = db_query_one(
-        """
+        f"""
         SELECT
           SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END) AS c30,
           SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END) AS c60,
           SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END) AS c120
         FROM pickup_logs pl
         WHERE pl.user_id=?
-          AND COALESCE(pl.is_voided, 0) IN (0, FALSE)
+          AND {pickup_log_not_voided_sql('pl')}
           AND created_at >= ?
         """,
         (int(now_ts) - 1800, int(now_ts) - 3600, int(now_ts) - 7200, int(user_id), int(now_ts) - 7200),
