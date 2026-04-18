@@ -6064,6 +6064,12 @@ def startup():
         )
     except Exception:
         _set_state(state="idle")
+    try:
+        from admin_auto_run_tests import run_startup_tests
+        run_startup_tests()
+    except Exception:
+        # Never let auto-run tests block startup.
+        traceback.print_exc()
     _log_runtime_integrity_summary()
 
 
