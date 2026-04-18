@@ -5853,6 +5853,24 @@ def startup():
             and bool(_bootstrap_state_snapshot.get("build_meta_present"))
             and not _bootstrap_state_snapshot.get("source_of_truth")
         )
+        # Fix L: detect signature mismatch on an otherwise-healthy exact_store.
+        # This covers the fourth failure mode not handled by Fix A+3 / F / G:
+        #   - store_exists: True
+        #   - build_meta_present: True
+        #   - source_of_truth: "exact_store" (not orphaned)
+        #   - exact_store_retired: False
+        #   - signature_match: False  (because code changed since last build)
+        # Example trigger: Fix K changed exact_history_feature_builder.py, which
+        # changed code_dependency_hash, which made existing artifacts mismatch.
+        _signature_match_now = bool(_bootstrap_state_snapshot.get("signature_match"))
+        _signature_mismatch_needs_rebuild_now = bool(
+            _store_exists_now
+            and bool(_bootstrap_state_snapshot.get("build_meta_present"))
+            and bool(_bootstrap_state_snapshot.get("source_of_truth"))
+            and not _exact_store_retired_now
+            and not _build_meta_orphaned_now
+            and not _signature_match_now
+        )
         # Fix G: detect "new active month has source parquet but no exact_store yet."
         # Triggered typically by calendar month rollover (e.g., May 1 switches active month
         # from 2025-04 to 2025-05). _maybe_promote_parquet_live_authority writes a
@@ -5965,6 +5983,42 @@ def startup():
             print(
                 f"startup_auto_prepare_month_rebuild_triggered "
                 f"month_key={target_month_key_candidate} orphan_reason=build_meta_missing_source_of_truth "
+                f"backoff_sec={AUTO_RETIRED_REBUILD_BACKOFF_SEC}"
+            )
+            # Leave startup_skip_reason as None — fall through to the existing rebuild path below.
+        elif _signature_mismatch_needs_rebuild_now and _auto_rebuild_triggered_this_boot:
+            # Fix L: signature mismatch — already triggered rebuild this boot. Do NOT trigger again.
+            startup_skip_reason = "signature_mismatch_already_triggered_this_boot"
+            print(
+                f"startup_auto_prepare_month_skipped_already_triggered_this_boot "
+                f"month_key={target_month_key_candidate} mismatch_reason=signature_mismatch_code_or_artifact"
+            )
+        elif _signature_mismatch_needs_rebuild_now and _auto_rebuild_in_persisted_backoff:
+            # Fix L: signature mismatch — persisted backoff prevents rebuild-per-redeploy during development.
+            _remaining_sig = int(AUTO_RETIRED_REBUILD_BACKOFF_SEC) - (
+                _now_unix_for_auto_rebuild - _last_auto_rebuild_attempt_unix
+            )
+            startup_skip_reason = "signature_mismatch_in_persisted_backoff"
+            print(
+                f"startup_auto_prepare_month_skipped_persisted_backoff "
+                f"month_key={target_month_key_candidate} mismatch_reason=signature_mismatch_code_or_artifact "
+                f"last_attempt_unix={_last_auto_rebuild_attempt_unix} remaining_sec={max(0, _remaining_sig)}"
+            )
+        elif _signature_mismatch_needs_rebuild_now and _in_process_failure_backoff:
+            # Fix L: signature mismatch — in-process failure backoff after a prior failed rebuild.
+            startup_skip_reason = "signature_mismatch_in_process_failure_backoff"
+            print(
+                f"startup_auto_prepare_month_skipped_in_process_failure_backoff "
+                f"month_key={target_month_key_candidate} mismatch_reason=signature_mismatch_code_or_artifact"
+            )
+        elif _signature_mismatch_needs_rebuild_now:
+            # Fix L: signature mismatch — all three gates cleared, auto-rebuild IS appropriate.
+            # Same mechanism as Fix A+3 and Fix F: write state FIRST so next redeploy sees the attempt.
+            _write_auto_rebuild_state(target_month_key_candidate)
+            _auto_rebuild_triggered_this_boot = True
+            print(
+                f"startup_auto_prepare_month_rebuild_triggered "
+                f"month_key={target_month_key_candidate} mismatch_reason=signature_mismatch_code_or_artifact "
                 f"backoff_sec={AUTO_RETIRED_REBUILD_BACKOFF_SEC}"
             )
             # Leave startup_skip_reason as None — fall through to the existing rebuild path below.
