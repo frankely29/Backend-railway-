@@ -5847,6 +5847,12 @@ def startup():
         )
         _exact_store_retired_now = bool(_bootstrap_state_snapshot.get("exact_store_retired"))
         _exact_store_retired_reason_now = str(_bootstrap_state_snapshot.get("exact_store_retired_reason") or "")
+        _store_exists_now = bool(_bootstrap_state_snapshot.get("store_exists"))
+        _build_meta_orphaned_now = bool(
+            _store_exists_now
+            and bool(_bootstrap_state_snapshot.get("build_meta_present"))
+            and not _bootstrap_state_snapshot.get("source_of_truth")
+        )
 
         # Read the persisted auto-rebuild attempt state so backoff survives redeploys.
         _auto_rebuild_state = (
@@ -5911,6 +5917,43 @@ def startup():
             print(
                 f"startup_auto_prepare_month_rebuild_triggered "
                 f"month_key={target_month_key_candidate} retired_reason={_exact_store_retired_reason_now} "
+                f"backoff_sec={AUTO_RETIRED_REBUILD_BACKOFF_SEC}"
+            )
+            # Leave startup_skip_reason as None — fall through to the existing rebuild path below.
+        elif (not _exact_store_retired_now) and _build_meta_orphaned_now and _auto_rebuild_triggered_this_boot:
+            # Fix F: orphaned build_meta (store exists, source_of_truth missing).
+            # Defense in depth: this process already triggered an auto-rebuild. Do NOT trigger again.
+            startup_skip_reason = "build_meta_orphaned_already_triggered_this_boot"
+            print(
+                f"startup_auto_prepare_month_skipped_already_triggered_this_boot "
+                f"month_key={target_month_key_candidate} orphan_reason=build_meta_missing_source_of_truth"
+            )
+        elif (not _exact_store_retired_now) and _build_meta_orphaned_now and _auto_rebuild_in_persisted_backoff:
+            # Fix F: orphaned build_meta — persisted backoff prevents rebuild-per-redeploy during development.
+            _remaining_orphan = int(AUTO_RETIRED_REBUILD_BACKOFF_SEC) - (
+                _now_unix_for_auto_rebuild - _last_auto_rebuild_attempt_unix
+            )
+            startup_skip_reason = "build_meta_orphaned_in_persisted_backoff"
+            print(
+                f"startup_auto_prepare_month_skipped_persisted_backoff "
+                f"month_key={target_month_key_candidate} orphan_reason=build_meta_missing_source_of_truth "
+                f"last_attempt_unix={_last_auto_rebuild_attempt_unix} remaining_sec={max(0, _remaining_orphan)}"
+            )
+        elif (not _exact_store_retired_now) and _build_meta_orphaned_now and _in_process_failure_backoff:
+            # Fix F: orphaned build_meta — in-process failure backoff.
+            startup_skip_reason = "build_meta_orphaned_in_process_failure_backoff"
+            print(
+                f"startup_auto_prepare_month_skipped_in_process_failure_backoff "
+                f"month_key={target_month_key_candidate} orphan_reason=build_meta_missing_source_of_truth"
+            )
+        elif (not _exact_store_retired_now) and _build_meta_orphaned_now:
+            # Fix F: orphaned build_meta — all three gates cleared, auto-rebuild IS appropriate.
+            # Same mechanism as the retired path: write state FIRST so the next redeploy sees the attempt.
+            _write_auto_rebuild_state(target_month_key_candidate)
+            _auto_rebuild_triggered_this_boot = True
+            print(
+                f"startup_auto_prepare_month_rebuild_triggered "
+                f"month_key={target_month_key_candidate} orphan_reason=build_meta_missing_source_of_truth "
                 f"backoff_sec={AUTO_RETIRED_REBUILD_BACKOFF_SEC}"
             )
             # Leave startup_skip_reason as None — fall through to the existing rebuild path below.
