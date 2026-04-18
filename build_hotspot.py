@@ -2206,6 +2206,8 @@ def build_hotspots_frames(
             "frame_count": int(len(timeline)),
             "first_frame_datetime": timeline[0] if timeline else None,
             "last_frame_datetime": timeline[-1] if timeline else None,
+            "source_of_truth": "exact_store",
+            "attested_via": "direct_build",
         }
         try:
             with published_build_meta_tmp_path.open("w", encoding="utf-8") as tmp_writer:
