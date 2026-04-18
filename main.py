@@ -6023,6 +6023,11 @@ def startup():
                 },
             )
             _log_runtime_integrity_summary()
+            try:
+                from admin_auto_run_tests import run_startup_tests
+                run_startup_tests()
+            except Exception:
+                traceback.print_exc()
             return
 
         now_unix = int(time.time())
@@ -6051,6 +6056,11 @@ def startup():
                 },
             )
             _log_runtime_integrity_summary()
+            try:
+                from admin_auto_run_tests import run_startup_tests
+                run_startup_tests()
+            except Exception:
+                traceback.print_exc()
             return
 
         print(f"startup_auto_prepare_month_start month_key={target_month_key_candidate}")
@@ -6064,13 +6074,18 @@ def startup():
         )
     except Exception:
         _set_state(state="idle")
+    _log_runtime_integrity_summary()
+
+    # Fix I.1: auto-run startup tests as the very last thing startup() does.
+    # Placed OUTSIDE the auto-prepare try/except so it fires on every exit path.
+    # Note: this block does not handle the two early-return branches in the
+    # auto-prepare section. Those are handled by Final Change 3 below.
     try:
         from admin_auto_run_tests import run_startup_tests
         run_startup_tests()
     except Exception:
         # Never let auto-run tests block startup.
         traceback.print_exc()
-    _log_runtime_integrity_summary()
 
 
 # =========================================================
