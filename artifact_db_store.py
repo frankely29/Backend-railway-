@@ -16,6 +16,7 @@ ALLOWED_ARTIFACT_KEYS = {
     "scoring_shadow_manifest",
     "timeline",
     "trap_candidate_review",
+    "month_tendency_benchmark",
 }
 
 
@@ -126,7 +127,7 @@ def ensure_generated_artifact_store_schema() -> None:
     _db_exec(
         """
         DELETE FROM generated_artifact_store
-        WHERE artifact_key NOT IN ('day_tendency_model','scoring_shadow_manifest','timeline','trap_candidate_review')
+        WHERE artifact_key NOT IN ('day_tendency_model','scoring_shadow_manifest','timeline','trap_candidate_review','month_tendency_benchmark')
         """
     )
 
