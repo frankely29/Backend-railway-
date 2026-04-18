@@ -3813,6 +3813,34 @@ def _ensure_requested_month_available_or_start_generate(
     )
 
 
+def _trim_generate_result_for_state(result: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    Fix M: strip the bulky `day_tendency.payload` subtree before storing a
+    generate_worker result into `_generate_state`.
+
+    `day_tendency.payload` contains the full tendency model (~7.6MB worth of
+    borough-weekday-bin entries). It is already persisted to the DB artifact
+    store (`day_tendency_model` key) and to `/data/day_tendency/model.json`,
+    so keeping a duplicate copy inside `_generate_state.result` only bloats
+    every `/status` response without adding information.
+
+    Keeps every other key (ok, model_path, trigger, skipped, warning,
+    requested_include_day_tendency, etc.) so /status consumers still see
+    the summary. Returns a shallow copy so the original result dict used
+    by callers is untouched.
+    """
+    if not isinstance(result, dict):
+        return result
+    trimmed = dict(result)
+    day_tendency = trimmed.get("day_tendency")
+    if isinstance(day_tendency, dict) and "payload" in day_tendency:
+        day_tendency_copy = dict(day_tendency)
+        day_tendency_copy.pop("payload", None)
+        day_tendency_copy["payload_omitted_from_state"] = True
+        trimmed["day_tendency"] = day_tendency_copy
+    return trimmed
+
+
 def _set_state(**kwargs):
     with _state_lock:
         _generate_state.update(kwargs)
@@ -3996,7 +4024,7 @@ def _generate_worker(
             state="done",
             finished_at_unix=end,
             duration_sec=round(end - start, 2),
-            result=result,
+            result=_trim_generate_result_for_state(result),
         )
         if _last_failed_month_key and str(_last_failed_month_key).strip() in {str(k).strip() for k in build_month_keys}:
             _last_failed_month_key = None
@@ -4004,6 +4032,21 @@ def _generate_worker(
             _last_failed_error = None
         _prune_stale_month_build_dirs()
         _prune_stale_month_backup_dirs()
+
+        # Fix M: re-run auto-run tests now that rebuild completed successfully.
+        # The startup-path auto-run (Fix I.1) fired BEFORE this rebuild started
+        # because start_generate() is non-blocking. Without this hook, the
+        # auto-run snapshot stays frozen at pre-rebuild-complete state until
+        # the next Railway redeploy. Safe to call multiple times — each call
+        # overwrites the module-memory cache. Wrapped in try/except so an
+        # auto-run failure never corrupts the worker's success state.
+        try:
+            from admin_auto_run_tests import run_startup_tests
+            run_startup_tests()
+            print("generate_worker_post_rebuild_auto_run_tests_completed")
+        except Exception:
+            print("generate_worker_post_rebuild_auto_run_tests_failed")
+            traceback.print_exc()
 
     except Exception as e:
         end = time.time()
