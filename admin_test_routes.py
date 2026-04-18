@@ -37,6 +37,7 @@ from admin_test_service import (
     test_trips_summary,
     test_zone_geometry_metrics,
 )
+from admin_auto_run_tests import get_last_results as get_auto_run_last_results
 
 router = APIRouter(prefix="/admin/tests", tags=["admin-tests"])
 
@@ -229,3 +230,13 @@ def admin_load_test_stop(admin: sqlite3.Row = Depends(require_admin_user)):
 def admin_load_test_last(admin: sqlite3.Row = Depends(require_admin_user)):
     _ = admin
     return get_last_load_test_result()
+
+
+@router.get("/auto_run_results")
+def admin_test_auto_run_results(admin: sqlite3.Row = Depends(require_admin_user)):
+    """
+    Returns the cached results of the 8 auto-run tests executed at startup.
+    Module-level memory only — resets on each Railway deploy.
+    """
+    _ = admin
+    return get_auto_run_last_results()
