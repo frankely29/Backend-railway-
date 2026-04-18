@@ -5853,6 +5853,17 @@ def startup():
             and bool(_bootstrap_state_snapshot.get("build_meta_present"))
             and not _bootstrap_state_snapshot.get("source_of_truth")
         )
+        # Fix G: detect "new active month has source parquet but no exact_store yet."
+        # Triggered typically by calendar month rollover (e.g., May 1 switches active month
+        # from 2025-04 to 2025-05). _maybe_promote_parquet_live_authority writes a
+        # parquet_live build_meta during bootstrap; this detector then upgrades to exact_store.
+        _new_month_needs_exact_store_build_now = bool(
+            (not _store_exists_now)
+            and bool(_bootstrap_state_snapshot.get("build_meta_present"))
+            and str(_bootstrap_state_snapshot.get("source_of_truth") or "").strip() == "parquet_live"
+            and not bool(_bootstrap_state_snapshot.get("exact_store_retired"))
+            and bool(_bootstrap_state_snapshot.get("source_parquet_exists"))
+        )
 
         # Read the persisted auto-rebuild attempt state so backoff survives redeploys.
         _auto_rebuild_state = (
@@ -5954,6 +5965,43 @@ def startup():
             print(
                 f"startup_auto_prepare_month_rebuild_triggered "
                 f"month_key={target_month_key_candidate} orphan_reason=build_meta_missing_source_of_truth "
+                f"backoff_sec={AUTO_RETIRED_REBUILD_BACKOFF_SEC}"
+            )
+            # Leave startup_skip_reason as None — fall through to the existing rebuild path below.
+        elif (not _exact_store_retired_now) and (not _build_meta_orphaned_now) and _new_month_needs_exact_store_build_now and _auto_rebuild_triggered_this_boot:
+            # Fix G: new active month with source parquet but no exact_store yet.
+            # Defense in depth: this process already triggered an auto-rebuild. Do NOT trigger again.
+            startup_skip_reason = "new_month_exact_store_build_already_triggered_this_boot"
+            print(
+                f"startup_auto_prepare_month_skipped_already_triggered_this_boot "
+                f"month_key={target_month_key_candidate} new_month_reason=parquet_live_needs_exact_store"
+            )
+        elif (not _exact_store_retired_now) and (not _build_meta_orphaned_now) and _new_month_needs_exact_store_build_now and _auto_rebuild_in_persisted_backoff:
+            # Fix G: new month needs exact_store — persisted backoff prevents rebuild-per-redeploy.
+            _remaining_new_month = int(AUTO_RETIRED_REBUILD_BACKOFF_SEC) - (
+                _now_unix_for_auto_rebuild - _last_auto_rebuild_attempt_unix
+            )
+            startup_skip_reason = "new_month_exact_store_build_in_persisted_backoff"
+            print(
+                f"startup_auto_prepare_month_skipped_persisted_backoff "
+                f"month_key={target_month_key_candidate} new_month_reason=parquet_live_needs_exact_store "
+                f"last_attempt_unix={_last_auto_rebuild_attempt_unix} remaining_sec={max(0, _remaining_new_month)}"
+            )
+        elif (not _exact_store_retired_now) and (not _build_meta_orphaned_now) and _new_month_needs_exact_store_build_now and _in_process_failure_backoff:
+            # Fix G: new month needs exact_store — in-process failure backoff.
+            startup_skip_reason = "new_month_exact_store_build_in_process_failure_backoff"
+            print(
+                f"startup_auto_prepare_month_skipped_in_process_failure_backoff "
+                f"month_key={target_month_key_candidate} new_month_reason=parquet_live_needs_exact_store"
+            )
+        elif (not _exact_store_retired_now) and (not _build_meta_orphaned_now) and _new_month_needs_exact_store_build_now:
+            # Fix G: new month needs exact_store — all three gates cleared, auto-build IS appropriate.
+            # Same mechanism as retired/orphaned: write state FIRST so the next redeploy sees the attempt.
+            _write_auto_rebuild_state(target_month_key_candidate)
+            _auto_rebuild_triggered_this_boot = True
+            print(
+                f"startup_auto_prepare_month_rebuild_triggered "
+                f"month_key={target_month_key_candidate} new_month_reason=parquet_live_needs_exact_store "
                 f"backoff_sec={AUTO_RETIRED_REBUILD_BACKOFF_SEC}"
             )
             # Leave startup_skip_reason as None — fall through to the existing rebuild path below.
