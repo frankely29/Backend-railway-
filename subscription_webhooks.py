@@ -263,6 +263,7 @@ def _handle_transaction_completed(user_id: int, data: Dict[str, Any], occurred_a
     period_end_iso = _extract_period_end(data)
     period_end_unix = _iso_to_unix(period_end_iso) if period_end_iso else None
 
+    outcome = "transaction_completed_no_period"
     if period_end_unix is not None:
         _db_exec(
             """
@@ -274,8 +275,32 @@ def _handle_transaction_completed(user_id: int, data: Dict[str, Any], occurred_a
             """,
             ("active", period_end_unix, occurred_at, user_id),
         )
-        return "transaction_completed_period_extended"
-    return "transaction_completed_no_period"
+        outcome = "transaction_completed_period_extended"
+
+    # STAGE 4B-B3: send first-paid welcome email only on first processed paid event.
+    try:
+        prior_paid_row = _db_query_one(
+            "SELECT COUNT(*) AS c FROM paddle_webhook_events "
+            "WHERE user_id=? AND event_type='transaction.completed' AND processed_at IS NOT NULL",
+            (user_id,),
+        )
+        prior_paid_count = int(prior_paid_row["c"]) if prior_paid_row else 0
+        if prior_paid_count == 0:
+            user_row = _db_query_one("SELECT email, display_name FROM users WHERE id=?", (user_id,))
+            if user_row:
+                try:
+                    from email_service import send_first_paid_welcome
+
+                    send_first_paid_welcome(
+                        email=str(user_row["email"]),
+                        display_name=str(user_row["display_name"] or "Driver"),
+                    )
+                except ImportError:
+                    logger.warning("email_service.send_first_paid_welcome not available; skipping")
+    except Exception as exc:
+        logger.warning("First-paid welcome email failed for user_id=%s: %s", user_id, exc)
+
+    return outcome
 
 
 def _handle_transaction_payment_failed(user_id: int, data: Dict[str, Any], occurred_at: int) -> str:
@@ -288,6 +313,19 @@ def _handle_transaction_payment_failed(user_id: int, data: Dict[str, Any], occur
         """,
         ("past_due", occurred_at, user_id),
     )
+    # STAGE 4B-B3: send payment-failed email.
+    try:
+        user_row = _db_query_one("SELECT email, display_name FROM users WHERE id=?", (user_id,))
+        if user_row:
+            try:
+                from email_service import send_payment_failed
+
+                send_payment_failed(user_row)
+            except ImportError:
+                logger.warning("email_service.send_payment_failed not available; skipping")
+    except Exception as exc:
+        logger.warning("Payment-failed email failed for user_id=%s: %s", user_id, exc)
+
     return "marked_past_due_from_payment_failed"
 
 

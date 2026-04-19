@@ -5602,6 +5602,133 @@ def _db_init() -> None:
     _migrate_legacy_dm_rows_to_private()
 
 
+def _ensure_grandfather_state_schema() -> None:
+    """Create one-row state table tracking grandfather migration execution."""
+    if DB_BACKEND == "postgres":
+        _db_exec(
+            """
+            CREATE TABLE IF NOT EXISTS subscription_migration_state (
+                id INTEGER PRIMARY KEY,
+                grandfather_applied_at BIGINT,
+                grandfather_user_count INTEGER
+            )
+            """
+        )
+    else:
+        _db_exec(
+            """
+            CREATE TABLE IF NOT EXISTS subscription_migration_state (
+                id INTEGER PRIMARY KEY,
+                grandfather_applied_at INTEGER,
+                grandfather_user_count INTEGER
+            )
+            """
+        )
+
+
+def _mark_grandfather_state(user_count: int) -> None:
+    """Portable upsert for migration-complete state row."""
+    existing = _db_query_one("SELECT id FROM subscription_migration_state WHERE id=1")
+    now_ts = int(time.time())
+    if existing:
+        _db_exec(
+            """
+            UPDATE subscription_migration_state
+            SET grandfather_applied_at=?, grandfather_user_count=?
+            WHERE id=1
+            """,
+            (now_ts, int(user_count)),
+        )
+        return
+    _db_exec(
+        """
+        INSERT INTO subscription_migration_state(id, grandfather_applied_at, grandfather_user_count)
+        VALUES(1, ?, ?)
+        """,
+        (now_ts, int(user_count)),
+    )
+
+
+def _run_grandfather_migration_once() -> None:
+    """Grant 30-day comp to legacy users whose subscription_status is still NULL."""
+    try:
+        _ensure_grandfather_state_schema()
+    except Exception:
+        print("[warn] grandfather state schema creation failed")
+        traceback.print_exc()
+        return
+
+    try:
+        existing = _db_query_one(
+            "SELECT grandfather_applied_at FROM subscription_migration_state WHERE id=1"
+        )
+    except Exception:
+        print("[warn] grandfather state check failed")
+        traceback.print_exc()
+        return
+
+    if existing and existing["grandfather_applied_at"]:
+        print(f"Grandfather migration already applied at {existing['grandfather_applied_at']}")
+        return
+
+    try:
+        rows = _db_query_all("SELECT id FROM users WHERE subscription_status IS NULL")
+    except Exception:
+        print("[warn] grandfather eligible-user query failed")
+        traceback.print_exc()
+        return
+
+    if not rows:
+        print("Grandfather migration: no eligible users (all users already have subscription_status)")
+        _mark_grandfather_state(user_count=0)
+        return
+
+    print(f"Grandfather migration: granting 30-day comp to {len(rows)} existing users")
+    now_ts = int(time.time())
+    comp_expires_ts = now_ts + (30 * 86400)
+    success_count = 0
+    fail_count = 0
+
+    for row in rows:
+        try:
+            user_id = int(row["id"])
+            _db_exec(
+                """
+                UPDATE users SET
+                    subscription_comp_expires_at=?,
+                    subscription_comp_reason=?,
+                    subscription_comp_granted_at=?,
+                    subscription_comp_granted_by=?,
+                    subscription_updated_at=?
+                WHERE id=? AND subscription_status IS NULL
+                """,
+                (
+                    comp_expires_ts,
+                    "grandfathered: existing user before subscription launch",
+                    now_ts,
+                    0,
+                    now_ts,
+                    user_id,
+                ),
+            )
+            success_count += 1
+        except Exception:
+            print(f"[warn] grandfather update failed for user_id={row.get('id')}")
+            traceback.print_exc()
+            fail_count += 1
+
+    if success_count > 0:
+        try:
+            _mark_grandfather_state(user_count=success_count)
+        except Exception:
+            print("[warn] grandfather state mark failed (migration will retry on next boot)")
+            traceback.print_exc()
+
+    print(
+        f"Grandfather migration completed: success={success_count}, failed={fail_count}, total={len(rows)}"
+    )
+
+
 # =========================================================
 # Auth helpers (no external deps)
 # =========================================================
@@ -5927,6 +6054,11 @@ def startup():
     EXACT_HISTORY_DIR.mkdir(parents=True, exist_ok=True)
     _clear_stale_generate_lock_if_orphaned()
     _db_init()
+    try:
+        _run_grandfather_migration_once()
+    except Exception:
+        print("[warn] grandfather migration crashed (non-fatal, continuing startup)")
+        traceback.print_exc()
     ensure_generated_artifact_store_schema()
     _prune_redundant_db_backed_artifact_files()
     init_leaderboard_schema()
@@ -7949,6 +8081,16 @@ def auth_signup(payload: SignupPayload):
 
     exp = now + TOKEN_TTL_SECONDS
     token = _make_token({"uid": int(row["id"]), "email": email, "exp": exp})
+
+    # STAGE 4B-B2: send signup confirmation email (non-blocking, best effort).
+    try:
+        from email_service import send_signup_confirmation
+
+        send_signup_confirmation(row)
+    except ImportError:
+        print("[warn] email_service.send_signup_confirmation not available; skipping")
+    except Exception as exc:
+        print(f"[warn] signup confirmation email failed for {email}: {exc}")
 
     return {
         "ok": True,
