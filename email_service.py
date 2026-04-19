@@ -102,3 +102,26 @@ def send_payment_failed(user_row, retry_date_iso: Optional[str] = None) -> bool:
 </div>
 """
     return _send(to=email, subject="Team Joseo: Payment failed", html=html)
+
+
+def send_launch_email(email: str, display_name: str) -> bool:
+    """One-off launch announcement for grandfathered users."""
+    safe_name = (display_name or "Driver").strip() or "Driver"
+
+    html = f"""
+<div style="font-family: -apple-system, system-ui, sans-serif; max-width: 600px; margin: 0 auto;">
+  <h2>Team Joseo is now a paid app, {safe_name}</h2>
+  <p>Thanks for being an early user. Your account is currently on complimentary access while we transition to paid subscriptions.</p>
+  <p><strong>Price:</strong> $8/week after complimentary access ends.</p>
+  <p>You can subscribe anytime inside the app from <strong>Settings → Subscription</strong>.</p>
+  <p>If you already subscribed, thank you — no action needed.</p>
+  <p style="color: #666; font-size: 12px; margin-top: 40px;">
+    Team Joseo — NYC TLC driver map
+  </p>
+</div>
+"""
+    return _send(
+        to=email,
+        subject="Team Joseo is now paid — your complimentary access details",
+        html=html,
+    )
