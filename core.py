@@ -321,9 +321,68 @@ def _enforce_trial_or_admin(user: sqlite3.Row) -> None:
         raise HTTPException(status_code=402, detail="Trial expired")
 
 
-def require_user(req: Request) -> sqlite3.Row:
+def _enforce_access_or_admin(user: sqlite3.Row) -> None:
+    """Full access ladder: admin → comp → active subscription → active trial → HTTP 402."""
+    if not ENFORCE_TRIAL:
+        return
+    if int(user["is_admin"]) == 1:
+        return
+
+    now = int(time.time())
+
+    try:
+        sub_status = user["subscription_status"] if "subscription_status" in user.keys() else None
+    except Exception:
+        sub_status = None
+
+    if sub_status == "comp":
+        try:
+            comp_expires = user["subscription_comp_expires_at"] if "subscription_comp_expires_at" in user.keys() else None
+            comp_expires_int = int(comp_expires) if comp_expires is not None else None
+        except Exception:
+            comp_expires_int = None
+        if comp_expires_int is None or comp_expires_int <= 0:
+            return
+        if now < comp_expires_int:
+            return
+
+    if sub_status == "active":
+        try:
+            period_end = user["subscription_current_period_end"] if "subscription_current_period_end" in user.keys() else None
+            period_end_int = int(period_end) if period_end is not None else None
+        except Exception:
+            period_end_int = None
+        if period_end_int and now < period_end_int:
+            return
+
+    trial_expires_at_raw = user["trial_expires_at"] if "trial_expires_at" in user.keys() else None
+    try:
+        trial_expires_at = int(trial_expires_at_raw) if trial_expires_at_raw is not None else None
+    except Exception:
+        trial_expires_at = None
+
+    if trial_expires_at is None or trial_expires_at <= 0:
+        trial_expires_at = now + max(1, TRIAL_DAYS) * 86400
+        try:
+            _db_exec("UPDATE users SET trial_expires_at=? WHERE id=?", (trial_expires_at, int(user["id"])))
+        except Exception:
+            return
+
+    if now < trial_expires_at:
+        return
+
+    raise HTTPException(status_code=402, detail="Subscription required")
+
+
+def require_user_basic(req: Request) -> sqlite3.Row:
+    """Verify token and block state only. Does not enforce subscription access."""
     user = _auth_user_from_request(req)
-    _enforce_trial_or_admin(user)
+    return user
+
+
+def require_user(req: Request) -> sqlite3.Row:
+    user = require_user_basic(req)
+    _enforce_access_or_admin(user)
     return user
 
 

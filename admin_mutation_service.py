@@ -5,8 +5,9 @@ from typing import Any, Dict, Optional
 
 from fastapi import HTTPException
 
-from core import DB_BACKEND, _db_exec, _db_query_one
+from core import DB_BACKEND, _db_exec, _db_query_all, _db_query_one
 from pickup_recording_feature import pickup_log_not_voided_sql, soft_void_pickup_trip
+from subscription_state import days_until_comp_ends, is_comp_forever
 
 
 def _flag_to_bool(value: Any) -> bool:
@@ -188,3 +189,205 @@ def clear_pickup_report(report_id: int, admin_user_id: int) -> Dict[str, Any]:
     }
     response.update(result)
     return response
+
+
+def _duration_to_seconds(unit: str, value: int) -> Optional[int]:
+    if unit == "forever":
+        return None
+    multipliers = {"hours": 3600, "days": 86400, "weeks": 604800}
+    return int(value) * multipliers[unit]
+
+
+def grant_comp(actor_user_id: int, user_id: int, duration_unit: str, duration_value: int, reason: str) -> Dict[str, Any]:
+    target = _db_query_one("SELECT id FROM users WHERE id=? LIMIT 1", (int(user_id),))
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    now = int(time.time())
+    seconds = _duration_to_seconds(duration_unit, int(duration_value))
+    comp_expires_at = None if seconds is None else (now + seconds)
+
+    _db_exec(
+        """
+        UPDATE users SET
+            subscription_status=?,
+            subscription_comp_reason=?,
+            subscription_comp_granted_by=?,
+            subscription_comp_granted_at=?,
+            subscription_comp_expires_at=?,
+            subscription_updated_at=?
+        WHERE id=?
+        """,
+        ("comp", reason, int(actor_user_id), now, comp_expires_at, now, int(user_id)),
+    )
+
+    updated = _db_query_one("SELECT * FROM users WHERE id=?", (int(user_id),))
+    days_remaining = days_until_comp_ends(updated)
+    is_forever = is_comp_forever(updated)
+
+    return {
+        "ok": True,
+        "user_id": int(user_id),
+        "status": "comp",
+        "comp_expires_at": comp_expires_at,
+        "comp_reason": reason,
+        "is_comp_forever": is_forever,
+        "days_remaining": days_remaining,
+    }
+
+
+def extend_comp(actor_user_id: int, user_id: int, duration_unit: str, duration_value: int) -> Dict[str, Any]:
+    target = _db_query_one(
+        "SELECT id, subscription_status, subscription_comp_expires_at, subscription_comp_reason FROM users WHERE id=? LIMIT 1",
+        (int(user_id),),
+    )
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    now = int(time.time())
+    seconds = _duration_to_seconds(duration_unit, int(duration_value))
+    if seconds is None:
+        raise HTTPException(status_code=400, detail="Cannot extend with 'forever' unit; use grant instead")
+
+    current_status = target["subscription_status"]
+    current_expires_raw = target["subscription_comp_expires_at"]
+
+    try:
+        current_expires = int(current_expires_raw) if current_expires_raw is not None else None
+    except Exception:
+        current_expires = None
+
+    if current_status == "comp" and current_expires is not None and current_expires > now:
+        new_expires = current_expires + seconds
+    else:
+        new_expires = now + seconds
+
+    reason = target["subscription_comp_reason"] or "Extended"
+
+    _db_exec(
+        """
+        UPDATE users SET
+            subscription_status=?,
+            subscription_comp_reason=?,
+            subscription_comp_granted_by=?,
+            subscription_comp_granted_at=?,
+            subscription_comp_expires_at=?,
+            subscription_updated_at=?
+        WHERE id=?
+        """,
+        ("comp", reason, int(actor_user_id), now, new_expires, now, int(user_id)),
+    )
+
+    updated = _db_query_one("SELECT * FROM users WHERE id=?", (int(user_id),))
+    return {
+        "ok": True,
+        "user_id": int(user_id),
+        "status": "comp",
+        "comp_expires_at": new_expires,
+        "comp_reason": reason,
+        "is_comp_forever": False,
+        "days_remaining": days_until_comp_ends(updated),
+    }
+
+
+def revoke_comp(actor_user_id: int, user_id: int) -> Dict[str, Any]:
+    _ = actor_user_id
+    target = _db_query_one(
+        "SELECT id, subscription_status, subscription_id, subscription_current_period_end FROM users WHERE id=? LIMIT 1",
+        (int(user_id),),
+    )
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    now = int(time.time())
+    new_status = "none"
+    period_end_raw = target["subscription_current_period_end"]
+    try:
+        period_end = int(period_end_raw) if period_end_raw is not None else None
+    except Exception:
+        period_end = None
+
+    if target["subscription_id"] and period_end and period_end > now:
+        new_status = "active"
+
+    _db_exec(
+        """
+        UPDATE users SET
+            subscription_status=?,
+            subscription_comp_reason=NULL,
+            subscription_comp_granted_by=NULL,
+            subscription_comp_granted_at=NULL,
+            subscription_comp_expires_at=NULL,
+            subscription_updated_at=?
+        WHERE id=?
+        """,
+        (new_status, now, int(user_id)),
+    )
+
+    return {
+        "ok": True,
+        "user_id": int(user_id),
+        "status": new_status,
+    }
+
+
+def list_active_comps(limit: int = 100, offset: int = 0, search: Optional[str] = None) -> Dict[str, Any]:
+    now = int(time.time())
+
+    search_clause = ""
+    search_params: list = []
+    if search:
+        search_clause = " AND (email LIKE ? OR display_name LIKE ? OR subscription_comp_reason LIKE ?)"
+        pattern = f"%{search}%"
+        search_params = [pattern, pattern, pattern]
+
+    base_where = f"""
+        subscription_status = 'comp'
+        AND (subscription_comp_expires_at IS NULL OR subscription_comp_expires_at > ?)
+        {search_clause}
+    """
+
+    count_row = _db_query_one(
+        f"SELECT COUNT(*) AS c FROM users WHERE {base_where}",
+        (now, *search_params),
+    )
+    total = int(count_row["c"]) if count_row else 0
+
+    rows = _db_query_all(
+        f"""
+        SELECT id, email, display_name,
+               subscription_comp_reason, subscription_comp_granted_by,
+               subscription_comp_granted_at, subscription_comp_expires_at
+        FROM users
+        WHERE {base_where}
+        ORDER BY subscription_comp_granted_at DESC
+        LIMIT ? OFFSET ?
+        """,
+        (now, *search_params, int(limit), int(offset)),
+    )
+
+    items = []
+    for row in rows:
+        comp_expires_raw = row["subscription_comp_expires_at"]
+        is_forever = comp_expires_raw is None
+        try:
+            comp_expires = int(comp_expires_raw) if comp_expires_raw is not None else None
+        except Exception:
+            comp_expires = None
+        days_remaining = None if comp_expires is None else max(0, (comp_expires - now) // 86400)
+
+        items.append(
+            {
+                "user_id": int(row["id"]),
+                "email": row["email"],
+                "display_name": row["display_name"],
+                "reason": row["subscription_comp_reason"],
+                "granted_by": int(row["subscription_comp_granted_by"]) if row["subscription_comp_granted_by"] is not None else None,
+                "granted_at": int(row["subscription_comp_granted_at"]) if row["subscription_comp_granted_at"] is not None else None,
+                "expires_at": comp_expires,
+                "days_remaining": days_remaining,
+                "is_forever": is_forever,
+            }
+        )
+
+    return {"items": items, "total": total}
