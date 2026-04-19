@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from typing import Optional
+from typing import Literal, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class SetAdminRequest(BaseModel):
@@ -40,3 +40,47 @@ class ClearReportResponse(BaseModel):
     ok: bool = True
     report_id: int
     cleared: bool
+
+
+class CompGrantRequest(BaseModel):
+    duration_unit: Literal["hours", "days", "weeks", "forever"]
+    duration_value: int = Field(default=0, ge=0, le=10000)
+    reason: str = Field(min_length=3, max_length=500)
+
+
+class CompExtendRequest(BaseModel):
+    duration_unit: Literal["hours", "days", "weeks"]
+    duration_value: int = Field(ge=1, le=10000)
+
+
+class CompGrantResponse(BaseModel):
+    ok: bool
+    user_id: int
+    status: str
+    comp_expires_at: Optional[int] = None
+    comp_reason: Optional[str] = None
+    is_comp_forever: bool = False
+    days_remaining: Optional[int] = None
+
+
+class CompRevokeResponse(BaseModel):
+    ok: bool
+    user_id: int
+    status: str
+
+
+class CompListItem(BaseModel):
+    user_id: int
+    email: str
+    display_name: str
+    reason: Optional[str] = None
+    granted_by: Optional[int] = None
+    granted_at: Optional[int] = None
+    expires_at: Optional[int] = None
+    days_remaining: Optional[int] = None
+    is_forever: bool
+
+
+class CompListResponse(BaseModel):
+    items: list[CompListItem]
+    total: int

@@ -107,8 +107,10 @@ from core import (
     _user_block_state,
     _require_jwt_secret,
     ENFORCE_TRIAL,
+    require_user_basic as core_require_user_basic,
     require_user as core_require_user,
 )
+from subscription_state import build_subscription_response
 
 # =========================================================
 # Paths (Railway volume)
@@ -4734,6 +4736,16 @@ def _db_init() -> None:
             "ALTER TABLE users ADD COLUMN is_suspended INTEGER NOT NULL DEFAULT 0;",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_suspended BOOLEAN NOT NULL DEFAULT FALSE;",
         )
+        _ensure_column("users", "subscription_status", "TEXT")
+        _ensure_column("users", "subscription_provider", "TEXT")
+        _ensure_column("users", "subscription_customer_id", "TEXT")
+        _ensure_column("users", "subscription_id", "TEXT")
+        _ensure_column("users", "subscription_current_period_end", "INTEGER")
+        _ensure_column("users", "subscription_comp_reason", "TEXT")
+        _ensure_column("users", "subscription_comp_granted_by", "INTEGER")
+        _ensure_column("users", "subscription_comp_granted_at", "INTEGER")
+        _ensure_column("users", "subscription_comp_expires_at", "INTEGER")
+        _ensure_column("users", "subscription_updated_at", "INTEGER")
 
         _db_exec(
             """
@@ -4766,6 +4778,32 @@ def _db_init() -> None:
             UPDATE users
             SET map_identity_mode = 'name'
             WHERE map_identity_mode IS NULL OR btrim(map_identity_mode) = '';
+            """
+        )
+        _db_exec(
+            """
+            CREATE TABLE IF NOT EXISTS paddle_webhook_events (
+                event_id TEXT PRIMARY KEY,
+                event_type TEXT NOT NULL,
+                occurred_at INTEGER NOT NULL,
+                received_at INTEGER NOT NULL,
+                processed_at INTEGER NULL,
+                user_id INTEGER NULL,
+                outcome TEXT NULL,
+                raw_event_json TEXT NOT NULL
+            )
+            """
+        )
+        _db_exec(
+            """
+            CREATE INDEX IF NOT EXISTS idx_paddle_webhook_events_occurred
+            ON paddle_webhook_events (occurred_at DESC)
+            """
+        )
+        _db_exec(
+            """
+            CREATE INDEX IF NOT EXISTS idx_paddle_webhook_events_unprocessed
+            ON paddle_webhook_events (processed_at) WHERE processed_at IS NULL
             """
         )
 
@@ -5192,6 +5230,16 @@ def _db_init() -> None:
     _try_alter("ALTER TABLE users ADD COLUMN avatar_version TEXT;")
     _try_alter("ALTER TABLE users ADD COLUMN map_identity_mode TEXT NOT NULL DEFAULT 'name';")
     _try_alter("ALTER TABLE users ADD COLUMN is_suspended INTEGER NOT NULL DEFAULT 0;")
+    _ensure_column("users", "subscription_status", "TEXT")
+    _ensure_column("users", "subscription_provider", "TEXT")
+    _ensure_column("users", "subscription_customer_id", "TEXT")
+    _ensure_column("users", "subscription_id", "TEXT")
+    _ensure_column("users", "subscription_current_period_end", "INTEGER")
+    _ensure_column("users", "subscription_comp_reason", "TEXT")
+    _ensure_column("users", "subscription_comp_granted_by", "INTEGER")
+    _ensure_column("users", "subscription_comp_granted_at", "INTEGER")
+    _ensure_column("users", "subscription_comp_expires_at", "INTEGER")
+    _ensure_column("users", "subscription_updated_at", "INTEGER")
 
     _db_exec(
         """
@@ -5205,6 +5253,32 @@ def _db_init() -> None:
         UPDATE users
         SET map_identity_mode = 'name'
         WHERE map_identity_mode IS NULL OR trim(map_identity_mode) = '';
+        """
+    )
+    _db_exec(
+        """
+        CREATE TABLE IF NOT EXISTS paddle_webhook_events (
+            event_id TEXT PRIMARY KEY,
+            event_type TEXT NOT NULL,
+            occurred_at INTEGER NOT NULL,
+            received_at INTEGER NOT NULL,
+            processed_at INTEGER NULL,
+            user_id INTEGER NULL,
+            outcome TEXT NULL,
+            raw_event_json TEXT NOT NULL
+        )
+        """
+    )
+    _db_exec(
+        """
+        CREATE INDEX IF NOT EXISTS idx_paddle_webhook_events_occurred
+        ON paddle_webhook_events (occurred_at DESC)
+        """
+    )
+    _db_exec(
+        """
+        CREATE INDEX IF NOT EXISTS idx_paddle_webhook_events_unprocessed
+        ON paddle_webhook_events (processed_at) WHERE processed_at IS NULL
         """
     )
 
@@ -5552,6 +5626,15 @@ def require_user(req: Request, token: str = Depends(get_bearer_token)) -> sqlite
     return core_require_user(request_with_bearer)
 
 
+def require_user_basic(req: Request, token: str = Depends(get_bearer_token)) -> sqlite3.Row:
+    scope = dict(req.scope)
+    scope_headers = [(k, v) for (k, v) in scope.get("headers", []) if k.lower() != b"authorization"]
+    scope_headers.append((b"authorization", f"Bearer {token}".encode("utf-8")))
+    scope["headers"] = scope_headers
+    request_with_bearer = Request(scope, receive=req.receive)
+    return core_require_user_basic(request_with_bearer)
+
+
 def require_admin(user: sqlite3.Row = Depends(require_user)) -> sqlite3.Row:
     if _flag_to_int(user["is_admin"]) != 1:
         raise HTTPException(status_code=403, detail="Admin only")
@@ -5584,6 +5667,26 @@ def _is_bool_column(table: str, column: str) -> bool:
         return data_type.startswith("bool")
     except Exception:
         return False
+
+
+def _get_existing_columns(table_name: str) -> set:
+    """Return set of column names for a table. Backend-agnostic."""
+    if DB_BACKEND == "postgres":
+        rows = _db_query_all(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = ?",
+            (table_name,),
+        )
+        return {row["column_name"] for row in rows}
+    rows = _db_query_all(f"PRAGMA table_info({table_name})")
+    return {row["name"] for row in rows}
+
+
+def _ensure_column(table_name: str, column_name: str, column_def: str):
+    """Idempotently add a column for SQLite/Postgres without IF NOT EXISTS portability issues."""
+    existing = _get_existing_columns(table_name)
+    if column_name in existing:
+        return
+    _db_exec(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_def}")
 
 
 def _flag_to_int(value: Any) -> int:
@@ -7883,7 +7986,7 @@ def auth_login(payload: LoginPayload):
 
 
 @app.get("/me")
-def me(user: sqlite3.Row = Depends(require_user)):
+def me(user: sqlite3.Row = Depends(require_user_basic)):
     dn = (user["display_name"] or "").strip() if "display_name" in user.keys() else ""
     if not dn:
         dn = _clean_display_name("", user["email"])
@@ -7907,6 +8010,7 @@ def me(user: sqlite3.Row = Depends(require_user)):
         "is_admin": bool(_flag_to_int(user["is_admin"])),
         "trial_expires_at": int(user["trial_expires_at"]),
         "leaderboard_badge_code": best_badge.get("leaderboard_badge_code"),
+        "subscription": build_subscription_response(user),
     }
 
 

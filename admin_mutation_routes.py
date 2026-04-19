@@ -2,19 +2,28 @@ from __future__ import annotations
 
 import sqlite3
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 
 from admin_mutation_models import (
     AdminActionUserResponse,
     AdminUserDetailResponse,
     ClearReportResponse,
+    CompExtendRequest,
+    CompGrantRequest,
+    CompGrantResponse,
+    CompListResponse,
+    CompRevokeResponse,
     SetAdminRequest,
     SetSuspendedRequest,
 )
 from admin_mutation_service import (
     clear_pickup_report,
     clear_police_report,
+    extend_comp,
     get_admin_user_detail,
+    grant_comp,
+    list_active_comps,
+    revoke_comp,
     set_user_admin,
     set_user_suspended,
 )
@@ -65,3 +74,51 @@ def admin_clear_pickup_report(
     admin: sqlite3.Row = Depends(require_admin_user),
 ):
     return clear_pickup_report(report_id=report_id, admin_user_id=int(admin["id"]))
+
+
+@router.post("/users/{user_id}/comp/grant", response_model=CompGrantResponse)
+def admin_grant_comp(
+    user_id: int,
+    payload: CompGrantRequest,
+    admin: sqlite3.Row = Depends(require_admin_user),
+):
+    return grant_comp(
+        actor_user_id=int(admin["id"]),
+        user_id=user_id,
+        duration_unit=payload.duration_unit,
+        duration_value=payload.duration_value,
+        reason=payload.reason,
+    )
+
+
+@router.post("/users/{user_id}/comp/extend", response_model=CompGrantResponse)
+def admin_extend_comp(
+    user_id: int,
+    payload: CompExtendRequest,
+    admin: sqlite3.Row = Depends(require_admin_user),
+):
+    return extend_comp(
+        actor_user_id=int(admin["id"]),
+        user_id=user_id,
+        duration_unit=payload.duration_unit,
+        duration_value=payload.duration_value,
+    )
+
+
+@router.post("/users/{user_id}/comp/revoke", response_model=CompRevokeResponse)
+def admin_revoke_comp(
+    user_id: int,
+    admin: sqlite3.Row = Depends(require_admin_user),
+):
+    return revoke_comp(actor_user_id=int(admin["id"]), user_id=user_id)
+
+
+@router.get("/comps", response_model=CompListResponse)
+def admin_list_comps(
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    search: str | None = Query(default=None, max_length=200),
+    admin: sqlite3.Row = Depends(require_admin_user),
+):
+    _ = admin
+    return list_active_comps(limit=limit, offset=offset, search=search)
