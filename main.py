@@ -6995,7 +6995,9 @@ def day_tendency_today(
     bronx_wash_heights_mode: Optional[int] = None,
     queens_mode: Optional[int] = None,
     brooklyn_mode: Optional[int] = None,
+    user: sqlite3.Row = Depends(require_user),
 ):
+    _ = user
     if not _has_day_tendency_model():
         print("[warn] day tendency model missing; call /generate or allow startup backfill")
         raise HTTPException(status_code=409, detail="day tendency not ready. Call /generate first.")
@@ -7022,7 +7024,9 @@ def day_tendency_for_date(
     bronx_wash_heights_mode: Optional[int] = None,
     queens_mode: Optional[int] = None,
     brooklyn_mode: Optional[int] = None,
+    user: sqlite3.Row = Depends(require_user),
 ):
+    _ = user
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", ymd or ""):
         raise HTTPException(status_code=400, detail="ymd must be YYYY-MM-DD")
     try:
@@ -7055,7 +7059,9 @@ def day_tendency_frame_context(
     bronx_wash_heights_mode: Optional[int] = None,
     queens_mode: Optional[int] = None,
     brooklyn_mode: Optional[int] = None,
+    user: sqlite3.Row = Depends(require_user),
 ):
+    _ = user
     if not _has_day_tendency_model():
         print("[warn] day tendency model missing; call /generate or allow startup backfill")
         raise HTTPException(status_code=409, detail="day tendency not ready. Call /generate first.")
@@ -7195,7 +7201,12 @@ def day_tendency_month_benchmark(
 
 
 @app.get("/timeline")
-def timeline(request: Request, month_key: Optional[str] = None):
+def timeline(
+    request: Request,
+    month_key: Optional[str] = None,
+    user: sqlite3.Row = Depends(require_user),
+):
+    _ = user
     target_month_key = _resolve_target_month_key_for_request(month_key=month_key)
     preparing_response = _ensure_requested_month_available_or_start_generate(
         month_key=target_month_key,
@@ -7237,7 +7248,9 @@ def assistant_outlook(
     request: Request,
     frame_time: str,
     location_ids: str,
+    user: sqlite3.Row = Depends(require_user),
 ):
+    _ = user
     requested_location_ids = _parse_assistant_location_ids(location_ids)
     if not requested_location_ids:
         raise HTTPException(status_code=400, detail="location_ids is required and must include at least one id.")
@@ -7629,7 +7642,13 @@ def assistant_guidance(
 
 
 @app.get("/frame/{idx}")
-def frame(idx: int, request: Request, month_key: Optional[str] = None):
+def frame(
+    idx: int,
+    request: Request,
+    month_key: Optional[str] = None,
+    user: sqlite3.Row = Depends(require_user),
+):
+    _ = user
     target_month_key = _resolve_target_month_key_for_request(month_key=month_key)
     preparing_response = _ensure_requested_month_available_or_start_generate(
         month_key=target_month_key,
@@ -7673,7 +7692,9 @@ def frame_viewport(
     max_lng: float,
     month_key: Optional[str] = None,
     padding_ratio: float = 0.18,
+    user: sqlite3.Row = Depends(require_user),
 ):
+    _ = user
     target_month_key = _resolve_target_month_key_for_request(month_key=month_key)
     preparing_response = _ensure_requested_month_available_or_start_generate(
         month_key=target_month_key,

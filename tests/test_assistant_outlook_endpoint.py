@@ -15,6 +15,20 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 
+def _signup_and_get_auth_headers(client: TestClient) -> dict[str, str]:
+    response = client.post(
+        "/auth/signup",
+        json={
+            "email": f"assistant-outlook-{os.urandom(4).hex()}@example.com",
+            "password": "password123",
+            "display_name": "Assistant Outlook Tester",
+        },
+    )
+    assert response.status_code == 200, response.text
+    token = response.json()["token"]
+    return {"Authorization": f"Bearer {token}"}
+
+
 @pytest.fixture()
 def app_env(monkeypatch):
     temp_dir = tempfile.TemporaryDirectory(prefix="backend-assistant-outlook-")
@@ -53,6 +67,12 @@ def app_env(monkeypatch):
         yield main, client, frames_dir
 
     temp_dir.cleanup()
+
+
+@pytest.fixture()
+def auth_headers(app_env):
+    _main, client, _frames_dir = app_env
+    return _signup_and_get_auth_headers(client)
 
 
 def _write_assistant_artifact(frames_dir: Path) -> None:
@@ -99,13 +119,14 @@ def _write_assistant_artifact(frames_dir: Path) -> None:
     (frames_dir / "assistant_outlook.json").write_text(json.dumps(payload), encoding="utf-8")
 
 
-def test_assistant_outlook_single_zone_returns_payload(app_env):
+def test_assistant_outlook_single_zone_returns_payload(app_env, auth_headers):
     _main, client, frames_dir = app_env
     _write_assistant_artifact(frames_dir)
 
     response = client.get(
         "/assistant/outlook",
         params={"frame_time": "2026-03-20T08:00:00Z", "location_ids": "100"},
+        headers=auth_headers,
     )
 
     assert response.status_code == 200, response.text
@@ -115,13 +136,14 @@ def test_assistant_outlook_single_zone_returns_payload(app_env):
     assert payload["zones"][0]["location_id"] == "100"
 
 
-def test_assistant_outlook_batch_two_ids_returns_both(app_env):
+def test_assistant_outlook_batch_two_ids_returns_both(app_env, auth_headers):
     _main, client, frames_dir = app_env
     _write_assistant_artifact(frames_dir)
 
     response = client.get(
         "/assistant/outlook",
         params={"frame_time": "2026-03-20T08:00:00Z", "location_ids": "100,200"},
+        headers=auth_headers,
     )
 
     assert response.status_code == 200, response.text
@@ -131,13 +153,14 @@ def test_assistant_outlook_batch_two_ids_returns_both(app_env):
     assert [zone["location_id"] for zone in payload["zones"]] == ["100", "200"]
 
 
-def test_assistant_outlook_missing_zone_id_is_partial_safe(app_env):
+def test_assistant_outlook_missing_zone_id_is_partial_safe(app_env, auth_headers):
     _main, client, frames_dir = app_env
     _write_assistant_artifact(frames_dir)
 
     response = client.get(
         "/assistant/outlook",
         params={"frame_time": "2026-03-20T08:00:00Z", "location_ids": "100,999"},
+        headers=auth_headers,
     )
 
     assert response.status_code == 200, response.text
@@ -147,25 +170,27 @@ def test_assistant_outlook_missing_zone_id_is_partial_safe(app_env):
     assert [zone["location_id"] for zone in payload["zones"]] == ["100"]
 
 
-def test_assistant_outlook_invalid_frame_time_returns_error(app_env):
+def test_assistant_outlook_invalid_frame_time_returns_error(app_env, auth_headers):
     _main, client, frames_dir = app_env
     _write_assistant_artifact(frames_dir)
 
     response = client.get(
         "/assistant/outlook",
         params={"frame_time": "2026-03-20T09:00:00Z", "location_ids": "100"},
+        headers=auth_headers,
     )
 
     assert response.status_code == 404, response.text
     assert "Unknown frame_time" in response.json()["detail"]
 
 
-def test_assistant_outlook_missing_artifact_returns_clear_error(app_env):
+def test_assistant_outlook_missing_artifact_returns_clear_error(app_env, auth_headers):
     _main, client, _frames_dir = app_env
 
     response = client.get(
         "/assistant/outlook",
         params={"frame_time": "2026-03-20T08:00:00Z", "location_ids": "100"},
+        headers=auth_headers,
     )
 
     assert response.status_code == 409, response.text

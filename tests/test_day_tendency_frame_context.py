@@ -73,6 +73,20 @@ def _write_model(data_dir: Path, model: dict) -> None:
     (day_tendency_dir / "model.json").write_text(json.dumps(model), encoding="utf-8")
 
 
+def _signup_and_get_auth_headers(client: TestClient) -> dict[str, str]:
+    response = client.post(
+        "/auth/signup",
+        json={
+            "email": f"day-tendency-{os.urandom(4).hex()}@example.com",
+            "password": "password123",
+            "display_name": "Day Tendency Tester",
+        },
+    )
+    assert response.status_code == 200, response.text
+    token = response.json()["token"]
+    return {"Authorization": f"Bearer {token}"}
+
+
 @pytest.fixture()
 def app_env(monkeypatch):
     temp_dir = tempfile.TemporaryDirectory(prefix="backend-day-tendency-frame-context-")
@@ -123,7 +137,13 @@ def app_env(monkeypatch):
     temp_dir.cleanup()
 
 
-def test_day_tendency_frame_context_returns_separated_global_and_local_contexts(app_env, monkeypatch):
+@pytest.fixture()
+def auth_headers(app_env):
+    _main, client = app_env
+    return _signup_and_get_auth_headers(client)
+
+
+def test_day_tendency_frame_context_returns_separated_global_and_local_contexts(app_env, auth_headers, monkeypatch):
     main, client = app_env
     monkeypatch.setattr(
         main,
@@ -139,6 +159,7 @@ def test_day_tendency_frame_context_returns_separated_global_and_local_contexts(
             "lng": -73.9911,
             "manhattan_mode": 1,
         },
+        headers=auth_headers,
     )
 
     assert response.status_code == 200, response.text
@@ -165,12 +186,13 @@ def test_day_tendency_frame_context_returns_separated_global_and_local_contexts(
     assert payload["advanced_context"]["bucket_drop_cap"] == 1
 
 
-def test_day_tendency_frame_context_keeps_global_context_when_location_is_missing(app_env):
+def test_day_tendency_frame_context_keeps_global_context_when_location_is_missing(app_env, auth_headers):
     _main, client = app_env
 
     response = client.get(
         "/day_tendency/frame_context",
         params={"frame_time": "2025-01-06T13:00:00Z"},
+        headers=auth_headers,
     )
 
     assert response.status_code == 200, response.text
@@ -195,19 +217,22 @@ def test_day_tendency_frame_context_keeps_global_context_when_location_is_missin
     assert payload["advanced_context"]["global_penalty_points"] >= 0
 
 
-def test_day_tendency_frame_context_invalid_frame_time_returns_400(app_env):
+def test_day_tendency_frame_context_invalid_frame_time_returns_400(app_env, auth_headers):
     _main, client = app_env
 
     response = client.get(
         "/day_tendency/frame_context",
         params={"frame_time": "badvalue"},
+        headers=auth_headers,
     )
 
     assert response.status_code == 400, response.text
     assert "Invalid frame_time" in response.json()["detail"]
 
 
-def test_day_tendency_frame_context_softens_mode_scope_when_local_context_falls_back_to_root_borough(app_env, monkeypatch):
+def test_day_tendency_frame_context_softens_mode_scope_when_local_context_falls_back_to_root_borough(
+    app_env, auth_headers, monkeypatch
+):
     main, client = app_env
     monkeypatch.setattr(
         main,
@@ -238,6 +263,7 @@ def test_day_tendency_frame_context_softens_mode_scope_when_local_context_falls_
             "lng": -73.9911,
             "manhattan_mode": 1,
         },
+        headers=auth_headers,
     )
     assert response.status_code == 200, response.text
     payload = response.json()
@@ -253,7 +279,7 @@ def test_day_tendency_frame_context_softens_mode_scope_when_local_context_falls_
     assert payload["advanced_context"]["local_penalty_points"] < 4
 
 
-def test_day_tendency_frame_context_keeps_full_local_strength_for_native_borough_scope(app_env, monkeypatch):
+def test_day_tendency_frame_context_keeps_full_local_strength_for_native_borough_scope(app_env, auth_headers, monkeypatch):
     main, client = app_env
     monkeypatch.setattr(
         main,
@@ -280,6 +306,7 @@ def test_day_tendency_frame_context_keeps_full_local_strength_for_native_borough
             "lat": 40.7501,
             "lng": -73.9911,
         },
+        headers=auth_headers,
     )
     assert response.status_code == 200, response.text
     payload = response.json()
@@ -292,7 +319,9 @@ def test_day_tendency_frame_context_keeps_full_local_strength_for_native_borough
     assert payload["advanced_context"]["local_penalty_points"] == 4
 
 
-def test_day_tendency_frame_context_ready_stays_true_when_context_is_ok_but_penalty_is_zero(app_env, monkeypatch):
+def test_day_tendency_frame_context_ready_stays_true_when_context_is_ok_but_penalty_is_zero(
+    app_env, auth_headers, monkeypatch
+):
     main, client = app_env
     monkeypatch.setattr(
         main,
@@ -321,6 +350,7 @@ def test_day_tendency_frame_context_ready_stays_true_when_context_is_ok_but_pena
             "lat": 40.7501,
             "lng": -73.9911,
         },
+        headers=auth_headers,
     )
     assert response.status_code == 200, response.text
     payload = response.json()
@@ -335,7 +365,7 @@ def test_day_tendency_frame_context_ready_stays_true_when_context_is_ok_but_pena
     assert payload["advanced_context"]["has_nonzero_penalty"] is False
 
 
-def test_legacy_day_tendency_routes_remain_single_payload_routes(app_env, monkeypatch):
+def test_legacy_day_tendency_routes_remain_single_payload_routes(app_env, auth_headers, monkeypatch):
     main, client = app_env
     monkeypatch.setattr(main, "_current_bin_index_from_dt", lambda dt, bin_minutes=20: 24)
     monkeypatch.setattr(
@@ -356,8 +386,16 @@ def test_legacy_day_tendency_routes_remain_single_payload_routes(app_env, monkey
     }
     _write_model(Path(os.environ["DATA_DIR"]), model)
 
-    today_response = client.get("/day_tendency/today", params={"lat": 40.7501, "lng": -73.9911})
-    date_response = client.get("/day_tendency/date/2025-01-06", params={"lat": 40.7501, "lng": -73.9911})
+    today_response = client.get(
+        "/day_tendency/today",
+        params={"lat": 40.7501, "lng": -73.9911},
+        headers=auth_headers,
+    )
+    date_response = client.get(
+        "/day_tendency/date/2025-01-06",
+        params={"lat": 40.7501, "lng": -73.9911},
+        headers=auth_headers,
+    )
     assert today_response.status_code == 200, today_response.text
     assert date_response.status_code == 200, date_response.text
 
