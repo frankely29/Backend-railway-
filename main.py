@@ -5880,6 +5880,11 @@ from games_service import (
     get_viewer_game_relationship,
 )
 from work_battles_routes import router as work_battles_router
+from subscription_routes import router as subscription_router
+from subscription_webhooks import (
+    replay_unprocessed_events_on_startup,
+    router as subscription_webhook_router,
+)
 from work_battles_service import ensure_work_battles_schema
 from leaderboard_tracker import increment_pickup_count, record_presence_heartbeat
 from pickup_recording_feature import (
@@ -5896,6 +5901,8 @@ app.include_router(leaderboard_router)
 app.include_router(pickup_recording_router)
 app.include_router(games_router)
 app.include_router(work_battles_router)
+app.include_router(subscription_router)
+app.include_router(subscription_webhook_router)
 
 # =========================================================
 # Startup
@@ -5927,6 +5934,11 @@ def startup():
     ensure_games_schema()
     ensure_work_battles_schema()
     _ensure_admin_seed()
+    try:
+        replayed_count = replay_unprocessed_events_on_startup()
+        print(f"Paddle webhook startup replay processed {replayed_count} unprocessed events")
+    except Exception:
+        traceback.print_exc()
     try:
         _purge_expired_chat_data(force=True)
     except Exception:
