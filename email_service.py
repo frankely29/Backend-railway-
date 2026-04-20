@@ -125,3 +125,43 @@ def send_launch_email(email: str, display_name: str) -> bool:
         subject="Team Joseo is now paid — your complimentary access details",
         html=html,
     )
+
+
+def send_first_paid_welcome(email: str, display_name: str) -> bool:
+    """Welcome email sent the first time a user successfully pays.
+
+    Called from subscription_webhooks.py _handle_transaction_completed
+    only when this is the user's first processed transaction.completed event.
+    Signature takes email and display_name directly (not a user_row) to match
+    the webhook's call site.
+    """
+    safe_name = (display_name or "Driver").strip() or "Driver"
+
+    html = f"""
+<div style="font-family: -apple-system, system-ui, sans-serif; max-width: 600px; margin: 0 auto;">
+  <h2>Welcome to Team Joseo, {safe_name}</h2>
+  <p>Your subscription is active. Thanks for supporting the project.</p>
+  <p><strong>Your subscription includes:</strong></p>
+  <ul>
+    <li>Live NYC TLC hotspot map with real-time demand signals</li>
+    <li>Day-tendency scoring for every neighborhood</li>
+    <li>Driver community, chat, and leaderboard</li>
+    <li>$8/week — cancel anytime from Settings → Subscription</li>
+  </ul>
+  <p><strong>Install on your phone for the best experience:</strong></p>
+  <ul>
+    <li><strong>iPhone:</strong> Open in Safari → Share → Add to Home Screen</li>
+    <li><strong>Android:</strong> Chrome menu → Install App</li>
+    <li><strong>Tesla:</strong> Open in the car browser and bookmark</li>
+  </ul>
+  <p>Questions? Reply to this email directly.</p>
+  <p style="color: #666; font-size: 12px; margin-top: 40px;">
+    Team Joseo — NYC TLC driver map
+  </p>
+</div>
+"""
+    return _send(
+        to=email,
+        subject="Welcome to Team Joseo — subscription active",
+        html=html,
+    )
