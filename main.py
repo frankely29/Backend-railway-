@@ -109,6 +109,7 @@ from core import (
     ENFORCE_TRIAL,
     require_user_basic as core_require_user_basic,
     require_user as core_require_user,
+    is_account_owner,
 )
 from subscription_state import build_subscription_response
 
@@ -12555,6 +12556,11 @@ class AdminDisablePayload(BaseModel):
 def admin_disable_user(payload: AdminDisablePayload, admin: sqlite3.Row = Depends(require_admin)):
     disabled_is_bool = _is_bool_column("users", "is_disabled")
     disabled_value = bool(payload.disabled) if disabled_is_bool else (1 if payload.disabled else 0)
+    target = _db_query_one("SELECT id, email FROM users WHERE id=? LIMIT 1", (int(payload.user_id),))
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    if bool(payload.disabled) and is_account_owner(target):
+        raise HTTPException(status_code=403, detail="Cannot modify the account owner")
     _db_exec("UPDATE users SET is_disabled=? WHERE id=?", (disabled_value, int(payload.user_id)))
     if bool(payload.disabled):
         _db_exec("DELETE FROM presence WHERE user_id=?", (int(payload.user_id),))
@@ -12581,6 +12587,13 @@ class AdminResetPayload(BaseModel):
 def admin_reset_password(payload: AdminResetPayload, admin: sqlite3.Row = Depends(require_admin)):
     if not payload.new_password or len(payload.new_password) < 6:
         raise HTTPException(status_code=400, detail="Password must be at least 6 chars")
+
+    target = _db_query_one("SELECT id, email FROM users WHERE id=? LIMIT 1", (int(payload.user_id),))
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    if is_account_owner(target):
+        raise HTTPException(status_code=403, detail="Cannot modify the account owner")
+
     salt, ph = _hash_password(payload.new_password)
     _db_exec("UPDATE users SET pass_salt=?, pass_hash=? WHERE id=?", (salt, ph, int(payload.user_id)))
     return {"ok": True}
