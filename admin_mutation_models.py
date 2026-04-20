@@ -30,6 +30,17 @@ class AdminUserDetailResponse(BaseModel):
     ghost_mode: bool
     avatar_url: Optional[str] = None
     created_at: Optional[str] = None
+    trial_expires_at: Optional[int] = None
+    subscription_status: Optional[str] = None
+    subscription_provider: Optional[str] = None
+    subscription_customer_id: Optional[str] = None
+    subscription_id: Optional[str] = None
+    subscription_current_period_end: Optional[int] = None
+    subscription_comp_reason: Optional[str] = None
+    subscription_comp_granted_by: Optional[int] = None
+    subscription_comp_granted_at: Optional[int] = None
+    subscription_comp_expires_at: Optional[int] = None
+    subscription_updated_at: Optional[int] = None
     presence: Optional[dict] = None
     pickup_count: Optional[int] = None
     voided_pickup_count: Optional[int] = None
