@@ -5,7 +5,7 @@ from typing import Any, Dict, Optional
 
 from fastapi import HTTPException
 
-from core import DB_BACKEND, _db_exec, _db_query_all, _db_query_one
+from core import DB_BACKEND, _db_exec, _db_query_all, _db_query_one, is_account_owner
 from pickup_recording_feature import pickup_log_not_voided_sql, soft_void_pickup_trip
 from subscription_state import days_until_comp_ends, is_comp_forever
 
@@ -36,9 +36,12 @@ def _bool_db_value(value: bool) -> Any:
 
 
 def set_user_admin(actor_user_id: int, user_id: int, is_admin: bool) -> Dict[str, Any]:
-    target = _db_query_one("SELECT id, is_admin FROM users WHERE id=? LIMIT 1", (int(user_id),))
+    target = _db_query_one("SELECT id, email, is_admin FROM users WHERE id=? LIMIT 1", (int(user_id),))
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
+
+    if not is_admin and is_account_owner(target):
+        raise HTTPException(status_code=403, detail="Cannot modify the account owner")
 
     if not is_admin and _flag_to_bool(target["is_admin"]):
         admin_count_row = _db_query_one("SELECT COUNT(*) AS c FROM users WHERE is_admin = ?", (_bool_db_value(True),))
@@ -52,9 +55,15 @@ def set_user_admin(actor_user_id: int, user_id: int, is_admin: bool) -> Dict[str
 
 
 def set_user_suspended(actor_user_id: int, user_id: int, is_suspended: bool) -> Dict[str, Any]:
-    target = _db_query_one("SELECT id, ghost_mode, is_disabled, is_suspended FROM users WHERE id=? LIMIT 1", (int(user_id),))
+    target = _db_query_one(
+        "SELECT id, email, ghost_mode, is_disabled, is_suspended FROM users WHERE id=? LIMIT 1",
+        (int(user_id),),
+    )
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
+
+    if bool(is_suspended) and is_account_owner(target):
+        raise HTTPException(status_code=403, detail="Cannot modify the account owner")
 
     if int(actor_user_id) == int(user_id) and bool(is_suspended):
         raise HTTPException(status_code=400, detail="Admins cannot suspend themselves")

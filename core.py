@@ -38,6 +38,30 @@ ENFORCE_TRIAL = str(os.environ.get("ENFORCE_TRIAL", "0")).strip().lower() in ("1
 POSTGRES_POOL_MIN = max(1, int(os.environ.get("POSTGRES_POOL_MIN", "2")))
 POSTGRES_POOL_MAX = max(POSTGRES_POOL_MIN, int(os.environ.get("POSTGRES_POOL_MAX", "24")))
 LIVE_TOKEN_TTL_SECONDS = min(90, max(30, int(os.environ.get("LIVE_TOKEN_TTL_SECONDS", "60"))))
+# Owner identity. Matches the signup-flow ADMIN_EMAIL bootstrap logic in main.py.
+# Duplicated read is intentional: admin_mutation_service imports from core, not main,
+# and core cannot import from main without a circular import.
+ADMIN_EMAIL = (os.environ.get("ADMIN_EMAIL") or "").strip().lower()
+
+
+def is_account_owner(user_row) -> bool:
+    """Return True if user_row represents the account owner (email matches ADMIN_EMAIL).
+
+    Case-insensitive, whitespace-trimmed comparison. Returns False if ADMIN_EMAIL is
+    not set or if user_row has no email attribute/key.
+    """
+    if not ADMIN_EMAIL:
+        return False
+    try:
+        email = user_row["email"] if "email" in user_row.keys() else None
+    except Exception:
+        return False
+    if not email:
+        return False
+    try:
+        return str(email).strip().lower() == ADMIN_EMAIL
+    except Exception:
+        return False
 
 
 class _DynamicDBLock:
