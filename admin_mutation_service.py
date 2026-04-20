@@ -103,7 +103,14 @@ def set_user_suspended(actor_user_id: int, user_id: int, is_suspended: bool) -> 
 def get_admin_user_detail(user_id: int) -> Dict[str, Any]:
     user = _db_query_one(
         """
-        SELECT id, email, display_name, is_admin, is_disabled, is_suspended, ghost_mode, avatar_url, created_at
+        SELECT id, email, display_name, is_admin, is_disabled, is_suspended, ghost_mode, avatar_url, created_at,
+               trial_expires_at,
+               subscription_status, subscription_provider,
+               subscription_customer_id, subscription_id,
+               subscription_current_period_end,
+               subscription_comp_reason, subscription_comp_granted_by, subscription_comp_granted_at,
+               subscription_comp_expires_at,
+               subscription_updated_at
         FROM users
         WHERE id=?
         LIMIT 1
@@ -164,6 +171,17 @@ def get_admin_user_detail(user_id: int) -> Dict[str, Any]:
         "ghost_mode": _flag_to_bool(user.get("ghost_mode")),
         "avatar_url": user.get("avatar_url"),
         "created_at": _to_iso(user.get("created_at")),
+        "trial_expires_at": user.get("trial_expires_at"),
+        "subscription_status": user.get("subscription_status"),
+        "subscription_provider": user.get("subscription_provider"),
+        "subscription_customer_id": user.get("subscription_customer_id"),
+        "subscription_id": user.get("subscription_id"),
+        "subscription_current_period_end": user.get("subscription_current_period_end"),
+        "subscription_comp_reason": user.get("subscription_comp_reason"),
+        "subscription_comp_granted_by": user.get("subscription_comp_granted_by"),
+        "subscription_comp_granted_at": user.get("subscription_comp_granted_at"),
+        "subscription_comp_expires_at": user.get("subscription_comp_expires_at"),
+        "subscription_updated_at": user.get("subscription_updated_at"),
         "presence": presence_payload,
         "pickup_count": int(active_pickup_count_row["c"]) if active_pickup_count_row else 0,
         "voided_pickup_count": int(voided_pickup_count_row["c"]) if voided_pickup_count_row else 0,
