@@ -95,7 +95,7 @@ def _make_citywide_shadow_duckdb(tmp_path: Path) -> tuple[duckdb.DuckDBPyConnect
     con.execute(
         "CREATE TEMP TABLE zone_metadata (PULocationID INTEGER, zone_name VARCHAR, borough_name VARCHAR, airport_excluded BOOLEAN)"
     )
-    metadata_rows = (
+    metadata_rows = [
         (101, "Manhattan Core Zone", "Manhattan", False),
         (102, "Manhattan Support Zone", "Manhattan", False),
         (201, "Queens Saturated Zone", "Queens", False),
@@ -104,7 +104,7 @@ def _make_citywide_shadow_duckdb(tmp_path: Path) -> tuple[duckdb.DuckDBPyConnect
         (302, "Brooklyn Destination Zone", "Brooklyn", False),
         (401, "Bronx Sample Zone", "Bronx", False),
         (501, "Staten Sample Zone", "Staten Island", False),
-    )
+    ]
     con.executemany("INSERT INTO zone_metadata VALUES (?, ?, ?, ?)", metadata_rows)
 
     return con, parquet_path

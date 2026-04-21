@@ -210,6 +210,7 @@ def test_build_hotspots_frames_handles_city_island_popup_metrics(tmp_path: Path)
         out_dir=out_dir,
         bin_minutes=20,
         min_trips_per_window=1,
+        month_key="2025-01",
     )
 
     assert result["count"] >= 1
