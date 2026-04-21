@@ -45,7 +45,13 @@ def is_subscription_active(user_row) -> bool:
 
 
 def is_comp_active(user_row) -> bool:
-    """True if user has an active admin-granted comp (status='comp' and not expired)."""
+    """True if user has an active admin-granted comp (status='comp' and not expired).
+
+    A NULL or non-positive comp_expires_at is treated as a forever comp, matching
+    the server-side access check in core._enforce_access_or_admin. Keeping both
+    in sync prevents the /me payload from reporting has_access=false while the
+    server is still granting access.
+    """
     fields = get_subscription_fields(user_row)
     if fields["status"] != "comp":
         return False
@@ -53,15 +59,26 @@ def is_comp_active(user_row) -> bool:
     if comp_expires is None:
         return True
     try:
-        return int(time.time()) < int(comp_expires)
+        comp_expires_int = int(comp_expires)
     except Exception:
         return False
+    if comp_expires_int <= 0:
+        return True
+    return int(time.time()) < comp_expires_int
 
 
 def is_comp_forever(user_row) -> bool:
-    """True if user has comp with no expiration."""
+    """True if user has comp with no expiration (NULL or non-positive comp_expires_at)."""
     fields = get_subscription_fields(user_row)
-    return fields["status"] == "comp" and fields["comp_expires_at"] is None
+    if fields["status"] != "comp":
+        return False
+    comp_expires = fields["comp_expires_at"]
+    if comp_expires is None:
+        return True
+    try:
+        return int(comp_expires) <= 0
+    except Exception:
+        return False
 
 
 def is_trial_active(user_row) -> bool:
