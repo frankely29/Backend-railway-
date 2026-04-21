@@ -385,14 +385,15 @@ def _enforce_access_or_admin(user: sqlite3.Row) -> None:
     except Exception:
         trial_expires_at = None
 
-    if trial_expires_at is None or trial_expires_at <= 0:
-        trial_expires_at = now + max(1, TRIAL_DAYS) * 86400
-        try:
-            _db_exec("UPDATE users SET trial_expires_at=? WHERE id=?", (trial_expires_at, int(user["id"])))
-        except Exception:
-            return
-
-    if now < trial_expires_at:
+    # No silent auto-grant of a fresh trial here. auth_signup sets trial_expires_at
+    # at account creation, and the grandfather migration set it for existing users.
+    # A user with NULL/zero trial_expires_at at this point either:
+    #   - is a legacy account with no trial record and no comp/subscription → correctly 402
+    #   - had their comp/subscription lapse → correctly 402
+    # Previously this block auto-issued a fresh 7-day trial, which silently extended
+    # access for expired-comp and expired-subscription users. That is not the intended
+    # access ladder per the subscription plan.
+    if trial_expires_at is not None and trial_expires_at > 0 and now < trial_expires_at:
         return
 
     raise HTTPException(status_code=402, detail="Subscription required")
