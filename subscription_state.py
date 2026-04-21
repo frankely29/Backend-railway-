@@ -4,6 +4,8 @@ from __future__ import annotations
 import time
 from typing import Any, Dict, Optional
 
+from core import ENFORCE_TRIAL
+
 
 def get_subscription_fields(user_row) -> Dict[str, Any]:
     """Extract all subscription_* columns from a user row into a plain dict."""
@@ -74,7 +76,13 @@ def is_trial_active(user_row) -> bool:
 
 
 def has_access(user_row) -> bool:
-    """Master access check — mirrors _enforce_access_or_admin logic for use in responses."""
+    """Master access check — mirrors _enforce_access_or_admin logic for use in responses.
+
+    When ENFORCE_TRIAL is false, access is ungated for any authenticated user,
+    so this returns True unconditionally (matches _enforce_access_or_admin early-return).
+    """
+    if not ENFORCE_TRIAL:
+        return True
     try:
         if int(user_row["is_admin"]) == 1:
             return True

@@ -263,6 +263,15 @@ def _handle_transaction_completed(user_id: int, data: Dict[str, Any], occurred_a
     period_end_iso = _extract_period_end(data)
     period_end_unix = _iso_to_unix(period_end_iso) if period_end_iso else None
 
+    # Opportunistically capture customer_id / subscription_id from the transaction payload.
+    # Paddle includes these on transaction events. If subscription.created arrived first
+    # and already populated them, we use COALESCE to avoid overwriting with NULL when
+    # Paddle omits a field on a given event.
+    customer_id_raw = data.get("customer_id") or ""
+    subscription_id_raw = data.get("subscription_id") or ""
+    customer_id = str(customer_id_raw).strip() or None
+    subscription_id = str(subscription_id_raw).strip() or None
+
     outcome = "transaction_completed_no_period"
     if period_end_unix is not None:
         _db_exec(
@@ -270,12 +279,31 @@ def _handle_transaction_completed(user_id: int, data: Dict[str, Any], occurred_a
             UPDATE users SET
                 subscription_status=?,
                 subscription_current_period_end=?,
+                subscription_provider=COALESCE(subscription_provider, ?),
+                subscription_customer_id=COALESCE(subscription_customer_id, ?),
+                subscription_id=COALESCE(subscription_id, ?),
                 subscription_updated_at=?
             WHERE id=?
             """,
-            ("active", period_end_unix, occurred_at, user_id),
+            ("active", period_end_unix, "paddle", customer_id, subscription_id, occurred_at, user_id),
         )
         outcome = "transaction_completed_period_extended"
+    else:
+        # Even without a parseable period_end, capture customer/subscription IDs if
+        # present so /subscription/portal works for this user. Still mark updated_at.
+        if customer_id or subscription_id:
+            _db_exec(
+                """
+                UPDATE users SET
+                    subscription_provider=COALESCE(subscription_provider, ?),
+                    subscription_customer_id=COALESCE(subscription_customer_id, ?),
+                    subscription_id=COALESCE(subscription_id, ?),
+                    subscription_updated_at=?
+                WHERE id=?
+                """,
+                ("paddle", customer_id, subscription_id, occurred_at, user_id),
+            )
+            outcome = "transaction_completed_ids_captured_no_period"
 
     # STAGE 4B-B3: send first-paid welcome email only on first processed paid event.
     try:
