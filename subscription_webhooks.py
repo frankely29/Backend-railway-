@@ -210,9 +210,53 @@ def _handle_subscription_activated(user_id: int, data: Dict[str, Any], occurred_
     return "marked_active_from_activated"
 
 
+def _paddle_status_to_internal(paddle_status: str) -> Optional[str]:
+    """Map Paddle's subscription.status to our internal subscription_status value.
+
+    Returns None if the Paddle status is absent or unrecognized so the caller
+    can leave subscription_status untouched instead of clobbering it.
+    """
+    mapping = {
+        "active": "active",
+        "trialing": "active",
+        "past_due": "past_due",
+        "paused": "paused",
+        "canceled": "cancelled",
+        "cancelled": "cancelled",
+    }
+    key = (paddle_status or "").strip().lower()
+    return mapping.get(key)
+
+
 def _handle_subscription_updated(user_id: int, data: Dict[str, Any], occurred_at: int) -> str:
     period_end_iso = _extract_period_end(data)
     period_end_unix = _iso_to_unix(period_end_iso) if period_end_iso else None
+    new_status = _paddle_status_to_internal(str(data.get("status") or ""))
+
+    if new_status is not None and period_end_unix is not None:
+        _db_exec(
+            """
+            UPDATE users SET
+                subscription_status=?,
+                subscription_current_period_end=?,
+                subscription_updated_at=?
+            WHERE id=?
+            """,
+            (new_status, period_end_unix, occurred_at, user_id),
+        )
+        return f"updated_status_and_period:{new_status}"
+
+    if new_status is not None:
+        _db_exec(
+            """
+            UPDATE users SET
+                subscription_status=?,
+                subscription_updated_at=?
+            WHERE id=?
+            """,
+            (new_status, occurred_at, user_id),
+        )
+        return f"updated_status:{new_status}"
 
     if period_end_unix is not None:
         _db_exec(
