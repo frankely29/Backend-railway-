@@ -87,6 +87,93 @@ def _iso_to_unix(iso_str: str) -> Optional[int]:
         return None
 
 
+def _normalize_email(email: Any) -> str:
+    if email is None:
+        return ""
+    return str(email).strip().lower()
+
+
+def _lookup_user_id_by_subscription_id(subscription_id: Any) -> Optional[int]:
+    subscription_id_text = str(subscription_id or "").strip()
+    if not subscription_id_text:
+        return None
+    row = _db_query_one(
+        "SELECT id FROM users WHERE subscription_id=? ORDER BY id ASC LIMIT 1",
+        (subscription_id_text,),
+    )
+    if not row:
+        return None
+    return int(row["id"])
+
+
+def _lookup_user_id_by_customer_id(customer_id: Any) -> Optional[int]:
+    customer_id_text = str(customer_id or "").strip()
+    if not customer_id_text:
+        return None
+    row = _db_query_one(
+        "SELECT id FROM users WHERE subscription_customer_id=? ORDER BY id ASC LIMIT 1",
+        (customer_id_text,),
+    )
+    if not row:
+        return None
+    return int(row["id"])
+
+
+def _lookup_user_id_by_email(email: Any) -> Optional[int]:
+    normalized = _normalize_email(email)
+    if not normalized:
+        return None
+    row = _db_query_one(
+        "SELECT id FROM users WHERE lower(trim(email))=? ORDER BY id ASC LIMIT 1",
+        (normalized,),
+    )
+    if not row:
+        return None
+    return int(row["id"])
+
+
+def _resolve_event_user_id(event: Dict[str, Any], data: Dict[str, Any]) -> tuple[Optional[int], str]:
+    custom_data = data.get("custom_data", {}) or {}
+
+    user_id_raw = custom_data.get("user_id")
+    try:
+        user_id = int(user_id_raw) if user_id_raw is not None else None
+    except (ValueError, TypeError):
+        user_id = None
+    if user_id is not None:
+        return user_id, "custom_data.user_id"
+
+    event_type = str(event.get("event_type") or "").strip().lower()
+    subscription_id = str(data.get("subscription_id") or "").strip()
+    if not subscription_id and event_type.startswith("subscription."):
+        subscription_id = str(data.get("id") or "").strip()
+    if subscription_id:
+        resolved = _lookup_user_id_by_subscription_id(subscription_id)
+        if resolved is not None:
+            return resolved, "subscription_id"
+
+    customer_id = str(data.get("customer_id") or "").strip()
+    if customer_id:
+        resolved = _lookup_user_id_by_customer_id(customer_id)
+        if resolved is not None:
+            return resolved, "customer_id"
+
+    customer = data.get("customer") if isinstance(data.get("customer"), dict) else {}
+    email_candidates = [
+        customer.get("email"),
+        data.get("email"),
+        data.get("customer_email"),
+        data.get("user_email"),
+        event.get("email"),
+    ]
+    for email in email_candidates:
+        resolved = _lookup_user_id_by_email(email)
+        if resolved is not None:
+            return resolved, "email"
+
+    return None, "no_user_mapping_found"
+
+
 def process_paddle_event_by_id(event_id: str) -> None:
     """Process one webhook by event_id."""
     try:
@@ -114,17 +201,10 @@ def process_paddle_event_by_id(event_id: str) -> None:
             return
 
         data = event.get("data", {}) or {}
-        custom_data = data.get("custom_data", {}) or {}
-
-        user_id_raw = custom_data.get("user_id")
-        try:
-            user_id = int(user_id_raw) if user_id_raw is not None else None
-        except (ValueError, TypeError):
-            user_id = None
-
+        user_id, resolution_source = _resolve_event_user_id(event, data)
         if user_id is None:
-            _mark_processed(event_id, user_id=None, outcome="no_user_id_in_custom_data")
-            logger.warning("Paddle event has no user_id in custom_data: %s", event_id)
+            _mark_processed(event_id, user_id=None, outcome="no_user_mapping_found")
+            logger.warning("Paddle event user mapping failed (%s): %s", resolution_source, event_id)
             return
 
         user_row = _db_query_one(
@@ -285,27 +365,33 @@ def _handle_subscription_updated(user_id: int, data: Dict[str, Any], occurred_at
 
 
 def _handle_subscription_canceled(user_id: int, data: Dict[str, Any], occurred_at: int) -> str:
+    period_end_iso = _extract_period_end(data)
+    period_end_unix = _iso_to_unix(period_end_iso) if period_end_iso else None
     _db_exec(
         """
         UPDATE users SET
             subscription_status=?,
+            subscription_current_period_end=COALESCE(?, subscription_current_period_end),
             subscription_updated_at=?
         WHERE id=?
         """,
-        ("cancelled", occurred_at, user_id),
+        ("cancelled", period_end_unix, occurred_at, user_id),
     )
     return "marked_cancelled"
 
 
 def _handle_subscription_past_due(user_id: int, data: Dict[str, Any], occurred_at: int) -> str:
+    period_end_iso = _extract_period_end(data)
+    period_end_unix = _iso_to_unix(period_end_iso) if period_end_iso else None
     _db_exec(
         """
         UPDATE users SET
             subscription_status=?,
+            subscription_current_period_end=COALESCE(?, subscription_current_period_end),
             subscription_updated_at=?
         WHERE id=?
         """,
-        ("past_due", occurred_at, user_id),
+        ("past_due", period_end_unix, occurred_at, user_id),
     )
     return "marked_past_due"
 

@@ -354,6 +354,30 @@ def _enforce_access_or_admin(user: sqlite3.Row) -> None:
 
     now = int(time.time())
 
+    def _normalize_subscription_status(raw_status: Any) -> str:
+        if raw_status is None:
+            return ""
+        return str(raw_status).strip().lower()
+
+    def _status_allows_paid_window_access(raw_status: Any) -> bool:
+        return _normalize_subscription_status(raw_status) in {"active", "cancelled", "canceled", "past_due"}
+
+    def _has_paid_window_access(row: sqlite3.Row, now_unix: int) -> bool:
+        try:
+            raw_status = row["subscription_status"] if "subscription_status" in row.keys() else None
+        except Exception:
+            raw_status = None
+        if not _status_allows_paid_window_access(raw_status):
+            return False
+        try:
+            period_end = row["subscription_current_period_end"] if "subscription_current_period_end" in row.keys() else None
+            period_end_int = int(period_end) if period_end is not None else None
+        except Exception:
+            period_end_int = None
+        if period_end_int is None:
+            return False
+        return now_unix < period_end_int
+
     try:
         sub_status = user["subscription_status"] if "subscription_status" in user.keys() else None
     except Exception:
@@ -370,14 +394,8 @@ def _enforce_access_or_admin(user: sqlite3.Row) -> None:
         if now < comp_expires_int:
             return
 
-    if sub_status == "active":
-        try:
-            period_end = user["subscription_current_period_end"] if "subscription_current_period_end" in user.keys() else None
-            period_end_int = int(period_end) if period_end is not None else None
-        except Exception:
-            period_end_int = None
-        if period_end_int and now < period_end_int:
-            return
+    if _has_paid_window_access(user, now):
+        return
 
     trial_expires_at_raw = user["trial_expires_at"] if "trial_expires_at" in user.keys() else None
     try:
