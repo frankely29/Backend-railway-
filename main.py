@@ -5698,6 +5698,7 @@ def _run_grandfather_migration_once() -> None:
             _db_exec(
                 """
                 UPDATE users SET
+                    subscription_status=?,
                     subscription_comp_expires_at=?,
                     subscription_comp_reason=?,
                     subscription_comp_granted_at=?,
@@ -5706,6 +5707,7 @@ def _run_grandfather_migration_once() -> None:
                 WHERE id=? AND subscription_status IS NULL
                 """,
                 (
+                    "comp",
                     comp_expires_ts,
                     "grandfathered: existing user before subscription launch",
                     now_ts,
@@ -5730,6 +5732,35 @@ def _run_grandfather_migration_once() -> None:
     print(
         f"Grandfather migration completed: success={success_count}, failed={fail_count}, total={len(rows)}"
     )
+
+
+def _repair_grandfather_comp_status_rows() -> None:
+    """Repair legacy comp rows that were granted comp metadata but left without status='comp'."""
+    now_ts = int(time.time())
+    try:
+        _db_exec(
+            """
+            UPDATE users
+            SET
+                subscription_status=?,
+                subscription_updated_at=COALESCE(subscription_updated_at, ?)
+            WHERE
+                (
+                    subscription_status IS NULL
+                    OR trim(subscription_status)=''
+                )
+                AND (
+                    subscription_comp_expires_at IS NOT NULL
+                    OR subscription_comp_reason IS NOT NULL
+                    OR subscription_comp_granted_at IS NOT NULL
+                    OR subscription_comp_granted_by IS NOT NULL
+                )
+            """,
+            ("comp", now_ts),
+        )
+    except Exception:
+        print("[warn] grandfather comp-status repair failed")
+        traceback.print_exc()
 
 
 # =========================================================
@@ -6061,6 +6092,11 @@ def startup():
         _run_grandfather_migration_once()
     except Exception:
         print("[warn] grandfather migration crashed (non-fatal, continuing startup)")
+        traceback.print_exc()
+    try:
+        _repair_grandfather_comp_status_rows()
+    except Exception:
+        print("[warn] grandfather comp-status repair crashed (non-fatal, continuing startup)")
         traceback.print_exc()
     ensure_generated_artifact_store_schema()
     _prune_redundant_db_backed_artifact_files()
