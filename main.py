@@ -4747,6 +4747,7 @@ def _db_init() -> None:
         _ensure_column("users", "subscription_comp_granted_at", "INTEGER")
         _ensure_column("users", "subscription_comp_expires_at", "INTEGER")
         _ensure_column("users", "subscription_updated_at", "INTEGER")
+        _ensure_column("users", "first_paid_welcome_sent_at", "INTEGER")
 
         _db_exec(
             """
@@ -5241,6 +5242,7 @@ def _db_init() -> None:
     _ensure_column("users", "subscription_comp_granted_at", "INTEGER")
     _ensure_column("users", "subscription_comp_expires_at", "INTEGER")
     _ensure_column("users", "subscription_updated_at", "INTEGER")
+    _ensure_column("users", "first_paid_welcome_sent_at", "INTEGER")
 
     _db_exec(
         """
