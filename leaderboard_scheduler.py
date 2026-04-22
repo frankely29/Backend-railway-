@@ -7,6 +7,7 @@ from typing import Optional
 from leaderboard_mailer import render_report_email, report_emails_enabled, send_report_email
 from leaderboard_models import LeaderboardMetric
 from leaderboard_service import (
+    _badge_for_rank,
     all_users_with_email,
     get_email_prefs,
     get_period_summary_for_user,
@@ -22,13 +23,9 @@ _stop_evt = threading.Event()
 
 def _badge_from_ranks(miles_rank: int | None, hours_rank: int | None) -> str | None:
     best = min([r for r in [miles_rank, hours_rank] if r is not None], default=None)
-    if best == 1:
-        return "RUBY"
-    if best == 2:
-        return "GOLD"
-    if best == 3:
-        return "SILVER"
-    return None
+    if best is None:
+        return None
+    return _badge_for_rank(int(best))
 
 
 def run_report_cycle() -> None:

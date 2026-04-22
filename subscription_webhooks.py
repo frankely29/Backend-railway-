@@ -9,7 +9,7 @@ from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 
-from core import _db_exec, _db_query_all, _db_query_one
+from core import _db_exec, _db_query_all, _db_query_one, _db_run_in_transaction, _sql
 from paddle_client import verify_webhook_signature
 
 logger = logging.getLogger(__name__)
@@ -349,15 +349,12 @@ def _handle_transaction_completed(user_id: int, data: Dict[str, Any], occurred_a
             )
             outcome = "transaction_completed_ids_captured_no_period"
 
-    # STAGE 4B-B3: send first-paid welcome email only on first processed paid event.
+    # STAGE 4B-B3: send first-paid welcome email only once per user.
+    # Atomically claim the slot by flipping first_paid_welcome_sent_at from NULL.
+    # Only the caller that wins the UPDATE (rowcount==1) sends the email, which
+    # prevents duplicates across webhook retries and concurrent processing.
     try:
-        prior_paid_row = _db_query_one(
-            "SELECT COUNT(*) AS c FROM paddle_webhook_events "
-            "WHERE user_id=? AND event_type='transaction.completed' AND processed_at IS NOT NULL",
-            (user_id,),
-        )
-        prior_paid_count = int(prior_paid_row["c"]) if prior_paid_row else 0
-        if prior_paid_count == 0:
+        if _claim_first_paid_welcome(user_id, occurred_at):
             user_row = _db_query_one("SELECT email, display_name FROM users WHERE id=?", (user_id,))
             if user_row:
                 try:
@@ -373,6 +370,31 @@ def _handle_transaction_completed(user_id: int, data: Dict[str, Any], occurred_a
         logger.warning("First-paid welcome email failed for user_id=%s: %s", user_id, exc)
 
     return outcome
+
+
+def _claim_first_paid_welcome(user_id: int, occurred_at: int) -> bool:
+    """Atomically mark the user as having received the first-paid welcome email.
+
+    Returns True iff this caller is the one that flipped the column from NULL
+    (i.e. it's responsible for sending the email). Returns False if another
+    processing pass already claimed it, or if the claim could not be made.
+    """
+
+    def _run(conn, cur):
+        cur.execute(
+            _sql(
+                "UPDATE users SET first_paid_welcome_sent_at=? "
+                "WHERE id=? AND first_paid_welcome_sent_at IS NULL"
+            ),
+            (occurred_at, user_id),
+        )
+        return int(cur.rowcount or 0)
+
+    try:
+        return _db_run_in_transaction(_run) == 1
+    except Exception as exc:
+        logger.warning("first_paid_welcome claim failed for user_id=%s: %s", user_id, exc)
+        return False
 
 
 def _handle_transaction_payment_failed(user_id: int, data: Dict[str, Any], occurred_at: int) -> str:
