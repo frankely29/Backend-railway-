@@ -137,7 +137,10 @@ def verify_webhook_signature(raw_body: bytes, signature_header: str) -> bool:
 
         try:
             ts_int = int(ts)
-            if abs(int(time.time()) - ts_int) > 300:
+            # Tight skew window (60s) limits the replay attempt surface if a
+            # signed payload is ever captured. Real duplicates are caught by
+            # event_id dedupe in subscription_webhooks.paddle_webhook.
+            if abs(int(time.time()) - ts_int) > 60:
                 logger.warning("Paddle webhook timestamp too old or too new: %s", ts)
                 return False
         except ValueError:

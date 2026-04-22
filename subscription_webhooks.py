@@ -177,6 +177,10 @@ def _handle_subscription_created(user_id: int, data: Dict[str, Any], occurred_at
     period_end_iso = _extract_period_end(data)
     period_end_unix = _iso_to_unix(period_end_iso) if period_end_iso else None
 
+    # Only overwrite subscription_current_period_end if Paddle actually gave us
+    # a period end. Otherwise COALESCE preserves whatever a prior event set, so
+    # we don't flip a paying user to inactive (is_subscription_active treats
+    # NULL period_end as not-active).
     _db_exec(
         """
         UPDATE users SET
@@ -184,7 +188,7 @@ def _handle_subscription_created(user_id: int, data: Dict[str, Any], occurred_at
             subscription_provider=?,
             subscription_customer_id=?,
             subscription_id=?,
-            subscription_current_period_end=?,
+            subscription_current_period_end=COALESCE(?, subscription_current_period_end),
             subscription_updated_at=?
         WHERE id=?
         """,
@@ -197,11 +201,14 @@ def _handle_subscription_activated(user_id: int, data: Dict[str, Any], occurred_
     period_end_iso = _extract_period_end(data)
     period_end_unix = _iso_to_unix(period_end_iso) if period_end_iso else None
 
+    # See _handle_subscription_created: preserve existing period_end if Paddle
+    # did not supply one, so we don't accidentally flip an active user to
+    # inactive when the payload omits current_billing_period/next_billed_at.
     _db_exec(
         """
         UPDATE users SET
             subscription_status=?,
-            subscription_current_period_end=?,
+            subscription_current_period_end=COALESCE(?, subscription_current_period_end),
             subscription_updated_at=?
         WHERE id=?
         """,
@@ -353,10 +360,16 @@ def _handle_transaction_completed(user_id: int, data: Dict[str, Any], occurred_a
     # Atomically claim the slot by flipping first_paid_welcome_sent_at from NULL.
     # Only the caller that wins the UPDATE (rowcount==1) sends the email, which
     # prevents duplicates across webhook retries and concurrent processing.
+    #
+    # If the send fails we release the claim so that the next qualifying event
+    # for this user can try again; otherwise a transient email outage would
+    # permanently consume the single chance to send this email.
     try:
         if _claim_first_paid_welcome(user_id, occurred_at):
             user_row = _db_query_one("SELECT email, display_name FROM users WHERE id=?", (user_id,))
-            if user_row:
+            if not user_row:
+                _release_first_paid_welcome_claim(user_id, occurred_at)
+            else:
                 try:
                     from email_service import send_first_paid_welcome
 
@@ -366,6 +379,14 @@ def _handle_transaction_completed(user_id: int, data: Dict[str, Any], occurred_a
                     )
                 except ImportError:
                     logger.warning("email_service.send_first_paid_welcome not available; skipping")
+                    _release_first_paid_welcome_claim(user_id, occurred_at)
+                except Exception as send_exc:
+                    _release_first_paid_welcome_claim(user_id, occurred_at)
+                    logger.warning(
+                        "First-paid welcome email send failed for user_id=%s, released claim: %s",
+                        user_id,
+                        send_exc,
+                    )
     except Exception as exc:
         logger.warning("First-paid welcome email failed for user_id=%s: %s", user_id, exc)
 
@@ -397,6 +418,29 @@ def _claim_first_paid_welcome(user_id: int, occurred_at: int) -> bool:
         return False
 
 
+def _release_first_paid_welcome_claim(user_id: int, claim_occurred_at: int) -> None:
+    """Reverse a prior _claim_first_paid_welcome when the send didn't happen.
+
+    Only clears the flag when it still equals our claim timestamp, so we don't
+    clobber a later successful claim+send by another processing pass.
+    """
+
+    def _run(conn, cur):
+        cur.execute(
+            _sql(
+                "UPDATE users SET first_paid_welcome_sent_at=NULL "
+                "WHERE id=? AND first_paid_welcome_sent_at=?"
+            ),
+            (user_id, claim_occurred_at),
+        )
+        return int(cur.rowcount or 0)
+
+    try:
+        _db_run_in_transaction(_run)
+    except Exception as exc:
+        logger.warning("first_paid_welcome release failed for user_id=%s: %s", user_id, exc)
+
+
 def _handle_transaction_payment_failed(user_id: int, data: Dict[str, Any], occurred_at: int) -> str:
     _db_exec(
         """
@@ -407,7 +451,10 @@ def _handle_transaction_payment_failed(user_id: int, data: Dict[str, Any], occur
         """,
         ("past_due", occurred_at, user_id),
     )
-    # STAGE 4B-B3: send payment-failed email.
+    # STAGE 4B-B3: send payment-failed email. We've already flipped the user
+    # to past_due above, so a silently-dropped email leaves the user unaware
+    # they need to update their card. Log at error level (not warning) so the
+    # failure is visible to on-call; subsequent dunning webhooks will retry.
     try:
         user_row = _db_query_one("SELECT email, display_name FROM users WHERE id=?", (user_id,))
         if user_row:
@@ -417,8 +464,14 @@ def _handle_transaction_payment_failed(user_id: int, data: Dict[str, Any], occur
                 send_payment_failed(user_row)
             except ImportError:
                 logger.warning("email_service.send_payment_failed not available; skipping")
+            except Exception as send_exc:
+                logger.error(
+                    "Payment-failed email send failed for user_id=%s; user already marked past_due: %s",
+                    user_id,
+                    send_exc,
+                )
     except Exception as exc:
-        logger.warning("Payment-failed email failed for user_id=%s: %s", user_id, exc)
+        logger.error("Payment-failed email flow failed for user_id=%s: %s", user_id, exc)
 
     return "marked_past_due_from_payment_failed"
 
