@@ -43,6 +43,9 @@ def set_user_admin(actor_user_id: int, user_id: int, is_admin: bool) -> Dict[str
     if not is_admin and is_account_owner(target):
         raise HTTPException(status_code=403, detail="Cannot modify the account owner")
 
+    if int(actor_user_id) == int(user_id) and not is_admin:
+        raise HTTPException(status_code=400, detail="Admins cannot demote themselves")
+
     if not is_admin and _flag_to_bool(target["is_admin"]):
         admin_count_row = _db_query_one("SELECT COUNT(*) AS c FROM users WHERE is_admin = ?", (_bool_db_value(True),))
         admin_count = int(admin_count_row["c"]) if admin_count_row else 0
