@@ -7063,7 +7063,9 @@ def generate_get(
     build_all_months: int = 0,
     include_day_tendency: int = 0,
     build_review_artifacts: int = 0,
+    admin: sqlite3.Row = Depends(require_admin),
 ):
+    _ = admin
     return start_generate(
         bin_minutes,
         min_trips_per_window,
@@ -8400,6 +8402,9 @@ def me_update(payload: MeUpdatePayload, user: sqlite3.Row = Depends(require_user
 
 @app.post("/me/change_password")
 async def change_password(payload: ChangePasswordPayload, user: dict = Depends(require_user)):
+    # Enforce the same minimum length signup and admin password-reset use.
+    if not payload.new_password or len(payload.new_password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 chars")
     # Look up current salt and hash for this user
     row = _db_query_one("SELECT pass_salt, pass_hash FROM users WHERE id=?", (user["id"],))
     if not row:

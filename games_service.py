@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import HTTPException
 
-from core import DB_BACKEND, _db_exec, _db_query_all, _db_query_one
+from core import DB_BACKEND, _db_exec, _db_query_all, _db_query_one, _db_run_in_transaction, _sql
 from core import _user_block_state
 from avatar_assets import avatar_thumb_url, avatar_version_for_data_url
 from leaderboard_service import get_best_current_badges_for_users, get_level_from_lifetime_xp, get_progression_for_user, get_progression_for_users
@@ -763,7 +763,7 @@ def accept_challenge(challenge_id: int, acting_user_id: int) -> Dict[str, Any]:
         raise HTTPException(status_code=409, detail="Challenge is not pending")
     now = int(time.time())
     if challenge.get("expires_at") is not None and int(challenge["expires_at"]) < now:
-        _db_exec("UPDATE game_challenges SET status='expired', updated_at=?, responded_at=? WHERE id=?", (now, now, int(challenge_id)))
+        _db_exec("UPDATE game_challenges SET status='expired', updated_at=?, responded_at=? WHERE id=? AND status='pending'", (now, now, int(challenge_id)))
         raise HTTPException(status_code=409, detail="Challenge expired")
 
     pair_conflict = _db_query_one(
@@ -778,6 +778,31 @@ def accept_challenge(challenge_id: int, acting_user_id: int) -> Dict[str, Any]:
     )
     if pair_conflict:
         raise HTTPException(status_code=409, detail="Active match conflict")
+
+    # Atomically claim the challenge by flipping pending -> accepted. Only the
+    # caller whose UPDATE affects exactly one row is allowed to create the
+    # match; any concurrent accept sees rowcount==0 and either returns the
+    # winner's match (once accepted_match_id is set) or gets a 409.
+    def _claim(conn, cur):
+        cur.execute(
+            _sql(
+                "UPDATE game_challenges SET status='accepted', updated_at=?, responded_at=? "
+                "WHERE id=? AND status='pending'"
+            ),
+            (now, now, int(challenge_id)),
+        )
+        return int(cur.rowcount or 0)
+    try:
+        claimed = _db_run_in_transaction(_claim)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="accept failed") from exc
+    if claimed != 1:
+        row2 = _db_query_one("SELECT status, accepted_match_id FROM game_challenges WHERE id=? LIMIT 1", (int(challenge_id),))
+        if row2:
+            r2 = dict(row2)
+            if r2.get("status") == "accepted" and r2.get("accepted_match_id"):
+                return get_match_bundle(int(r2["accepted_match_id"]), int(acting_user_id))
+        raise HTTPException(status_code=409, detail="Challenge is not pending")
 
     player_one = int(challenge["challenger_user_id"])
     player_two = int(challenge["challenged_user_id"])
@@ -810,7 +835,7 @@ def accept_challenge(challenge_id: int, acting_user_id: int) -> Dict[str, Any]:
     match_row = _db_query_one("SELECT * FROM game_matches WHERE challenge_id=? ORDER BY id DESC LIMIT 1", (int(challenge_id),))
     assert match_row
     match_id = int(match_row["id"])
-    _db_exec("UPDATE game_challenges SET status='accepted', updated_at=?, responded_at=?, accepted_match_id=? WHERE id=?", (now, now, match_id, int(challenge_id)))
+    _db_exec("UPDATE game_challenges SET accepted_match_id=? WHERE id=?", (match_id, int(challenge_id)))
     _db_exec(
         "INSERT INTO game_match_participants(match_id, user_id, team_no, seat_role, result, xp_awarded, joined_at) VALUES(?,?,?,?,?,?,?)",
         (match_id, player_one, 1, "solo", "pending", 0, now),
