@@ -5,7 +5,7 @@ from typing import Any, Dict, Optional
 
 from fastapi import HTTPException
 
-from core import DB_BACKEND, _db_exec, _db_query_all, _db_query_one, is_account_owner
+from core import DB_BACKEND, _db_exec, _db_query_all, _db_query_one, _db_run_in_transaction, _sql, is_account_owner
 from pickup_recording_feature import pickup_log_not_voided_sql, soft_void_pickup_trip
 from subscription_state import days_until_comp_ends, is_comp_forever
 
@@ -222,6 +222,12 @@ def _duration_to_seconds(unit: str, value: int) -> Optional[int]:
     if unit == "forever":
         return None
     multipliers = {"hours": 3600, "days": 86400, "weeks": 604800}
+    if unit not in multipliers:
+        # The Pydantic models (CompGrantRequest, CompExtendRequest) restrict
+        # duration_unit to a Literal set, so this path is unreachable via the
+        # public API today. Guard it anyway so a direct internal caller (test
+        # helper, future refactor) gets a 400 instead of a KeyError crash.
+        raise HTTPException(status_code=400, detail=f"Invalid duration unit: {unit}")
     return int(value) * multipliers[unit]
 
 
@@ -264,54 +270,69 @@ def grant_comp(actor_user_id: int, user_id: int, duration_unit: str, duration_va
 
 
 def extend_comp(actor_user_id: int, user_id: int, duration_unit: str, duration_value: int) -> Dict[str, Any]:
-    target = _db_query_one(
-        "SELECT id, subscription_status, subscription_comp_expires_at, subscription_comp_reason FROM users WHERE id=? LIMIT 1",
-        (int(user_id),),
-    )
-    if not target:
-        raise HTTPException(status_code=404, detail="User not found")
-
     now = int(time.time())
     seconds = _duration_to_seconds(duration_unit, int(duration_value))
     if seconds is None:
         raise HTTPException(status_code=400, detail="Cannot extend with 'forever' unit; use grant instead")
 
-    current_status = target["subscription_status"]
-    current_expires_raw = target["subscription_comp_expires_at"]
+    # Perform the read, decision, and write atomically inside a transaction.
+    # Without this, two concurrent extend_comp calls (or one extend racing
+    # with a revoke) could each read the same comp_expires_at and both add
+    # their `seconds`, losing one admin's extension. The transaction
+    # serializes via the shared _db_lock on SQLite and via connection-level
+    # isolation on Postgres.
+    def _extend(conn, cur) -> Dict[str, Any]:
+        cur.execute(
+            _sql(
+                "SELECT id, subscription_status, subscription_comp_expires_at, subscription_comp_reason "
+                "FROM users WHERE id=? LIMIT 1"
+            ),
+            (int(user_id),),
+        )
+        target = cur.fetchone()
+        if not target:
+            raise HTTPException(status_code=404, detail="User not found")
 
-    try:
-        current_expires = int(current_expires_raw) if current_expires_raw is not None else None
-    except Exception:
-        current_expires = None
+        current_status = target["subscription_status"]
+        current_expires_raw = target["subscription_comp_expires_at"]
+        try:
+            current_expires = int(current_expires_raw) if current_expires_raw is not None else None
+        except Exception:
+            current_expires = None
 
-    if current_status == "comp" and current_expires is not None and current_expires > now:
-        new_expires = current_expires + seconds
-    else:
-        new_expires = now + seconds
+        if current_status == "comp" and current_expires is not None and current_expires > now:
+            new_expires = current_expires + seconds
+        else:
+            new_expires = now + seconds
 
-    reason = target["subscription_comp_reason"] or "Extended"
+        reason = target["subscription_comp_reason"] or "Extended"
 
-    _db_exec(
-        """
-        UPDATE users SET
-            subscription_status=?,
-            subscription_comp_reason=?,
-            subscription_comp_granted_by=?,
-            subscription_comp_granted_at=?,
-            subscription_comp_expires_at=?,
-            subscription_updated_at=?
-        WHERE id=?
-        """,
-        ("comp", reason, int(actor_user_id), now, new_expires, now, int(user_id)),
-    )
+        cur.execute(
+            _sql(
+                """
+                UPDATE users SET
+                    subscription_status=?,
+                    subscription_comp_reason=?,
+                    subscription_comp_granted_by=?,
+                    subscription_comp_granted_at=?,
+                    subscription_comp_expires_at=?,
+                    subscription_updated_at=?
+                WHERE id=?
+                """
+            ),
+            ("comp", reason, int(actor_user_id), now, new_expires, now, int(user_id)),
+        )
+        return {"new_expires": new_expires, "reason": reason}
+
+    outcome = _db_run_in_transaction(_extend)
 
     updated = _db_query_one("SELECT * FROM users WHERE id=?", (int(user_id),))
     return {
         "ok": True,
         "user_id": int(user_id),
         "status": "comp",
-        "comp_expires_at": new_expires,
-        "comp_reason": reason,
+        "comp_expires_at": outcome["new_expires"],
+        "comp_reason": outcome["reason"],
         "is_comp_forever": False,
         "days_remaining": days_until_comp_ends(updated),
     }
