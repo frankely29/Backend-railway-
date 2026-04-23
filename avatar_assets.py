@@ -31,6 +31,12 @@ def normalize_avatar_data_url(value: Optional[str], max_length: int) -> Optional
         raise ValueError("avatar_url must be an image data URL")
     if "," not in avatar:
         raise ValueError("avatar_url must be a valid data URL")
+    # Validate the base64 payload here, at the request boundary, instead of
+    # waiting for _ensure_avatar_thumb_materialized to fail later. Without
+    # this check a malformed data URL was written to users.avatar_url first,
+    # and then the deferred decode raised an unhandled ValueError that
+    # bubbled up as a 500 (after the row was already updated).
+    decode_avatar_data_url(avatar)
     return avatar
 
 
