@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 logger = logging.getLogger(__name__)
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from core import DB_BACKEND, _db, _db_exec, _db_lock, _db_query_all, _db_query_one, _sql, require_user
 from leaderboard_service import (
@@ -55,8 +55,12 @@ def _invalidate_pickup_write_caches() -> None:
 
 
 class PickupRecordingPayload(BaseModel):
-    lat: float
-    lng: float
+    # Reject NaN / +-Inf on lat/lng. FastAPI's response encoder uses
+    # allow_nan=False, so a NaN sneaking through Pydantic crashes the handler
+    # with a 500 when it tries to echo the payload or serialize derived
+    # values. Bounds also clamp to valid geographic ranges.
+    lat: float = Field(allow_inf_nan=False, ge=-90.0, le=90.0)
+    lng: float = Field(allow_inf_nan=False, ge=-180.0, le=180.0)
     zone_id: Optional[int] = None
     zone_name: Optional[str] = None
     borough: Optional[str] = None
@@ -69,15 +73,15 @@ class AdminVoidPickupPayload(BaseModel):
 
 class AdminGuardEvaluatePayload(BaseModel):
     user_id: int
-    lat: float
-    lng: float
+    lat: float = Field(allow_inf_nan=False, ge=-90.0, le=90.0)
+    lng: float = Field(allow_inf_nan=False, ge=-180.0, le=180.0)
     now_ts: Optional[int] = None
 
 
 class AdminSimulateSavePayload(BaseModel):
     user_id: int
-    lat: float
-    lng: float
+    lat: float = Field(allow_inf_nan=False, ge=-90.0, le=90.0)
+    lng: float = Field(allow_inf_nan=False, ge=-180.0, le=180.0)
     zone_id: Optional[int] = None
     zone_name: Optional[str] = None
     borough: Optional[str] = None

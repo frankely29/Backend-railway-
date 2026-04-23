@@ -25,10 +25,11 @@ from zoneinfo import ZoneInfo
 from timeline_time_utils import to_frontend_local_iso
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Depends, Response
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from pyproj import Transformer
 from shapely.geometry import MultiPolygon, Point, Polygon, mapping, shape
 from shapely.ops import transform, unary_union
@@ -369,6 +370,32 @@ _parquet_inventory_snapshot: Dict[str, Any] = {"rows": [], "warnings": [], "warn
 # App
 # =========================================================
 app = FastAPI(title="NYC TLC Hotspot Backend", version="2.2")
+
+
+def _sanitize_validation_value(value: Any) -> Any:
+    """Strip NaN / +-Inf from values that FastAPI's default
+    RequestValidationError handler echoes back in the 422 response body.
+    Starlette's JSONResponse calls json.dumps(allow_nan=False) by default,
+    which raises ValueError on non-finite floats and turns a 422 into a 500
+    crash — exposing a trivial DoS (post {"lat": NaN} to any endpoint with
+    a float field, server crashes)."""
+    if isinstance(value, float):
+        if value != value or value in (float("inf"), float("-inf")):
+            return str(value)
+        return value
+    if isinstance(value, dict):
+        return {k: _sanitize_validation_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_validation_value(v) for v in value]
+    return value
+
+
+@app.exception_handler(RequestValidationError)
+async def _request_validation_exception_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(
+        status_code=422,
+        content={"detail": _sanitize_validation_value(exc.errors())},
+    )
 
 
 def _split_env_origins(*names: str) -> list[str]:
@@ -8475,10 +8502,14 @@ async def delete_account(user: dict = Depends(require_user)):
 # PRESENCE
 # =========================================================
 class PresencePayload(BaseModel):
-    lat: float
-    lng: float
-    heading: Optional[float] = None
-    accuracy: Optional[float] = None
+    # Reject NaN / +-Inf: Python's json.dumps raises ValueError on these when
+    # allow_nan=False (FastAPI's default), and posting NaN would otherwise
+    # crash the server with a 500. Latitude/longitude bounds also clamp to
+    # valid geographic ranges.
+    lat: float = Field(allow_inf_nan=False, ge=-90.0, le=90.0)
+    lng: float = Field(allow_inf_nan=False, ge=-180.0, le=180.0)
+    heading: Optional[float] = Field(default=None, allow_inf_nan=False)
+    accuracy: Optional[float] = Field(default=None, allow_inf_nan=False, ge=0.0)
 
 
 @app.post("/presence/update")
@@ -8698,14 +8729,14 @@ def presence_summary(
 # EVENTS
 # =========================================================
 class PolicePayload(BaseModel):
-    lat: float
-    lng: float
+    lat: float = Field(allow_inf_nan=False, ge=-90.0, le=90.0)
+    lng: float = Field(allow_inf_nan=False, ge=-180.0, le=180.0)
     note: Optional[str] = ""
 
 
 class PickupPayload(BaseModel):
-    lat: float
-    lng: float
+    lat: float = Field(allow_inf_nan=False, ge=-90.0, le=90.0)
+    lng: float = Field(allow_inf_nan=False, ge=-180.0, le=180.0)
     zone_id: Optional[int] = None
     zone_name: Optional[str] = None
     borough: Optional[str] = None

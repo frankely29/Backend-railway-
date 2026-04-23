@@ -2322,7 +2322,7 @@ def _list_messages_for_room(room: str, after: str | None, limit: int) -> dict:
             SELECT id, room, user_id, display_name, message, created_at, message_type, audio_path, audio_mime_type, audio_duration_ms, image_path, image_mime_type
             FROM (
                 {select_sql.format(where_clause='msg.room = ?')}
-                ORDER BY id DESC
+                ORDER BY msg.id DESC
                 LIMIT ?
             ) recent
             ORDER BY id ASC
