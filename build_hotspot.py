@@ -1709,7 +1709,7 @@ def build_hotspots_frames(
 
             flush_frame()
             trap_candidate_review_payload = {
-                "generated_at_utc": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+                "generated_at_utc": datetime.now(tz=timezone.utc).replace(microsecond=0, tzinfo=None).isoformat() + "Z",
                 "engine_release": "team-joseo-score-v2-final-live",
                 "bin_minutes": int(bin_minutes),
                 "profile_reviews": {},

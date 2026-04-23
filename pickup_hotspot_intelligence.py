@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import statistics
 import time
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
@@ -677,8 +678,9 @@ def get_zone_or_hotspot_outcome_modifier(
                 pass
     weighted_conversion_rate = weighted_conversion_mass / max(0.0001, weighted_total)
     raw_conversion_rate = converted / max(1, sample_count)
-    mins.sort()
-    raw_median_minutes = mins[len(mins) // 2] if mins else 15.0
+    # Use true median (average of two middle values for even-length lists)
+    # rather than the upper-middle element returned by mins[len(mins) // 2].
+    raw_median_minutes = float(statistics.median(mins)) if mins else 15.0
     weighted_minutes = weighted_minutes_mass / max(0.0001, weighted_minutes_total) if weighted_minutes_total > 0.0 else 15.0
 
     conv_boost = (weighted_conversion_rate - 0.45) * 0.55
