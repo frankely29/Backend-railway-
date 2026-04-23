@@ -7355,7 +7355,9 @@ def day_tendency_frame_context(
 def day_tendency_month_benchmark(
     month_key: Optional[str] = None,
     frame_time: Optional[str] = None,
+    user: sqlite3.Row = Depends(require_user),
 ):
+    _ = user
     resolved_month_key, active_month_key = _resolve_month_key_for_tendency_benchmark(
         month_key=month_key,
         frame_time=frame_time,
