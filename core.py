@@ -360,7 +360,7 @@ def _enforce_access_or_admin(user: sqlite3.Row) -> None:
         return str(raw_status).strip().lower()
 
     def _status_allows_paid_window_access(raw_status: Any) -> bool:
-        return _normalize_subscription_status(raw_status) in {"active", "cancelled", "canceled", "past_due"}
+        return _normalize_subscription_status(raw_status) in {"active", "past_due"}
 
     def _has_paid_window_access(row: sqlite3.Row, now_unix: int) -> bool:
         try:

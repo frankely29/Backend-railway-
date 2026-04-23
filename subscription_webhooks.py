@@ -133,7 +133,7 @@ def _lookup_user_id_by_email(email: Any) -> Optional[int]:
 
 
 def _resolve_event_user_id(event: Dict[str, Any], data: Dict[str, Any]) -> tuple[Optional[int], str]:
-    custom_data = data.get("custom_data", {}) or {}
+    custom_data = data.get("custom_data", {}) or event.get("custom_data", {}) or {}
 
     user_id_raw = custom_data.get("user_id")
     try:
@@ -152,13 +152,13 @@ def _resolve_event_user_id(event: Dict[str, Any], data: Dict[str, Any]) -> tuple
         if resolved is not None:
             return resolved, "subscription_id"
 
-    customer_id = str(data.get("customer_id") or "").strip()
+    customer = data.get("customer") if isinstance(data.get("customer"), dict) else {}
+    customer_id = str(data.get("customer_id") or customer.get("id") or "").strip()
     if customer_id:
         resolved = _lookup_user_id_by_customer_id(customer_id)
         if resolved is not None:
             return resolved, "customer_id"
 
-    customer = data.get("customer") if isinstance(data.get("customer"), dict) else {}
     email_candidates = [
         customer.get("email"),
         data.get("email"),
@@ -235,8 +235,12 @@ def process_paddle_event_by_id(event_id: str) -> None:
 def _dispatch_event(event_type: str, user_id: int, data: Dict[str, Any], occurred_at: int) -> str:
     if event_type == "subscription.created":
         return _handle_subscription_created(user_id, data, occurred_at)
+    if event_type == "subscription.trialing":
+        return _handle_subscription_trialing(user_id, data, occurred_at)
     if event_type == "subscription.activated":
         return _handle_subscription_activated(user_id, data, occurred_at)
+    if event_type == "subscription.resumed":
+        return _handle_subscription_resumed(user_id, data, occurred_at)
     if event_type == "subscription.updated":
         return _handle_subscription_updated(user_id, data, occurred_at)
     if event_type == "subscription.canceled":
@@ -252,49 +256,90 @@ def _dispatch_event(event_type: str, user_id: int, data: Dict[str, Any], occurre
 
 
 def _handle_subscription_created(user_id: int, data: Dict[str, Any], occurred_at: int) -> str:
-    subscription_id = str(data.get("id") or "")
-    customer_id = str(data.get("customer_id") or "")
+    subscription_id = str(data.get("id") or data.get("subscription_id") or "").strip() or None
+    customer_id = str(data.get("customer_id") or "").strip() or None
     period_end_iso = _extract_period_end(data)
     period_end_unix = _iso_to_unix(period_end_iso) if period_end_iso else None
+    payload_status = _paddle_status_to_internal(str(data.get("status") or ""))
 
-    # Only overwrite subscription_current_period_end if Paddle actually gave us
-    # a period end. Otherwise COALESCE preserves whatever a prior event set, so
-    # we don't flip a paying user to inactive (is_subscription_active treats
-    # NULL period_end as not-active).
+    _db_exec(
+        """
+        UPDATE users SET
+            subscription_status=COALESCE(?, subscription_status, ?),
+            subscription_provider=?,
+            subscription_customer_id=COALESCE(?, subscription_customer_id),
+            subscription_id=COALESCE(?, subscription_id),
+            subscription_current_period_end=COALESCE(?, subscription_current_period_end),
+            subscription_updated_at=?
+        WHERE id=?
+        """,
+        (payload_status, "trialing", "paddle", customer_id, subscription_id, period_end_unix, occurred_at, user_id),
+    )
+    return f"created_status:{payload_status or 'preserved_or_trialing'}"
+
+
+def _handle_subscription_trialing(user_id: int, data: Dict[str, Any], occurred_at: int) -> str:
+    subscription_id = str(data.get("id") or data.get("subscription_id") or "").strip() or None
+    customer_id = str(data.get("customer_id") or "").strip() or None
+    period_end_iso = _extract_period_end(data)
+    period_end_unix = _iso_to_unix(period_end_iso) if period_end_iso else None
     _db_exec(
         """
         UPDATE users SET
             subscription_status=?,
             subscription_provider=?,
-            subscription_customer_id=?,
-            subscription_id=?,
+            subscription_customer_id=COALESCE(?, subscription_customer_id),
+            subscription_id=COALESCE(?, subscription_id),
+            subscription_current_period_end=COALESCE(?, subscription_current_period_end),
+            subscription_updated_at=?
+        WHERE id=?
+        """,
+        ("trialing", "paddle", customer_id, subscription_id, period_end_unix, occurred_at, user_id),
+    )
+    return "marked_trialing"
+
+
+def _handle_subscription_activated(user_id: int, data: Dict[str, Any], occurred_at: int) -> str:
+    subscription_id = str(data.get("id") or data.get("subscription_id") or "").strip() or None
+    customer_id = str(data.get("customer_id") or "").strip() or None
+    period_end_iso = _extract_period_end(data)
+    period_end_unix = _iso_to_unix(period_end_iso) if period_end_iso else None
+
+    _db_exec(
+        """
+        UPDATE users SET
+            subscription_status=?,
+            subscription_provider=?,
+            subscription_customer_id=COALESCE(?, subscription_customer_id),
+            subscription_id=COALESCE(?, subscription_id),
             subscription_current_period_end=COALESCE(?, subscription_current_period_end),
             subscription_updated_at=?
         WHERE id=?
         """,
         ("active", "paddle", customer_id, subscription_id, period_end_unix, occurred_at, user_id),
     )
-    return "marked_active_from_created"
+    return "marked_active_from_activated"
 
 
-def _handle_subscription_activated(user_id: int, data: Dict[str, Any], occurred_at: int) -> str:
+def _handle_subscription_resumed(user_id: int, data: Dict[str, Any], occurred_at: int) -> str:
+    subscription_id = str(data.get("id") or data.get("subscription_id") or "").strip() or None
+    customer_id = str(data.get("customer_id") or "").strip() or None
     period_end_iso = _extract_period_end(data)
     period_end_unix = _iso_to_unix(period_end_iso) if period_end_iso else None
-
-    # See _handle_subscription_created: preserve existing period_end if Paddle
-    # did not supply one, so we don't accidentally flip an active user to
-    # inactive when the payload omits current_billing_period/next_billed_at.
     _db_exec(
         """
         UPDATE users SET
             subscription_status=?,
+            subscription_provider=?,
+            subscription_customer_id=COALESCE(?, subscription_customer_id),
+            subscription_id=COALESCE(?, subscription_id),
             subscription_current_period_end=COALESCE(?, subscription_current_period_end),
             subscription_updated_at=?
         WHERE id=?
         """,
-        ("active", period_end_unix, occurred_at, user_id),
+        ("active", "paddle", customer_id, subscription_id, period_end_unix, occurred_at, user_id),
     )
-    return "marked_active_from_activated"
+    return "marked_active_from_resumed"
 
 
 def _paddle_status_to_internal(paddle_status: str) -> Optional[str]:
@@ -305,7 +350,7 @@ def _paddle_status_to_internal(paddle_status: str) -> Optional[str]:
     """
     mapping = {
         "active": "active",
-        "trialing": "active",
+        "trialing": "trialing",
         "past_due": "past_due",
         "paused": "paused",
         "canceled": "cancelled",
@@ -316,82 +361,71 @@ def _paddle_status_to_internal(paddle_status: str) -> Optional[str]:
 
 
 def _handle_subscription_updated(user_id: int, data: Dict[str, Any], occurred_at: int) -> str:
+    subscription_id = str(data.get("id") or data.get("subscription_id") or "").strip() or None
+    customer_id = str(data.get("customer_id") or "").strip() or None
     period_end_iso = _extract_period_end(data)
     period_end_unix = _iso_to_unix(period_end_iso) if period_end_iso else None
     new_status = _paddle_status_to_internal(str(data.get("status") or ""))
-
-    if new_status is not None and period_end_unix is not None:
-        _db_exec(
-            """
-            UPDATE users SET
-                subscription_status=?,
-                subscription_current_period_end=?,
-                subscription_updated_at=?
-            WHERE id=?
-            """,
-            (new_status, period_end_unix, occurred_at, user_id),
-        )
-        return f"updated_status_and_period:{new_status}"
-
-    if new_status is not None:
-        _db_exec(
-            """
-            UPDATE users SET
-                subscription_status=?,
-                subscription_updated_at=?
-            WHERE id=?
-            """,
-            (new_status, occurred_at, user_id),
-        )
-        return f"updated_status:{new_status}"
-
-    if period_end_unix is not None:
-        _db_exec(
-            """
-            UPDATE users SET
-                subscription_current_period_end=?,
-                subscription_updated_at=?
-            WHERE id=?
-            """,
-            (period_end_unix, occurred_at, user_id),
-        )
-        return "updated_period_end"
-
     _db_exec(
-        "UPDATE users SET subscription_updated_at=? WHERE id=?",
-        (occurred_at, user_id),
+        """
+        UPDATE users SET
+            subscription_status=COALESCE(?, subscription_status),
+            subscription_provider=?,
+            subscription_customer_id=COALESCE(?, subscription_customer_id),
+            subscription_id=COALESCE(?, subscription_id),
+            subscription_current_period_end=COALESCE(?, subscription_current_period_end),
+            subscription_updated_at=?
+        WHERE id=?
+        """,
+        (new_status, "paddle", customer_id, subscription_id, period_end_unix, occurred_at, user_id),
     )
+    if new_status is not None and period_end_unix is not None:
+        return f"updated_status_and_period:{new_status}"
+    if new_status is not None:
+        return f"updated_status:{new_status}"
+    if period_end_unix is not None:
+        return "updated_period_end"
     return "updated_no_period_change"
 
 
 def _handle_subscription_canceled(user_id: int, data: Dict[str, Any], occurred_at: int) -> str:
+    subscription_id = str(data.get("id") or data.get("subscription_id") or "").strip() or None
+    customer_id = str(data.get("customer_id") or "").strip() or None
     period_end_iso = _extract_period_end(data)
     period_end_unix = _iso_to_unix(period_end_iso) if period_end_iso else None
     _db_exec(
         """
         UPDATE users SET
             subscription_status=?,
+            subscription_provider=?,
+            subscription_customer_id=COALESCE(?, subscription_customer_id),
+            subscription_id=COALESCE(?, subscription_id),
             subscription_current_period_end=COALESCE(?, subscription_current_period_end),
             subscription_updated_at=?
         WHERE id=?
         """,
-        ("cancelled", period_end_unix, occurred_at, user_id),
+        ("cancelled", "paddle", customer_id, subscription_id, period_end_unix, occurred_at, user_id),
     )
     return "marked_cancelled"
 
 
 def _handle_subscription_past_due(user_id: int, data: Dict[str, Any], occurred_at: int) -> str:
+    subscription_id = str(data.get("id") or data.get("subscription_id") or "").strip() or None
+    customer_id = str(data.get("customer_id") or "").strip() or None
     period_end_iso = _extract_period_end(data)
     period_end_unix = _iso_to_unix(period_end_iso) if period_end_iso else None
     _db_exec(
         """
         UPDATE users SET
             subscription_status=?,
+            subscription_provider=?,
+            subscription_customer_id=COALESCE(?, subscription_customer_id),
+            subscription_id=COALESCE(?, subscription_id),
             subscription_current_period_end=COALESCE(?, subscription_current_period_end),
             subscription_updated_at=?
         WHERE id=?
         """,
-        ("past_due", period_end_unix, occurred_at, user_id),
+        ("past_due", "paddle", customer_id, subscription_id, period_end_unix, occurred_at, user_id),
     )
     return "marked_past_due"
 
