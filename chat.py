@@ -448,12 +448,17 @@ def _collect_expired_chat_media_rows(public_cutoff_unix: int, private_cutoff_uni
         """,
         (int(private_cutoff_unix),),
     )
+    # Use row["key"] rather than row.get("key"): _db_query_all returns
+    # sqlite3.Row objects on SQLite (which lack .get), so a prior
+    # row.get(...) crashed the retention sweep as soon as there was a
+    # row to iterate. audio_path and image_path are both in the SELECT
+    # list above, so indexing is always safe.
     rows.extend(
-        {"scope": "public", "id": int(row["id"]), "audio_path": row.get("audio_path"), "image_path": row.get("image_path")}
+        {"scope": "public", "id": int(row["id"]), "audio_path": row["audio_path"], "image_path": row["image_path"]}
         for row in public_rows
     )
     rows.extend(
-        {"scope": "private", "id": int(row["id"]), "audio_path": row.get("audio_path"), "image_path": row.get("image_path")}
+        {"scope": "private", "id": int(row["id"]), "audio_path": row["audio_path"], "image_path": row["image_path"]}
         for row in private_rows
     )
     return rows
@@ -1036,7 +1041,11 @@ def _search_private_directory_users(me: int, q: str | None, limit: int, offset: 
         {
             "id": int(row["id"]),
             "display_name": _clean_display_name(row["display_name"] or "", row["email"]),
-            "avatar_url": row.get("avatar_url"),
+            # row["avatar_url"] works on both sqlite3.Row and RealDictRow; a
+            # prior `row.get("avatar_url")` crashed on SQLite because
+            # sqlite3.Row has no .get() method, turning any non-empty
+            # response into a 500.
+            "avatar_url": row["avatar_url"],
         }
         for row in raw_items[:safe_limit]
     ]
