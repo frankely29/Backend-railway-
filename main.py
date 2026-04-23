@@ -5735,7 +5735,7 @@ def _run_grandfather_migration_once() -> None:
 
 
 def _repair_grandfather_comp_status_rows() -> None:
-    """Repair legacy comp rows that were granted comp metadata but left without status='comp'."""
+    """Repair legacy comp rows that have comp metadata but missing subscription_status."""
     now_ts = int(time.time())
     try:
         _db_exec(
@@ -5751,7 +5751,7 @@ def _repair_grandfather_comp_status_rows() -> None:
                 )
                 AND (
                     subscription_comp_expires_at IS NOT NULL
-                    OR subscription_comp_reason IS NOT NULL
+                    OR (subscription_comp_reason IS NOT NULL AND trim(subscription_comp_reason) <> '')
                     OR subscription_comp_granted_at IS NOT NULL
                     OR subscription_comp_granted_by IS NOT NULL
                 )

@@ -34,7 +34,7 @@ def is_subscription_active(user_row) -> bool:
     """True if user still has paid-period access based on status + future period end."""
     fields = get_subscription_fields(user_row)
     status = str(fields["status"] or "").strip().lower()
-    if status not in {"active", "cancelled", "canceled", "past_due"}:
+    if status not in {"active", "past_due"}:
         return False
     period_end = fields["current_period_end"]
     if period_end is None:
