@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
 import math
 import inspect
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional
 from zoneinfo import ZoneInfo
+
+logger = logging.getLogger(__name__)
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -128,8 +131,17 @@ def ensure_pickup_recording_schema() -> None:
     for col_name, col_type in alter_specs:
         try:
             _db_exec(f"ALTER TABLE pickup_logs ADD COLUMN {col_name} {col_type}")
-        except Exception:
-            pass
+        except Exception as exc:
+            # Tolerate "column already exists" (the common case on restart) but
+            # surface any other failure so a broken migration doesn't leave the
+            # schema silently inconsistent.
+            message = str(exc).lower()
+            if "already exists" in message or "duplicate column" in message:
+                continue
+            logger.exception(
+                "pickup_logs ALTER TABLE failed for column %s: %s", col_name, exc
+            )
+            raise
 
 
 def pickup_log_not_voided_sql(alias: str) -> str:

@@ -9,7 +9,7 @@ from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 
-from core import _db_exec, _db_query_all, _db_query_one, _db_run_in_transaction, _sql
+from core import DB_BACKEND, _db_exec, _db_query_all, _db_query_one, _db_run_in_transaction, _sql
 from paddle_client import verify_webhook_signature
 
 logger = logging.getLogger(__name__)
@@ -50,29 +50,65 @@ async def paddle_webhook(request: Request, background_tasks: BackgroundTasks):
         logger.error("Paddle webhook has invalid occurred_at: %s", occurred_at_iso)
         raise HTTPException(status_code=400, detail="Invalid occurred_at")
 
-    existing = _db_query_one(
-        "SELECT event_id, processed_at FROM paddle_webhook_events WHERE event_id=? LIMIT 1",
-        (event_id,),
-    )
-    if existing:
-        processed_at = existing["processed_at"] if "processed_at" in existing.keys() else None
-        if processed_at is not None:
-            logger.info("Paddle webhook duplicate (already processed): %s", event_id)
-            return {"ok": True, "outcome": "already_processed"}
-        logger.info("Paddle webhook duplicate (unprocessed, reprocessing): %s", event_id)
+    # Atomic claim: INSERT with conflict-do-nothing, then decide based on
+    # cursor.rowcount. If we inserted (rowcount > 0), we are the exclusive
+    # owner of this event and must enqueue processing. If the row pre-existed,
+    # another webhook delivery for the same event_id won the race — we must
+    # NOT re-enqueue (that would cause double-processing and double-grant).
+    # Unprocessed events left behind by a crashed processor are recovered by
+    # replay_unprocessed_events_on_startup().
+    raw_body_text = raw_body.decode("utf-8")
+    claim_args = (event_id, event_type, occurred_at_unix, _now(), raw_body_text)
+    if DB_BACKEND == "postgres":
+        insert_sql = (
+            "INSERT INTO paddle_webhook_events "
+            "(event_id, event_type, occurred_at, received_at, processed_at, raw_event_json) "
+            "VALUES (?, ?, ?, ?, NULL, ?) "
+            "ON CONFLICT (event_id) DO NOTHING"
+        )
     else:
-        try:
-            _db_exec(
-                """
-                INSERT INTO paddle_webhook_events
-                    (event_id, event_type, occurred_at, received_at, processed_at, raw_event_json)
-                VALUES (?, ?, ?, ?, NULL, ?)
-                """,
-                (event_id, event_type, occurred_at_unix, _now(), raw_body.decode("utf-8")),
-            )
-        except Exception as exc:
-            logger.error("Paddle webhook INSERT failed for event_id=%s: %s", event_id, exc)
-            raise HTTPException(status_code=500, detail="Storage error")
+        insert_sql = (
+            "INSERT OR IGNORE INTO paddle_webhook_events "
+            "(event_id, event_type, occurred_at, received_at, processed_at, raw_event_json) "
+            "VALUES (?, ?, ?, ?, NULL, ?)"
+        )
+
+    def _claim(conn, cur) -> str:
+        cur.execute(_sql(insert_sql), claim_args)
+        if cur.rowcount and cur.rowcount > 0:
+            return "claimed"
+        cur.execute(
+            _sql("SELECT processed_at FROM paddle_webhook_events WHERE event_id=? LIMIT 1"),
+            (event_id,),
+        )
+        existing_row = cur.fetchone()
+        existing_processed_at: Optional[int] = None
+        if existing_row is not None:
+            try:
+                existing_processed_at = existing_row["processed_at"]
+            except Exception:
+                try:
+                    existing_processed_at = existing_row[0]
+                except Exception:
+                    existing_processed_at = None
+        return "already_processed" if existing_processed_at is not None else "already_claimed"
+
+    try:
+        claim_outcome = _db_run_in_transaction(_claim)
+    except Exception as exc:
+        logger.error("Paddle webhook claim failed for event_id=%s: %s", event_id, exc)
+        raise HTTPException(status_code=500, detail="Storage error")
+
+    if claim_outcome == "already_processed":
+        logger.info("Paddle webhook duplicate (already processed): %s", event_id)
+        return {"ok": True, "outcome": "already_processed"}
+
+    if claim_outcome == "already_claimed":
+        # Another concurrent delivery already enqueued this event; do NOT
+        # enqueue again. Startup replay recovers it if the other delivery's
+        # processor crashes before marking it done.
+        logger.info("Paddle webhook duplicate (claim in flight): %s", event_id)
+        return {"ok": True, "outcome": "already_claimed"}
 
     background_tasks.add_task(process_paddle_event_by_id, event_id)
     return {"ok": True, "outcome": "enqueued"}
@@ -217,9 +253,14 @@ def process_paddle_event_by_id(event_id: str) -> None:
             return
 
         last_updated = user_row["subscription_updated_at"] if "subscription_updated_at" in user_row.keys() else None
-        if last_updated is not None and int(last_updated) > occurred_at:
+        # Use >= so that a replay of the *same* event (which set
+        # subscription_updated_at = occurred_at on the first pass) is skipped
+        # idempotently. This is the recovery path for a processor that crashed
+        # between _dispatch_event and _mark_processed — the event re-surfaces
+        # via replay_unprocessed_events_on_startup but is not double-applied.
+        if last_updated is not None and int(last_updated) >= occurred_at:
             _mark_processed(event_id, user_id=user_id, outcome="skipped_older_than_current")
-            logger.info("Paddle event older than stored update, skipping: %s", event_id)
+            logger.info("Paddle event older or equal to stored update, skipping: %s", event_id)
             return
 
         outcome = _dispatch_event(event_type, user_id, data, occurred_at)

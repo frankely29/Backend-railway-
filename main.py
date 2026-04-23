@@ -8072,8 +8072,13 @@ def _decide_admin_for_signup(email: str, bootstrap_token: Optional[str]) -> int:
     if ADMIN_EMAIL and email == ADMIN_EMAIL:
         is_admin = 1
 
-    # Optional bootstrap token can also grant admin
-    if ADMIN_BOOTSTRAP_TOKEN and bootstrap_token and bootstrap_token == ADMIN_BOOTSTRAP_TOKEN:
+    # Optional bootstrap token can also grant admin.
+    # compare_digest is constant-time to prevent timing attacks from deriving the token.
+    if (
+        ADMIN_BOOTSTRAP_TOKEN
+        and bootstrap_token
+        and hmac.compare_digest(str(bootstrap_token), str(ADMIN_BOOTSTRAP_TOKEN))
+    ):
         is_admin = 1
 
     return is_admin

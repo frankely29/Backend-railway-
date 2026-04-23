@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import List, Dict, Any, Tuple
-from datetime import datetime, timedelta, time as dt_time, date as dt_date
+from datetime import datetime, timedelta, time as dt_time, date as dt_date, timezone
 import calendar
 import json
 import math
@@ -2196,7 +2196,7 @@ def build_hotspots_frames(
         published_build_meta_tmp_path = resolved_exact_history_dir / "build_meta.json.tmp"
         build_meta_payload = {
             "month_key": str(month_key or "").strip() or None,
-            "built_at_unix": int(datetime.now().timestamp()),
+            "built_at_unix": int(datetime.now(tz=timezone.utc).timestamp()),
             "bin_minutes": int(bin_minutes),
             "min_trips_per_window": int(min_trips_per_window),
             "source_parquet_files": [Path(p).name for p in (parquet_files or [])],
