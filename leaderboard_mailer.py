@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import os
 import smtplib
 from email.mime.multipart import MIMEMultipart
@@ -12,6 +13,10 @@ def report_emails_enabled() -> bool:
 
 
 def render_report_email(display_name: str, report_type: str, period_key: str, summary: Dict, miles_rank: int | None, hours_rank: int | None, badge: str | None) -> Tuple[str, str, str]:
+    # display_name and badge come from user-controlled fields. Keep the
+    # plain-text body unescaped but HTML-escape every value that lands in
+    # the HTML body to avoid HTML/script injection in mail clients that
+    # render the multipart/alternative html part.
     title = f"Your {report_type.capitalize()} NYC TLC report ({period_key})"
     who = display_name or "Driver"
     text = (
@@ -25,10 +30,14 @@ def render_report_email(display_name: str, report_type: str, period_key: str, su
         f"Hours rank: #{hours_rank if hours_rank else 'N/A'}\n"
         f"Badge: {badge or 'None'}\n"
     )
-    html = f"""
+    who_html = html.escape(who)
+    report_type_html = html.escape(report_type)
+    period_key_html = html.escape(period_key)
+    badge_html = html.escape(badge or "None")
+    html_body = f"""
     <html><body>
-      <p>Hi {who},</p>
-      <p>Here is your <b>{report_type}</b> summary for <b>{period_key}</b>.</p>
+      <p>Hi {who_html},</p>
+      <p>Here is your <b>{report_type_html}</b> summary for <b>{period_key_html}</b>.</p>
       <ul>
         <li>Miles worked: <b>{summary['miles_worked']}</b></li>
         <li>Hours worked: <b>{summary['hours_worked']}</b></li>
@@ -36,11 +45,11 @@ def render_report_email(display_name: str, report_type: str, period_key: str, su
         <li>Pickups recorded: <b>{summary['pickups_recorded']}</b></li>
         <li>Miles rank: <b>#{miles_rank if miles_rank else 'N/A'}</b></li>
         <li>Hours rank: <b>#{hours_rank if hours_rank else 'N/A'}</b></li>
-        <li>Badge: <b>{badge or 'None'}</b></li>
+        <li>Badge: <b>{badge_html}</b></li>
       </ul>
     </body></html>
     """
-    return title, text, html
+    return title, text, html_body
 
 
 def send_report_email(to_email: str, subject: str, text_body: str, html_body: str) -> None:

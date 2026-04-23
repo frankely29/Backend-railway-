@@ -3,6 +3,7 @@ Functions exist but are not called from any route in Stage 1.
 Wired into signup flow in Stage 4."""
 from __future__ import annotations
 
+import html
 import logging
 import os
 from typing import Optional
@@ -57,9 +58,10 @@ def send_signup_confirmation(user_row) -> bool:
     except Exception:
         return False
 
-    html = f"""
+    display_name_html = html.escape(display_name)
+    html_body = f"""
 <div style="font-family: -apple-system, system-ui, sans-serif; max-width: 600px; margin: 0 auto;">
-  <h2>Welcome to Team Joseo, {display_name}</h2>
+  <h2>Welcome to Team Joseo, {display_name_html}</h2>
   <p>Your account is ready. You have 7 days of free access.</p>
   <p><strong>Install on your phone for the best experience:</strong></p>
   <ul>
@@ -73,7 +75,7 @@ def send_signup_confirmation(user_row) -> bool:
   </p>
 </div>
 """
-    return _send(to=email, subject="Welcome to Team Joseo", html=html)
+    return _send(to=email, subject="Welcome to Team Joseo", html=html_body)
 
 
 def send_payment_failed(user_row, retry_date_iso: Optional[str] = None) -> bool:
@@ -85,14 +87,15 @@ def send_payment_failed(user_row, retry_date_iso: Optional[str] = None) -> bool:
         return False
 
     retry_line = (
-        f"<p>We'll try again on {retry_date_iso}.</p>"
+        f"<p>We'll try again on {html.escape(retry_date_iso)}.</p>"
         if retry_date_iso
         else "<p>Please update your payment method in Settings.</p>"
     )
 
-    html = f"""
+    display_name_html = html.escape(display_name)
+    html_body = f"""
 <div style="font-family: -apple-system, system-ui, sans-serif; max-width: 600px; margin: 0 auto;">
-  <h2>Payment failed, {display_name}</h2>
+  <h2>Payment failed, {display_name_html}</h2>
   <p>We couldn't process your subscription payment.</p>
   {retry_line}
   <p>Update your card in the app → Settings → Subscription.</p>
@@ -101,16 +104,17 @@ def send_payment_failed(user_row, retry_date_iso: Optional[str] = None) -> bool:
   </p>
 </div>
 """
-    return _send(to=email, subject="Team Joseo: Payment failed", html=html)
+    return _send(to=email, subject="Team Joseo: Payment failed", html=html_body)
 
 
 def send_launch_email(email: str, display_name: str) -> bool:
     """One-off launch announcement for grandfathered users."""
     safe_name = (display_name or "Driver").strip() or "Driver"
 
-    html = f"""
+    safe_name_html = html.escape(safe_name)
+    html_body = f"""
 <div style="font-family: -apple-system, system-ui, sans-serif; max-width: 600px; margin: 0 auto;">
-  <h2>Team Joseo is now a paid app, {safe_name}</h2>
+  <h2>Team Joseo is now a paid app, {safe_name_html}</h2>
   <p>Thanks for being an early user. Your account is currently on complimentary access while we transition to paid subscriptions.</p>
   <p><strong>Price:</strong> $8/week after complimentary access ends.</p>
   <p>You can subscribe anytime inside the app from <strong>Settings → Subscription</strong>.</p>
@@ -123,7 +127,7 @@ def send_launch_email(email: str, display_name: str) -> bool:
     return _send(
         to=email,
         subject="Team Joseo is now paid — your complimentary access details",
-        html=html,
+        html=html_body,
     )
 
 
@@ -137,9 +141,10 @@ def send_first_paid_welcome(email: str, display_name: str) -> bool:
     """
     safe_name = (display_name or "Driver").strip() or "Driver"
 
-    html = f"""
+    safe_name_html = html.escape(safe_name)
+    html_body = f"""
 <div style="font-family: -apple-system, system-ui, sans-serif; max-width: 600px; margin: 0 auto;">
-  <h2>Welcome to Team Joseo, {safe_name}</h2>
+  <h2>Welcome to Team Joseo, {safe_name_html}</h2>
   <p>Your subscription is active. Thanks for supporting the project.</p>
   <p><strong>Your subscription includes:</strong></p>
   <ul>
@@ -163,5 +168,5 @@ def send_first_paid_welcome(email: str, display_name: str) -> bool:
     return _send(
         to=email,
         subject="Welcome to Team Joseo — subscription active",
-        html=html,
+        html=html_body,
     )

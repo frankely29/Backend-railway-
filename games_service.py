@@ -1168,8 +1168,24 @@ def move_match(match_id: int, actor_user_id: int, payload: Dict[str, Any]) -> Di
         players[str(opponent_user_id)]["targets_cleared"] = 7 - int(players[str(opponent_user_id)]["targets_remaining"])
         winner_user_id = result_state.get("winner_user_id")
         if winner_user_id is not None:
-            winner_user_id = int(winner_user_id)
-        elif 8 in pocketed:
+            # The client may submit winner_user_id to resolve ambiguous end
+            # states, but we must never trust it blindly — otherwise a player
+            # can claim victory (or name any third user as winner, because the
+            # loser-fallback at the ternary below always resolves to
+            # challenger_user_id and XP / badges would be awarded to a user
+            # who isn't even in this match). Accept the value only if it
+            # names one of the two real players; otherwise drop it and let
+            # the natural 8-ball rule below decide.
+            try:
+                candidate_winner = int(winner_user_id)
+            except (TypeError, ValueError):
+                candidate_winner = None
+            valid_winners = {int(match["challenger_user_id"]), int(match["challenged_user_id"])}
+            if candidate_winner not in valid_winners:
+                winner_user_id = None
+            else:
+                winner_user_id = candidate_winner
+        if winner_user_id is None and 8 in pocketed:
             if int(players[str(actor_user_id)]["targets_remaining"]) <= 0:
                 winner_user_id = int(actor_user_id)
             else:
