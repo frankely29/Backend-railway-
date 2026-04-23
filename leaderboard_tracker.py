@@ -161,7 +161,16 @@ def increment_pickup_count(user_id: int, amount: int = 1) -> None:
     _increment_daily_counter(user_id, "pickups_recorded", amount)
 
 
+_ALLOWED_DAILY_COUNTER_FIELDS = frozenset({"trips_recorded", "pickups_recorded"})
+
+
 def _increment_daily_counter(user_id: int, field_name: str, amount: int) -> None:
+    # field_name is interpolated into SQL via f-string (column-name position,
+    # which cannot be parameterized). Gate it behind a hardcoded whitelist so
+    # that a future refactor sourcing field_name from config or user input
+    # cannot turn this into SQL injection.
+    if field_name not in _ALLOWED_DAILY_COUNTER_FIELDS:
+        raise ValueError(f"Refusing to increment unknown daily counter: {field_name!r}")
     nyc_date = nyc_date_from_unix(int(time.time()))
     with _db_lock:
         conn = _db()
