@@ -7918,7 +7918,7 @@ def frame_viewport(
 
 
 @app.post("/upload_zones_geojson")
-async def upload_zones_geojson(file: UploadFile = File(...)):
+async def upload_zones_geojson(file: UploadFile = File(...), admin: sqlite3.Row = Depends(require_admin)):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     target = DATA_DIR / "taxi_zones.geojson"
 
@@ -7994,7 +7994,7 @@ async def _stream_upload_to_path(upload: UploadFile, target: Path, chunk_size: i
 
 
 @app.post("/upload_parquet")
-async def upload_parquet(file: UploadFile = File(...)):
+async def upload_parquet(file: UploadFile = File(...), admin: sqlite3.Row = Depends(require_admin)):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     filename = _safe_upload_filename(file.filename or "upload.parquet", "upload.parquet")
@@ -8756,7 +8756,8 @@ def report_police(payload: PolicePayload, user: sqlite3.Row = Depends(require_us
 
 
 @app.get("/events/police")
-def get_police(window_sec: int = 6 * 3600):
+def get_police(window_sec: int = 6 * 3600, user: sqlite3.Row = Depends(require_user)):
+    _ = user
     now = int(time.time())
     cutoff = now - max(300, min(7 * 24 * 3600, int(window_sec)))
     rows = _db_query_all(
