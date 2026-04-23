@@ -26,11 +26,9 @@ def _flag_to_optional_bool(value: Any) -> Optional[bool]:
 
 
 def _outcome_status(converted_to_trip: Optional[bool]) -> str:
-    if converted_to_trip is True:
-        return "converted"
-    if converted_to_trip is False:
-        return "not_converted"
-    return "pending"
+    if converted_to_trip is None:
+        return "pending"
+    return "converted" if converted_to_trip else "not_converted"
 
 
 def _to_iso(ts: Any) -> Optional[str]:

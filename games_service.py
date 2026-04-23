@@ -3,10 +3,13 @@ from __future__ import annotations
 import json
 import math
 import random
+import re
 import threading
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+
+_SAFE_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 from fastapi import HTTPException
 
@@ -240,6 +243,15 @@ def _postgres_columns_by_table(table_names: List[str]) -> Dict[str, set[str]]:
 def _ensure_column_if_missing(table_name: str, existing_columns: set[str], column_name: str, ddl: str) -> None:
     if column_name in existing_columns:
         return
+    # Gate f-string interpolation behind an identifier whitelist so a future
+    # refactor that sources table/column names from config or user input
+    # cannot turn this into SQL injection. `ddl` still carries the type
+    # expression (e.g. "is_voided BOOLEAN NOT NULL DEFAULT FALSE") and is
+    # assumed to be a trusted developer-supplied literal.
+    if not _SAFE_IDENT_RE.match(table_name):
+        raise ValueError(f"Refusing to ALTER TABLE: unsafe table name {table_name!r}")
+    if not _SAFE_IDENT_RE.match(column_name):
+        raise ValueError(f"Refusing to ALTER TABLE {table_name}: unsafe column name {column_name!r}")
     _db_exec(f"ALTER TABLE {table_name} ADD COLUMN {ddl}")
     existing_columns.add(column_name)
 
