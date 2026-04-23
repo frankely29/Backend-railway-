@@ -778,24 +778,40 @@ def accept_challenge(challenge_id: int, acting_user_id: int) -> Dict[str, Any]:
         _db_exec("UPDATE game_challenges SET status='expired', updated_at=?, responded_at=? WHERE id=? AND status='pending'", (now, now, int(challenge_id)))
         raise HTTPException(status_code=409, detail="Challenge expired")
 
-    pair_conflict = _db_query_one(
-        """
-        SELECT id FROM game_matches
-        WHERE status='active'
-          AND game_type=?
-          AND (challenger_user_id IN (?,?) OR challenged_user_id IN (?,?))
-        LIMIT 1
-        """,
-        (challenge["game_type"], int(challenge["challenger_user_id"]), int(challenge["challenged_user_id"]), int(challenge["challenger_user_id"]), int(challenge["challenged_user_id"])),
-    )
-    if pair_conflict:
-        raise HTTPException(status_code=409, detail="Active match conflict")
+    player_one = int(challenge["challenger_user_id"])
+    player_two = int(challenge["challenged_user_id"])
+    state = _default_state(str(challenge["game_type"]), player_one, player_two)
+    state_json = json.dumps(state, separators=(",", ":"))
 
-    # Atomically claim the challenge by flipping pending -> accepted. Only the
-    # caller whose UPDATE affects exactly one row is allowed to create the
-    # match; any concurrent accept sees rowcount==0 and either returns the
-    # winner's match (once accepted_match_id is set) or gets a 409.
-    def _claim(conn, cur):
+    # Perform the pair-conflict check, the pending->accepted claim, AND the
+    # game_matches INSERT inside a single transaction. Without this, two
+    # concurrent accepts of different pending challenges that would both
+    # produce an active match between the same pair (or involving the same
+    # user on the same game_type) could each pass the pair_conflict SELECT
+    # before either INSERT lands, and both create an "active" match row.
+    # The shared _db_lock on SQLite and the autocommit-off transaction on
+    # Postgres serialize these accepts so only the first succeeds.
+    _CONFLICT_SENTINEL = object()
+
+    def _claim_and_create(conn, cur):
+        cur.execute(
+            _sql(
+                """
+                SELECT id FROM game_matches
+                WHERE status='active'
+                  AND game_type=?
+                  AND (challenger_user_id IN (?,?) OR challenged_user_id IN (?,?))
+                LIMIT 1
+                """
+            ),
+            (
+                challenge["game_type"],
+                player_one, player_two,
+                player_one, player_two,
+            ),
+        )
+        if cur.fetchone() is not None:
+            return _CONFLICT_SENTINEL
         cur.execute(
             _sql(
                 "UPDATE game_challenges SET status='accepted', updated_at=?, responded_at=? "
@@ -803,12 +819,73 @@ def accept_challenge(challenge_id: int, acting_user_id: int) -> Dict[str, Any]:
             ),
             (now, now, int(challenge_id)),
         )
-        return int(cur.rowcount or 0)
+        if int(cur.rowcount or 0) != 1:
+            return None  # another accept/decline/cancel raced us; caller handles it
+        cur.execute(
+            _sql(
+                """
+                INSERT INTO game_matches(
+                  challenge_id, game_type, challenger_user_id, challenged_user_id,
+                  player_one_user_id, player_two_user_id, current_turn_user_id,
+                  status, match_state_json, result_summary, created_at, updated_at, accepted_at, expires_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """
+            ),
+            (
+                int(challenge_id),
+                challenge["game_type"],
+                int(challenge["challenger_user_id"]),
+                int(challenge["challenged_user_id"]),
+                player_one,
+                player_two,
+                player_one,
+                "active",
+                state_json,
+                None,
+                now,
+                now,
+                now,
+                now + MATCH_TTL_SECONDS,
+            ),
+        )
+        cur.execute(
+            _sql("SELECT id FROM game_matches WHERE challenge_id=? ORDER BY id DESC LIMIT 1"),
+            (int(challenge_id),),
+        )
+        inserted = cur.fetchone()
+        if inserted is None:
+            raise HTTPException(status_code=500, detail="accept failed (match row missing)")
+        try:
+            new_match_id = int(inserted["id"])
+        except Exception:
+            new_match_id = int(inserted[0])
+        cur.execute(
+            _sql("UPDATE game_challenges SET accepted_match_id=? WHERE id=?"),
+            (new_match_id, int(challenge_id)),
+        )
+        cur.execute(
+            _sql("INSERT INTO game_match_participants(match_id, user_id, team_no, seat_role, result, xp_awarded, joined_at) VALUES(?,?,?,?,?,?,?)"),
+            (new_match_id, player_one, 1, "solo", "pending", 0, now),
+        )
+        cur.execute(
+            _sql("INSERT INTO game_match_participants(match_id, user_id, team_no, seat_role, result, xp_awarded, joined_at) VALUES(?,?,?,?,?,?,?)"),
+            (new_match_id, player_two, 2, "solo", "pending", 0, now),
+        )
+        return new_match_id
+
     try:
-        claimed = _db_run_in_transaction(_claim)
+        outcome = _db_run_in_transaction(_claim_and_create)
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail="accept failed") from exc
-    if claimed != 1:
+
+    if outcome is _CONFLICT_SENTINEL:
+        raise HTTPException(status_code=409, detail="Active match conflict")
+    if outcome is None:
+        # Challenge status changed between our SELECT and UPDATE (another
+        # accept, decline, or cancel won the race). If the winner created a
+        # match, return it; otherwise this is a 409.
         row2 = _db_query_one("SELECT status, accepted_match_id FROM game_challenges WHERE id=? LIMIT 1", (int(challenge_id),))
         if row2:
             r2 = dict(row2)
@@ -816,47 +893,7 @@ def accept_challenge(challenge_id: int, acting_user_id: int) -> Dict[str, Any]:
                 return get_match_bundle(int(r2["accepted_match_id"]), int(acting_user_id))
         raise HTTPException(status_code=409, detail="Challenge is not pending")
 
-    player_one = int(challenge["challenger_user_id"])
-    player_two = int(challenge["challenged_user_id"])
-    state = _default_state(str(challenge["game_type"]), player_one, player_two)
-    _db_exec(
-        """
-        INSERT INTO game_matches(
-          challenge_id, game_type, challenger_user_id, challenged_user_id,
-          player_one_user_id, player_two_user_id, current_turn_user_id,
-          status, match_state_json, result_summary, created_at, updated_at, accepted_at, expires_at
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """,
-        (
-            int(challenge_id),
-            challenge["game_type"],
-            int(challenge["challenger_user_id"]),
-            int(challenge["challenged_user_id"]),
-            player_one,
-            player_two,
-            player_one,
-            "active",
-            json.dumps(state, separators=(",", ":")),
-            None,
-            now,
-            now,
-            now,
-            now + MATCH_TTL_SECONDS,
-        ),
-    )
-    match_row = _db_query_one("SELECT * FROM game_matches WHERE challenge_id=? ORDER BY id DESC LIMIT 1", (int(challenge_id),))
-    assert match_row
-    match_id = int(match_row["id"])
-    _db_exec("UPDATE game_challenges SET accepted_match_id=? WHERE id=?", (match_id, int(challenge_id)))
-    _db_exec(
-        "INSERT INTO game_match_participants(match_id, user_id, team_no, seat_role, result, xp_awarded, joined_at) VALUES(?,?,?,?,?,?,?)",
-        (match_id, player_one, 1, "solo", "pending", 0, now),
-    )
-    _db_exec(
-        "INSERT INTO game_match_participants(match_id, user_id, team_no, seat_role, result, xp_awarded, joined_at) VALUES(?,?,?,?,?,?,?)",
-        (match_id, player_two, 2, "solo", "pending", 0, now),
-    )
-    return get_match_bundle(match_id, int(acting_user_id), challenge_id=int(challenge_id))
+    return get_match_bundle(int(outcome), int(acting_user_id), challenge_id=int(challenge_id))
 
 
 def decline_challenge(challenge_id: int, acting_user_id: int) -> Dict[str, Any]:
