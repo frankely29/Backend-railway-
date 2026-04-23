@@ -8181,6 +8181,43 @@ def auth_signup(payload: SignupPayload):
     }
 
 
+_LOGIN_FAILURE_TRACKER: Dict[str, List[float]] = {}
+_LOGIN_FAILURE_LOCK = threading.Lock()
+_LOGIN_FAILURE_WINDOW_SECONDS = 60.0
+_LOGIN_FAILURE_MAX_FAILURES = 8
+_LOGIN_FAILURE_TTL_SECONDS = 300.0
+
+
+def _login_record_failure(email: str) -> int:
+    """Record a failed login for `email` and return the recent failure count
+    inside the rolling _LOGIN_FAILURE_WINDOW_SECONDS window."""
+    if not email:
+        return 0
+    now = time.monotonic()
+    with _LOGIN_FAILURE_LOCK:
+        timestamps = _LOGIN_FAILURE_TRACKER.get(email, [])
+        timestamps = [ts for ts in timestamps if (now - ts) < _LOGIN_FAILURE_WINDOW_SECONDS]
+        timestamps.append(now)
+        timestamps = timestamps[-(_LOGIN_FAILURE_MAX_FAILURES * 4):]
+        _LOGIN_FAILURE_TRACKER[email] = timestamps
+        # Opportunistic eviction of long-stale entries so the dict stays bounded.
+        if len(_LOGIN_FAILURE_TRACKER) > 10000:
+            stale_keys = [
+                k for k, v in _LOGIN_FAILURE_TRACKER.items()
+                if not v or (now - v[-1]) > _LOGIN_FAILURE_TTL_SECONDS
+            ]
+            for k in stale_keys:
+                _LOGIN_FAILURE_TRACKER.pop(k, None)
+        return len(timestamps)
+
+
+def _login_clear_failures(email: str) -> None:
+    if not email:
+        return
+    with _LOGIN_FAILURE_LOCK:
+        _LOGIN_FAILURE_TRACKER.pop(email, None)
+
+
 @app.post("/auth/login")
 def auth_login(payload: LoginPayload):
     _require_jwt_secret()
@@ -8191,6 +8228,13 @@ def auth_login(payload: LoginPayload):
 
     row = _db_query_one("SELECT * FROM users WHERE lower(email)=lower(?) LIMIT 1", (email,))
     if not row:
+        # Record + check counter even for unknown emails so an attacker
+        # enumerating addresses is also throttled. The 401 vs 429 below has
+        # the same cap so the response shape doesn't leak whether the email
+        # exists.
+        recent = _login_record_failure(email)
+        if recent > _LOGIN_FAILURE_MAX_FAILURES:
+            raise HTTPException(status_code=429, detail="Too many failed login attempts. Try again in a minute.")
         raise HTTPException(status_code=401, detail="Invalid email or password")
     _enforce_user_not_blocked(row)
 
@@ -8203,8 +8247,20 @@ def auth_login(payload: LoginPayload):
     if not hmac.compare_digest(check, stored_hash):
         _, legacy_check = _hash_password(payload.password, salt_b64=salt, iterations=100_000)
         if not hmac.compare_digest(legacy_check, stored_hash):
+            # Wrong password. Record the failure and (if over cap) return 429
+            # instead of 401 so an attacker hammering the same email gets
+            # rate-limited. Verification runs FIRST so a legit user with the
+            # right password always gets through, even if an attacker is
+            # currently brute-forcing the same address — that's the denial-
+            # of-service angle of throttle-before-verify, which we avoid.
+            recent = _login_record_failure(email)
+            if recent > _LOGIN_FAILURE_MAX_FAILURES:
+                raise HTTPException(status_code=429, detail="Too many failed login attempts. Try again in a minute.")
             raise HTTPException(status_code=401, detail="Invalid email or password")
         matched_legacy = True
+
+    # Successful login: clear the rolling failure window for this email.
+    _login_clear_failures(email)
 
     if matched_legacy:
         _, upgraded_hash = _hash_password(payload.password, salt_b64=salt)
