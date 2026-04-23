@@ -16,7 +16,19 @@ def _table_exists(cur, table_name: str) -> bool:
     return cur.fetchone() is not None
 
 
+_AUDIO_TABLE_WHERE_WHITELIST = frozenset({
+    ("chat_messages", "user_id=?"),
+    ("private_chat_messages", "sender_user_id=? OR recipient_user_id=?"),
+})
+
+
 def _collect_audio_paths(cur, table_name: str, where_sql: str, params: tuple[Any, ...]) -> List[str]:
+    # Both table_name and where_sql are interpolated into the f-string because
+    # SQL cannot bind identifiers. Gate the call behind a hardcoded whitelist
+    # of (table, where-clause) pairs so a future refactor that sources either
+    # from config or user input cannot turn this into SQL injection.
+    if (table_name, where_sql) not in _AUDIO_TABLE_WHERE_WHITELIST:
+        raise ValueError(f"Refusing audio-path query for ({table_name!r}, {where_sql!r})")
     if not _table_exists(cur, table_name):
         return []
     cur.execute(

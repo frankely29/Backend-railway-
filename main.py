@@ -5869,8 +5869,20 @@ def _get_existing_columns(table_name: str) -> set:
     return {row["name"] for row in rows}
 
 
+_SAFE_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
 def _ensure_column(table_name: str, column_name: str, column_def: str):
     """Idempotently add a column for SQLite/Postgres without IF NOT EXISTS portability issues."""
+    # Gate f-string interpolation behind an identifier whitelist so a future
+    # refactor that sources table / column names from config or user input
+    # cannot turn this into SQL injection. `column_def` still carries the
+    # type expression (e.g. "TEXT", "INTEGER DEFAULT 0") and is assumed to
+    # be a trusted developer-supplied literal at the call site.
+    if not _SAFE_IDENT_RE.match(table_name):
+        raise ValueError(f"Refusing to ALTER TABLE: unsafe table name {table_name!r}")
+    if not _SAFE_IDENT_RE.match(column_name):
+        raise ValueError(f"Refusing to ALTER TABLE {table_name}: unsafe column name {column_name!r}")
     existing = _get_existing_columns(table_name)
     if column_name in existing:
         return
