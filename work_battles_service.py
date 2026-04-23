@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 from fastapi import HTTPException
 
 from avatar_assets import avatar_thumb_url, avatar_version_for_data_url
-from core import DB_BACKEND, _db_exec, _db_query_all, _db_query_one
+from core import DB_BACKEND, _db_exec, _db_query_all, _db_query_one, _db_run_in_transaction, _sql
 from leaderboard_service import get_best_current_badges_for_users, get_progression_for_users
 from work_battles_db import ensure_work_battles_schema as _ensure_work_battles_schema
 
@@ -250,40 +250,63 @@ def _refresh_challenge_row(challenge_id: int, *, now_ms: Optional[int] = None) -
     return dict(row)
 
 
+_DUPLICATE_SQL = """
+    SELECT id, status
+    FROM work_battle_challenges
+    WHERE metric_key=?
+      AND period_key=?
+      AND status IN ('pending', 'active')
+      AND (
+        (challenger_user_id=? AND challenged_user_id=?)
+        OR
+        (challenger_user_id=? AND challenged_user_id=?)
+      )
+    ORDER BY id DESC
+    LIMIT 1
+    """
+
+_OVERLAP_SQL = """
+    SELECT id
+    FROM work_battle_challenges
+    WHERE metric_key=?
+      AND period_key=?
+      AND status='active'
+      AND (
+        challenger_user_id IN (?, ?)
+        OR challenged_user_id IN (?, ?)
+      )
+    LIMIT 1
+    """
+
+
+def _assert_no_duplicate_or_overlap_cur(cur, challenger_user_id: int, challenged_user_id: int, metric_key: str, period_key: str) -> None:
+    """Same checks as _assert_no_duplicate_or_overlap, but running on a
+    caller-supplied cursor so they can share a transaction with the INSERT."""
+    cur.execute(
+        _sql(_DUPLICATE_SQL),
+        (metric_key, period_key, int(challenger_user_id), int(challenged_user_id), int(challenged_user_id), int(challenger_user_id)),
+    )
+    if cur.fetchone():
+        raise HTTPException(status_code=409, detail="A pending or active work battle already exists between these users")
+
+    cur.execute(
+        _sql(_OVERLAP_SQL),
+        (metric_key, period_key, int(challenger_user_id), int(challenged_user_id), int(challenger_user_id), int(challenged_user_id)),
+    )
+    if cur.fetchone():
+        raise HTTPException(status_code=409, detail="One of these users already has an active work battle for this metric and period")
+
+
 def _assert_no_duplicate_or_overlap(challenger_user_id: int, challenged_user_id: int, metric_key: str, period_key: str) -> None:
     duplicate = _db_query_one(
-        """
-        SELECT id, status
-        FROM work_battle_challenges
-        WHERE metric_key=?
-          AND period_key=?
-          AND status IN ('pending', 'active')
-          AND (
-            (challenger_user_id=? AND challenged_user_id=?)
-            OR
-            (challenger_user_id=? AND challenged_user_id=?)
-          )
-        ORDER BY id DESC
-        LIMIT 1
-        """,
+        _DUPLICATE_SQL,
         (metric_key, period_key, int(challenger_user_id), int(challenged_user_id), int(challenged_user_id), int(challenger_user_id)),
     )
     if duplicate:
         raise HTTPException(status_code=409, detail="A pending or active work battle already exists between these users")
 
     overlap = _db_query_one(
-        """
-        SELECT id
-        FROM work_battle_challenges
-        WHERE metric_key=?
-          AND period_key=?
-          AND status='active'
-          AND (
-            challenger_user_id IN (?, ?)
-            OR challenged_user_id IN (?, ?)
-          )
-        LIMIT 1
-        """,
+        _OVERLAP_SQL,
         (metric_key, period_key, int(challenger_user_id), int(challenged_user_id), int(challenger_user_id), int(challenged_user_id)),
     )
     if overlap:
@@ -300,36 +323,62 @@ def create_challenge(challenger_user_id: int, target_user_id: int, battle_type: 
     battle = _catalog_item(battle_type)
     _require_user_exists(int(challenger_user_id))
     _require_user_exists(int(target_user_id))
-    _assert_no_duplicate_or_overlap(int(challenger_user_id), int(target_user_id), battle["metric_key"], battle["period_key"])
     expires_at_ms = current_ms + PENDING_EXPIRY_MS
-    _db_exec(
-        """
-        INSERT INTO work_battle_challenges(
-          metric_key, period_key, challenger_user_id, challenged_user_id, status,
-          created_at_ms, expires_at_ms, last_action_at_ms
-        )
-        VALUES(?,?,?,?,?,?,?,?)
-        """,
-        (
-            battle["metric_key"],
-            battle["period_key"],
+
+    # Run the duplicate-check and the INSERT in a single transaction so two
+    # concurrent create_challenge() calls for the same pair cannot both
+    # observe "no duplicate" before either insert lands. Without this, two
+    # racing POSTs could create two parallel pending challenges for the same
+    # (metric_key, period_key, challenger, challenged) tuple.
+    def _claim_and_insert(conn, cur) -> int:
+        _assert_no_duplicate_or_overlap_cur(
+            cur,
             int(challenger_user_id),
             int(target_user_id),
-            "pending",
-            current_ms,
-            expires_at_ms,
-            current_ms,
-        ),
-    )
-    row = _db_query_one(
-        """
-        SELECT * FROM work_battle_challenges
-        WHERE challenger_user_id=? AND challenged_user_id=? AND created_at_ms=?
-        ORDER BY id DESC LIMIT 1
-        """,
-        (int(challenger_user_id), int(target_user_id), current_ms),
-    )
-    return get_challenge_detail(int(row["id"]), int(challenger_user_id), now_ms=current_ms)
+            battle["metric_key"],
+            battle["period_key"],
+        )
+        cur.execute(
+            _sql(
+                """
+                INSERT INTO work_battle_challenges(
+                  metric_key, period_key, challenger_user_id, challenged_user_id, status,
+                  created_at_ms, expires_at_ms, last_action_at_ms
+                )
+                VALUES(?,?,?,?,?,?,?,?)
+                """
+            ),
+            (
+                battle["metric_key"],
+                battle["period_key"],
+                int(challenger_user_id),
+                int(target_user_id),
+                "pending",
+                current_ms,
+                expires_at_ms,
+                current_ms,
+            ),
+        )
+        cur.execute(
+            _sql(
+                """
+                SELECT id FROM work_battle_challenges
+                WHERE challenger_user_id=? AND challenged_user_id=? AND created_at_ms=?
+                ORDER BY id DESC LIMIT 1
+                """
+            ),
+            (int(challenger_user_id), int(target_user_id), current_ms),
+        )
+        created = cur.fetchone()
+        if created is None:
+            raise HTTPException(status_code=500, detail="Failed to create challenge")
+        try:
+            return int(created["id"])
+        except Exception:
+            return int(created[0])
+
+    challenge_id = _db_run_in_transaction(_claim_and_insert)
+    return get_challenge_detail(challenge_id, int(challenger_user_id), now_ms=current_ms)
 
 
 def accept_challenge(challenge_id: int, acting_user_id: int, *, now_ms: Optional[int] = None) -> Dict[str, Any]:
