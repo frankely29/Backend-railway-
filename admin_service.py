@@ -138,7 +138,31 @@ def _build_bin_filter_clause_and_params(
     return clauses, params
 
 
+# Table names go into an f-string with no parameterization because SQL does
+# not permit binding a table name as a parameter. Gate the interpolation
+# behind a hardcoded whitelist so a future refactor cannot turn this into
+# SQL injection. All current call sites pass literals from this set.
+_COUNTABLE_TABLES = frozenset({
+    "users",
+    "presence",
+    "events",
+    "pickup_logs",
+    "chat_messages",
+    "private_chat_messages",
+    "hotspot_experiment_bins",
+    "micro_hotspot_experiment_bins",
+    "recommendation_outcomes",
+    "micro_recommendation_outcomes",
+    "driver_daily_stats",
+    "driver_work_state",
+    "leaderboard_badges_current",
+    "paddle_webhook_events",
+})
+
+
 def _safe_count(table: str) -> Optional[int]:
+    if table not in _COUNTABLE_TABLES:
+        return None
     try:
         row = _db_query_one(f"SELECT COUNT(*) AS c FROM {table}")
         return int(row["c"]) if row else 0
@@ -147,6 +171,8 @@ def _safe_count(table: str) -> Optional[int]:
 
 
 def _recent_count(table: str, window_seconds: int = 86400) -> int:
+    if table not in _COUNTABLE_TABLES:
+        return 0
     cutoff = int(time.time()) - int(window_seconds)
     try:
         if DB_BACKEND == "postgres":
