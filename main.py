@@ -9615,6 +9615,22 @@ def _build_historical_fallback_zone_hotspot_features(
     return emitted, debug
 
 
+def _micro_top_n_for_zone_area(area_m2: float) -> int:
+    # Zone-size-aware cap: small zones get one hotspot, medium two, large three.
+    # Thresholds chosen against NYC taxi-zone area distribution (median ~0.5 km²).
+    try:
+        area = float(area_m2)
+    except Exception:
+        return 1
+    if not math.isfinite(area) or area <= 0:
+        return 1
+    if area < 200_000.0:
+        return 1
+    if area < 1_000_000.0:
+        return 2
+    return 3
+
+
 def _build_zone_micro_hotspots_payload(
     zone_id: int,
     zone_meta: Dict[str, Any],
@@ -9653,6 +9669,10 @@ def _build_zone_micro_hotspots_payload(
     minx, miny, _, _ = zone_proj.bounds
     weighted_buckets: Dict[Tuple[int, int], float] = defaultdict(float)
     raw_counts: Dict[Tuple[int, int], int] = defaultdict(int)
+    # Bucket the lat/lng of each qualifying point by cell so we can compute a
+    # true weighted-mean centroid per selected cell instead of snapping to the
+    # grid-cell center. Centroids then drift smoothly as new pickups land.
+    cell_points: Dict[Tuple[int, int], List[Tuple[float, float, float]]] = defaultdict(list)
 
     for idx, row in enumerate(point_rows):
         try:
@@ -9670,39 +9690,70 @@ def _build_zone_micro_hotspots_payload(
         gy = int(math.floor((y - miny) / cell_size_m))
         weighted_buckets[(gx, gy)] += weight
         raw_counts[(gx, gy)] += 1
+        cell_points[(gx, gy)].append((lat, lng, weight))
 
     if not weighted_buckets:
         return []
 
-    best_cell = max(weighted_buckets.items(), key=lambda kv: kv[1])[0]
-    gx, gy = best_cell
-    center_x = minx + ((gx + 0.5) * cell_size_m)
-    center_y = miny + ((gy + 0.5) * cell_size_m)
-    center_lng, center_lat = _to_4326.transform(center_x, center_y)
-    event_count = int(raw_counts.get(best_cell, 0))
-    intensity = round(min(1.0, max(0.2, weighted_buckets[best_cell] / 7.5)), 3)
-    confidence = round(min(0.98, 0.5 + (weighted_buckets[best_cell] / 12.0)), 3)
+    # Pick up to top_n cells by weighted score, skipping any 8-neighbor of an
+    # already-selected cell so adjacent grid bins don't double-count what is
+    # really one cluster. Keeps the output spatially distinct and lightweight.
+    try:
+        top_n = _micro_top_n_for_zone_area(zone_proj.area)
+    except Exception:
+        top_n = 1
+    sorted_cells = sorted(weighted_buckets.items(), key=lambda kv: kv[1], reverse=True)
+    selected_cells: List[Tuple[int, int]] = []
+    blocked: set[Tuple[int, int]] = set()
+    for (cx, cy), _weight in sorted_cells:
+        if (cx, cy) in blocked:
+            continue
+        selected_cells.append((cx, cy))
+        if len(selected_cells) >= top_n:
+            break
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                blocked.add((cx + dx, cy + dy))
 
     zone_name = zone_meta.get("zone_name") or ((point_rows[0].get("zone_name") if point_rows else "") or "")
     borough = zone_meta.get("borough") or ((point_rows[0].get("borough") if point_rows else "") or "")
 
-    micro = {
-        "cluster_id": f"{hotspot_id}:{gx}:{gy}",
-        "zone_id": zone_id,
-        "hotspot_id": hotspot_id,
-        "hotspot_index": int(hotspot_index),
-        "center_lat": center_lat,
-        "center_lng": center_lng,
-        "radius_m": 42,
-        "intensity": intensity,
-        "confidence": confidence,
-        "event_count": event_count,
-        "recommended": False,
-        "zone_name": zone_name,
-        "borough": borough,
-        "micro_method": "densest_cell_inside_hotspot",
-    }
-    return [micro]
+    micros: List[Dict[str, Any]] = []
+    for cell_idx, (gx, gy) in enumerate(selected_cells):
+        cell_pts = cell_points.get((gx, gy)) or []
+        if not cell_pts:
+            continue
+        total_w = sum(w for _, _, w in cell_pts)
+        if total_w <= 0:
+            continue
+        # Weighted-mean centroid of actual points in the cell — drifts smoothly
+        # toward the real cluster mass instead of snapping to cell center.
+        center_lat = sum(lat * w for lat, _, w in cell_pts) / total_w
+        center_lng = sum(lng * w for _, lng, w in cell_pts) / total_w
+        event_count = int(raw_counts.get((gx, gy), 0))
+        bucket_weight = weighted_buckets[(gx, gy)]
+        intensity = round(min(1.0, max(0.2, bucket_weight / 7.5)), 3)
+        confidence = round(min(0.98, 0.5 + (bucket_weight / 12.0)), 3)
+
+        micros.append({
+            "cluster_id": f"{hotspot_id}:{gx}:{gy}",
+            "zone_id": zone_id,
+            "hotspot_id": hotspot_id,
+            "hotspot_index": int(hotspot_index),
+            "rank": cell_idx,
+            "center_lat": center_lat,
+            "center_lng": center_lng,
+            "radius_m": 42,
+            "intensity": intensity,
+            "confidence": confidence,
+            "event_count": event_count,
+            "recommended": False,
+            "zone_name": zone_name,
+            "borough": borough,
+            "micro_method": "densest_cell_inside_hotspot",
+        })
+
+    return micros
 
 
 def _current_timeslot_bin(now_ts: int, bin_minutes: int = HOTSPOT_TIMESLOT_BIN_MINUTES) -> int:
@@ -11899,7 +11950,7 @@ def _pickup_zone_hotspots_with_debug(
                     if zone_debug is not None:
                         zone_debug["errors"].append("micro_hotspot_build_failed")
                     print(f"[warn] Failed to build pickup micro-hotspots for zone {zone_id}", traceback.format_exc())
-                props["micro_hotspots"] = [item for item in micro_payload if isinstance(item, dict)][:1]
+                props["micro_hotspots"] = [item for item in micro_payload if isinstance(item, dict)]
                 zone_micro_total += len(props["micro_hotspots"])
                 feature.pop("_hotspot_proj", None)
                 feature.pop("_component_cells", None)
