@@ -2646,6 +2646,144 @@ def _start_storage_cleanup_sweeper() -> None:
     threading.Thread(target=_worker, daemon=True, name="storage-cleanup-sweeper").start()
 
 
+# How often the monthly-rollover watcher wakes up and re-checks whether the
+# new calendar month needs a build. Default 1 hour. The watcher is gated by
+# the same persisted backoff (AUTO_RETIRED_REBUILD_BACKOFF_SEC) used at
+# startup, so this interval is effectively a "how soon do we notice" knob,
+# not a "how often do we rebuild" knob.
+MONTHLY_ROLLOVER_CHECK_INTERVAL_SECONDS = int(
+    os.environ.get("MONTHLY_ROLLOVER_CHECK_INTERVAL_SECONDS", "3600")
+)
+
+
+def _start_monthly_rollover_watcher() -> None:
+    """Background watcher that triggers a build when the calendar rolls into
+    a new NYC month and the new month's optimized exact_store / tendency
+    artifacts aren't yet built.
+
+    Without this, a long-running container that doesn't restart at the
+    month boundary keeps serving the previous month's tendency until the
+    next deploy. Startup auto-prepare only fires at boot time.
+
+    Behavior:
+      * Wakes every MONTHLY_ROLLOVER_CHECK_INTERVAL_SECONDS (default 1h).
+      * Resolves today's target month from current NYC time.
+      * Skips if a /generate run is already in progress.
+      * Skips if the active month's exact_store is already on disk AND the
+        day_tendency artifact has been refreshed since the start of the
+        current calendar month (UTC) — a coarse but cheap freshness check.
+      * Otherwise calls start_generate(month_key=..., include_day_tendency=True)
+        and writes auto-rebuild state, gated by the same persisted backoff
+        used by the startup auto-prepare path.
+    """
+
+    def _today_month_anchor_unix() -> int:
+        try:
+            today_nyc = datetime.now(timezone.utc).astimezone(NYC_TZ)
+            anchor_local = datetime(
+                today_nyc.year, today_nyc.month, 1,
+                tzinfo=NYC_TZ,
+            )
+            return int(anchor_local.astimezone(timezone.utc).timestamp())
+        except Exception:
+            return 0
+
+    def _tendency_fresh_for_month() -> bool:
+        try:
+            artifact = _generated_artifact_record("day_tendency_model")
+        except Exception:
+            artifact = None
+        if not isinstance(artifact, dict):
+            return False
+        updated_at = int(artifact.get("updated_at_unix") or 0)
+        if updated_at <= 0:
+            return False
+        return updated_at >= _today_month_anchor_unix()
+
+    def _worker() -> None:
+        while True:
+            try:
+                time.sleep(max(60, int(MONTHLY_ROLLOVER_CHECK_INTERVAL_SECONDS)))
+
+                state = _get_state()
+                state_name = str(state.get("state") or "").strip()
+                if state_name == "running":
+                    continue
+
+                source_month_keys = _available_source_month_keys()
+                if not source_month_keys:
+                    continue
+                target_month_key_candidate = resolve_active_month_key(
+                    datetime.now(timezone.utc).astimezone(NYC_TZ),
+                    source_month_keys,
+                )
+                if not target_month_key_candidate:
+                    continue
+
+                store_path = _month_store_path(target_month_key_candidate)
+                exact_store_present = bool(
+                    store_path and store_path.exists() and store_path.stat().st_size > 0
+                )
+                tendency_fresh = _tendency_fresh_for_month()
+                if exact_store_present and tendency_fresh:
+                    continue
+
+                # Persisted backoff — survives redeploys and prevents the
+                # watcher from hammering when a build keeps failing.
+                rebuild_state = _read_auto_rebuild_state(target_month_key_candidate) or {}
+                last_attempt_unix = int(rebuild_state.get("last_attempt_unix") or 0)
+                now_unix = int(time.time())
+                if (
+                    last_attempt_unix > 0
+                    and (now_unix - last_attempt_unix) < int(AUTO_RETIRED_REBUILD_BACKOFF_SEC)
+                ):
+                    continue
+
+                # In-process failure backoff (separate, shorter gate).
+                if (
+                    _last_failed_month_key
+                    and str(_last_failed_month_key).strip() == str(target_month_key_candidate).strip()
+                    and _last_failed_at_unix is not None
+                    and (now_unix - int(_last_failed_at_unix)) < int(MONTH_BUILD_FAILURE_BACKOFF_SEC)
+                ):
+                    continue
+
+                _write_auto_rebuild_state(target_month_key_candidate)
+                print(
+                    "[monthly-rollover-watcher] triggered rebuild "
+                    f"month_key={target_month_key_candidate} "
+                    f"exact_store_present={exact_store_present} "
+                    f"tendency_fresh={tendency_fresh}"
+                )
+                start_generate(
+                    bin_minutes=DEFAULT_BIN_MINUTES,
+                    min_trips_per_window=DEFAULT_MIN_TRIPS_PER_WINDOW,
+                    include_day_tendency=True,
+                    build_review_artifacts=False,
+                    month_key=target_month_key_candidate,
+                    build_all_months=False,
+                )
+            except Exception:
+                traceback.print_exc()
+
+    threading.Thread(
+        target=_worker,
+        daemon=True,
+        name="monthly-rollover-watcher",
+    ).start()
+
+
+def _generated_artifact_record(artifact_key: str) -> Optional[Dict[str, Any]]:
+    """Return the metadata row for a generated artifact (updated_at_unix etc.)
+    or None if absent. Wraps the lower-level metadata loader so callers don't
+    need to materialise the artifact payload just to read its timestamp."""
+    try:
+        from artifact_db_store import load_generated_artifact_metadata
+        return load_generated_artifact_metadata(artifact_key)
+    except Exception:
+        return None
+
+
 def _weekday_name_from_mon0(dow: int) -> str:
     names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
     idx = max(0, min(6, int(dow)))
@@ -6189,6 +6327,10 @@ def startup():
     except Exception:
         traceback.print_exc()
     try:
+        _start_monthly_rollover_watcher()
+    except Exception:
+        traceback.print_exc()
+    try:
         manifest = _load_month_manifest()
         for built_month_key in list(manifest.get("available_month_keys") or []):
             _maybe_repair_month_timeline_iso(str(built_month_key))
@@ -6486,10 +6628,16 @@ def startup():
             return
 
         print(f"startup_auto_prepare_month_start month_key={target_month_key_candidate}")
+        # Always include day_tendency on auto-prepare runs. Without this, a
+        # rollover-triggered build (Fix G — new active month with parquet
+        # but no exact_store yet) leaves day_tendency_model and the
+        # downstream assistant_outlook frozen at the previous month's data.
+        # The cost of (re)building tendency is small relative to the core
+        # build that's already running.
         start_generate(
             bin_minutes=DEFAULT_BIN_MINUTES,
             min_trips_per_window=DEFAULT_MIN_TRIPS_PER_WINDOW,
-            include_day_tendency=False,
+            include_day_tendency=True,
             build_review_artifacts=False,
             month_key=target_month_key_candidate,
             build_all_months=False,
