@@ -6,16 +6,22 @@ from hotspot_models import ZoneScoreResult
 
 
 def recency_decay_weight(age_seconds: float) -> float:
+    # Flatter decay than before. The product owner's guidance: "history is
+    # more important than the most recent — recent trips can shift a hotspot
+    # but history is the foundation." Old curve dropped to 6% at >2 hours,
+    # which effectively erased older live evidence. New curve keeps the
+    # recent trips strongest (1.0 at <=12 min) but lets a trip from 2 hours
+    # ago still contribute ~25% of a current trip, instead of 6%.
     age_minutes = max(0.0, age_seconds / 60.0)
     if age_minutes <= 12:
         return 1.0
     if age_minutes <= 30:
-        return 0.65
+        return 0.85
     if age_minutes <= 60:
-        return 0.34
+        return 0.65
     if age_minutes <= 120:
-        return 0.15
-    return 0.06
+        return 0.45
+    return 0.25
 
 
 def _clip(v: float, lo: float = 0.0, hi: float = 1.0) -> float:
