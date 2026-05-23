@@ -122,6 +122,23 @@ def score_micro_hotspots(
         setattr(results[-1], "event_count", len(points))
 
     results.sort(key=lambda r: r.final_score, reverse=True)
+
+    # Within-zone relative intensity. The user-facing question for a micro
+    # hotspot dot is "where IN THIS ZONE are the most trips concentrated?" —
+    # which is a within-zone comparison, not citywide. We rescale `intensity`
+    # so the strongest cluster in this zone always reaches 1.0 and the rest
+    # fade by their share of that strongest cluster's score. This is what
+    # drives the dot's visual size/color on the frontend (see
+    # app.part10.js — `props.intensity`).
+    #
+    # `final_score` is left untouched so absolute-score consumers (e.g. the
+    # recommendation engine that gates "is this hotspot worth showing")
+    # still see the un-normalized value.
+    max_final_score = max((r.final_score for r in results), default=0.0)
+    if max_final_score > 0:
+        for r in results:
+            r.intensity = _clip(r.final_score / max_final_score)
+
     cap = max(1, min(3, int(top_n)))
     recommended = [r for r in results if r.recommended]
     if recommended:
