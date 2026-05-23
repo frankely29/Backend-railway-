@@ -85,9 +85,15 @@ def score_micro_hotspots(
         diversity = 0.30 + 0.70 * _clip(unique_count / max(1.0, weighted))
         weighted_adj = weighted * diversity
 
-        baseline_component = 0.56 * _clip(historical_zone_support / 14.0)
-        live_component = 0.24 * _clip(weighted_adj / 7.0)
-        timeslot_component = 0.17 * _clip(same_timeslot_support / 8.0)
+        # Component weights — history-dominant per product guidance.
+        # Historical zone support (long-run baseline) + same-timeslot support
+        # (same day-of-week, same hour pattern) combine to 0.82, while the
+        # live (decayed) signal contributes 0.18. Live still matters — it can
+        # shift a hotspot — but history is the foundation. Previous weights
+        # were 0.56 / 0.17 / 0.24 (history total 0.73, live 0.24).
+        baseline_component = 0.60 * _clip(historical_zone_support / 14.0)
+        live_component = 0.18 * _clip(weighted_adj / 7.0)
+        timeslot_component = 0.22 * _clip(same_timeslot_support / 8.0)
         crowding_component = 0.08 * _clip(density_penalty)
 
         # ETA-aware approximation: clusters with effective approach proxy near 5 minutes get a slight boost.
@@ -99,6 +105,16 @@ def score_micro_hotspots(
         confidence = _clip(0.22 + 0.38 * _clip(weighted_adj / 6.0) + 0.25 * _clip(unique_count / 4.0) + 0.15 * _clip(same_timeslot_support / 6.0))
         final_score = _clip(max(0.0, raw) * confidence)
 
+        # Hard minimum: a hotspot needs at least 3 trips to be considered
+        # at all (product guidance). Below that, the cluster is just noise.
+        event_count = len(points)
+        recommended = bool(
+            event_count >= 3
+            and weighted_adj >= 0.85
+            and unique_count >= 1
+            and confidence >= 0.18
+            and final_score >= 0.10
+        )
         results.append(
             MicroHotspotScoreResult(
                 cluster_id=f"z{zone_id}_{gx}_{gy}",
@@ -115,11 +131,11 @@ def score_micro_hotspots(
                 live_component=live_component,
                 same_timeslot_component=timeslot_component,
                 final_score=final_score,
-                recommended=bool(weighted_adj >= 0.85 and unique_count >= 1 and confidence >= 0.18 and final_score >= 0.10),
+                recommended=recommended,
                 eta_alignment=eta_alignment,
             )
         )
-        setattr(results[-1], "event_count", len(points))
+        setattr(results[-1], "event_count", event_count)
 
     results.sort(key=lambda r: r.final_score, reverse=True)
 
@@ -145,10 +161,12 @@ def score_micro_hotspots(
         return recommended[:cap]
 
     # Conservative fallback only after zone-level 5-dot qualification upstream.
+    # Minimum trip count bumped from 2 to 3 per product guidance — under 3
+    # trips, the cluster is noise even as a fallback.
     fallback = [
         r
         for r in results
-        if cast(int, getattr(r, "event_count", 0)) >= 2
+        if cast(int, getattr(r, "event_count", 0)) >= 3
         and r.unique_driver_count >= 1
         and r.confidence >= 0.08
         and r.final_score >= 0.03
