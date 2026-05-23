@@ -87,12 +87,16 @@ def score_micro_hotspots(
 
         # Component weights — history-dominant per product guidance.
         # Historical zone support (long-run baseline) + same-timeslot support
-        # (same day-of-week, same hour pattern) combine to 0.82, while the
-        # live (decayed) signal contributes 0.18. Live still matters — it can
-        # shift a hotspot — but history is the foundation. Previous weights
-        # were 0.56 / 0.17 / 0.24 (history total 0.73, live 0.24).
-        baseline_component = 0.60 * _clip(historical_zone_support / 14.0)
-        live_component = 0.18 * _clip(weighted_adj / 7.0)
+        # (same day-of-week, same hour pattern) combine to 0.90 of the
+        # positive score, while the live (decayed) signal contributes 0.10.
+        # Live still has weight — it can shift a hotspot when there's a real
+        # surge — but history is the primary signal. Even a strong burst of
+        # recent activity can move the score by only ~0.10, while a strong
+        # historical pattern can move it by up to 0.90, so the dominant cue
+        # for "is this a hotspot?" is the historical record. Prior weights
+        # iterated: 0.56/0.17/0.24 -> 0.60/0.22/0.18 -> 0.68/0.22/0.10.
+        baseline_component = 0.68 * _clip(historical_zone_support / 14.0)
+        live_component = 0.10 * _clip(weighted_adj / 7.0)
         timeslot_component = 0.22 * _clip(same_timeslot_support / 8.0)
         crowding_component = 0.08 * _clip(density_penalty)
 
