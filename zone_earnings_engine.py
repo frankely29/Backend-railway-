@@ -517,6 +517,15 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
         COUNT(pickups_per_sq_mile_now) OVER (PARTITION BY exact_bin_local_ts) AS demand_density_now_n,
         ROW_NUMBER() OVER (PARTITION BY exact_bin_local_ts ORDER BY pickups_per_sq_mile_next) AS demand_density_next_rn,
         COUNT(pickups_per_sq_mile_next) OVER (PARTITION BY exact_bin_local_ts) AS demand_density_next_n,
+        -- Absolute pickup volume relative to the busiest zone in the same
+        -- time bin. The percentile-rank columns above tell you "where this
+        -- zone ranks" but compress the gap between #1 and #50, so a zone
+        -- with 500 pickups looks similar to a zone with 100 pickups. The
+        -- MAX(pickups) windowed value preserves the absolute magnitude,
+        -- and we sqrt-normalize so the spread is meaningful without one
+        -- freak zone collapsing the rest of the map.
+        MAX(pickups_now) OVER (PARTITION BY exact_bin_local_ts) AS pickup_volume_now_max_in_bin,
+        MAX(pickups_next) OVER (PARTITION BY exact_bin_local_ts) AS pickup_volume_next_max_in_bin,
         ROW_NUMBER() OVER (PARTITION BY exact_bin_local_ts ORDER BY long_trip_share_20plus) AS long_trip_share_20plus_rn,
         COUNT(long_trip_share_20plus) OVER (PARTITION BY exact_bin_local_ts) AS long_trip_share_20plus_n,
         ROW_NUMBER() OVER (PARTITION BY exact_bin_local_ts ORDER BY balanced_trip_share) AS balanced_trip_share_rn,
@@ -575,6 +584,16 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
           WHEN demand_next_n <= 1 THEN 0.0
           ELSE (demand_next_rn - 1) * 1.0 / (demand_next_n - 1)
         END AS demand_next_n,
+        CASE
+          WHEN pickups_now <= 0 THEN 0.0
+          WHEN pickup_volume_now_max_in_bin IS NULL OR pickup_volume_now_max_in_bin <= 0 THEN 0.0
+          ELSE SQRT(pickups_now * 1.0) / SQRT(pickup_volume_now_max_in_bin * 1.0)
+        END AS pickup_volume_magnitude_now_n,
+        CASE
+          WHEN pickups_next <= 0 THEN 0.0
+          WHEN pickup_volume_next_max_in_bin IS NULL OR pickup_volume_next_max_in_bin <= 0 THEN 0.0
+          ELSE SQRT(pickups_next * 1.0) / SQRT(pickup_volume_next_max_in_bin * 1.0)
+        END AS pickup_volume_magnitude_next_n,
         CASE
           WHEN median_driver_pay IS NULL THEN NULL
           WHEN pay_n <= 1 THEN 0.0
@@ -670,8 +689,15 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
           GREATEST((0.20 + 0.80 * GREATEST(demand_now_n, demand_next_n)), 0.0),
           1.0
         ) AS effective_demand_density_next_n,
-        LEAST(GREATEST((0.68 * demand_now_n + 0.32 * (COALESCE(demand_density_now_n, demand_now_n) * LEAST(GREATEST((0.20 + 0.80 * GREATEST(demand_now_n, demand_next_n)), 0.0), 1.0))), 0.0), 1.0) AS busy_now_base_n,
-        LEAST(GREATEST((0.62 * demand_next_n + 0.38 * (COALESCE(demand_density_next_n, demand_next_n) * LEAST(GREATEST((0.20 + 0.80 * GREATEST(demand_now_n, demand_next_n)), 0.0), 1.0))), 0.0), 1.0) AS busy_next_base_n,
+        -- busy_now_base_n now combines three signals:
+        --   45%  percentile rank of pickups_now within the bin (smooth, captures relative position)
+        --   25%  density rank (small zones with concentrated demand still rewarded)
+        --   30%  absolute pickup magnitude, sqrt-of-max normalized (where pickups actually happen)
+        -- The 30% magnitude weight is what makes zones with the most raw pickups
+        -- visibly hotter than zones that are merely "above the median" — see
+        -- pickup_volume_magnitude_now_n definition above.
+        LEAST(GREATEST((0.45 * demand_now_n + 0.25 * (COALESCE(demand_density_now_n, demand_now_n) * LEAST(GREATEST((0.20 + 0.80 * GREATEST(demand_now_n, demand_next_n)), 0.0), 1.0)) + 0.30 * pickup_volume_magnitude_now_n), 0.0), 1.0) AS busy_now_base_n,
+        LEAST(GREATEST((0.40 * demand_next_n + 0.30 * (COALESCE(demand_density_next_n, demand_next_n) * LEAST(GREATEST((0.20 + 0.80 * GREATEST(demand_now_n, demand_next_n)), 0.0), 1.0)) + 0.30 * pickup_volume_magnitude_next_n), 0.0), 1.0) AS busy_next_base_n,
         LEAST(
           GREATEST(
             (
