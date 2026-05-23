@@ -115,6 +115,32 @@ CITYWIDE_TRAP_CANDIDATE_SCORE_FIELD = "earnings_shadow_score_citywide_v3_trap_ca
 CITYWIDE_TRAP_CANDIDATE_CONF_FIELD = "earnings_shadow_confidence_citywide_v3_trap_candidate"
 CITYWIDE_BASELINE_SCORE_FIELD = "earnings_shadow_score_citywide_v3_anchor_shadow"
 CITYWIDE_BASELINE_CONF_FIELD = "earnings_shadow_confidence_citywide_v3"
+
+# Same-weekday historical blend. To improve map accuracy, the per-zone score
+# shown for "today at HH:MM" is blended with the same weekday/time from the
+# previous 3 weeks. Driver demand patterns are highly weekly-periodic (e.g.,
+# a Saturday at 11:24 looks more like other Saturdays at 11:24 than like
+# the same weekday at a different hour), so averaging across same-weekday
+# slots dampens single-day noise without losing today's signal.
+#
+# Weights:
+#   today        : 0.40
+#   each of last 3 same-weekday slots : 0.20 (= 0.60 combined)
+# When fewer than 3 prior weeks have data for a given zone, weights are
+# normalized over only the present samples. We look back up to 12 weeks
+# trying to find 3 valid priors per zone before normalizing.
+SAME_WEEKDAY_BLEND_TODAY_WEIGHT = 0.40
+SAME_WEEKDAY_BLEND_PRIOR_WEIGHT = 0.20
+SAME_WEEKDAY_BLEND_PRIOR_TARGET_COUNT = 3
+SAME_WEEKDAY_BLEND_MAX_LOOKBACK_WEEKS = 12
+SAME_WEEKDAY_BLEND_COLUMNS: Tuple[str, ...] = (
+    "earnings_shadow_score_citywide_v3",
+    "earnings_shadow_score_citywide_v3_anchor_shadow",
+    "earnings_shadow_score_citywide_v3_trap_candidate",
+    "earnings_shadow_confidence_citywide_v3",
+    "earnings_shadow_confidence_citywide_v3_trap_candidate",
+    "earnings_shadow_rating_citywide_v3",
+)
 V3_PROFILE_CONFIG = {
     "citywide_v3": {
         "score": "earnings_shadow_score_citywide_v3_anchor_shadow",
@@ -1110,6 +1136,89 @@ def build_single_frame_for_month(
     return {"time": requested_frame_time, "polygons": {"type": "FeatureCollection", "features": features}}
 
 
+def _same_weekday_blended_scores(
+    con: "duckdb.DuckDBPyConnection",
+    requested_frame_time: str,
+    columns: Tuple[str, ...],
+) -> Dict[int, Dict[str, float]]:
+    """For each zone present in the requested frame, blend its score columns
+    with the same weekday/time from the previous 3 weeks. Looks back up to
+    SAME_WEEKDAY_BLEND_MAX_LOOKBACK_WEEKS to find SAME_WEEKDAY_BLEND_PRIOR_
+    TARGET_COUNT valid priors. Returns {zone_id: {column: blended_value}}.
+
+    Weights: today contributes SAME_WEEKDAY_BLEND_TODAY_WEIGHT, each found
+    prior contributes SAME_WEEKDAY_BLEND_PRIOR_WEIGHT. Weights are
+    re-normalized over present samples so zones with fewer priors aren't
+    diluted (e.g., today-only zones return today's value unchanged).
+    """
+    try:
+        req_dt = datetime.strptime(requested_frame_time, "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        return {}
+
+    candidate_priors_iso: List[str] = []
+    for k in range(1, SAME_WEEKDAY_BLEND_MAX_LOOKBACK_WEEKS + 1):
+        candidate_priors_iso.append((req_dt - timedelta(weeks=k)).strftime("%Y-%m-%dT%H:%M:%S"))
+    all_times = [requested_frame_time] + candidate_priors_iso
+    placeholders = ",".join(["?"] * len(all_times))
+    score_cols_sql = ", ".join(columns)
+    cursor = con.execute(
+        f"""
+        SELECT PULocationID, exact_bin_local_ts, {score_cols_sql}
+        FROM exact_shadow_rows
+        WHERE exact_bin_local_ts IN ({placeholders})
+        """,
+        all_times,
+    )
+    by_zone: Dict[int, List[Tuple[str, Tuple[Any, ...]]]] = {}
+    for row in cursor.fetchall():
+        try:
+            zid = int(row[0])
+        except Exception:
+            continue
+        ts = str(row[1])
+        score_values = row[2 : 2 + len(columns)]
+        by_zone.setdefault(zid, []).append((ts, score_values))
+
+    blended_by_zone: Dict[int, Dict[str, float]] = {}
+    for zid, entries in by_zone.items():
+        today_entry: Tuple[str, Tuple[Any, ...]] | None = None
+        prior_entries: List[Tuple[str, Tuple[Any, ...]]] = []
+        for entry in entries:
+            if entry[0] == requested_frame_time:
+                today_entry = entry
+            else:
+                prior_entries.append(entry)
+        if today_entry is None:
+            continue
+        prior_entries.sort(key=lambda e: e[0], reverse=True)
+        prior_entries = prior_entries[:SAME_WEEKDAY_BLEND_PRIOR_TARGET_COUNT]
+        weighted_samples = [(SAME_WEEKDAY_BLEND_TODAY_WEIGHT, today_entry[1])]
+        for entry in prior_entries:
+            weighted_samples.append((SAME_WEEKDAY_BLEND_PRIOR_WEIGHT, entry[1]))
+
+        blended_cols: Dict[str, float] = {}
+        for col_idx, col_name in enumerate(columns):
+            total_weight = 0.0
+            weighted_sum = 0.0
+            for weight, score_values in weighted_samples:
+                value = score_values[col_idx]
+                if value is None:
+                    continue
+                try:
+                    numeric = float(value)
+                except (TypeError, ValueError):
+                    continue
+                weighted_sum += weight * numeric
+                total_weight += weight
+            if total_weight <= 0.0:
+                continue
+            blended_cols[col_name] = weighted_sum / total_weight
+        if blended_cols:
+            blended_by_zone[zid] = blended_cols
+    return blended_by_zone
+
+
 def build_single_frame_from_exact_store(
     *,
     exact_store_path: Path,
@@ -1151,6 +1260,9 @@ def build_single_frame_from_exact_store(
         )
         rows = cursor.fetchall()
         columns = [str(desc[0]) for desc in (cursor.description or [])]
+        blended_by_zone = _same_weekday_blended_scores(
+            con, requested_frame_time, SAME_WEEKDAY_BLEND_COLUMNS
+        )
     finally:
         con.close()
 
@@ -1164,6 +1276,13 @@ def build_single_frame_from_exact_store(
         geom = geom_by_id.get(zid)
         if not geom:
             continue
+        blended_cols = blended_by_zone.get(zid)
+        if blended_cols:
+            for col_name, blended_value in blended_cols.items():
+                if col_name == "earnings_shadow_rating_citywide_v3":
+                    row_map[col_name] = int(round(blended_value))
+                else:
+                    row_map[col_name] = blended_value
         features.append(
             {
                 "type": "Feature",
