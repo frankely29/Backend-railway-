@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hmac
 import hashlib
+import inspect
 import gzip
 import json
 import math
@@ -668,6 +669,67 @@ def _month_frame_cache_file(month_key: str, frame_index: int, frame_time: str) -
     safe_time = re.sub(r"[^0-9A-Za-z]+", "_", str(frame_time or "").strip()).strip("_")
     suffix = safe_time[:64] if safe_time else "unknown"
     return _month_frame_cache_dir(month_key) / f"frame_{int(frame_index):05d}_{suffix}.json"
+
+
+# Frame rating cache invalidation. The cache files at _month_frame_cache_file
+# are filled by _generate_worker running build_hotspots_frames -> the SQL in
+# zone_earnings_engine.py. Their etag at _read_frame_cached doesn't depend on
+# the SQL or profile weights, so saturation-tuning PRs landed without ever
+# changing what the server hands out. _rating_logic_version_token() solves
+# that two ways:
+#   1. It's mixed into the frame etag so any in-memory entry is invalidated
+#      after a code change, and the disk file mtime is also folded in so an
+#      in-memory entry from before the worker rewrote the file is invalidated
+#      after the rewrite.
+#   2. It's compared on startup against a sidecar file -- a mismatch triggers
+#      start_generate(build_all_months=True) in the background so the cache
+#      rebuilds without anyone hitting an admin endpoint.
+_RATING_LOGIC_VERSION_CACHE: Optional[str] = None
+
+
+def _rating_logic_version_token() -> str:
+    global _RATING_LOGIC_VERSION_CACHE
+    if _RATING_LOGIC_VERSION_CACHE is not None:
+        return _RATING_LOGIC_VERSION_CACHE
+    digest = hashlib.sha256()
+    try:
+        import zone_earnings_engine as _zee
+        import zone_mode_profiles as _zmp
+        for mod in (_zee, _zmp):
+            try:
+                digest.update(inspect.getsource(mod).encode("utf-8"))
+            except (OSError, TypeError):
+                # Source unavailable (e.g. frozen). Fall back to file mtime.
+                try:
+                    digest.update(str(Path(mod.__file__).stat().st_mtime_ns).encode("utf-8"))
+                except Exception:
+                    digest.update(b"unknown")
+    except Exception:
+        digest.update(b"version-import-failed")
+    _RATING_LOGIC_VERSION_CACHE = digest.hexdigest()[:16]
+    return _RATING_LOGIC_VERSION_CACHE
+
+
+def _rating_logic_version_file() -> Path:
+    return DATA_DIR / ".rating_logic_version"
+
+
+def _read_stored_rating_logic_version() -> str:
+    path = _rating_logic_version_file()
+    if not path.exists():
+        return ""
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except Exception:
+        return ""
+
+
+def _write_stored_rating_logic_version(version: str) -> None:
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        _rating_logic_version_file().write_text(str(version or ""), encoding="utf-8")
+    except Exception:
+        traceback.print_exc()
 
 
 def _month_build_meta_path(month_key: str) -> Path:
@@ -1899,7 +1961,11 @@ def _read_frame_cached(idx: int, month_key: Optional[str] = None) -> Dict[str, A
     timeline_etag = str((timeline_cached or {}).get("etag") or "")
     cache_idx = (active_month_key, int(idx))
     cache_file = _month_frame_cache_file(active_month_key, idx, frame_time)
-    etag = f'W/"frame-{active_month_key}-{idx}-{abs(hash((frame_time, timeline_etag))) & 0xffffffff:x}"'
+    try:
+        cache_file_mtime_ns = cache_file.stat().st_mtime_ns if cache_file.exists() else 0
+    except Exception:
+        cache_file_mtime_ns = 0
+    etag = f'W/"frame-{active_month_key}-{idx}-{abs(hash((frame_time, timeline_etag, _rating_logic_version_token(), cache_file_mtime_ns))) & 0xffffffff:x}"'
     with _frame_cache_lock:
         cached = _frame_cache.get(cache_idx)
         if cached is not None and cached.get("etag") == etag:
@@ -6321,6 +6387,32 @@ def startup():
     except Exception:
         _cleanup_last_startup_removed_count = 0
         _cleanup_last_startup_freed_bytes_estimate = 0
+        traceback.print_exc()
+    try:
+        current_version = _rating_logic_version_token()
+        stored_version = _read_stored_rating_logic_version()
+        if stored_version != current_version:
+            print(
+                f"[rating-logic] version changed (stored={stored_version!r} current={current_version!r}); "
+                f"triggering background frame-cache regeneration via start_generate(build_all_months=True)"
+            )
+            try:
+                start_generate(
+                    DEFAULT_BIN_MINUTES,
+                    DEFAULT_MIN_TRIPS_PER_WINDOW,
+                    force_clear_lock=False,
+                    include_day_tendency=False,
+                    build_review_artifacts=False,
+                    month_key=None,
+                    build_all_months=True,
+                )
+                _write_stored_rating_logic_version(current_version)
+            except Exception:
+                print("[warn] auto-regen on rating-logic version change failed (non-fatal)")
+                traceback.print_exc()
+        else:
+            print(f"[rating-logic] version unchanged (version={current_version!r}); no auto-regen needed")
+    except Exception:
         traceback.print_exc()
     try:
         _start_storage_cleanup_sweeper()
