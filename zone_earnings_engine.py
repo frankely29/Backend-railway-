@@ -687,11 +687,11 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
           1.0
         ) AS market_saturation_pressure_n,
         CASE
-          WHEN lower(coalesce(borough_name, '')) LIKE '%manhattan%' THEN 1.15
+          WHEN lower(coalesce(borough_name, '')) LIKE '%manhattan%' THEN 1.55
           WHEN lower(coalesce(borough_name, '')) LIKE '%brooklyn%' THEN 0.55
           WHEN lower(coalesce(borough_name, '')) LIKE '%queens%' THEN 0.50
           WHEN lower(coalesce(borough_name, '')) LIKE '%bronx%' THEN 0.40
-          WHEN lower(coalesce(borough_name, '')) LIKE '%staten%' THEN 0.16
+          WHEN lower(coalesce(borough_name, '')) LIKE '%staten%' THEN 0.10
           ELSE 0.35
         END AS borough_multiplier,
         CASE
