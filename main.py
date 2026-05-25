@@ -4155,10 +4155,6 @@ def _generate_worker(
             failed_month_key_candidate = str(build_month_keys[0]).strip()
         months_manifest: Dict[str, Dict[str, Any]] = dict((_load_month_manifest().get("months") or {}))
         build_results: Dict[str, Any] = {}
-        source_target_month_key = resolve_active_month_key(
-            datetime.now(timezone.utc).astimezone(NYC_TZ),
-            sorted(grouped_parquets.keys()),
-        )
         for mk in build_month_keys:
             print(f"monthly_partition_build_start month_key={mk}")
             month_dir = _month_dir(mk)
@@ -4202,7 +4198,7 @@ def _generate_worker(
                 mk,
                 existing={"source_parquet_filenames": [p.name for p in (grouped_parquets.get(mk) or [])]},
             )
-            if str(mk).strip() == str(source_target_month_key or "").strip() and bool(freshness.get("signature_match")):
+            if bool(freshness.get("signature_match")):
                 stale_removed = _purge_month_frame_cache(mk)
                 print(f"monthly_partition_frame_cache_purged month_key={mk} removed={stale_removed}")
             build_results[mk] = month_result
@@ -4281,6 +4277,20 @@ def _generate_worker(
         except Exception:
             print("generate_worker_post_rebuild_auto_run_tests_failed")
             traceback.print_exc()
+
+        # Persist rating-logic version token only after a successful full rebuild.
+        # The startup hook used to write this before the worker ran, which meant a
+        # crashed worker would still advance the token and silently skip regen on
+        # the next restart. build_all_months=True is the only path that rebuilds
+        # every duckdb store the engine reads from, so this is the correct
+        # success boundary for marking the token as committed.
+        if bool(build_all_months):
+            try:
+                _write_stored_rating_logic_version(_rating_logic_version_token())
+                print("generate_worker_rating_logic_version_committed")
+            except Exception:
+                print("generate_worker_rating_logic_version_commit_failed")
+                traceback.print_exc()
 
     except Exception as e:
         end = time.time()
@@ -6406,7 +6416,9 @@ def startup():
                     month_key=None,
                     build_all_months=True,
                 )
-                _write_stored_rating_logic_version(current_version)
+                # Token is now persisted by the worker on successful completion,
+                # not here. This keeps a crashed/aborted worker from advancing the
+                # stored version and silently skipping regen on the next restart.
             except Exception:
                 print("[warn] auto-regen on rating-logic version change failed (non-fatal)")
                 traceback.print_exc()
