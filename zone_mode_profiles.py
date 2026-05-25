@@ -80,7 +80,7 @@ ZONE_MODE_PROFILES: Dict[str, ZoneScoreProfileWeights] = {
         same_zone_retention_penalty_weight=0.09,
         pickup_friction_penalty_weight=0.032,
         shared_ride_penalty_weight=0.012,
-        market_saturation_penalty_weight=0.22,
+        market_saturation_penalty_weight=0.30,
     ),
     "bronx_wash_heights_v2": ZoneScoreProfileWeights(
         demand_now_weight=0.18,
@@ -192,7 +192,7 @@ ZONE_MODE_PROFILES: Dict[str, ZoneScoreProfileWeights] = {
         same_zone_retention_penalty_weight=0.020,
         pickup_friction_penalty_weight=0.015,
         shared_ride_penalty_weight=0.005,
-        market_saturation_penalty_weight=0.04,
+        market_saturation_penalty_weight=0.02,
     ),
 }
 
