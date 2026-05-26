@@ -188,11 +188,11 @@ ZONE_MODE_PROFILES: Dict[str, ZoneScoreProfileWeights] = {
         balanced_trip_share_weight=0.11,
         long_trip_share_20plus_weight=0.02,
         downstream_weight=0.07,
-        short_trip_penalty_weight=0.018,
-        same_zone_retention_penalty_weight=0.020,
-        pickup_friction_penalty_weight=0.015,
-        shared_ride_penalty_weight=0.005,
-        market_saturation_penalty_weight=0.011,
+        short_trip_penalty_weight=0.014,
+        same_zone_retention_penalty_weight=0.016,
+        pickup_friction_penalty_weight=0.012,
+        shared_ride_penalty_weight=0.004,
+        market_saturation_penalty_weight=0.009,
     ),
 }
 
