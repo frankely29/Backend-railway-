@@ -148,7 +148,7 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
           CASE
             WHEN {manhattan_core_citywide_guard_sql}
             THEN
-              0.330 * manhattan_core_saturation_penalty_n +
+              0.360 * manhattan_core_saturation_penalty_n +
               0.110 * citywide_manhattan_short_trip_trap_penalty_n
             ELSE 0.0
           END
@@ -162,7 +162,7 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
           CASE
             WHEN {manhattan_core_citywide_guard_sql}
             THEN
-              0.330 * manhattan_core_saturation_penalty_n +
+              0.360 * manhattan_core_saturation_penalty_n +
               0.110 * citywide_manhattan_short_trip_trap_penalty_n
             ELSE 0.0
           END
@@ -763,7 +763,7 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
         END AS manhattan_core_saturation_penalty_n,
         CASE
           WHEN {manhattan_core_citywide_guard_sql}
-          THEN LEAST(GREATEST(1.0 - (0.43 * manhattan_core_saturation_penalty_n), 0.57), 1.00)
+          THEN LEAST(GREATEST(1.0 - (0.47 * manhattan_core_saturation_penalty_n), 0.53), 1.00)
           ELSE 1.00
         END AS citywide_manhattan_saturation_discount_factor_n,
         CASE
@@ -951,7 +951,7 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
           {mw3.pickup_friction_penalty_weight:.8f} * pickup_friction_penalty_n +
           {mw3.shared_ride_penalty_weight:.8f} * shared_ride_penalty_n +
           {mw3.market_saturation_penalty_weight:.8f} * COALESCE(market_saturation_penalty_n, 0.0) +
-          0.33 * manhattan_core_saturation_penalty_n
+          0.36 * manhattan_core_saturation_penalty_n
         ) AS negative_score_manhattan_v3,
         {nullable_weighted_average_sql([
           (f"{bw3_busy_now_weight:.8f}", "busy_now_base_n"),
@@ -1368,7 +1368,7 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
       CASE
         WHEN {manhattan_core_citywide_guard_sql}
         THEN
-          0.330 * manhattan_core_saturation_penalty_n +
+          0.360 * manhattan_core_saturation_penalty_n +
           0.110 * citywide_manhattan_short_trip_trap_penalty_n
         ELSE 0.0
       END AS earnings_shadow_saturation_penalty_citywide_v3,
@@ -1379,7 +1379,7 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
       ({mw3.short_trip_penalty_weight:.8f} * short_trip_penalty_n) AS earnings_shadow_short_trip_penalty_manhattan_v3,
       ({mw3.same_zone_retention_penalty_weight:.8f} * COALESCE(same_zone_retention_penalty_n, 0.0)) AS earnings_shadow_retention_penalty_manhattan_v3,
       ({mw3.pickup_friction_penalty_weight:.8f} * pickup_friction_penalty_n + {mw3.shared_ride_penalty_weight:.8f} * shared_ride_penalty_n) AS earnings_shadow_friction_penalty_manhattan_v3,
-      ({mw3.market_saturation_penalty_weight:.8f} * market_saturation_penalty_n + 0.33 * manhattan_core_saturation_penalty_n) AS earnings_shadow_saturation_penalty_manhattan_v3,
+      ({mw3.market_saturation_penalty_weight:.8f} * market_saturation_penalty_n + 0.36 * manhattan_core_saturation_penalty_n) AS earnings_shadow_saturation_penalty_manhattan_v3,
       ({bw3_busy_now_weight:.8f} * busy_now_base_n + {bw3_busy_next_weight:.8f} * busy_next_base_n) AS earnings_shadow_busy_size_positive_bronx_wash_heights_v3,
       ({bw3.pay_weight:.8f} * pay_n_safe + {bw3.pay_per_min_weight:.8f} * pay_per_min_n_safe + {bw3.pay_per_mile_weight:.8f} * pay_per_mile_n_safe) AS earnings_shadow_pay_quality_positive_bronx_wash_heights_v3,
       ({bw3.balanced_trip_share_weight:.8f} * COALESCE(balanced_trip_share_n, 0.0) + {bw3.long_trip_share_20plus_weight:.8f} * COALESCE(long_trip_share_20plus_n, 0.0)) AS earnings_shadow_trip_mix_positive_bronx_wash_heights_v3,
