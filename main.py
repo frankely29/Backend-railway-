@@ -9217,13 +9217,32 @@ def long_trip_flags_probe():
         rowcount = 0
         table_ok = False
         table_err = f"{type(exc).__name__}: {exc}"
+    # Also report the events-based store that the front-end actually
+    # talks to since PR #457. If row_count_events stays at 0 while
+    # drivers report placing flags, POST is silently failing somewhere
+    # between the browser and the backend.
+    try:
+        ev_count = _db_query_one(
+            "SELECT COUNT(*) AS n FROM events WHERE type = ?",
+            (_LTF_EVENT_TYPE,),
+        )
+        ev_rowcount = int(ev_count["n"]) if ev_count and ev_count["n"] is not None else 0
+        events_ok = True
+        events_err = None
+    except Exception as exc:
+        ev_rowcount = 0
+        events_ok = False
+        events_err = f"{type(exc).__name__}: {exc}"
     return {
         "feature": "long_trip_flags",
-        "build": "pr-456",
+        "build": "pr-458",
         "db_backend": DB_BACKEND,
         "table_ready": table_ok,
         "table_error": table_err,
-        "row_count": rowcount,
+        "row_count": rowcount,                # PR #456 long_trip_flags table
+        "events_ready": events_ok,
+        "events_error": events_err,
+        "row_count_events": ev_rowcount,      # PR #457 events table (live path)
     }
 
 
