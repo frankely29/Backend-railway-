@@ -9409,8 +9409,20 @@ def long_trip_flags_events_create(
     payload: LongTripFlagCreatePayload,
     user: sqlite3.Row = Depends(require_user),
 ):
+    # Diagnostic: driver reports placements aren't reaching Postgres
+    # (row_count_events stayed at 0 even after placing). Need to see
+    # whether (a) POST never enters this handler at all (would be a
+    # CORS / preflight / routing issue upstream), or (b) it enters but
+    # something inside fails. Print on entry + around the INSERT, with
+    # exception text on failure, so Railway logs reveal which.
+    try:
+        uid_dbg = user["id"] if user is not None else None
+    except Exception:
+        uid_dbg = "<no-id>"
+    print(f"[ltf-post] enter user_id={uid_dbg} lng={payload.lng} lat={payload.lat} color={payload.color!r}", flush=True)
     color = str(payload.color or "").strip().lower()
     if color not in _LONG_TRIP_FLAG_COLORS:
+        print(f"[ltf-post] reject invalid color: {color!r}", flush=True)
         raise HTTPException(status_code=400, detail="invalid color (must be green, sky, or yellow)")
     now_ms = int(time.time() * 1000)
     expires_secs = int(time.time()) + _LTF_EVENT_EXPIRES_SECS
@@ -9418,11 +9430,15 @@ def long_trip_flags_events_create(
         user_id = int(user["id"]) if user is not None else 0
     except Exception:
         user_id = 0
-    _db_exec(
-        "INSERT INTO events(type, user_id, lat, lng, text, zone_id, created_at, expires_at) "
-        "VALUES(?,?,?,?,?,?,?,?)",
-        (_LTF_EVENT_TYPE, user_id, float(payload.lat), float(payload.lng), color, None, now_ms, expires_secs),
-    )
+    try:
+        _db_exec(
+            "INSERT INTO events(type, user_id, lat, lng, text, zone_id, created_at, expires_at) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (_LTF_EVENT_TYPE, user_id, float(payload.lat), float(payload.lng), color, None, now_ms, expires_secs),
+        )
+    except Exception as insert_exc:
+        print(f"[ltf-post] INSERT failed user_id={user_id}: {type(insert_exc).__name__}: {insert_exc}", flush=True)
+        raise HTTPException(status_code=500, detail=f"insert failed: {type(insert_exc).__name__}")
     # Read back the just-inserted row to get its auto-generated id. Match
     # by (user_id, created_at, type) which is essentially unique at ms
     # resolution. Bounded retry in case clock-skew + race ever produces
@@ -9434,8 +9450,11 @@ def long_trip_flags_events_create(
         (_LTF_EVENT_TYPE, user_id, now_ms),
     )
     if row is None:
+        print(f"[ltf-post] INSERT ok but SELECT returned no row user_id={user_id} created_at={now_ms}", flush=True)
         raise HTTPException(status_code=500, detail="flag inserted but could not be read back")
-    return _ltf_event_row_to_dict(row)
+    out = _ltf_event_row_to_dict(row)
+    print(f"[ltf-post] success id={out.get('id')} user_id={user_id}", flush=True)
+    return out
 
 
 @app.patch("/events/long_trip_flag/{flag_id}")
