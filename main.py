@@ -9132,6 +9132,164 @@ def log_pickup(payload: PickupPayload, user: sqlite3.Row = Depends(require_user)
     return create_pickup_record(payload, user)
 
 
+# Long Trips Block flags -- driver-placed pins marking spots worth waiting
+# at for trips of 45+ minutes. Shared across all drivers (anyone can
+# edit/remove per driver request). No per-driver cap yet. Persisted to a
+# simple JSON file on the volume mount; thread-safe via _long_trip_flags_lock.
+_long_trip_flags_lock = threading.Lock()
+_LONG_TRIP_FLAG_COLORS = {"green", "sky", "yellow"}
+
+
+def _long_trip_flags_path() -> Path:
+    return DATA_DIR / "long_trip_flags.json"
+
+
+def _read_long_trip_flags() -> List[Dict[str, Any]]:
+    path = _long_trip_flags_path()
+    if not path.exists():
+        return []
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except Exception:
+        return []
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return []
+    if not isinstance(data, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        fid = entry.get("id")
+        lng = entry.get("lng")
+        lat = entry.get("lat")
+        color = entry.get("color")
+        if not isinstance(fid, str) or not fid:
+            continue
+        try:
+            lng_f = float(lng); lat_f = float(lat)
+        except Exception:
+            continue
+        if not (-180.0 <= lng_f <= 180.0 and -90.0 <= lat_f <= 90.0):
+            continue
+        if color not in _LONG_TRIP_FLAG_COLORS:
+            continue
+        out.append({
+            "id": fid,
+            "lng": lng_f,
+            "lat": lat_f,
+            "color": color,
+            "createdAt": int(entry.get("createdAt") or 0),
+            "createdBy": str(entry.get("createdBy") or "") or None,
+        })
+    return out
+
+
+def _write_long_trip_flags(flags: List[Dict[str, Any]]) -> None:
+    path = _long_trip_flags_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    encoded = json.dumps(flags, separators=(",", ":")).encode("utf-8")
+    with tmp.open("wb") as handle:
+        handle.write(encoded)
+        handle.flush()
+        try: os.fsync(handle.fileno())
+        except Exception: pass
+    os.replace(tmp, path)
+
+
+class LongTripFlagCreatePayload(BaseModel):
+    lng: float = Field(allow_inf_nan=False, ge=-180.0, le=180.0)
+    lat: float = Field(allow_inf_nan=False, ge=-90.0, le=90.0)
+    color: str
+
+
+class LongTripFlagUpdatePayload(BaseModel):
+    lng: Optional[float] = Field(default=None, allow_inf_nan=False, ge=-180.0, le=180.0)
+    lat: Optional[float] = Field(default=None, allow_inf_nan=False, ge=-90.0, le=90.0)
+    color: Optional[str] = None
+
+
+def _ltf_coerce_user_id(user: sqlite3.Row) -> Optional[str]:
+    try:
+        uid = user["id"] if user is not None else None
+    except Exception:
+        uid = None
+    return str(uid) if uid is not None else None
+
+
+@app.get("/long_trip_flags")
+def long_trip_flags_list(user: sqlite3.Row = Depends(require_user)):
+    _ = user
+    with _long_trip_flags_lock:
+        return {"flags": _read_long_trip_flags()}
+
+
+@app.post("/long_trip_flags")
+def long_trip_flags_create(
+    payload: LongTripFlagCreatePayload,
+    user: sqlite3.Row = Depends(require_user),
+):
+    color = str(payload.color or "").strip().lower()
+    if color not in _LONG_TRIP_FLAG_COLORS:
+        raise HTTPException(status_code=400, detail="invalid color (must be green, sky, or yellow)")
+    flag = {
+        "id": f"ltf-{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}",
+        "lng": float(payload.lng),
+        "lat": float(payload.lat),
+        "color": color,
+        "createdAt": int(time.time() * 1000),
+        "createdBy": _ltf_coerce_user_id(user),
+    }
+    with _long_trip_flags_lock:
+        flags = _read_long_trip_flags()
+        flags.append(flag)
+        _write_long_trip_flags(flags)
+    return flag
+
+
+@app.patch("/long_trip_flags/{flag_id}")
+def long_trip_flags_update(
+    flag_id: str,
+    payload: LongTripFlagUpdatePayload,
+    user: sqlite3.Row = Depends(require_user),
+):
+    _ = user
+    flag_id = str(flag_id or "").strip()
+    if not flag_id:
+        raise HTTPException(status_code=400, detail="flag_id required")
+    with _long_trip_flags_lock:
+        flags = _read_long_trip_flags()
+        for f in flags:
+            if str(f.get("id")) != flag_id:
+                continue
+            if payload.lng is not None: f["lng"] = float(payload.lng)
+            if payload.lat is not None: f["lat"] = float(payload.lat)
+            if payload.color is not None:
+                color = str(payload.color or "").strip().lower()
+                if color not in _LONG_TRIP_FLAG_COLORS:
+                    raise HTTPException(status_code=400, detail="invalid color")
+                f["color"] = color
+            _write_long_trip_flags(flags)
+            return f
+    raise HTTPException(status_code=404, detail="flag not found")
+
+
+@app.delete("/long_trip_flags/{flag_id}")
+def long_trip_flags_delete(flag_id: str, user: sqlite3.Row = Depends(require_user)):
+    _ = user
+    flag_id = str(flag_id or "").strip()
+    if not flag_id:
+        raise HTTPException(status_code=400, detail="flag_id required")
+    with _long_trip_flags_lock:
+        flags = _read_long_trip_flags()
+        new_flags = [f for f in flags if str(f.get("id")) != flag_id]
+        if len(new_flags) == len(flags):
+            raise HTTPException(status_code=404, detail="flag not found")
+        _write_long_trip_flags(new_flags)
+    return {"ok": True, "id": flag_id}
 
 
 def _load_pickup_zone_geometries() -> Dict[int, Dict[str, Any]]:
