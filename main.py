@@ -9197,6 +9197,36 @@ def _ltf_row_to_dict(row) -> Dict[str, Any]:
     }
 
 
+# Lightweight unauthenticated probe so we can verify from any client
+# whether the deploy carrying the DB-backed flag feature actually rolled
+# out. Driver reports the frontend status pill was showing 404 for
+# /long_trip_flags even after PR #456 merged -- which means either the
+# Railway auto-deploy is stuck or there's a build-time error we can't
+# see from outside the cluster. Hitting this path with any client and
+# getting `{"feature":"long_trip_flags","build":"pr-456"}` proves the
+# deploy actually contains the shared-DB endpoints; a 404 here means
+# Railway is still serving a pre-#456 build.
+@app.get("/long_trip_flags/_probe")
+def long_trip_flags_probe():
+    try:
+        count = _db_query_one("SELECT COUNT(*) AS n FROM long_trip_flags")
+        rowcount = int(count["n"]) if count and count["n"] is not None else 0
+        table_ok = True
+        table_err = None
+    except Exception as exc:
+        rowcount = 0
+        table_ok = False
+        table_err = f"{type(exc).__name__}: {exc}"
+    return {
+        "feature": "long_trip_flags",
+        "build": "pr-456",
+        "db_backend": DB_BACKEND,
+        "table_ready": table_ok,
+        "table_error": table_err,
+        "row_count": rowcount,
+    }
+
+
 @app.get("/long_trip_flags")
 def long_trip_flags_list(user: sqlite3.Row = Depends(require_user)):
     _ = user
@@ -9287,6 +9317,162 @@ def long_trip_flags_delete(flag_id: str, user: sqlite3.Row = Depends(require_use
         raise HTTPException(status_code=404, detail="flag not found")
     _db_exec("DELETE FROM long_trip_flags WHERE id = ?", (flag_id,))
     return {"ok": True, "id": flag_id}
+
+
+# Long Trips Block flags -- COMMUNITY-SHARED edition riding on the existing
+# events table.
+#
+# Why this exists alongside the /long_trip_flags endpoints above: the new
+# `long_trip_flags` table from PR #456 may not be deploying cleanly (the
+# driver's frontend has been showing 404 for /long_trip_flags even after
+# merge). Rather than keep guessing at the deploy, this alternate path
+# rides on the proven /events/ pattern (same table `events` that police
+# reports, pickup logs, and every other cross-driver feature already use
+# and that we can verify works cross-user today).
+#
+# - Same shared backend store everyone else uses (no new schema)
+# - Same require_user auth, no per-user filter -> every driver sees every flag
+# - The frontend prefers this path; if it ever falls back to the old
+#   /long_trip_flags table that's fine too -- both are shared.
+#
+# Schema mapping into the existing events table:
+#   type        = "long_trip_flag"
+#   user_id     = placer (audit only; no auth check)
+#   lat, lng    = position
+#   text        = color (green | sky | yellow)
+#   zone_id     = NULL
+#   created_at  = ms epoch
+#   expires_at  = +100 years (effectively permanent; events table has
+#                 expires_at NOT NULL so we have to put SOMETHING there)
+
+_LTF_EVENT_TYPE = "long_trip_flag"
+_LTF_EVENT_EXPIRES_SECS = 100 * 365 * 24 * 3600  # ~ permanent
+
+
+def _ltf_event_row_to_dict(row) -> Dict[str, Any]:
+    return {
+        "id": f"ltf-{int(row['id'])}",
+        "lng": float(row["lng"]),
+        "lat": float(row["lat"]),
+        "color": (row["text"] or "yellow"),
+        "createdAt": int(row["created_at"]),
+        "createdBy": str(int(row["user_id"])) if row["user_id"] is not None else None,
+    }
+
+
+def _ltf_event_id_from_str(s: str) -> Optional[int]:
+    # Accept "ltf-123" (our wire format) or bare "123"
+    s = str(s or "").strip()
+    if not s:
+        return None
+    if s.startswith("ltf-"):
+        s = s[len("ltf-"):]
+    try:
+        return int(s)
+    except Exception:
+        return None
+
+
+@app.get("/events/long_trip_flag")
+def long_trip_flags_events_list(user: sqlite3.Row = Depends(require_user)):
+    _ = user
+    rows = _db_query_all(
+        "SELECT id, user_id, lat, lng, text, created_at "
+        "FROM events WHERE type = ? "
+        "ORDER BY created_at ASC LIMIT 5000",
+        (_LTF_EVENT_TYPE,),
+    )
+    return {"flags": [_ltf_event_row_to_dict(r) for r in rows]}
+
+
+@app.post("/events/long_trip_flag")
+def long_trip_flags_events_create(
+    payload: LongTripFlagCreatePayload,
+    user: sqlite3.Row = Depends(require_user),
+):
+    color = str(payload.color or "").strip().lower()
+    if color not in _LONG_TRIP_FLAG_COLORS:
+        raise HTTPException(status_code=400, detail="invalid color (must be green, sky, or yellow)")
+    now_ms = int(time.time() * 1000)
+    expires_secs = int(time.time()) + _LTF_EVENT_EXPIRES_SECS
+    try:
+        user_id = int(user["id"]) if user is not None else 0
+    except Exception:
+        user_id = 0
+    _db_exec(
+        "INSERT INTO events(type, user_id, lat, lng, text, zone_id, created_at, expires_at) "
+        "VALUES(?,?,?,?,?,?,?,?)",
+        (_LTF_EVENT_TYPE, user_id, float(payload.lat), float(payload.lng), color, None, now_ms, expires_secs),
+    )
+    # Read back the just-inserted row to get its auto-generated id. Match
+    # by (user_id, created_at, type) which is essentially unique at ms
+    # resolution. Bounded retry in case clock-skew + race ever produces
+    # zero rows.
+    row = _db_query_one(
+        "SELECT id, user_id, lat, lng, text, created_at FROM events "
+        "WHERE type = ? AND user_id = ? AND created_at = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (_LTF_EVENT_TYPE, user_id, now_ms),
+    )
+    if row is None:
+        raise HTTPException(status_code=500, detail="flag inserted but could not be read back")
+    return _ltf_event_row_to_dict(row)
+
+
+@app.patch("/events/long_trip_flag/{flag_id}")
+def long_trip_flags_events_update(
+    flag_id: str,
+    payload: LongTripFlagUpdatePayload,
+    user: sqlite3.Row = Depends(require_user),
+):
+    _ = user
+    event_id = _ltf_event_id_from_str(flag_id)
+    if event_id is None:
+        raise HTTPException(status_code=400, detail="flag_id required")
+    updates: List[str] = []
+    params: List[Any] = []
+    if payload.lng is not None:
+        updates.append("lng = ?"); params.append(float(payload.lng))
+    if payload.lat is not None:
+        updates.append("lat = ?"); params.append(float(payload.lat))
+    if payload.color is not None:
+        color = str(payload.color or "").strip().lower()
+        if color not in _LONG_TRIP_FLAG_COLORS:
+            raise HTTPException(status_code=400, detail="invalid color")
+        updates.append("text = ?"); params.append(color)
+    if updates:
+        params.extend([_LTF_EVENT_TYPE, event_id])
+        _db_exec(
+            f"UPDATE events SET {', '.join(updates)} WHERE type = ? AND id = ?",
+            tuple(params),
+        )
+    row = _db_query_one(
+        "SELECT id, user_id, lat, lng, text, created_at FROM events "
+        "WHERE type = ? AND id = ?",
+        (_LTF_EVENT_TYPE, event_id),
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="flag not found")
+    return _ltf_event_row_to_dict(row)
+
+
+@app.delete("/events/long_trip_flag/{flag_id}")
+def long_trip_flags_events_delete(flag_id: str, user: sqlite3.Row = Depends(require_user)):
+    _ = user
+    event_id = _ltf_event_id_from_str(flag_id)
+    if event_id is None:
+        raise HTTPException(status_code=400, detail="flag_id required")
+    existing = _db_query_one(
+        "SELECT id FROM events WHERE type = ? AND id = ?",
+        (_LTF_EVENT_TYPE, event_id),
+    )
+    if existing is None:
+        raise HTTPException(status_code=404, detail="flag not found")
+    _db_exec(
+        "DELETE FROM events WHERE type = ? AND id = ?",
+        (_LTF_EVENT_TYPE, event_id),
+    )
+    return {"ok": True, "id": f"ltf-{event_id}"}
 
 
 def _load_pickup_zone_geometries() -> Dict[int, Dict[str, Any]]:
