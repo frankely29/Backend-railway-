@@ -9197,6 +9197,36 @@ def _ltf_row_to_dict(row) -> Dict[str, Any]:
     }
 
 
+# Lightweight unauthenticated probe so we can verify from any client
+# whether the deploy carrying the DB-backed flag feature actually rolled
+# out. Driver reports the frontend status pill was showing 404 for
+# /long_trip_flags even after PR #456 merged -- which means either the
+# Railway auto-deploy is stuck or there's a build-time error we can't
+# see from outside the cluster. Hitting this path with any client and
+# getting `{"feature":"long_trip_flags","build":"pr-456"}` proves the
+# deploy actually contains the shared-DB endpoints; a 404 here means
+# Railway is still serving a pre-#456 build.
+@app.get("/long_trip_flags/_probe")
+def long_trip_flags_probe():
+    try:
+        count = _db_query_one("SELECT COUNT(*) AS n FROM long_trip_flags")
+        rowcount = int(count["n"]) if count and count["n"] is not None else 0
+        table_ok = True
+        table_err = None
+    except Exception as exc:
+        rowcount = 0
+        table_ok = False
+        table_err = f"{type(exc).__name__}: {exc}"
+    return {
+        "feature": "long_trip_flags",
+        "build": "pr-456",
+        "db_backend": DB_BACKEND,
+        "table_ready": table_ok,
+        "table_error": table_err,
+        "row_count": rowcount,
+    }
+
+
 @app.get("/long_trip_flags")
 def long_trip_flags_list(user: sqlite3.Row = Depends(require_user)):
     _ = user
