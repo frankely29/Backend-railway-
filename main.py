@@ -5125,6 +5125,20 @@ def _db_init() -> None:
 
         _db_exec(
             """
+            CREATE TABLE IF NOT EXISTS long_trip_flags (
+              id TEXT PRIMARY KEY,
+              lng DOUBLE PRECISION NOT NULL,
+              lat DOUBLE PRECISION NOT NULL,
+              color TEXT NOT NULL,
+              created_at BIGINT NOT NULL,
+              created_by BIGINT
+            );
+            """
+        )
+        _db_exec("CREATE INDEX IF NOT EXISTS idx_long_trip_flags_created ON long_trip_flags(created_at);")
+
+        _db_exec(
+            """
             CREATE TABLE IF NOT EXISTS pickup_logs (
               id BIGSERIAL PRIMARY KEY,
               user_id BIGINT NOT NULL,
@@ -5598,6 +5612,20 @@ def _db_init() -> None:
     )
     _db_exec("CREATE INDEX IF NOT EXISTS idx_events_type_time ON events(type, created_at);")
     _db_exec("CREATE INDEX IF NOT EXISTS idx_events_expires ON events(expires_at);")
+
+    _db_exec(
+        """
+        CREATE TABLE IF NOT EXISTS long_trip_flags (
+          id TEXT PRIMARY KEY,
+          lng REAL NOT NULL,
+          lat REAL NOT NULL,
+          color TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          created_by INTEGER
+        );
+        """
+    )
+    _db_exec("CREATE INDEX IF NOT EXISTS idx_long_trip_flags_created ON long_trip_flags(created_at);")
 
     _db_exec(
         """
@@ -9134,70 +9162,15 @@ def log_pickup(payload: PickupPayload, user: sqlite3.Row = Depends(require_user)
 
 # Long Trips Block flags -- driver-placed pins marking spots worth waiting
 # at for trips of 45+ minutes. Shared across all drivers (anyone can
-# edit/remove per driver request). No per-driver cap yet. Persisted to a
-# simple JSON file on the volume mount; thread-safe via _long_trip_flags_lock.
-_long_trip_flags_lock = threading.Lock()
+# edit/remove per driver request).
+#
+# Persisted in the same DB as every other cross-driver feature (events,
+# pickup_logs, presence...). The previous JSON-file-on-DATA_DIR approach
+# (PR #455) does not survive multi-replica Railway deployments -- each
+# instance had its own copy of the file, so a flag POSTed to replica A
+# was invisible to drivers whose GET hit replica B. The DB lives outside
+# the container and is the single source of truth for shared state.
 _LONG_TRIP_FLAG_COLORS = {"green", "sky", "yellow"}
-
-
-def _long_trip_flags_path() -> Path:
-    return DATA_DIR / "long_trip_flags.json"
-
-
-def _read_long_trip_flags() -> List[Dict[str, Any]]:
-    path = _long_trip_flags_path()
-    if not path.exists():
-        return []
-    try:
-        raw = path.read_text(encoding="utf-8")
-    except Exception:
-        return []
-    try:
-        data = json.loads(raw)
-    except Exception:
-        return []
-    if not isinstance(data, list):
-        return []
-    out: List[Dict[str, Any]] = []
-    for entry in data:
-        if not isinstance(entry, dict):
-            continue
-        fid = entry.get("id")
-        lng = entry.get("lng")
-        lat = entry.get("lat")
-        color = entry.get("color")
-        if not isinstance(fid, str) or not fid:
-            continue
-        try:
-            lng_f = float(lng); lat_f = float(lat)
-        except Exception:
-            continue
-        if not (-180.0 <= lng_f <= 180.0 and -90.0 <= lat_f <= 90.0):
-            continue
-        if color not in _LONG_TRIP_FLAG_COLORS:
-            continue
-        out.append({
-            "id": fid,
-            "lng": lng_f,
-            "lat": lat_f,
-            "color": color,
-            "createdAt": int(entry.get("createdAt") or 0),
-            "createdBy": str(entry.get("createdBy") or "") or None,
-        })
-    return out
-
-
-def _write_long_trip_flags(flags: List[Dict[str, Any]]) -> None:
-    path = _long_trip_flags_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".json.tmp")
-    encoded = json.dumps(flags, separators=(",", ":")).encode("utf-8")
-    with tmp.open("wb") as handle:
-        handle.write(encoded)
-        handle.flush()
-        try: os.fsync(handle.fileno())
-        except Exception: pass
-    os.replace(tmp, path)
 
 
 class LongTripFlagCreatePayload(BaseModel):
@@ -9212,19 +9185,26 @@ class LongTripFlagUpdatePayload(BaseModel):
     color: Optional[str] = None
 
 
-def _ltf_coerce_user_id(user: sqlite3.Row) -> Optional[str]:
-    try:
-        uid = user["id"] if user is not None else None
-    except Exception:
-        uid = None
-    return str(uid) if uid is not None else None
+def _ltf_row_to_dict(row) -> Dict[str, Any]:
+    created_by = row["created_by"]
+    return {
+        "id": row["id"],
+        "lng": float(row["lng"]),
+        "lat": float(row["lat"]),
+        "color": row["color"],
+        "createdAt": int(row["created_at"]),
+        "createdBy": str(created_by) if created_by is not None else None,
+    }
 
 
 @app.get("/long_trip_flags")
 def long_trip_flags_list(user: sqlite3.Row = Depends(require_user)):
     _ = user
-    with _long_trip_flags_lock:
-        return {"flags": _read_long_trip_flags()}
+    rows = _db_query_all(
+        "SELECT id, lng, lat, color, created_at, created_by "
+        "FROM long_trip_flags ORDER BY created_at ASC LIMIT 5000"
+    )
+    return {"flags": [_ltf_row_to_dict(r) for r in rows]}
 
 
 @app.post("/long_trip_flags")
@@ -9235,19 +9215,25 @@ def long_trip_flags_create(
     color = str(payload.color or "").strip().lower()
     if color not in _LONG_TRIP_FLAG_COLORS:
         raise HTTPException(status_code=400, detail="invalid color (must be green, sky, or yellow)")
-    flag = {
-        "id": f"ltf-{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}",
+    flag_id = f"ltf-{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}"
+    created_at = int(time.time() * 1000)
+    try:
+        created_by = int(user["id"]) if user is not None else None
+    except Exception:
+        created_by = None
+    _db_exec(
+        "INSERT INTO long_trip_flags(id, lng, lat, color, created_at, created_by) "
+        "VALUES(?,?,?,?,?,?)",
+        (flag_id, float(payload.lng), float(payload.lat), color, created_at, created_by),
+    )
+    return {
+        "id": flag_id,
         "lng": float(payload.lng),
         "lat": float(payload.lat),
         "color": color,
-        "createdAt": int(time.time() * 1000),
-        "createdBy": _ltf_coerce_user_id(user),
+        "createdAt": created_at,
+        "createdBy": str(created_by) if created_by is not None else None,
     }
-    with _long_trip_flags_lock:
-        flags = _read_long_trip_flags()
-        flags.append(flag)
-        _write_long_trip_flags(flags)
-    return flag
 
 
 @app.patch("/long_trip_flags/{flag_id}")
@@ -9260,21 +9246,31 @@ def long_trip_flags_update(
     flag_id = str(flag_id or "").strip()
     if not flag_id:
         raise HTTPException(status_code=400, detail="flag_id required")
-    with _long_trip_flags_lock:
-        flags = _read_long_trip_flags()
-        for f in flags:
-            if str(f.get("id")) != flag_id:
-                continue
-            if payload.lng is not None: f["lng"] = float(payload.lng)
-            if payload.lat is not None: f["lat"] = float(payload.lat)
-            if payload.color is not None:
-                color = str(payload.color or "").strip().lower()
-                if color not in _LONG_TRIP_FLAG_COLORS:
-                    raise HTTPException(status_code=400, detail="invalid color")
-                f["color"] = color
-            _write_long_trip_flags(flags)
-            return f
-    raise HTTPException(status_code=404, detail="flag not found")
+    updates: List[str] = []
+    params: List[Any] = []
+    if payload.lng is not None:
+        updates.append("lng = ?"); params.append(float(payload.lng))
+    if payload.lat is not None:
+        updates.append("lat = ?"); params.append(float(payload.lat))
+    if payload.color is not None:
+        color = str(payload.color or "").strip().lower()
+        if color not in _LONG_TRIP_FLAG_COLORS:
+            raise HTTPException(status_code=400, detail="invalid color")
+        updates.append("color = ?"); params.append(color)
+    if updates:
+        params.append(flag_id)
+        _db_exec(
+            f"UPDATE long_trip_flags SET {', '.join(updates)} WHERE id = ?",
+            tuple(params),
+        )
+    row = _db_query_one(
+        "SELECT id, lng, lat, color, created_at, created_by "
+        "FROM long_trip_flags WHERE id = ?",
+        (flag_id,),
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="flag not found")
+    return _ltf_row_to_dict(row)
 
 
 @app.delete("/long_trip_flags/{flag_id}")
@@ -9283,12 +9279,13 @@ def long_trip_flags_delete(flag_id: str, user: sqlite3.Row = Depends(require_use
     flag_id = str(flag_id or "").strip()
     if not flag_id:
         raise HTTPException(status_code=400, detail="flag_id required")
-    with _long_trip_flags_lock:
-        flags = _read_long_trip_flags()
-        new_flags = [f for f in flags if str(f.get("id")) != flag_id]
-        if len(new_flags) == len(flags):
-            raise HTTPException(status_code=404, detail="flag not found")
-        _write_long_trip_flags(new_flags)
+    existing = _db_query_one(
+        "SELECT id FROM long_trip_flags WHERE id = ?",
+        (flag_id,),
+    )
+    if existing is None:
+        raise HTTPException(status_code=404, detail="flag not found")
+    _db_exec("DELETE FROM long_trip_flags WHERE id = ?", (flag_id,))
     return {"ok": True, "id": flag_id}
 
 
