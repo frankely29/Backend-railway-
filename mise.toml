@@ -1,0 +1,15 @@
+# Railway's Railpack uses mise to install the Python toolchain. As of mise
+# 2026.5.16 (currently on Railway's builder), attestation verification on
+# the Python download is on by default. The official Python tarballs are
+# not signed via GitHub Actions attestations, so the install step fails:
+#
+#   mise ERROR Failed to install core:python@3.12.7:
+#   No GitHub artifact attestations found for python@3.12.7
+#
+# Every backend deploy since PR #454 has failed at this step. Disabling
+# attestation verification specifically for python (per mise's error
+# message guidance) unblocks the build without weakening security for
+# anything else.
+
+[settings]
+python.github_attestations = false
