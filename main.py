@@ -6157,6 +6157,16 @@ def _avatar_thumb_headers(user_id: int, version: str) -> Dict[str, str]:
     return {
         "Cache-Control": f"public, max-age={AVATAR_THUMB_IMMUTABLE_CACHE_SECONDS}, immutable",
         "ETag": f'"avatar-{int(user_id)}-{version}"',
+        # CORS for the front-end's GeoJSON-layer presence renderer
+        # (frontend PR #956). The layer code uses
+        #   img.crossOrigin = "anonymous"
+        # so it can canvas-compose the avatar + addImage to the map.
+        # Without these headers the browser silently fails the load and
+        # the driver falls back to DOM-marker rendering, which drifts
+        # at fractional zooms. The avatar is a static thumbnail image,
+        # no auth required, so allow-origin=* is appropriate.
+        "Access-Control-Allow-Origin": "*",
+        "Cross-Origin-Resource-Policy": "cross-origin",
     }
 
 
