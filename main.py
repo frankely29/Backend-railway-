@@ -9261,8 +9261,18 @@ def long_trip_flags_create(
     payload: LongTripFlagCreatePayload,
     user: sqlite3.Row = Depends(require_user),
 ):
+    # Same diagnostic logging as the /events/long_trip_flag handler --
+    # driver reports placements aren't saving and we don't know whether
+    # POST is even reaching this handler. Print on entry, on INSERT
+    # exception, on success. Output goes to Railway deploy logs.
+    try:
+        uid_dbg = user["id"] if user is not None else None
+    except Exception:
+        uid_dbg = "<no-id>"
+    print(f"[ltf-post-table] enter user_id={uid_dbg} lng={payload.lng} lat={payload.lat} color={payload.color!r}", flush=True)
     color = str(payload.color or "").strip().lower()
     if color not in _LONG_TRIP_FLAG_COLORS:
+        print(f"[ltf-post-table] reject invalid color: {color!r}", flush=True)
         raise HTTPException(status_code=400, detail="invalid color (must be green, sky, or yellow)")
     flag_id = f"ltf-{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}"
     created_at = int(time.time() * 1000)
@@ -9270,11 +9280,16 @@ def long_trip_flags_create(
         created_by = int(user["id"]) if user is not None else None
     except Exception:
         created_by = None
-    _db_exec(
-        "INSERT INTO long_trip_flags(id, lng, lat, color, created_at, created_by) "
-        "VALUES(?,?,?,?,?,?)",
-        (flag_id, float(payload.lng), float(payload.lat), color, created_at, created_by),
-    )
+    try:
+        _db_exec(
+            "INSERT INTO long_trip_flags(id, lng, lat, color, created_at, created_by) "
+            "VALUES(?,?,?,?,?,?)",
+            (flag_id, float(payload.lng), float(payload.lat), color, created_at, created_by),
+        )
+    except Exception as insert_exc:
+        print(f"[ltf-post-table] INSERT failed id={flag_id} user_id={created_by}: {type(insert_exc).__name__}: {insert_exc}", flush=True)
+        raise HTTPException(status_code=500, detail=f"insert failed: {type(insert_exc).__name__}")
+    print(f"[ltf-post-table] success id={flag_id} user_id={created_by}", flush=True)
     return {
         "id": flag_id,
         "lng": float(payload.lng),
