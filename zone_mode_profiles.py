@@ -16,6 +16,16 @@ class ZoneScoreProfileWeights:
     balanced_trip_quality_weight: float = 0.0
     balanced_trip_share_weight: float = 0.0
     long_trip_share_20plus_weight: float = 0.0
+    # "Premium long trip" = trip_time ≥ 2700s (45 min) OR trip_miles ≥ 10.
+    # Three orthogonal axes, all normalized [0, 1] per time bin:
+    #   share    — how many trips here qualify as premium
+    #   avg_min  — when they qualify, how LONG they run in time
+    #   avg_mile — when they qualify, how FAR they run in miles
+    # Profiles that don't care about premium-long-trip behavior leave
+    # these at 0.0; trips_45plus_v3 sets them high.
+    premium_long_trip_share_weight: float = 0.0
+    premium_long_trip_avg_minutes_weight: float = 0.0
+    premium_long_trip_avg_miles_weight: float = 0.0
     downstream_weight: float = 0.0
     short_trip_penalty_weight: float = 0.0
     same_zone_retention_penalty_weight: float = 0.0
@@ -195,6 +205,60 @@ ZONE_MODE_PROFILES: Dict[str, ZoneScoreProfileWeights] = {
         # Per driver: zero out saturation for Staten Island so the
         # score never penalizes Staten zones for saturation.
         market_saturation_penalty_weight=0.0,
+    ),
+    # "45+ trips mode": ranks zones by likelihood of getting a long trip.
+    # Designed so a zone scores high when the share of long trips AND the
+    # absolute volume of trips are both high — i.e. "many trips here, and
+    # a large fraction of them are long ones."
+    #
+    # Signals used (all already computed per-zone in the live engine):
+    #   long_trip_share_20plus_n  — share of trips ≥ 20 min (proxy for
+    #                               long-distance trips; the closest
+    #                               long-trip signal the data exposes)
+    #   demand_now_n              — current volume of pickups
+    #   demand_density_now_n      — volume normalized by zone area
+    #   pay_per_mile_n            — long trips correlate with high $/mi
+    #
+    # Weights are tuned so a zone with avg demand but high long_trip_share
+    # still beats a zone with high demand but low long_trip_share. Short
+    # trip penalty zeroed since short-trip behaviour is irrelevant here.
+    # Saturation penalty kept moderate so drivers aren't routed into
+    # over-saturated zones even if those zones have long trips.
+    "trips_45plus_v3": ZoneScoreProfileWeights(
+        # Volume / demand signals — needed for QUANTITY of long trips
+        # (share alone isn't enough; a zone with 1 trip that's 45 min
+        # long shouldn't outrank a zone with 50 trips half of which
+        # are 45 min).
+        demand_now_weight=0.10,
+        demand_next_weight=0.06,
+        demand_density_now_weight=0.10,
+        demand_density_next_weight=0.06,
+        # Pay-per-mile correlates with trip length, so a soft bonus.
+        pay_weight=0.03,
+        pay_per_min_weight=0.05,
+        pay_per_mile_weight=0.12,
+        balanced_trip_share_weight=0.02,
+        # Keep a small weight on the 20+ minute share so zones with any
+        # long-ish trip volume still get partial credit.
+        long_trip_share_20plus_weight=0.05,
+        # PRIMARY signals for "45+ trips mode":
+        #   share    — how often a qualifying long trip happens here
+        #   avg_min  — when one happens, how long it runs in minutes
+        #   avg_mile — when one happens, how far it runs in miles
+        # Together these reward zones that have MANY premium long trips
+        # AND where those trips tend to be even longer.
+        premium_long_trip_share_weight=0.22,
+        premium_long_trip_avg_minutes_weight=0.10,
+        premium_long_trip_avg_miles_weight=0.10,
+        downstream_weight=0.04,
+        # Short-trip behavior is irrelevant for this mode.
+        short_trip_penalty_weight=0.01,
+        same_zone_retention_penalty_weight=0.03,
+        pickup_friction_penalty_weight=0.03,
+        shared_ride_penalty_weight=0.02,
+        # Saturation still matters — drivers don't want to be routed
+        # into an over-supplied zone even if it has long trips.
+        market_saturation_penalty_weight=0.10,
     ),
 }
 
