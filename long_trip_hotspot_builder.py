@@ -175,12 +175,11 @@ NYC_LONG_TRIP_POIS: List[Tuple[str, float, float, str, float]] = [
     ("Sheraton Brooklyn",         40.6918, -73.9890, "hotel_luxury", 1.9),
     ("Brooklyn Bridge Marriott",  40.6948, -73.9892, "hotel_luxury", 2.0),
 
-    # DUMBO — boutique hotels + Etsy HQ + Dock 72 + tourist draw
-    ("Empire Stores",             40.7035, -73.9885, "corporate", 1.4),
-    ("Time Out Market NY",        40.7036, -73.9879, "corporate", 1.3),
+    # DUMBO — Etsy HQ corporate + Dock 72 corporate + 1 Hotel DUMBO.
+    # Dropped Empire Stores / Time Out Market / St Ann's — they're tourist
+    # foot-traffic or niche performance, not wealth or car-service volume.
     ("Etsy HQ (DUMBO)",           40.7045, -73.9870, "corporate", 1.6),
     ("Dock 72 (Brooklyn Navy Yard)", 40.7036, -73.9711, "corporate", 1.5),
-    ("St Ann's Warehouse",        40.7029, -73.9889, "performance", 1.3),
     ("1 Hotel Brooklyn (DUMBO)",  40.7034, -73.9931, "hotel_luxury", 2.0),
 
     # Williamsburg — boutique hotels + nightlife wealth
@@ -198,21 +197,12 @@ NYC_LONG_TRIP_POIS: List[Tuple[str, float, float, str, float]] = [
     ("Z NYC Hotel",               40.7482, -73.9461, "hotel_luxury", 1.6),
     ("Ravel Hotel LIC",           40.7693, -73.9181, "hotel_luxury", 1.5),
 
-    # Astoria — Kaufman Astoria Studios + Museum of Moving Image
-    ("Kaufman Astoria Studios",   40.7563, -73.9224, "corporate", 1.6),
-    ("Museum of the Moving Image", 40.7565, -73.9241, "corporate", 1.4),
+    # Astoria — Mt Sinai Astoria (hospital, high-traffic). Dropped
+    # Kaufman Studios + Museum of Moving Image — working soundstage and
+    # niche museum, neither produces wealthy long-trip riders.
     ("Mt Sinai Astoria",          40.7644, -73.9226, "hospital", 2.0),
 
-    # Brooklyn — Park Slope / Prospect Heights
-    ("Brooklyn Museum",           40.6712, -73.9636, "performance", 1.5),
-    ("Brooklyn Botanic Garden",   40.6694, -73.9626, "performance", 1.4),
-    ("Brooklyn Public Library",   40.6724, -73.9686, "corporate", 1.4),
-    ("Brooklyn Academy of Music", 40.6862, -73.9789, "performance", 1.5),
-
-    # Brooklyn — Industry City / Sunset Park (wealth tech offices)
-    ("Industry City",             40.6552, -74.0090, "corporate", 1.6),
-
-    # Brooklyn — Crown Heights / Bed-Stuy hospitals
+    # Brooklyn — Crown Heights / Bed-Stuy hospitals (real medical volume).
     ("Kings County Hospital",     40.6585, -73.9460, "hospital", 2.5),
     ("SUNY Downstate Medical",    40.6557, -73.9472, "hospital", 2.5),
 
@@ -220,16 +210,18 @@ NYC_LONG_TRIP_POIS: List[Tuple[str, float, float, str, float]] = [
     ("Riverdale Country School",  40.9023, -73.9133, "private_school", 1.5),
     ("Horace Mann School (Bronx)", 40.9012, -73.9100, "private_school", 1.5),
 
-    # Queens — Forest Hills wealthy / Long Island Jewish
-    ("Forest Hills Tower",        40.7195, -73.8473, "corporate", 1.3),
+    # Queens — Long Island Jewish + Northwell hospitals (huge medical
+    # campuses with constant car-service traffic). Dropped Forest Hills
+    # Tower — single medium office building, no special wealth.
     ("Long Island Jewish Hospital", 40.7587, -73.7079, "hospital", 2.8),
     ("Northwell North Shore Univ", 40.7766, -73.7045, "hospital", 2.5),
     ("Northwell Imaging Manhasset", 40.7798, -73.7028, "hospital", 1.8),
 
-    # Hoboken — terminal + W Hotel + Pier 13
+    # Hoboken — Terminal (PATH+NJT, very high traffic) + W Hotel.
+    # Dropped Pier 13 — outdoor open-air beer garden, summer-only,
+    # not a building.
     ("Hoboken Terminal",          40.7359, -74.0291, "transit_hub", 2.3),
     ("W Hoboken",                 40.7368, -74.0276, "hotel_luxury", 2.0),
-    ("Pier 13 Hoboken",           40.7407, -74.0260, "corporate", 1.3),
 
     # Jersey City — Exchange Place financial cluster
     ("Goldman Sachs Tower (JC)",  40.7164, -74.0327, "corporate", 1.8),
@@ -247,16 +239,17 @@ NYC_LONG_TRIP_POIS: List[Tuple[str, float, float, str, float]] = [
     ("Mercer Hotel",              40.7242, -73.9989, "hotel_luxury", 2.0),
     ("Soho Grand Hotel",          40.7223, -74.0027, "hotel_luxury", 1.9),
 
-    # Manhattan — Chelsea / Meatpacking (wealthy nightlife heads home in cars)
+    # Manhattan — Chelsea / Meatpacking luxury hotels. Dropped The High
+    # Line (public elevated park, not a building). Hotel Chelsea kept —
+    # post-renovation it's a true luxury hotel again.
     ("Standard High Line",        40.7409, -74.0080, "hotel_luxury", 2.1),
     ("Gansevoort Meatpacking",    40.7396, -74.0089, "hotel_luxury", 1.9),
     ("Hotel Chelsea",             40.7440, -73.9968, "hotel_luxury", 1.8),
-    ("The High Line (W 14)",      40.7407, -74.0079, "performance", 1.2),
 
-    # Manhattan — Flatiron / Madison Square corporate
+    # Manhattan — Flatiron / NoMad luxury hotels. Dropped Madison Square
+    # Park (public park) and Eataly (tourist food hall). Flatiron Bldg
+    # kept — it's a real high-traffic office + ground-floor retail tower.
     ("Flatiron Building",         40.7411, -73.9897, "corporate", 1.4),
-    ("Madison Square Park",       40.7423, -73.9879, "corporate", 1.3),
-    ("Eataly Flatiron",           40.7421, -73.9899, "corporate", 1.2),
     ("Ace Hotel NY",              40.7464, -73.9883, "hotel_luxury", 1.9),
     ("NoMad Hotel",               40.7444, -73.9879, "hotel_luxury", 2.0),
     ("The James NoMad",           40.7438, -73.9874, "hotel_luxury", 1.8),
