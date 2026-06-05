@@ -109,15 +109,21 @@ NYC_LONG_TRIP_POIS: List[Tuple[str, float, float, str, float]] = [
 ]
 
 
-# Clustering radius: two POIs can land in the same cluster only if they
-# are within this distance of EACH OTHER (complete-link, not single-link
-# — single-link chains POIs across long Manhattan stretches and produces
-# one giant blob covering Penn → Grand Central → Times Sq). 0.18 mi is
-# about a 3-4 minute walk; tight enough to separate Penn/MSG from Grand
-# Central from Times Sq, loose enough that a hospital row like Mt Sinai
-# Hospital / Hospital for Special Surgery / Sloan Kettering stays one
-# cluster.
-CLUSTER_RADIUS_MI = 0.18
+# Clustering radius: two POIs land in the same cluster only if they're
+# within this distance of EACH OTHER (complete-link, not single-link —
+# single-link chains POIs across long Manhattan stretches and produces
+# one giant blob covering Penn → Grand Central → Times Sq). 0.30 mi is
+# about a 5-6 minute walk and lets genuine concentrations (UES hospital
+# row, Midtown East hotel cluster, Times Sq hotel cluster, Lincoln
+# Center area) coalesce while still keeping Penn-area separate from
+# Grand Central / Times Sq.
+CLUSTER_RADIUS_MI = 0.30
+
+# Minimum POIs in a cluster for it to count as a hotspot. The whole
+# point is "a SPOT where 3+ important buildings are nearby" — single
+# isolated landmarks and lone pairs aren't significant enough to mark
+# on the map.
+MIN_MEMBERS_PER_HOTSPOT = 3
 
 # Category priority for the cluster-icon label. Higher index in this
 # list wins when a cluster has multiple categories. Drivers care most
@@ -222,7 +228,13 @@ def build_long_trip_hotspots() -> List[Dict[str, Any]]:
     """
     groups = _cluster_pois(NYC_LONG_TRIP_POIS, CLUSTER_RADIUS_MI)
     hotspots: List[Dict[str, Any]] = []
-    for cluster_id, indices in enumerate(groups, start=1):
+    next_id = 1
+    for indices in groups:
+        # A hotspot requires MIN_MEMBERS_PER_HOTSPOT (3 by default)
+        # POIs clustered together. Singletons and isolated pairs are
+        # dropped — they're not significant enough to merit an icon.
+        if len(indices) < MIN_MEMBERS_PER_HOTSPOT:
+            continue
         # Weighted centroid: sum(lat * weight) / sum(weight), same for lng.
         total_w = 0.0
         lat_w = 0.0
@@ -238,7 +250,7 @@ def build_long_trip_hotspots() -> List[Dict[str, Any]]:
             continue
         members.sort(key=lambda m: -m["weight"])
         hotspots.append({
-            "id": cluster_id,
+            "id": next_id,
             "lat": round(lat_w / total_w, 6),
             "lng": round(lng_w / total_w, 6),
             "label": _cluster_label(indices),
@@ -247,6 +259,7 @@ def build_long_trip_hotspots() -> List[Dict[str, Any]]:
             "total_weight": round(total_w, 3),
             "members": members,
         })
+        next_id += 1
     # Sort by total_weight descending — drivers see the strongest
     # generators first if there's any list view.
     hotspots.sort(key=lambda h: -h["total_weight"])
