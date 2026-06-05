@@ -268,15 +268,14 @@ NYC_LONG_TRIP_POIS: List[Tuple[str, float, float, str, float]] = [
 ]
 
 
-# Clustering radius: two POIs land in the same cluster only if they're
-# within this distance of EACH OTHER (complete-link, not single-link —
-# single-link chains POIs across long Manhattan stretches and produces
-# one giant blob covering Penn → Grand Central → Times Sq). 0.30 mi is
-# about a 5-6 minute walk and lets genuine concentrations (UES hospital
-# row, Midtown East hotel cluster, Times Sq hotel cluster, Lincoln
-# Center area) coalesce while still keeping Penn-area separate from
-# Grand Central / Times Sq.
-CLUSTER_RADIUS_MI = 0.35
+# Clustering radius: complete-link cap on the max pair-distance
+# between any two members of a cluster. 0.25 mi ≈ 5 min walk at a
+# normal 3 mph pace — the driver-stated bar for "close enough to
+# qualify as one hotspot". Triangle inequality means every member is
+# within 5 min of the centroid (and the snapped flag) too, so the
+# popup's "buildings represented" list is also the buildings any
+# passenger could walk to from the flag in 5 min.
+CLUSTER_RADIUS_MI = 0.25
 
 # Minimum POIs in a cluster for it to count as a hotspot. The whole
 # point is "a SPOT where 3+ important buildings are nearby" — single
@@ -579,6 +578,48 @@ def _best_hours_for(category: str) -> str:
     return BEST_HOURS_BY_CATEGORY.get(category, "Varies")
 
 
+# Per-category dim schedule for the dollar-flag time-of-day signal.
+#
+# - `peak`: hour ranges [start_h, end_h_exclusive] in NYC local time
+#   when the flag should be at full brightness.
+# - `off`:  hour ranges when the flag should be dimmed (no business
+#   here right now — pickup volume is low).
+# - `weekday_only`: if true, weekends count as "off" regardless of hour
+#   (corporate towers, schools, conventions — none of those generate
+#   trips on a Sunday at 3pm even though the clock is "midday").
+#
+# Hour ranges can wrap past midnight ([23, 5] = 11pm to 5am).
+# Anything not in `peak` and not in `off` is "medium" — neither dimmed
+# nor highlighted. Hospitals + airports have no off hours: they
+# generate trips 24/7.
+CATEGORY_DIM_SCHEDULE: Dict[str, Dict[str, Any]] = {
+    "airport":         {"peak": [[5, 9], [16, 22]], "off": [],            "weekday_only": False},
+    "hospital":        {"peak": [[10, 16]],          "off": [],            "weekday_only": False},
+    "hotel_luxury":    {"peak": [[7, 11], [15, 19]], "off": [[23, 5]],     "weekday_only": False},
+    "transit_hub":     {"peak": [[7, 10], [16, 20]], "off": [[23, 5]],     "weekday_only": False},
+    "corporate":       {"peak": [[8, 10], [17, 19]], "off": [[20, 6]],     "weekday_only": True},
+    "private_school":  {"peak": [[7, 9], [14, 16]],  "off": [[19, 6]],     "weekday_only": True},
+    "private_club":    {"peak": [[12, 14], [18, 22]], "off": [[0, 10]],    "weekday_only": False},
+    "luxury_condo":    {"peak": [[7, 9]],             "off": [[22, 6]],    "weekday_only": False},
+    "luxury_shopping": {"peak": [[11, 19]],           "off": [[20, 10]],   "weekday_only": False},
+    "performance":     {"peak": [[19, 23]],           "off": [[2, 12]],    "weekday_only": False},
+    "stadium":         {"peak": [[19, 23]],           "off": [[2, 12]],    "weekday_only": False},
+    "convention":      {"peak": [[9, 17]],            "off": [[19, 7]],    "weekday_only": True},
+}
+
+
+def _dim_schedule_for(category: str) -> Dict[str, Any]:
+    sched = CATEGORY_DIM_SCHEDULE.get(category)
+    if not sched:
+        # Unknown category → no dim hints, frontend treats as always-on.
+        return {"peak": [], "off": [], "weekday_only": False}
+    return {
+        "peak": [list(r) for r in sched["peak"]],
+        "off": [list(r) for r in sched["off"]],
+        "weekday_only": bool(sched["weekday_only"]),
+    }
+
+
 def haversine_miles(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     R_MI = 3958.7613
     phi1 = math.radians(lat1)
@@ -728,6 +769,7 @@ def build_long_trip_hotspots() -> List[Dict[str, Any]]:
             "rationale": rationale,
             "category_counts": counts,
             "best_hours": _best_hours_for(dom_cat),
+            "dim_schedule": _dim_schedule_for(dom_cat),
             "members": members,
         })
         next_id += 1
