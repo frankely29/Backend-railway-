@@ -507,6 +507,69 @@ POI_ADDRESSES: Dict[str, str] = {
 }
 
 
+def _category_summary(member_indices: List[int]) -> Tuple[Dict[str, int], str]:
+    """
+    Returns (counts_by_category, human_rationale_string).
+
+    The rationale string is what the popup shows the driver — a plain
+    English summary of why this cluster qualifies as a hotspot.
+    """
+    counts: Dict[str, int] = {}
+    for i in member_indices:
+        cat = NYC_LONG_TRIP_POIS[i][3]
+        counts[cat] = counts.get(cat, 0) + 1
+
+    pretty = {
+        "airport":         ("airport", "airports"),
+        "hospital":        ("major hospital", "major hospitals"),
+        "hotel_luxury":    ("luxury hotel", "luxury hotels"),
+        "transit_hub":     ("transit hub", "transit hubs"),
+        "corporate":       ("corporate tower", "corporate towers"),
+        "private_school":  ("elite private school", "elite private schools"),
+        "private_club":    ("private club", "private clubs"),
+        "luxury_condo":    ("luxury condo", "luxury condos"),
+        "luxury_shopping": ("luxury retail flagship", "luxury retail flagships"),
+        "performance":     ("performance venue", "performance venues"),
+        "stadium":         ("stadium", "stadiums"),
+        "convention":      ("convention venue", "convention venues"),
+        "tourist":         ("tourist landmark", "tourist landmarks"),
+    }
+    # Order parts by category priority so the most-important type is
+    # named first ("1 major hospital + 4 luxury hotels"), not last.
+    order = list(reversed(_CATEGORY_PRIORITY))
+    parts: List[str] = []
+    for cat in order:
+        n = counts.get(cat, 0)
+        if not n:
+            continue
+        singular, plural = pretty.get(cat, (cat, cat))
+        parts.append(f"{n} {singular if n == 1 else plural}")
+    rationale = " + ".join(parts) if parts else "high-traffic cluster"
+    return counts, rationale
+
+
+def _nearest_member_to_centroid(
+    indices: List[int], lat_c: float, lng_c: float,
+) -> Tuple[float, float]:
+    """
+    Pick the member POI closest to the weighted centroid and return its
+    (lat, lng). The raw centroid is mathematically the "middle" but it
+    can land in the middle of an intersection or on a building face the
+    driver can't reach. Snapping to the nearest real building gives a
+    physically-meaningful stand spot.
+    """
+    best_idx = indices[0]
+    best_d = float("inf")
+    for i in indices:
+        lat_i = NYC_LONG_TRIP_POIS[i][1]
+        lng_i = NYC_LONG_TRIP_POIS[i][2]
+        d = haversine_miles(lat_c, lng_c, lat_i, lng_i)
+        if d < best_d:
+            best_d = d
+            best_idx = i
+    return NYC_LONG_TRIP_POIS[best_idx][1], NYC_LONG_TRIP_POIS[best_idx][2]
+
+
 def _poi_address(name: str) -> str:
     """Return the street address for a POI, or a neutral fallback."""
     return POI_ADDRESSES.get(name, "Address not listed")
@@ -640,14 +703,31 @@ def build_long_trip_hotspots() -> List[Dict[str, Any]]:
         if total_w <= 0:
             continue
         members.sort(key=lambda m: -m["weight"])
+        # Raw weighted centroid (mathematical middle of the buildings).
+        lat_centroid = lat_w / total_w
+        lng_centroid = lng_w / total_w
+        # Snap the flag's actual stand-spot to the member POI closest to
+        # the centroid. This guarantees the pin sits on a real building
+        # face the driver can navigate to, not in the middle of an
+        # intersection.
+        stand_lat, stand_lng = _nearest_member_to_centroid(
+            indices, lat_centroid, lng_centroid,
+        )
+        dom_cat = _dominant_category(indices)
+        counts, rationale = _category_summary(indices)
         hotspots.append({
             "id": next_id,
-            "lat": round(lat_w / total_w, 6),
-            "lng": round(lng_w / total_w, 6),
+            "lat": round(stand_lat, 6),
+            "lng": round(stand_lng, 6),
+            "centroid_lat": round(lat_centroid, 6),
+            "centroid_lng": round(lng_centroid, 6),
             "label": _cluster_label(indices),
-            "dominant_category": _dominant_category(indices),
+            "dominant_category": dom_cat,
             "member_count": len(indices),
             "total_weight": round(total_w, 3),
+            "rationale": rationale,
+            "category_counts": counts,
+            "best_hours": _best_hours_for(dom_cat),
             "members": members,
         })
         next_id += 1
