@@ -5137,6 +5137,28 @@ def _db_init() -> None:
         )
         _db_exec("CREATE INDEX IF NOT EXISTS idx_long_trip_flags_created ON long_trip_flags(created_at);")
 
+        # long_trip_hotspots: static cluster pins for long-trip generator
+        # landmarks (hospitals, airports, transit hubs, hotels,
+        # convention centers, stadiums). Each row = one icon on the map
+        # at a weighted-centroid lat/lng. Built ONCE via
+        # /admin/long_trip_hotspots/rebuild; read by the frontend overlay.
+        # See long_trip_hotspot_builder.py for the POI list and clustering.
+        _db_exec(
+            """
+            CREATE TABLE IF NOT EXISTS long_trip_hotspots (
+              id INTEGER PRIMARY KEY,
+              lat DOUBLE PRECISION NOT NULL,
+              lng DOUBLE PRECISION NOT NULL,
+              label TEXT NOT NULL,
+              dominant_category TEXT NOT NULL,
+              member_count INTEGER NOT NULL,
+              total_weight DOUBLE PRECISION NOT NULL,
+              members_json TEXT NOT NULL DEFAULT '[]',
+              generated_at_unix BIGINT NOT NULL DEFAULT 0
+            );
+            """
+        )
+
         _db_exec(
             """
             CREATE TABLE IF NOT EXISTS pickup_logs (
@@ -5626,6 +5648,24 @@ def _db_init() -> None:
         """
     )
     _db_exec("CREATE INDEX IF NOT EXISTS idx_long_trip_flags_created ON long_trip_flags(created_at);")
+
+    # SQLite mirror of long_trip_hotspots. See the postgres branch above
+    # and long_trip_hotspot_builder.py for the purpose.
+    _db_exec(
+        """
+        CREATE TABLE IF NOT EXISTS long_trip_hotspots (
+          id INTEGER PRIMARY KEY,
+          lat REAL NOT NULL,
+          lng REAL NOT NULL,
+          label TEXT NOT NULL,
+          dominant_category TEXT NOT NULL,
+          member_count INTEGER NOT NULL,
+          total_weight REAL NOT NULL,
+          members_json TEXT NOT NULL DEFAULT '[]',
+          generated_at_unix INTEGER NOT NULL DEFAULT 0
+        );
+        """
+    )
 
     _db_exec(
         """
@@ -9264,6 +9304,56 @@ def long_trip_flags_list(user: sqlite3.Row = Depends(require_user)):
         "FROM long_trip_flags ORDER BY created_at ASC LIMIT 5000"
     )
     return {"flags": [_ltf_row_to_dict(r) for r in rows]}
+
+
+@app.post("/admin/long_trip_hotspots/rebuild")
+def long_trip_hotspots_rebuild(admin: sqlite3.Row = Depends(require_admin)):
+    """
+    One-shot rebuild of the long_trip_hotspots table from the hand-curated
+    POI list in long_trip_hotspot_builder.py. Clusters the POIs (single-
+    link agglomerative within CLUSTER_RADIUS_MI), computes the weighted
+    centroid of each cluster, and stores one row per cluster pin.
+
+    Call this once per deploy that touches the POI list. Idempotent
+    (REPLACE-style: deletes the table and re-inserts).
+    """
+    _ = admin
+    from long_trip_hotspot_builder import write_long_trip_hotspots
+
+    summary = write_long_trip_hotspots(_db_exec)
+    return {"ok": True, **summary}
+
+
+@app.get("/long_trip_hotspots")
+def long_trip_hotspots_list(user: sqlite3.Row = Depends(require_user)):
+    """
+    Returns the persisted hotspot pins. Frontend reads this once on map
+    init and drops one icon per row at (lat, lng).
+    """
+    _ = user
+    rows = _db_query_all(
+        "SELECT id, lat, lng, label, dominant_category, member_count, "
+        "total_weight, members_json, generated_at_unix "
+        "FROM long_trip_hotspots ORDER BY total_weight DESC"
+    )
+    out = []
+    for r in rows:
+        try:
+            members = json.loads(r["members_json"] or "[]")
+        except Exception:
+            members = []
+        out.append({
+            "id": int(r["id"]),
+            "lat": float(r["lat"]),
+            "lng": float(r["lng"]),
+            "label": str(r["label"] or ""),
+            "dominant_category": str(r["dominant_category"] or ""),
+            "member_count": int(r["member_count"] or 0),
+            "total_weight": float(r["total_weight"] or 0.0),
+            "members": members,
+            "generated_at_unix": int(r["generated_at_unix"] or 0),
+        })
+    return {"hotspots": out}
 
 
 @app.post("/long_trip_flags")
