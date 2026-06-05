@@ -404,6 +404,16 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
         COALESCE(w.short_trip_share_3mi_12min, 0.0) AS short_trip_share_3mi_12min,
         COALESCE(w.shared_ride_share, 0.0) AS shared_ride_share,
         COALESCE(w.long_trip_share_20plus, 0.0) AS long_trip_share_20plus,
+        -- 45+ trips mode signals — pass through from zone_bin_actual
+        -- so the joined / ranked / normalized chain can normalize and
+        -- score them. Without these the trips_45plus_v3 SQL fails to
+        -- bind (BinderException: z.premium_long_trip_share not found)
+        -- and the engine raises during build_hotspots_frames, which
+        -- silently falls back, which makes the live frontend toggle
+        -- look like it does nothing.
+        COALESCE(w.premium_long_trip_share, 0.0) AS premium_long_trip_share,
+        w.premium_long_trip_avg_minutes,
+        w.premium_long_trip_avg_miles,
         COALESCE(w.balanced_trip_share, 0.0) AS balanced_trip_share,
         COALESCE(w.same_zone_dropoff_share, 0.0) AS same_zone_dropoff_share,
         COALESCE(w.airport_exit_share, 0.0) AS airport_exit_share,
@@ -584,6 +594,12 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
         short_trip_share_3mi_12min,
         shared_ride_share,
         long_trip_share_20plus,
+        -- 45+ trips mode: pass raw aggregates through `normalized` so
+        -- the *_shadow output projections (later) can expose them and
+        -- the new score SQL can blend the normalized _n columns.
+        premium_long_trip_share,
+        premium_long_trip_avg_minutes,
+        premium_long_trip_avg_miles,
         balanced_trip_share,
         same_zone_dropoff_share,
         airport_exit_share,
