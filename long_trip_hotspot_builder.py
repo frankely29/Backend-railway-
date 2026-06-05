@@ -106,6 +106,46 @@ NYC_LONG_TRIP_POIS: List[Tuple[str, float, float, str, float]] = [
     ("Bryant Park (corporate)",   40.7536, -73.9832, "corporate", 1.3),
     ("Bloomberg Tower",           40.7587, -73.9686, "corporate", 1.3),
     ("One Vanderbilt",            40.7546, -73.9778, "corporate", 1.3),
+
+    # ---------------- Outer-borough additions ----------------
+    # Brooklyn — Prospect Park / Crown Heights cultural cluster
+    # (Brooklyn Museum + Brooklyn Botanic Garden + Brooklyn Public
+    # Library + Grand Army Plaza are all within 4-5 blocks of each
+    # other on the NE side of Prospect Park — a real 3+ landmark
+    # spot for visitors who'll head back to Manhattan / outer
+    # boroughs).
+    ("Brooklyn Museum",           40.6712, -73.9636, "tourist", 1.5),
+    ("Brooklyn Botanic Garden",   40.6694, -73.9626, "tourist", 1.2),
+    ("Brooklyn Public Library (Central)", 40.6716, -73.9683, "tourist", 1.2),
+    ("Grand Army Plaza / Prospect Park", 40.6726, -73.9706, "tourist", 1.2),
+    # Brooklyn — Downtown Brooklyn densifiers near the existing
+    # Atlantic Terminal / Barclays / BAM trio
+    ("Brooklyn Borough Hall",     40.6925, -73.9899, "corporate", 1.5),
+    # Staten Island — St. George Ferry Terminal area
+    # (Ferry + Borough Hall + Empire Outlets all within 0.3 mi
+    # of each other right at the ferry landing).
+    ("St. George Ferry Terminal", 40.6438, -74.0731, "transit_hub", 2.5),
+    ("Staten Island Borough Hall", 40.6435, -74.0779, "corporate", 1.5),
+    ("Empire Outlets (SI)",       40.6453, -74.0784, "tourist", 1.0),
+    # Queens — Long Island City transit + arts
+    ("MoMA PS1 (LIC)",            40.7456, -73.9476, "performance", 1.5),
+    ("Court Square (LIC)",        40.7470, -73.9445, "transit_hub", 2.0),
+    # Queens — Flushing Meadows-Corona Park (Citi Field + USTA
+    # already exist; add Queens Museum + Hall of Science for a
+    # genuine 4-anchor cluster).
+    ("NYC Hall of Science",       40.7474, -73.8519, "tourist", 1.0),
+    ("Queens Museum",             40.7458, -73.8459, "tourist", 1.0),
+    # Queens — Flushing transit hub (Main St 7-train + LIRR are
+    # right on top of each other; both are massive ridership stops).
+    ("Flushing-Main St (7 train)", 40.7593, -73.8302, "transit_hub", 2.0),
+    ("Flushing LIRR Station",     40.7607, -73.8311, "transit_hub", 2.0),
+    # Bronx — Fordham / Bronx Zoo area (Zoo + Botanical Garden +
+    # Fordham University are NOT within 0.3 mi of each other; left
+    # as individual landmarks. Adding for completeness but they
+    # won't form a 3+ cluster unless the radius is widened later.)
+    ("Bronx Zoo (Main Gate)",     40.8506, -73.8770, "tourist", 1.5),
+    ("New York Botanical Garden", 40.8624, -73.8801, "tourist", 1.5),
+    ("Fordham University Rose Hill", 40.8612, -73.8866, "corporate", 1.0),
 ]
 
 
@@ -117,7 +157,7 @@ NYC_LONG_TRIP_POIS: List[Tuple[str, float, float, str, float]] = [
 # row, Midtown East hotel cluster, Times Sq hotel cluster, Lincoln
 # Center area) coalesce while still keeping Penn-area separate from
 # Grand Central / Times Sq.
-CLUSTER_RADIUS_MI = 0.30
+CLUSTER_RADIUS_MI = 0.35
 
 # Minimum POIs in a cluster for it to count as a hotspot. The whole
 # point is "a SPOT where 3+ important buildings are nearby" — single
