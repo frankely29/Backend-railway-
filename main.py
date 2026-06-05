@@ -5137,6 +5137,30 @@ def _db_init() -> None:
         )
         _db_exec("CREATE INDEX IF NOT EXISTS idx_long_trip_flags_created ON long_trip_flags(created_at);")
 
+        # zone_long_trip_generator_scores: static per-zone proximity to
+        # known long-trip POI generators (airports, hospitals, transit
+        # hubs, large hotels, convention centers, stadiums, etc.).
+        # Built ONCE via /admin/long_trip_generators/rebuild; read by
+        # the frontend overlay to draw a "long-trip generator" ring on
+        # the map. See long_trip_generator_builder.py for the POI list
+        # and scoring formula.
+        _db_exec(
+            """
+            CREATE TABLE IF NOT EXISTS zone_long_trip_generator_scores (
+              location_id INTEGER PRIMARY KEY,
+              score DOUBLE PRECISION NOT NULL DEFAULT 0,
+              tier TEXT NOT NULL DEFAULT 'none',
+              nearby_pois_json TEXT NOT NULL DEFAULT '[]',
+              category_counts_json TEXT NOT NULL DEFAULT '{}',
+              radius_mi DOUBLE PRECISION NOT NULL DEFAULT 0.4,
+              generated_at_unix BIGINT NOT NULL DEFAULT 0
+            );
+            """
+        )
+        _db_exec(
+            "CREATE INDEX IF NOT EXISTS idx_zone_lt_gen_tier ON zone_long_trip_generator_scores(tier);"
+        )
+
         _db_exec(
             """
             CREATE TABLE IF NOT EXISTS pickup_logs (
@@ -5626,6 +5650,26 @@ def _db_init() -> None:
         """
     )
     _db_exec("CREATE INDEX IF NOT EXISTS idx_long_trip_flags_created ON long_trip_flags(created_at);")
+
+    # SQLite mirror of the postgres zone_long_trip_generator_scores table.
+    # See the postgres branch above and long_trip_generator_builder.py for
+    # the purpose; same columns, SQLite-compatible types.
+    _db_exec(
+        """
+        CREATE TABLE IF NOT EXISTS zone_long_trip_generator_scores (
+          location_id INTEGER PRIMARY KEY,
+          score REAL NOT NULL DEFAULT 0,
+          tier TEXT NOT NULL DEFAULT 'none',
+          nearby_pois_json TEXT NOT NULL DEFAULT '[]',
+          category_counts_json TEXT NOT NULL DEFAULT '{}',
+          radius_mi REAL NOT NULL DEFAULT 0.4,
+          generated_at_unix INTEGER NOT NULL DEFAULT 0
+        );
+        """
+    )
+    _db_exec(
+        "CREATE INDEX IF NOT EXISTS idx_zone_lt_gen_tier ON zone_long_trip_generator_scores(tier);"
+    )
 
     _db_exec(
         """
@@ -9264,6 +9308,61 @@ def long_trip_flags_list(user: sqlite3.Row = Depends(require_user)):
         "FROM long_trip_flags ORDER BY created_at ASC LIMIT 5000"
     )
     return {"flags": [_ltf_row_to_dict(r) for r in rows]}
+
+
+@app.post("/admin/long_trip_generators/rebuild")
+def long_trip_generators_rebuild(admin: sqlite3.Row = Depends(require_admin)):
+    """
+    One-time (or on-demand) build of the zone_long_trip_generator_scores
+    table from the hand-curated NYC POI list. Should be called once after
+    deploying long_trip_generator_builder.py (or any change to its POI
+    list). Idempotent — running it again with the same list just refreshes
+    generated_at_unix.
+    """
+    _ = admin
+    from build_hotspot import ensure_zones_geojson
+    from long_trip_generator_builder import build_zone_long_trip_generator_scores
+
+    zones_path = ensure_zones_geojson(DATA_DIR, force=False)
+    if not zones_path or not Path(zones_path).exists():
+        raise HTTPException(status_code=500, detail="zones geojson missing")
+    summary = build_zone_long_trip_generator_scores(
+        Path(zones_path), _db_exec, _db_query_all
+    )
+    return {"ok": True, **summary}
+
+
+@app.get("/long_trip_generators")
+def long_trip_generators_list(user: sqlite3.Row = Depends(require_user)):
+    """
+    Returns per-zone long-trip POI proximity scores. Read once on map
+    init; cached in the frontend. No recomputation per request.
+    """
+    _ = user
+    rows = _db_query_all(
+        "SELECT location_id, score, tier, nearby_pois_json, category_counts_json, "
+        "radius_mi, generated_at_unix FROM zone_long_trip_generator_scores"
+    )
+    out = []
+    for r in rows:
+        try:
+            nearby = json.loads(r["nearby_pois_json"] or "[]")
+        except Exception:
+            nearby = []
+        try:
+            cats = json.loads(r["category_counts_json"] or "{}")
+        except Exception:
+            cats = {}
+        out.append({
+            "location_id": int(r["location_id"]),
+            "score": float(r["score"] or 0.0),
+            "tier": str(r["tier"] or "none"),
+            "nearby_pois": nearby,
+            "category_counts": cats,
+            "radius_mi": float(r["radius_mi"] or 0.4),
+            "generated_at_unix": int(r["generated_at_unix"] or 0),
+        })
+    return {"zones": out}
 
 
 @app.post("/long_trip_flags")
