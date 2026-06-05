@@ -73,6 +73,7 @@ def build_zone_earnings_shadow_sql(
     queens_v3_profile: Optional[ZoneScoreProfileWeights] = None,
     brooklyn_v3_profile: Optional[ZoneScoreProfileWeights] = None,
     staten_island_v3_profile: Optional[ZoneScoreProfileWeights] = None,
+    trips_45plus_v3_profile: Optional[ZoneScoreProfileWeights] = None,
     available_columns: Optional[Set[str]] = None,
 ) -> str:
     parquet_sql = ", ".join("'" + p.replace("'", "''") + "'" for p in parquet_files)
@@ -105,6 +106,9 @@ def build_zone_earnings_shadow_sql(
     qw3 = queens_v3_profile or qw
     bkw3 = brooklyn_v3_profile or bkw
     sw3 = staten_island_v3_profile or sw
+    # 45+ trips mode: long-trip-biased citywide profile. Falls back to
+    # citywide_v3 if no dedicated profile is passed.
+    tw3 = trips_45plus_v3_profile or c3w
     c3_busy_now_weight = c3w.demand_now_weight + c3w.demand_density_now_weight
     c3_busy_next_weight = c3w.demand_next_weight + c3w.demand_density_next_weight
     mw3_busy_now_weight = mw3.demand_now_weight + mw3.demand_density_now_weight
@@ -117,6 +121,8 @@ def build_zone_earnings_shadow_sql(
     bkw3_busy_next_weight = bkw3.demand_next_weight + bkw3.demand_density_next_weight
     sw3_busy_now_weight = sw3.demand_now_weight + sw3.demand_density_now_weight
     sw3_busy_next_weight = sw3.demand_next_weight + sw3.demand_density_next_weight
+    tw3_busy_now_weight = tw3.demand_now_weight + tw3.demand_density_now_weight
+    tw3_busy_next_weight = tw3.demand_next_weight + tw3.demand_density_next_weight
     manhattan_core_citywide_guard_sql = f"""
 POSITION('manhattan' IN LOWER(COALESCE(borough_name, ''))) > 0
 AND COALESCE(centroid_latitude, 999.0) <= 40.795
@@ -237,6 +243,15 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
         CASE WHEN trip_miles <= 3.0 AND trip_time <= 720.0 THEN 1 ELSE 0 END AS is_short_trip,
         CASE WHEN shared_flag = 1 THEN 1 ELSE 0 END AS is_shared,
         CASE WHEN trip_time >= 1200 THEN 1 ELSE 0 END AS is_long_trip_20plus,
+        -- Premium long trip: 45+ minutes OR 10+ miles. Drives the
+        -- "45+ trips mode" (trips_45plus_v3) score.
+        CASE WHEN trip_time >= 2700 OR trip_miles >= 10.0 THEN 1 ELSE 0 END AS is_premium_long_trip,
+        -- Length signals for premium long trips (NULL when the trip
+        -- doesn't qualify, so AVG() over a zone only averages the
+        -- qualifiers — exactly what we want for "how long are the long
+        -- trips here?").
+        CASE WHEN trip_time >= 2700 OR trip_miles >= 10.0 THEN trip_time / 60.0 END AS premium_long_trip_minutes,
+        CASE WHEN trip_time >= 2700 OR trip_miles >= 10.0 THEN trip_miles END AS premium_long_trip_miles,
         CASE WHEN trip_miles BETWEEN 3.0 AND 10.0 AND trip_time BETWEEN 720.0 AND 2400.0 THEN 1 ELSE 0 END AS is_balanced_trip,
         CASE WHEN DOLocationID = PULocationID THEN 1 ELSE 0 END AS is_same_zone_dropoff,
         CASE
@@ -344,6 +359,14 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
         AVG(is_short_trip * 1.0) AS short_trip_share_3mi_12min,
         AVG(is_shared * 1.0) AS shared_ride_share,
         AVG(is_long_trip_20plus * 1.0) AS long_trip_share_20plus,
+        -- Per-zone premium long trip aggregates (45+ min OR 10+ mi).
+        -- share averages the boolean across all trips; the avg_*
+        -- aggregates only consider the qualifying trips (NULL for
+        -- non-qualifiers, so AVG ignores them), giving the average
+        -- length/duration of long trips at this zone.
+        AVG(is_premium_long_trip * 1.0) AS premium_long_trip_share,
+        AVG(premium_long_trip_minutes) AS premium_long_trip_avg_minutes,
+        AVG(premium_long_trip_miles) AS premium_long_trip_avg_miles,
         AVG(is_balanced_trip * 1.0) AS balanced_trip_share,
         AVG(is_same_zone_dropoff * 1.0) AS same_zone_dropoff_share,
         AVG(is_airport_exit * 1.0) AS airport_exit_share,
@@ -519,6 +542,12 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
         COUNT(pickups_per_sq_mile_next) OVER (PARTITION BY exact_bin_local_ts) AS demand_density_next_n,
         ROW_NUMBER() OVER (PARTITION BY exact_bin_local_ts ORDER BY long_trip_share_20plus) AS long_trip_share_20plus_rn,
         COUNT(long_trip_share_20plus) OVER (PARTITION BY exact_bin_local_ts) AS long_trip_share_20plus_n,
+        ROW_NUMBER() OVER (PARTITION BY exact_bin_local_ts ORDER BY premium_long_trip_share) AS premium_long_trip_share_rn,
+        COUNT(premium_long_trip_share) OVER (PARTITION BY exact_bin_local_ts) AS premium_long_trip_share_n,
+        ROW_NUMBER() OVER (PARTITION BY exact_bin_local_ts ORDER BY premium_long_trip_avg_minutes) AS premium_long_trip_avg_minutes_rn,
+        COUNT(premium_long_trip_avg_minutes) OVER (PARTITION BY exact_bin_local_ts) AS premium_long_trip_avg_minutes_n,
+        ROW_NUMBER() OVER (PARTITION BY exact_bin_local_ts ORDER BY premium_long_trip_avg_miles) AS premium_long_trip_avg_miles_rn,
+        COUNT(premium_long_trip_avg_miles) OVER (PARTITION BY exact_bin_local_ts) AS premium_long_trip_avg_miles_n,
         ROW_NUMBER() OVER (PARTITION BY exact_bin_local_ts ORDER BY balanced_trip_share) AS balanced_trip_share_rn,
         COUNT(balanced_trip_share) OVER (PARTITION BY exact_bin_local_ts) AS balanced_trip_share_n,
         ROW_NUMBER() OVER (PARTITION BY exact_bin_local_ts ORDER BY same_zone_dropoff_share) AS same_zone_retention_penalty_rn,
@@ -611,6 +640,21 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
           WHEN long_trip_share_20plus_n <= 1 THEN 0.0
           ELSE (long_trip_share_20plus_rn - 1) * 1.0 / (long_trip_share_20plus_n - 1)
         END AS long_trip_share_20plus_n,
+        CASE
+          WHEN premium_long_trip_share IS NULL THEN NULL
+          WHEN premium_long_trip_share_n <= 1 THEN 0.0
+          ELSE (premium_long_trip_share_rn - 1) * 1.0 / (premium_long_trip_share_n - 1)
+        END AS premium_long_trip_share_n,
+        CASE
+          WHEN premium_long_trip_avg_minutes IS NULL THEN NULL
+          WHEN premium_long_trip_avg_minutes_n <= 1 THEN 0.0
+          ELSE (premium_long_trip_avg_minutes_rn - 1) * 1.0 / (premium_long_trip_avg_minutes_n - 1)
+        END AS premium_long_trip_avg_minutes_n,
+        CASE
+          WHEN premium_long_trip_avg_miles IS NULL THEN NULL
+          WHEN premium_long_trip_avg_miles_n <= 1 THEN 0.0
+          ELSE (premium_long_trip_avg_miles_rn - 1) * 1.0 / (premium_long_trip_avg_miles_n - 1)
+        END AS premium_long_trip_avg_miles_n,
         CASE
           WHEN same_zone_dropoff_share IS NULL THEN NULL
           WHEN same_zone_retention_penalty_n <= 1 THEN 0.0
@@ -1021,6 +1065,26 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
           {sw3.shared_ride_penalty_weight:.8f} * shared_ride_penalty_n +
           {sw3.market_saturation_penalty_weight:.8f} * COALESCE(market_saturation_penalty_n, 0.0)
         ) AS negative_score_staten_island_v3,
+        {nullable_weighted_average_sql([
+          (f"{tw3_busy_now_weight:.8f}", "busy_now_base_n"),
+          (f"{tw3_busy_next_weight:.8f}", "busy_next_base_n"),
+          (f"{tw3.pay_weight:.8f}", "pay_n_safe"),
+          (f"{tw3.pay_per_min_weight:.8f}", "pay_per_min_n_safe"),
+          (f"{tw3.pay_per_mile_weight:.8f}", "pay_per_mile_n_safe"),
+          (f"{tw3.balanced_trip_share_weight:.8f}", "COALESCE(balanced_trip_share_n, 0.0)"),
+          (f"{tw3.long_trip_share_20plus_weight:.8f}", "COALESCE(long_trip_share_20plus_n, 0.0)"),
+          (f"{tw3.premium_long_trip_share_weight:.8f}", "COALESCE(premium_long_trip_share_n, 0.0)"),
+          (f"{tw3.premium_long_trip_avg_minutes_weight:.8f}", "COALESCE(premium_long_trip_avg_minutes_n, 0.0)"),
+          (f"{tw3.premium_long_trip_avg_miles_weight:.8f}", "COALESCE(premium_long_trip_avg_miles_n, 0.0)"),
+          (f"{tw3.downstream_weight:.8f}", "downstream_value_n"),
+        ])} AS positive_score_trips_45plus_v3,
+        (
+          {tw3.short_trip_penalty_weight:.8f} * short_trip_penalty_n +
+          {tw3.same_zone_retention_penalty_weight:.8f} * COALESCE(same_zone_retention_penalty_n, 0.0) +
+          {tw3.pickup_friction_penalty_weight:.8f} * pickup_friction_penalty_n +
+          {tw3.shared_ride_penalty_weight:.8f} * shared_ride_penalty_n +
+          {tw3.market_saturation_penalty_weight:.8f} * COALESCE(market_saturation_penalty_n, 0.0)
+        ) AS negative_score_trips_45plus_v3,
         LEAST(1.0, pickups_now / 40.0) * (0.70 + 0.30 * downstream_coverage) AS earnings_shadow_confidence_citywide_v2_base
       FROM trap_exit_shadow
     ),
@@ -1085,6 +1149,7 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
         {clip01('positive_score_queens_v3 - negative_score_queens_v3')} AS shadow_score_raw_queens_v3,
         {clip01('positive_score_brooklyn_v3 - negative_score_brooklyn_v3')} AS shadow_score_raw_brooklyn_v3,
         {clip01('positive_score_staten_island_v3 - negative_score_staten_island_v3')} AS shadow_score_raw_staten_island_v3,
+        {clip01('positive_score_trips_45plus_v3 - negative_score_trips_45plus_v3')} AS shadow_score_raw_trips_45plus_v3,
         earnings_shadow_confidence_citywide_v2_base * sample_support_strength_shadow AS earnings_shadow_confidence_citywide_v2,
         {clip01(f"{clip01('positive_score - negative_score')} * (earnings_shadow_confidence_citywide_v2_base * sample_support_strength_shadow)")} AS earnings_shadow_score_citywide_v2,
         earnings_shadow_confidence_citywide_v2_base * sample_support_strength_shadow AS earnings_shadow_confidence_manhattan_v2,
@@ -1109,7 +1174,9 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
         {clip01(f"{clip01('positive_score_staten_island_v3 - negative_score_staten_island_v3')} * ({clip01('0.80 * earnings_shadow_confidence_citywide_v2_base + 0.20 * COALESCE(balanced_trip_share_n, 0.0)')} * sample_support_strength_shadow)")} AS earnings_shadow_score_staten_island_v3,
         {clip01('0.85 * earnings_shadow_confidence_citywide_v2_base + 0.15 * demand_support_n')} * sample_support_strength_shadow AS earnings_shadow_confidence_citywide_v3,
         {clip01('shadow_score_raw_citywide_v3 * citywide_manhattan_saturation_discount_factor_n')} AS earnings_shadow_score_citywide_v3_anchor_shadow,
-        {clip01(f"shadow_score_raw_citywide_v3 * ({clip01('0.85 * earnings_shadow_confidence_citywide_v2_base + 0.15 * demand_support_n')} * sample_support_strength_shadow) * citywide_manhattan_saturation_discount_factor_n")} AS earnings_shadow_score_citywide_v3
+        {clip01(f"shadow_score_raw_citywide_v3 * ({clip01('0.85 * earnings_shadow_confidence_citywide_v2_base + 0.15 * demand_support_n')} * sample_support_strength_shadow) * citywide_manhattan_saturation_discount_factor_n")} AS earnings_shadow_score_citywide_v3,
+        {clip01('0.85 * earnings_shadow_confidence_citywide_v2_base + 0.15 * demand_support_n')} * sample_support_strength_shadow AS earnings_shadow_confidence_trips_45plus_v3,
+        {clip01(f"shadow_score_raw_trips_45plus_v3 * ({clip01('0.85 * earnings_shadow_confidence_citywide_v2_base + 0.15 * demand_support_n')} * sample_support_strength_shadow)")} AS earnings_shadow_score_trips_45plus_v3
       FROM scored
     ),
     candidate_trap_adjusted AS (
@@ -1352,6 +1419,14 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
       shadow_score_raw_queens_v3 AS earnings_shadow_score_raw_queens_v3,
       shadow_score_raw_brooklyn_v3 AS earnings_shadow_score_raw_brooklyn_v3,
       shadow_score_raw_staten_island_v3 AS earnings_shadow_score_raw_staten_island_v3,
+      shadow_score_raw_trips_45plus_v3 AS earnings_shadow_score_raw_trips_45plus_v3,
+      CAST(ROUND(1 + 99 * shadow_score_raw_trips_45plus_v3) AS INTEGER) AS earnings_shadow_rating_trips_45plus_v3,
+      premium_long_trip_share AS premium_long_trip_share_shadow,
+      premium_long_trip_share_n AS premium_long_trip_share_n_shadow,
+      premium_long_trip_avg_minutes AS premium_long_trip_avg_minutes_shadow,
+      premium_long_trip_avg_minutes_n AS premium_long_trip_avg_minutes_n_shadow,
+      premium_long_trip_avg_miles AS premium_long_trip_avg_miles_shadow,
+      premium_long_trip_avg_miles_n AS premium_long_trip_avg_miles_n_shadow,
       ({c3_busy_now_weight:.8f} * busy_now_base_n + {c3_busy_next_weight:.8f} * busy_next_base_n) AS earnings_shadow_busy_size_positive_citywide_v3,
       ({c3w.pay_weight:.8f} * pay_n_safe + {c3w.pay_per_min_weight:.8f} * pay_per_min_n_safe + {c3w.pay_per_mile_weight:.8f} * pay_per_mile_n_safe) AS earnings_shadow_pay_quality_positive_citywide_v3,
       (citywide_v3_effective_balanced_trip_weight * COALESCE(balanced_trip_share_n, 0.0) + citywide_v3_effective_long_trip_weight * COALESCE(long_trip_share_20plus_n, 0.0)) +

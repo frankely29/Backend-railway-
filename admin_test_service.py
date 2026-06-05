@@ -564,6 +564,7 @@ def test_score_sql_definitions() -> Dict[str, Any]:
             queens_v3_profile=ZONE_MODE_PROFILES["queens_v3"],
             brooklyn_v3_profile=ZONE_MODE_PROFILES["brooklyn_v3"],
             staten_island_v3_profile=ZONE_MODE_PROFILES["staten_island_v3"],
+            trips_45plus_v3_profile=ZONE_MODE_PROFILES["trips_45plus_v3"],
             available_columns={"request_datetime", "shared_match_flag", "shared_request_flag"},
         )
     except Exception as exc:

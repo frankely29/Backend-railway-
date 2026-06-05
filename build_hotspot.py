@@ -1091,6 +1091,7 @@ def build_single_frame_for_month(
             queens_v3_profile=ZONE_MODE_PROFILES["queens_v3"],
             brooklyn_v3_profile=ZONE_MODE_PROFILES["brooklyn_v3"],
             staten_island_v3_profile=ZONE_MODE_PROFILES["staten_island_v3"],
+            trips_45plus_v3_profile=ZONE_MODE_PROFILES["trips_45plus_v3"],
             available_columns=available_columns,
         )
         cursor = con.execute(
@@ -1470,6 +1471,7 @@ def build_hotspots_frames(
                     queens_v3_profile=ZONE_MODE_PROFILES["queens_v3"],
                     brooklyn_v3_profile=ZONE_MODE_PROFILES["brooklyn_v3"],
                     staten_island_v3_profile=ZONE_MODE_PROFILES["staten_island_v3"],
+                    trips_45plus_v3_profile=ZONE_MODE_PROFILES["trips_45plus_v3"],
                     available_columns=available_columns,
                 )
                 if create_table:
