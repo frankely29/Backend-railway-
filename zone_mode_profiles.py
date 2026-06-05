@@ -233,10 +233,15 @@ ZONE_MODE_PROFILES: Dict[str, ZoneScoreProfileWeights] = {
         demand_next_weight=0.06,
         demand_density_now_weight=0.10,
         demand_density_next_weight=0.06,
-        # Pay-per-mile correlates with trip length, so a soft bonus.
-        pay_weight=0.03,
+        # Pay: rewards RAW driver_pay (which scales naturally with
+        # trip length — a 60-min trip pays more than a 15-min one).
+        # pay_per_mile_weight intentionally LOW because that metric
+        # actually punishes long-trip zones: a $20 / 4mi crosstown
+        # gets $5/mi vs a $80 / 30mi JFK that gets $2.67/mi. We don't
+        # want this mode favoring short urban trips.
+        pay_weight=0.07,
         pay_per_min_weight=0.05,
-        pay_per_mile_weight=0.12,
+        pay_per_mile_weight=0.04,
         balanced_trip_share_weight=0.02,
         # Keep a small weight on the 20+ minute share so zones with any
         # long-ish trip volume still get partial credit.
@@ -245,12 +250,20 @@ ZONE_MODE_PROFILES: Dict[str, ZoneScoreProfileWeights] = {
         #   share    — how often a qualifying long trip happens here
         #   avg_min  — when one happens, how long it runs in minutes
         #   avg_mile — when one happens, how far it runs in miles
-        # Together these reward zones that have MANY premium long trips
-        # AND where those trips tend to be even longer.
-        premium_long_trip_share_weight=0.22,
-        premium_long_trip_avg_minutes_weight=0.10,
-        premium_long_trip_avg_miles_weight=0.10,
-        downstream_weight=0.04,
+        # Boosted avg_minutes and avg_miles (0.10 -> 0.14 each) so
+        # the mode actively rewards LONGER long trips — driver's
+        # explicit ask: "the longer the trips the better."
+        premium_long_trip_share_weight=0.26,
+        premium_long_trip_avg_minutes_weight=0.14,
+        premium_long_trip_avg_miles_weight=0.14,
+        # downstream_weight ZEROED for this mode. The downstream
+        # signal rewards zones whose NEXT-bin trips are easy to
+        # catch — but long-trip zones often drop drivers in worse
+        # pickup areas (airports, residential outskirts), so they
+        # score lower on downstream. Keeping a positive weight here
+        # acts as an implicit penalty against long-trip zones, which
+        # contradicts the mode's intent.
+        downstream_weight=0.0,
         # Short-trip behavior is irrelevant for this mode.
         short_trip_penalty_weight=0.01,
         same_zone_retention_penalty_weight=0.03,
