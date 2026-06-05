@@ -78,6 +78,26 @@ NYC_LONG_TRIP_POIS: List[Tuple[str, float, float, str, float]] = [
     ("NY Hilton Midtown",         40.7621, -73.9789, "hotel_luxury", 2.5),
     ("Sheraton Times Square",     40.7625, -73.9826, "hotel_luxury", 2.3),
     ("Conrad NY Downtown",        40.7144, -74.0152, "hotel_luxury", 2.3),
+    # Hotel densifiers (Midtown West, Midtown East, UES luxury, FiDi)
+    ("W Times Square",            40.7601, -73.9849, "hotel_luxury", 2.2),
+    ("The Knickerbocker",         40.7563, -73.9854, "hotel_luxury", 2.2),
+    ("The Edition Times Square",  40.7568, -73.9858, "hotel_luxury", 2.3),
+    ("Westin Times Square",       40.7589, -73.9892, "hotel_luxury", 2.2),
+    ("Hilton Garden Inn Times Sq", 40.7572, -73.9866, "hotel_luxury", 2.0),
+    ("Crowne Plaza Times Square", 40.7596, -73.9869, "hotel_luxury", 2.0),
+    ("Westin NY Grand Central",   40.7568, -73.9722, "hotel_luxury", 2.2),
+    ("The Peninsula NY",          40.7616, -73.9744, "hotel_luxury", 2.5),
+    ("The Whitby Hotel",          40.7619, -73.9758, "hotel_luxury", 2.3),
+    ("The Algonquin Hotel",       40.7569, -73.9837, "hotel_luxury", 2.0),
+    ("Trump Tower",               40.7625, -73.9744, "hotel_luxury", 2.0),
+    ("Trump International Hotel", 40.7685, -73.9819, "hotel_luxury", 2.3),
+    ("Loews Regency NY",          40.7665, -73.9695, "hotel_luxury", 2.2),
+    ("The Carlyle",               40.7747, -73.9633, "hotel_luxury", 2.5),
+    ("The Mark Hotel",            40.7740, -73.9618, "hotel_luxury", 2.5),
+    ("The Surrey",                40.7752, -73.9627, "hotel_luxury", 2.3),
+    ("The Beekman Hotel",         40.7113, -74.0064, "hotel_luxury", 2.3),
+    ("Four Seasons Downtown",     40.7105, -74.0096, "hotel_luxury", 2.3),
+    ("11 Howard",                 40.7202, -73.9988, "hotel_luxury", 2.0),
 
     # Convention / performance / stadium
     ("Javits Center",             40.7577, -74.0024, "convention", 2.2),
@@ -116,12 +136,142 @@ NYC_LONG_TRIP_POIS: List[Tuple[str, float, float, str, float]] = [
     ("Bloomingdale's flagship",   40.7625, -73.9684, "luxury_shopping", 1.3),
     ("Apple Fifth Ave",           40.7637, -73.9728, "luxury_shopping", 1.2),
 
+    # ---------------- UES private schools (wealthy parents,
+    # frequent long trips to weekend homes / airports). E 80s-90s
+    # form a real walking cluster. ----------------
+    ("Dalton School",             40.7787, -73.9569, "private_school", 1.6),
+    ("Spence School",             40.7766, -73.9583, "private_school", 1.6),
+    ("Brearley School",           40.7726, -73.9460, "private_school", 1.6),
+    ("Chapin School",             40.7714, -73.9485, "private_school", 1.6),
+    ("Buckley School",            40.7708, -73.9577, "private_school", 1.6),
+    ("Trinity School (UWS)",      40.7864, -73.9788, "private_school", 1.5),
+    ("Collegiate School",         40.7754, -73.9889, "private_school", 1.5),
+    ("Nightingale-Bamford",       40.7795, -73.9568, "private_school", 1.5),
+    ("Marymount School NY",       40.7785, -73.9612, "private_school", 1.5),
+
+    # ---------------- Park Ave / Midtown East corporate row
+    # — institutional wealth, lots of car-service-out-of-town. ----------------
+    ("JP Morgan HQ (270 Park)",   40.7572, -73.9743, "corporate", 1.8),
+    ("MetLife Building (200 Park)", 40.7546, -73.9763, "corporate", 1.7),
+    ("Seagram Building (375 Park)", 40.7585, -73.9722, "corporate", 1.6),
+    ("Lever House (390 Park)",    40.7593, -73.9716, "corporate", 1.6),
+    ("GM Building (767 5th)",     40.7635, -73.9729, "corporate", 1.6),
+    ("General Electric Bldg (570 Lex)", 40.7572, -73.9728, "corporate", 1.6),
+    ("Chrysler Building",         40.7516, -73.9755, "corporate", 1.6),
+    ("Empire State Building",     40.7484, -73.9857, "corporate", 1.6),
+    ("Park Ave Plaza (55 E 52)",  40.7587, -73.9737, "corporate", 1.5),
+    ("245 Park Ave",              40.7556, -73.9749, "corporate", 1.5),
+    ("280 Park Ave",              40.7563, -73.9743, "corporate", 1.5),
+
     # ---------------- Outer-borough additions ----------------
     # Brooklyn — Downtown Brooklyn (corporate, court system,
     # major transit). Atlantic Terminal + Barclays + Borough Hall +
     # 1 Hotel Brooklyn Bridge form the genuine downtown cluster.
     ("Brooklyn Borough Hall",     40.6925, -73.9899, "corporate", 1.5),
     ("1 Hotel Brooklyn Bridge",   40.7032, -73.9931, "hotel_luxury", 2.2),
+    ("MetroTech Center",          40.6943, -73.9870, "corporate", 1.6),
+    ("Brooklyn Marriott Bridge",  40.6951, -73.9893, "hotel_luxury", 2.0),
+    ("Aloft Brooklyn",            40.6928, -73.9854, "hotel_luxury", 1.8),
+    ("Sheraton Brooklyn",         40.6918, -73.9890, "hotel_luxury", 1.9),
+    ("Brooklyn Bridge Marriott",  40.6948, -73.9892, "hotel_luxury", 2.0),
+
+    # DUMBO — boutique hotels + Etsy HQ + Dock 72 + tourist draw
+    ("Empire Stores",             40.7035, -73.9885, "corporate", 1.4),
+    ("Time Out Market NY",        40.7036, -73.9879, "corporate", 1.3),
+    ("Etsy HQ (DUMBO)",           40.7045, -73.9870, "corporate", 1.6),
+    ("Dock 72 (Brooklyn Navy Yard)", 40.7036, -73.9711, "corporate", 1.5),
+    ("St Ann's Warehouse",        40.7029, -73.9889, "performance", 1.3),
+    ("1 Hotel Brooklyn (DUMBO)",  40.7034, -73.9931, "hotel_luxury", 2.0),
+
+    # Williamsburg — boutique hotels + nightlife wealth
+    ("William Vale Hotel",        40.7218, -73.9568, "hotel_luxury", 2.0),
+    ("Wythe Hotel",               40.7223, -73.9577, "hotel_luxury", 2.0),
+    ("Hoxton Williamsburg",       40.7210, -73.9573, "hotel_luxury", 1.9),
+    ("McCarren Hotel & Pool",     40.7204, -73.9527, "hotel_luxury", 1.8),
+
+    # LIC corporate (Citi tower, JetBlue HQ, JACX) — actual finance + tech wealth
+    ("Citigroup Tower (LIC)",     40.7475, -73.9420, "corporate", 1.8),
+    ("JetBlue HQ (Brewster Bldg)", 40.7480, -73.9402, "corporate", 1.7),
+    ("JACX Queens Plaza",         40.7491, -73.9414, "corporate", 1.6),
+    ("Court Square (LIC)",        40.7475, -73.9450, "transit_hub", 1.8),
+    ("Boro Hotel LIC",            40.7479, -73.9417, "hotel_luxury", 1.7),
+    ("Z NYC Hotel",               40.7482, -73.9461, "hotel_luxury", 1.6),
+    ("Ravel Hotel LIC",           40.7693, -73.9181, "hotel_luxury", 1.5),
+
+    # Astoria — Kaufman Astoria Studios + Museum of Moving Image
+    ("Kaufman Astoria Studios",   40.7563, -73.9224, "corporate", 1.6),
+    ("Museum of the Moving Image", 40.7565, -73.9241, "corporate", 1.4),
+    ("Mt Sinai Astoria",          40.7644, -73.9226, "hospital", 2.0),
+
+    # Brooklyn — Park Slope / Prospect Heights
+    ("Brooklyn Museum",           40.6712, -73.9636, "performance", 1.5),
+    ("Brooklyn Botanic Garden",   40.6694, -73.9626, "performance", 1.4),
+    ("Brooklyn Public Library",   40.6724, -73.9686, "corporate", 1.4),
+    ("Brooklyn Academy of Music", 40.6862, -73.9789, "performance", 1.5),
+
+    # Brooklyn — Industry City / Sunset Park (wealth tech offices)
+    ("Industry City",             40.6552, -74.0090, "corporate", 1.6),
+
+    # Brooklyn — Crown Heights / Bed-Stuy hospitals
+    ("Kings County Hospital",     40.6585, -73.9460, "hospital", 2.5),
+    ("SUNY Downstate Medical",    40.6557, -73.9472, "hospital", 2.5),
+
+    # Bronx — Riverdale wealthy enclave
+    ("Riverdale Country School",  40.9023, -73.9133, "private_school", 1.5),
+    ("Horace Mann School (Bronx)", 40.9012, -73.9100, "private_school", 1.5),
+
+    # Queens — Forest Hills wealthy / Long Island Jewish
+    ("Forest Hills Tower",        40.7195, -73.8473, "corporate", 1.3),
+    ("Long Island Jewish Hospital", 40.7587, -73.7079, "hospital", 2.8),
+    ("Northwell North Shore Univ", 40.7766, -73.7045, "hospital", 2.5),
+    ("Northwell Imaging Manhasset", 40.7798, -73.7028, "hospital", 1.8),
+
+    # Hoboken — terminal + W Hotel + Pier 13
+    ("Hoboken Terminal",          40.7359, -74.0291, "transit_hub", 2.3),
+    ("W Hoboken",                 40.7368, -74.0276, "hotel_luxury", 2.0),
+    ("Pier 13 Hoboken",           40.7407, -74.0260, "corporate", 1.3),
+
+    # Jersey City — Exchange Place financial cluster
+    ("Goldman Sachs Tower (JC)",  40.7164, -74.0327, "corporate", 1.8),
+    ("Hyatt Regency Jersey City", 40.7166, -74.0339, "hotel_luxury", 2.0),
+    ("Exchange Place PATH",       40.7162, -74.0335, "transit_hub", 2.2),
+    ("Harborside Plaza",          40.7173, -74.0335, "corporate", 1.6),
+    ("Newport Centre / PATH",     40.7270, -74.0339, "transit_hub", 2.0),
+    ("W Hotel JC (Newport)",      40.7271, -74.0354, "hotel_luxury", 2.0),
+
+    # Manhattan — Tribeca / Soho boutique hotels (often missed)
+    ("Greenwich Hotel",           40.7195, -74.0107, "hotel_luxury", 2.2),
+    ("Roxy Hotel",                40.7203, -74.0046, "hotel_luxury", 1.9),
+    ("Mr C Seaport",              40.7066, -74.0044, "hotel_luxury", 1.8),
+    ("Crosby Street Hotel",       40.7233, -73.9989, "hotel_luxury", 2.1),
+    ("Mercer Hotel",              40.7242, -73.9989, "hotel_luxury", 2.0),
+    ("Soho Grand Hotel",          40.7223, -74.0027, "hotel_luxury", 1.9),
+
+    # Manhattan — Chelsea / Meatpacking (wealthy nightlife heads home in cars)
+    ("Standard High Line",        40.7409, -74.0080, "hotel_luxury", 2.1),
+    ("Gansevoort Meatpacking",    40.7396, -74.0089, "hotel_luxury", 1.9),
+    ("Hotel Chelsea",             40.7440, -73.9968, "hotel_luxury", 1.8),
+    ("The High Line (W 14)",      40.7407, -74.0079, "performance", 1.2),
+
+    # Manhattan — Flatiron / Madison Square corporate
+    ("Flatiron Building",         40.7411, -73.9897, "corporate", 1.4),
+    ("Madison Square Park",       40.7423, -73.9879, "corporate", 1.3),
+    ("Eataly Flatiron",           40.7421, -73.9899, "corporate", 1.2),
+    ("Ace Hotel NY",              40.7464, -73.9883, "hotel_luxury", 1.9),
+    ("NoMad Hotel",               40.7444, -73.9879, "hotel_luxury", 2.0),
+    ("The James NoMad",           40.7438, -73.9874, "hotel_luxury", 1.8),
+    ("Marriott Edition Madison",  40.7437, -73.9874, "hotel_luxury", 1.9),
+
+    # Manhattan — UWS hotels + Lincoln Center cluster densifier
+    ("Empire Hotel",              40.7720, -73.9826, "hotel_luxury", 1.9),
+    ("Hotel Beacon",              40.7807, -73.9803, "hotel_luxury", 1.7),
+    ("NYU Langone Hospital UWS",  40.7822, -73.9805, "hospital", 2.5),
+
+    # Manhattan — Financial District densifier (existing hotels + offices)
+    ("Hotel AKA Wall St",         40.7064, -74.0103, "hotel_luxury", 1.9),
+    ("Wall Street Inn",           40.7041, -74.0112, "hotel_luxury", 1.7),
+    ("Cipriani Wall Street",      40.7059, -74.0099, "performance", 1.4),
+    ("70 Pine Street",            40.7062, -74.0079, "corporate", 1.5),
 ]
 
 
@@ -146,7 +296,8 @@ MIN_MEMBERS_PER_HOTSPOT = 3
 # about airports → hospitals → transit → hotels, so airports win the
 # label if any airport POI is in the cluster.
 _CATEGORY_PRIORITY: List[str] = [
-    "tourist", "corporate", "performance", "stadium", "convention",
+    "tourist", "luxury_shopping", "luxury_condo", "private_club",
+    "private_school", "corporate", "performance", "stadium", "convention",
     "hotel_luxury", "transit_hub", "hospital", "airport",
 ]
 
