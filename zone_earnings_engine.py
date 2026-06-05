@@ -735,6 +735,18 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
         ) AS effective_demand_density_next_n,
         LEAST(GREATEST((0.68 * demand_now_n + 0.32 * (COALESCE(demand_density_now_n, demand_now_n) * LEAST(GREATEST((0.20 + 0.80 * GREATEST(demand_now_n, demand_next_n)), 0.0), 1.0))), 0.0), 1.0) AS busy_now_base_n,
         LEAST(GREATEST((0.62 * demand_next_n + 0.38 * (COALESCE(demand_density_next_n, demand_next_n) * LEAST(GREATEST((0.20 + 0.80 * GREATEST(demand_now_n, demand_next_n)), 0.0), 1.0))), 0.0), 1.0) AS busy_next_base_n,
+        -- Size-fair busy signal for 45+ Trips mode. The default
+        -- busy_now_base_n (68:32 volume:density) rewards big zones
+        -- just for being big, which fights the user-stated intent of
+        -- the mode: find PLACES where premium long trips concentrate,
+        -- not big areas with mediocre trip mix. This 50:50 split still
+        -- requires some absolute volume (the support gate inside
+        -- effective_demand_density_now_n already prevents tiny zones
+        -- with 1 lucky long trip from leading the rank) while halving
+        -- the zone-size advantage. Used only by the trips_45plus_v3
+        -- score block below; all other modes keep busy_now_base_n.
+        LEAST(GREATEST((0.50 * demand_now_n + 0.50 * (COALESCE(demand_density_now_n, demand_now_n) * LEAST(GREATEST((0.20 + 0.80 * GREATEST(demand_now_n, demand_next_n)), 0.0), 1.0))), 0.0), 1.0) AS busy_now_density_fair_n,
+        LEAST(GREATEST((0.50 * demand_next_n + 0.50 * (COALESCE(demand_density_next_n, demand_next_n) * LEAST(GREATEST((0.20 + 0.80 * GREATEST(demand_now_n, demand_next_n)), 0.0), 1.0))), 0.0), 1.0) AS busy_next_density_fair_n,
         LEAST(
           GREATEST(
             (
@@ -1085,8 +1097,8 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
           {sw3.market_saturation_penalty_weight:.8f} * COALESCE(market_saturation_penalty_n, 0.0)
         ) AS negative_score_staten_island_v3,
         {nullable_weighted_average_sql([
-          (f"{tw3_busy_now_weight:.8f}", "busy_now_base_n"),
-          (f"{tw3_busy_next_weight:.8f}", "busy_next_base_n"),
+          (f"{tw3_busy_now_weight:.8f}", "busy_now_density_fair_n"),
+          (f"{tw3_busy_next_weight:.8f}", "busy_next_density_fair_n"),
           (f"{tw3.pay_weight:.8f}", "pay_n_safe"),
           (f"{tw3.pay_per_min_weight:.8f}", "pay_per_min_n_safe"),
           (f"{tw3.pay_per_mile_weight:.8f}", "pay_per_mile_n_safe"),
