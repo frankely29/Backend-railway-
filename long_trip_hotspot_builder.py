@@ -295,6 +295,227 @@ _CATEGORY_PRIORITY: List[str] = [
 ]
 
 
+# Best hours by category — when a driver standing near this kind of
+# building is most likely to get long-trip pickups. These are heuristics
+# based on building-type patterns, not measured trip data; they're a
+# hint for the driver, not a guarantee.
+BEST_HOURS_BY_CATEGORY: Dict[str, str] = {
+    "airport":         "24/7 — peaks 5–8am, 4–9pm",
+    "hospital":        "24/7 — discharges peak 10am–4pm",
+    "hotel_luxury":    "Checkout 7–11am, check-in 3–7pm",
+    "transit_hub":     "Weekday rush 7–9am, 5–7pm",
+    "corporate":       "Weekday 8–10am, 5–7pm",
+    "private_school":  "Drop-off 7:30–8:30am, pickup 2:30–4pm",
+    "private_club":    "Lunch 12–2pm, dinner 6–9pm",
+    "luxury_condo":    "Weekday morning 7–9am",
+    "luxury_shopping": "11am–7pm, peak Sat 1–6pm",
+    "performance":     "1–3 hours after curtain",
+    "stadium":         "1–2 hours after game ends",
+    "convention":      "9am–6pm during events",
+    "tourist":         "10am–6pm",
+}
+
+
+# Street addresses for the POIs. Hand-curated from common knowledge of
+# the most-visited NYC buildings. Where I'm not confident in a precise
+# street number, the value is a cross-street / neighborhood description
+# instead of a guess — better vague-but-correct than precise-but-wrong.
+# Drivers using the popup should treat the address as a navigation hint,
+# not gospel.
+POI_ADDRESSES: Dict[str, str] = {
+    # Airports
+    "JFK Airport (central)": "JFK Airport, Jamaica, NY 11430",
+    "LaGuardia Airport": "LaGuardia Airport, Flushing, NY 11371",
+    "Newark Liberty Airport": "Newark Liberty Intl Airport, Newark, NJ 07114",
+    # Hospitals
+    "Mt Sinai Hospital (Main)": "1 Gustave L. Levy Place, NY 10029",
+    "Mt Sinai West": "1000 10th Ave, NY 10019",
+    "Mt Sinai Morningside": "1111 Amsterdam Ave, NY 10025",
+    "Mt Sinai Beth Israel": "281 1st Ave, NY 10003",
+    "NYU Langone Tisch": "550 1st Ave, NY 10016",
+    "NYU Langone Brooklyn": "150 55th St, Brooklyn 11220",
+    "Bellevue Hospital": "462 1st Ave, NY 10016",
+    "Memorial Sloan Kettering": "1275 York Ave, NY 10065",
+    "Hospital for Special Surgery": "535 E 70th St, NY 10021",
+    "Lenox Hill Hospital": "100 E 77th St, NY 10075",
+    "Columbia Presbyterian": "622 W 168th St, NY 10032",
+    "NewYork-Presbyterian (LM)": "170 William St, NY 10038",
+    "NewYork-Presbyterian Queens": "56-45 Main St, Flushing 11355",
+    "Brooklyn Hospital Center": "121 DeKalb Ave, Brooklyn 11201",
+    "Maimonides Medical Center": "4802 10th Ave, Brooklyn 11219",
+    "Coney Island Hospital": "2601 Ocean Pkwy, Brooklyn 11235",
+    "Elmhurst Hospital": "79-01 Broadway, Elmhurst 11373",
+    "Queens Hospital Center": "82-68 164th St, Jamaica 11432",
+    "Cohen Children's Medical": "269-01 76th Ave, New Hyde Park 11040",
+    "Montefiore Medical (Bronx)": "111 E 210th St, Bronx 10467",
+    "Lincoln Hospital (Bronx)": "234 E 149th St, Bronx 10451",
+    "Staten Island Univ Hospital": "475 Seaview Ave, Staten Island 10305",
+    "Mt Sinai Astoria": "25-10 30th Ave, Astoria 11102",
+    "Kings County Hospital": "451 Clarkson Ave, Brooklyn 11203",
+    "SUNY Downstate Medical": "450 Clarkson Ave, Brooklyn 11203",
+    "Long Island Jewish Hospital": "270-05 76th Ave, New Hyde Park 11040",
+    "Northwell North Shore Univ": "300 Community Dr, Manhasset 11030",
+    "Northwell Imaging Manhasset": "1554 Northern Blvd, Manhasset 11030",
+    "NYU Langone Hospital UWS": "211 W 61st St, NY 10023",
+    # Transit hubs
+    "Penn Station": "31st St & 7th Ave, NY 10001",
+    "Grand Central Terminal": "89 E 42nd St, NY 10017",
+    "Port Authority Bus Terminal": "625 8th Ave, NY 10018",
+    "Atlantic Terminal (Brooklyn)": "139 Flatbush Ave, Brooklyn 11217",
+    "Jamaica Station (LIRR/AirTrain)": "Sutphin Blvd & Archer Ave, Jamaica 11435",
+    "Hunters Point LIRR": "49-01 5th St, LIC 11101",
+    "Newark Penn Station": "1 Raymond Plaza W, Newark, NJ 07102",
+    "Court Square (LIC)": "Jackson Ave & 23rd St, LIC 11101",
+    "Hoboken Terminal": "1 Hudson Pl, Hoboken, NJ 07030",
+    "Exchange Place PATH": "10 Exchange Pl, Jersey City, NJ 07302",
+    "Newport Centre / PATH": "30 Mall Dr W, Jersey City, NJ 07310",
+    # Hotels — luxury
+    "Plaza Hotel": "768 5th Ave, NY 10019",
+    "St Regis NY": "2 E 55th St, NY 10022",
+    "Waldorf Astoria NY": "301 Park Ave, NY 10022",
+    "The Pierre": "2 E 61st St, NY 10065",
+    "Mandarin Oriental NY": "80 Columbus Cir, NY 10023",
+    "Park Hyatt NY": "153 W 57th St, NY 10019",
+    "Lotte NY Palace": "455 Madison Ave, NY 10022",
+    "Ritz-Carlton Central Park": "50 Central Park S, NY 10019",
+    "Ritz-Carlton Battery Park": "2 West St, NY 10004",
+    "Four Seasons Tribeca": "27 Barclay St, NY 10007",
+    "Marriott Marquis Times Sq": "1535 Broadway, NY 10036",
+    "NY Hilton Midtown": "1335 6th Ave, NY 10019",
+    "Sheraton Times Square": "811 7th Ave, NY 10019",
+    "Conrad NY Downtown": "102 N End Ave, NY 10282",
+    "W Times Square": "1567 Broadway, NY 10036",
+    "The Knickerbocker": "6 Times Sq, NY 10036",
+    "The Edition Times Square": "701 7th Ave, NY 10036",
+    "Westin Times Square": "270 W 43rd St, NY 10036",
+    "Hilton Garden Inn Times Sq": "790 8th Ave, NY 10019",
+    "Crowne Plaza Times Square": "1605 Broadway, NY 10019",
+    "Westin NY Grand Central": "212 E 42nd St, NY 10017",
+    "The Peninsula NY": "700 5th Ave, NY 10019",
+    "The Whitby Hotel": "18 W 56th St, NY 10019",
+    "The Algonquin Hotel": "59 W 44th St, NY 10036",
+    "Trump Tower": "725 5th Ave, NY 10022",
+    "Trump International Hotel": "1 Central Park W, NY 10023",
+    "Loews Regency NY": "540 Park Ave, NY 10065",
+    "The Carlyle": "35 E 76th St, NY 10021",
+    "The Mark Hotel": "25 E 77th St, NY 10075",
+    "The Surrey": "20 E 76th St, NY 10021",
+    "The Beekman Hotel": "123 Nassau St, NY 10038",
+    "Four Seasons Downtown": "27 Barclay St, NY 10007",
+    "11 Howard": "11 Howard St, NY 10013",
+    "1 Hotel Brooklyn Bridge": "60 Furman St, Brooklyn 11201",
+    "Brooklyn Marriott Bridge": "333 Adams St, Brooklyn 11201",
+    "Aloft Brooklyn": "216 Duffield St, Brooklyn 11201",
+    "Sheraton Brooklyn": "228 Duffield St, Brooklyn 11201",
+    "Brooklyn Bridge Marriott": "333 Adams St, Brooklyn 11201",
+    "1 Hotel Brooklyn (DUMBO)": "60 Furman St, Brooklyn 11201",
+    "William Vale Hotel": "111 N 12th St, Brooklyn 11249",
+    "Wythe Hotel": "80 Wythe Ave, Brooklyn 11249",
+    "Hoxton Williamsburg": "97 Wythe Ave, Brooklyn 11249",
+    "McCarren Hotel & Pool": "160 N 12th St, Brooklyn 11249",
+    "Boro Hotel LIC": "38-28 27th St, LIC 11101",
+    "Z NYC Hotel": "11-01 43rd Ave, LIC 11101",
+    "Ravel Hotel LIC": "8-08 Queens Plaza S, LIC 11101",
+    "W Hoboken": "225 River St, Hoboken, NJ 07030",
+    "Hyatt Regency Jersey City": "2 Exchange Pl, Jersey City, NJ 07302",
+    "W Hotel JC (Newport)": "541 Washington Blvd, Jersey City, NJ 07310",
+    "Greenwich Hotel": "377 Greenwich St, NY 10013",
+    "Roxy Hotel": "2 6th Ave, NY 10013",
+    "Mr C Seaport": "33 Peck Slip, NY 10038",
+    "Crosby Street Hotel": "79 Crosby St, NY 10012",
+    "Mercer Hotel": "147 Mercer St, NY 10012",
+    "Soho Grand Hotel": "310 W Broadway, NY 10013",
+    "Standard High Line": "848 Washington St, NY 10014",
+    "Gansevoort Meatpacking": "18 9th Ave, NY 10014",
+    "Hotel Chelsea": "222 W 23rd St, NY 10011",
+    "Ace Hotel NY": "20 W 29th St, NY 10001",
+    "NoMad Hotel": "1170 Broadway, NY 10001",
+    "The James NoMad": "22 E 29th St, NY 10016",
+    "Marriott Edition Madison": "5 Madison Ave, NY 10010",
+    "Empire Hotel": "44 W 63rd St, NY 10023",
+    "Hotel Beacon": "2130 Broadway, NY 10023",
+    "Hotel AKA Wall St": "84 William St, NY 10038",
+    "Wall Street Inn": "9 S William St, NY 10004",
+    # Convention / performance / stadium
+    "Javits Center": "429 11th Ave, NY 10001",
+    "Madison Square Garden": "4 Pennsylvania Plaza, NY 10001",
+    "Lincoln Center": "10 Lincoln Center Plaza, NY 10023",
+    "Carnegie Hall": "881 7th Ave, NY 10019",
+    "Citi Field": "41 Seaver Way, Flushing 11368",
+    "Yankee Stadium": "1 E 161st St, Bronx 10451",
+    "USTA Billie Jean King": "Flushing Meadows-Corona Park, Flushing 11368",
+    "Barclays Center": "620 Atlantic Ave, Brooklyn 11217",
+    "Cipriani Wall Street": "55 Wall St, NY 10005",
+    # Corporate / financial
+    "NYSE / Wall St": "11 Wall St, NY 10005",
+    "Goldman Sachs HQ": "200 West St, NY 10282",
+    "Hudson Yards": "20 Hudson Yards, NY 10001",
+    "Rockefeller Center": "45 Rockefeller Plaza, NY 10111",
+    "Bryant Park (corporate)": "1095 6th Ave (Bank of America Tower), NY 10036",
+    "Bloomberg Tower": "731 Lexington Ave, NY 10022",
+    "One Vanderbilt": "1 Vanderbilt Ave, NY 10017",
+    "Citigroup Center (601 Lex)": "601 Lexington Ave, NY 10022",
+    "Time Warner Center": "10 Columbus Cir, NY 10019",
+    "JP Morgan HQ (270 Park)": "270 Park Ave, NY 10017",
+    "MetLife Building (200 Park)": "200 Park Ave, NY 10166",
+    "Seagram Building (375 Park)": "375 Park Ave, NY 10152",
+    "Lever House (390 Park)": "390 Park Ave, NY 10022",
+    "GM Building (767 5th)": "767 5th Ave, NY 10153",
+    "General Electric Bldg (570 Lex)": "570 Lexington Ave, NY 10022",
+    "Chrysler Building": "405 Lexington Ave, NY 10174",
+    "Empire State Building": "20 W 34th St, NY 10001",
+    "Park Ave Plaza (55 E 52)": "55 E 52nd St, NY 10055",
+    "245 Park Ave": "245 Park Ave, NY 10167",
+    "280 Park Ave": "280 Park Ave, NY 10017",
+    "Brooklyn Borough Hall": "209 Joralemon St, Brooklyn 11201",
+    "MetroTech Center": "2 MetroTech Center, Brooklyn 11201",
+    "Etsy HQ (DUMBO)": "117 Adams St, Brooklyn 11201",
+    "Dock 72 (Brooklyn Navy Yard)": "63 Flushing Ave, Brooklyn 11205",
+    "Citigroup Tower (LIC)": "1 Court Square, LIC 11101",
+    "JetBlue HQ (Brewster Bldg)": "27-01 Queens Plaza N, LIC 11101",
+    "JACX Queens Plaza": "28-07 Jackson Ave, LIC 11101",
+    "Flatiron Building": "175 5th Ave, NY 10010",
+    "Goldman Sachs Tower (JC)": "30 Hudson St, Jersey City, NJ 07302",
+    "Harborside Plaza": "210 Hudson St, Jersey City, NJ 07311",
+    "70 Pine Street": "70 Pine St, NY 10005",
+    # Private clubs
+    "Yale Club": "50 Vanderbilt Ave, NY 10017",
+    "University Club": "1 W 54th St, NY 10019",
+    "New York Athletic Club": "180 Central Park S, NY 10019",
+    # Luxury condos
+    "432 Park Ave": "432 Park Ave, NY 10022",
+    "15 Central Park West": "15 Central Park W, NY 10023",
+    "220 Central Park South": "220 Central Park S, NY 10019",
+    # Luxury shopping
+    "Saks Fifth Ave": "611 5th Ave, NY 10022",
+    "Bergdorf Goodman": "754 5th Ave, NY 10019",
+    "Bloomingdale's flagship": "1000 3rd Ave, NY 10022",
+    "Apple Fifth Ave": "767 5th Ave, NY 10153",
+    # Private schools (UES)
+    "Dalton School": "108 E 89th St, NY 10128",
+    "Spence School": "22 E 91st St, NY 10128",
+    "Brearley School": "610 E 83rd St, NY 10028",
+    "Chapin School": "100 East End Ave, NY 10028",
+    "Buckley School": "113 E 73rd St, NY 10021",
+    "Trinity School (UWS)": "139 W 91st St, NY 10024",
+    "Collegiate School": "301 Freedom Pl S, NY 10069",
+    "Nightingale-Bamford": "20 E 92nd St, NY 10128",
+    "Marymount School NY": "1026 5th Ave, NY 10028",
+    # Bronx private schools
+    "Riverdale Country School": "5250 Fieldston Rd, Bronx 10471",
+    "Horace Mann School (Bronx)": "231 W 246th St, Bronx 10471",
+}
+
+
+def _poi_address(name: str) -> str:
+    """Return the street address for a POI, or a neutral fallback."""
+    return POI_ADDRESSES.get(name, "Address not listed")
+
+
+def _best_hours_for(category: str) -> str:
+    return BEST_HOURS_BY_CATEGORY.get(category, "Varies")
+
+
 def haversine_miles(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     R_MI = 3958.7613
     phi1 = math.radians(lat1)
@@ -405,7 +626,17 @@ def build_long_trip_hotspots() -> List[Dict[str, Any]]:
             total_w += w
             lat_w += lat * w
             lng_w += lng * w
-            members.append({"name": name, "category": cat, "weight": w})
+            # Include each member's lat/lng so the frontend can render a
+            # small "building" dot at the actual POI location alongside
+            # the cluster's centroid dollar-flag pin. Address and
+            # best-hours are also baked in so the popup can show them
+            # without a second round-trip per click.
+            members.append({
+                "name": name, "category": cat, "weight": w,
+                "lat": lat, "lng": lng,
+                "address": _poi_address(name),
+                "best_hours": _best_hours_for(cat),
+            })
         if total_w <= 0:
             continue
         members.sort(key=lambda m: -m["weight"])
