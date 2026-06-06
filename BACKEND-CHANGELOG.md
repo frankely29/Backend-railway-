@@ -1,5 +1,14 @@
 # BACKEND CHANGELOG
 
+## Current pass: Zone-size-aware pickup hotspot footprint (backend)
+
+### Pickup zone hotspot polygons scale down for small zones
+- Shrank pickup-zone hotspot polygons in small NYC taxi zones so a single cluster no longer covers a large fraction of the zone. Previously the shaping buffers in `_shape_hotspot_component` were a fixed absolute size, so the same hotspot footprint that is a small slice of a big zone swallowed most of a small one.
+- Added a zone-area-aware `zone_scale` (in `_shape_hotspot_component`, main.py) that scales the `expand`/`smooth` buffers down for small zones and leaves zones at/above the reference area (~1 km²) unchanged, floored at `PICKUP_ZONE_HOTSPOT_SMALL_ZONE_MIN_SCALE` so the shape never collapses.
+- Added a hard per-hotspot coverage cap (`PICKUP_ZONE_HOTSPOT_MAX_ZONE_COVERAGE`, default 0.38): if a hotspot still exceeds that fraction of its zone, it is eroded inward in bounded steps until under the cap.
+- New tunable constants: `PICKUP_ZONE_HOTSPOT_SCALE_REFERENCE_M2` (1,000,000), `PICKUP_ZONE_HOTSPOT_SMALL_ZONE_MIN_SCALE` (0.5), `PICKUP_ZONE_HOTSPOT_MAX_ZONE_COVERAGE` (0.38). Areas are EPSG:3857 m², matching `zone_proj.area` used elsewhere.
+- Offline geometry check (single 135 m density cell): small-zone coverage drops from ~86%/69%/46% (0.08/0.10/0.15 km²) to ~26%/24%/24%; zones ≥1 km² are unchanged; all output polygons stay valid and non-empty. Frontend needs no change — it renders whatever polygon geometry the backend sends.
+
 ## Current pass: Outer-borough long-trip hotspot expansion (backend)
 
 ### long_trip_hotspot_builder POI list — outer-borough clusters
