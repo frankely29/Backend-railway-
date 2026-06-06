@@ -265,6 +265,50 @@ NYC_LONG_TRIP_POIS: List[Tuple[str, float, float, str, float]] = [
     ("Wall Street Inn",           40.7041, -74.0112, "hotel_luxury", 1.7),
     ("Cipriani Wall Street",      40.7059, -74.0099, "performance", 1.4),
     ("70 Pine Street",            40.7062, -74.0079, "corporate", 1.5),
+
+    # ---------------- Outer-borough cluster expansion ----------------
+    # The earlier outer-borough POIs left the Bronx and Staten Island
+    # with zero flags and several lone landmarks (Yankee Stadium, Lincoln/
+    # Kings County hospitals, Atlantic Terminal/Barclays, 1 Hotel DUMBO)
+    # stranded as singletons/pairs. These additions complete those into
+    # genuine 3+ clusters using the "busy buildings" bar where outright
+    # wealth is sparse — major transit, medical complexes, civic/retail.
+
+    # Queens — Downtown Flushing (transit hub + malls + hotel + office)
+    ("Flushing-Main St (7 train)", 40.7596, -73.8302, "transit_hub", 2.3),
+    ("Sheraton LaGuardia East",   40.7576, -73.8263, "hotel_luxury", 1.8),
+    ("New World Mall (Flushing)", 40.7590, -73.8270, "luxury_shopping", 1.5),
+    ("Tangram (Flushing)",        40.7570, -73.8281, "luxury_shopping", 1.5),
+    ("One Fulton Square (Flushing)", 40.7605, -73.8287, "corporate", 1.4),
+
+    # Queens — Forest Hills (LIRR + subway + Forest Hills Stadium)
+    ("Forest Hills LIRR",         40.7213, -73.8447, "transit_hub", 1.9),
+    ("71 Av-Continental (subway)", 40.7186, -73.8449, "transit_hub", 1.8),
+    ("Forest Hills Stadium",      40.7197, -73.8455, "performance", 1.5),
+
+    # Brooklyn — Atlantic Yards (completes Atlantic Terminal + Barclays)
+    ("1 Hanson Place (Brooklyn)", 40.6846, -73.9776, "luxury_condo", 1.5),
+    ("Atlantic Center (mall)",    40.6839, -73.9766, "luxury_shopping", 1.4),
+
+    # Brooklyn — DUMBO (completes the two 1 Hotel Brooklyn Bridge entries)
+    ("Olympia Dumbo (condos)",    40.7028, -73.9899, "luxury_condo", 1.5),
+    ("10 Jay St (DUMBO offices)", 40.7041, -73.9920, "corporate", 1.4),
+
+    # Brooklyn — Crown Heights medical (completes Kings County + Downstate)
+    ("University Hospital of Brooklyn", 40.6553, -73.9479, "hospital", 2.5),
+
+    # Bronx — The Hub / South Bronx (completes Lincoln Hospital)
+    ("149 St-Grand Concourse (subway)", 40.8183, -73.9268, "transit_hub", 2.0),
+    ("Bronx General Post Office", 40.8167, -73.9266, "corporate", 1.3),
+
+    # Bronx — 161 St / Yankee Stadium (completes Yankee Stadium)
+    ("161 St-Yankee Stadium (subway)", 40.8276, -73.9257, "transit_hub", 2.0),
+    ("Bronx County Courthouse",   40.8275, -73.9229, "corporate", 1.5),
+
+    # Staten Island — St. George (ferry + outlet mall + waterfront hotel)
+    ("Staten Island Ferry - St. George", 40.6437, -74.0735, "transit_hub", 2.3),
+    ("Movenpick Lighthouse Point", 40.6432, -74.0721, "hotel_luxury", 1.8),
+    ("Empire Outlets",            40.6448, -74.0759, "luxury_shopping", 1.6),
 ]
 
 
@@ -503,6 +547,27 @@ POI_ADDRESSES: Dict[str, str] = {
     # Bronx private schools
     "Riverdale Country School": "5250 Fieldston Rd, Bronx 10471",
     "Horace Mann School (Bronx)": "231 W 246th St, Bronx 10471",
+    # Outer-borough cluster expansion
+    "Flushing-Main St (7 train)": "Main St & Roosevelt Ave, Flushing 11354",
+    "Sheraton LaGuardia East": "135-20 39th Ave, Flushing 11354",
+    "New World Mall (Flushing)": "136-20 Roosevelt Ave, Flushing 11354",
+    "Tangram (Flushing)": "133-27 39th Ave, Flushing 11354",
+    "One Fulton Square (Flushing)": "39-16 Prince St, Flushing 11354",
+    "Forest Hills LIRR": "Station Sq, Forest Hills 11375",
+    "71 Av-Continental (subway)": "Queens Blvd & 71st Ave, Forest Hills 11375",
+    "Forest Hills Stadium": "1 Tennis Pl, Forest Hills 11375",
+    "1 Hanson Place (Brooklyn)": "1 Hanson Pl, Brooklyn 11217",
+    "Atlantic Center (mall)": "625 Atlantic Ave, Brooklyn 11217",
+    "Olympia Dumbo (condos)": "30 Front St, Brooklyn 11201",
+    "10 Jay St (DUMBO offices)": "10 Jay St, Brooklyn 11201",
+    "University Hospital of Brooklyn": "445 Lenox Rd, Brooklyn 11203",
+    "149 St-Grand Concourse (subway)": "E 149th St & Grand Concourse, Bronx 10451",
+    "Bronx General Post Office": "558 Grand Concourse, Bronx 10451",
+    "161 St-Yankee Stadium (subway)": "E 161st St & River Ave, Bronx 10451",
+    "Bronx County Courthouse": "851 Grand Concourse, Bronx 10451",
+    "Staten Island Ferry - St. George": "1 Bay St, Staten Island 10301",
+    "Movenpick Lighthouse Point": "8 Navy Pier Ct, Staten Island 10301",
+    "Empire Outlets": "55 Richmond Terrace, Staten Island 10301",
 }
 
 
