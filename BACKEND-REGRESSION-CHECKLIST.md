@@ -49,3 +49,8 @@
 
 ## Compatibility
 - [x] no route regression for current frontend compatibility surfaces verified by regression tests
+
+## Long-trip hotspots
+- [x] `build_long_trip_hotspots()` yields clusters in all five boroughs, each with 3+ members
+- [x] every POI in `NYC_LONG_TRIP_POIS` has a `POI_ADDRESSES` entry and a category supported by all category maps
+- [x] `POST /admin/long_trip_hotspots/rebuild` then `GET /long_trip_hotspots` returns the rebuilt pins

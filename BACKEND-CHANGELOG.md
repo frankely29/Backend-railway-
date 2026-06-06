@@ -1,5 +1,14 @@
 # BACKEND CHANGELOG
 
+## Current pass: Outer-borough long-trip hotspot expansion (backend)
+
+### long_trip_hotspot_builder POI list — outer-borough clusters
+- Added 20 POIs to `NYC_LONG_TRIP_POIS` forming 8 new long-trip "dollar-flag" clusters: Downtown Flushing, Forest Hills, Atlantic Yards, DUMBO, Crown Heights medical, The Hub / South Bronx, 161 St / Yankee Stadium, and St. George (Staten Island).
+- Gives the Bronx (0 to 2) and Staten Island (0 to 1) their first long-trip flags and pulls previously isolated POIs (Yankee Stadium, Lincoln/Kings County/SUNY Downstate hospitals, Atlantic Terminal/Barclays, both 1 Hotel Brooklyn Bridge entries) into genuine 3+ clusters.
+- Kept the rule unchanged: `CLUSTER_RADIUS_MI = 0.25` (about a 5-minute walk) and `MIN_MEMBERS_PER_HOTSPOT = 3`. No new categories, maps, or dim schedules.
+- Added matching `POI_ADDRESSES` entries for every new POI (outer-borough address style, no ", NY").
+- Total flags rebuild from 17 to 25; POI list grows to 190. Requires one `POST /admin/long_trip_hotspots/rebuild` for the change to take effect.
+
 ## Current pass: Phase 9 Staten Island v3 live visible cutover (backend)
 
 ### Phase 9 rollout-state manifest update
