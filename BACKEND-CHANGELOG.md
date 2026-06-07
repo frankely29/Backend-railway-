@@ -1,5 +1,15 @@
 # BACKEND CHANGELOG
 
+## Current pass: Dollar-flag prime-time pulse signal (backend)
+
+### Per-category `prime` window + read-path schedule/rationale plumbing
+- Added a researched `prime` hour-window per category to `CATEGORY_DIM_SCHEDULE` in `long_trip_hotspot_builder.py` — the tightest "best time to be near it" window(s), a strict subset of `peak`. Drives the new pulsing ring at each dollar flag's pole base. Grounded in building busy-hour patterns: airport arrival banks (5–9am / 4–9pm), hospital discharges peaking ~4pm, hotel morning airport runs (7–11am), transit + corporate evening rush (5:30–6:30pm), school pickup (2:30–4pm). Heuristics, not measured trip data.
+- Of the 25 live clusters, only 5 dominant categories actually occur (`hotel_luxury` ×12, `transit_hub` ×8, `hospital` ×3, `private_school` ×1, `corporate` ×1), so those are the windows that drive the pulse in practice.
+- Nudged two `peak` ranges to keep `prime ⊆ peak`: hospital `[[10,16]] → [[10,17]]` (afternoon discharge peak at 4pm) and corporate `[[8,10],[17,19]] → [[8,10],[16,19]]` (evening rush starts 4pm). Verified `prime ⊆ peak` for all 12 categories.
+- `_dim_schedule_for` now emits `prime` alongside `peak`/`off`/`weekday_only`.
+- **Fixed a latent gap**: `GET /long_trip_hotspots` previously served only `id/lat/lng/label/dominant_category/member_count/total_weight/members`, so the frontend never received `dim_schedule`, `best_hours`, or `rationale` — the time-of-day dim was dormant and the popup's "Best hours"/"Why this is a hotspot" rows rendered blank. Added `hotspot_runtime_meta()` (shared with the build path via the new `summarize_categories()`), and the endpoint now recomputes and serves `dim_schedule` (incl. `prime`), `best_hours`, `rationale`, and `category_counts` per row.
+- Recompute-on-read by design: these are pure functions of the static category tables, so there is **no DB column or migration**, the signal works for already-stored rows, and editing a schedule takes effect on the next request without an admin rebuild. No change to the table schema, the rebuild path, or the POI list.
+
 ## Current pass: Outer-borough long-trip hotspot expansion (backend)
 
 ### long_trip_hotspot_builder POI list — outer-borough clusters

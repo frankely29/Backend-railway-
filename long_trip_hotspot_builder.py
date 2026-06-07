@@ -571,16 +571,20 @@ POI_ADDRESSES: Dict[str, str] = {
 }
 
 
-def _category_summary(member_indices: List[int]) -> Tuple[Dict[str, int], str]:
+def summarize_categories(categories: List[str]) -> Tuple[Dict[str, int], str]:
     """
-    Returns (counts_by_category, human_rationale_string).
+    Returns (counts_by_category, human_rationale_string) from a flat list
+    of category strings.
 
     The rationale string is what the popup shows the driver — a plain
-    English summary of why this cluster qualifies as a hotspot.
+    English summary of why this cluster qualifies as a hotspot. Shared by
+    the build path (cluster member indices) and the read path (members
+    loaded back from members_json) so both produce identical wording.
     """
     counts: Dict[str, int] = {}
-    for i in member_indices:
-        cat = NYC_LONG_TRIP_POIS[i][3]
+    for cat in categories:
+        if not cat:
+            continue
         counts[cat] = counts.get(cat, 0) + 1
 
     pretty = {
@@ -610,6 +614,11 @@ def _category_summary(member_indices: List[int]) -> Tuple[Dict[str, int], str]:
         parts.append(f"{n} {singular if n == 1 else plural}")
     rationale = " + ".join(parts) if parts else "high-traffic cluster"
     return counts, rationale
+
+
+def _category_summary(member_indices: List[int]) -> Tuple[Dict[str, int], str]:
+    """Counts + rationale for a cluster given its POI member indices."""
+    return summarize_categories([NYC_LONG_TRIP_POIS[i][3] for i in member_indices])
 
 
 def _nearest_member_to_centroid(
@@ -645,43 +654,81 @@ def _best_hours_for(category: str) -> str:
 
 # Per-category dim schedule for the dollar-flag time-of-day signal.
 #
-# - `peak`: hour ranges [start_h, end_h_exclusive] in NYC local time
+# - `peak`:  hour ranges [start_h, end_h_exclusive] in NYC local time
 #   when the flag should be at full brightness.
-# - `off`:  hour ranges when the flag should be dimmed (no business
+# - `off`:   hour ranges when the flag should be dimmed (no business
 #   here right now — pickup volume is low).
-# - `weekday_only`: if true, weekends count as "off" regardless of hour
-#   (corporate towers, schools, conventions — none of those generate
-#   trips on a Sunday at 3pm even though the clock is "midday").
+# - `prime`: the tightest "best time to be near it" window(s) — the
+#   subset of `peak` when this building type most reliably throws a
+#   long trip. Drives the pulsing ring at the flag's pole base on the
+#   map. Always a subset of `peak`, so a pulsing flag is also at full
+#   brightness. Grounded in building busy-hour patterns: airport
+#   arrival banks (5–9am / 4–9pm), hospital discharges peaking ~4pm,
+#   hotel morning airport runs (luggage out 7–11am), transit + corporate
+#   evening rush (5:30–6:30pm), school pickup (2:30–4pm). Heuristics, a
+#   hint for the driver — not measured trip data.
+# - `weekday_only`: if true, weekends count as "off" (and never prime)
+#   regardless of hour (corporate towers, schools, conventions — none of
+#   those generate trips on a Sunday at 3pm even though the clock is
+#   "midday").
 #
 # Hour ranges can wrap past midnight ([23, 5] = 11pm to 5am).
 # Anything not in `peak` and not in `off` is "medium" — neither dimmed
 # nor highlighted. Hospitals + airports have no off hours: they
 # generate trips 24/7.
 CATEGORY_DIM_SCHEDULE: Dict[str, Dict[str, Any]] = {
-    "airport":         {"peak": [[5, 9], [16, 22]], "off": [],            "weekday_only": False},
-    "hospital":        {"peak": [[10, 16]],          "off": [],            "weekday_only": False},
-    "hotel_luxury":    {"peak": [[7, 11], [15, 19]], "off": [[23, 5]],     "weekday_only": False},
-    "transit_hub":     {"peak": [[7, 10], [16, 20]], "off": [[23, 5]],     "weekday_only": False},
-    "corporate":       {"peak": [[8, 10], [17, 19]], "off": [[20, 6]],     "weekday_only": True},
-    "private_school":  {"peak": [[7, 9], [14, 16]],  "off": [[19, 6]],     "weekday_only": True},
-    "private_club":    {"peak": [[12, 14], [18, 22]], "off": [[0, 10]],    "weekday_only": False},
-    "luxury_condo":    {"peak": [[7, 9]],             "off": [[22, 6]],    "weekday_only": False},
-    "luxury_shopping": {"peak": [[11, 19]],           "off": [[20, 10]],   "weekday_only": False},
-    "performance":     {"peak": [[19, 23]],           "off": [[2, 12]],    "weekday_only": False},
-    "stadium":         {"peak": [[19, 23]],           "off": [[2, 12]],    "weekday_only": False},
-    "convention":      {"peak": [[9, 17]],            "off": [[19, 7]],    "weekday_only": True},
+    "airport":         {"peak": [[5, 9], [16, 22]],  "off": [],          "weekday_only": False, "prime": [[6, 9], [16, 21]]},
+    "hospital":        {"peak": [[10, 17]],          "off": [],          "weekday_only": False, "prime": [[13, 17]]},
+    "hotel_luxury":    {"peak": [[7, 11], [15, 19]], "off": [[23, 5]],   "weekday_only": False, "prime": [[7, 11]]},
+    "transit_hub":     {"peak": [[7, 10], [16, 20]], "off": [[23, 5]],   "weekday_only": False, "prime": [[7, 9], [17, 20]]},
+    "corporate":       {"peak": [[8, 10], [16, 19]], "off": [[20, 6]],   "weekday_only": True,  "prime": [[16, 19]]},
+    "private_school":  {"peak": [[7, 9], [14, 16]],  "off": [[19, 6]],   "weekday_only": True,  "prime": [[14, 16]]},
+    "private_club":    {"peak": [[12, 14], [18, 22]], "off": [[0, 10]],  "weekday_only": False, "prime": [[19, 22]]},
+    "luxury_condo":    {"peak": [[7, 9]],             "off": [[22, 6]],  "weekday_only": False, "prime": [[7, 9]]},
+    "luxury_shopping": {"peak": [[11, 19]],           "off": [[20, 10]], "weekday_only": False, "prime": [[14, 18]]},
+    "performance":     {"peak": [[19, 23]],           "off": [[2, 12]],  "weekday_only": False, "prime": [[22, 23]]},
+    "stadium":         {"peak": [[19, 23]],           "off": [[2, 12]],  "weekday_only": False, "prime": [[22, 23]]},
+    "convention":      {"peak": [[9, 17]],            "off": [[19, 7]],  "weekday_only": True,  "prime": [[15, 17]]},
 }
 
 
 def _dim_schedule_for(category: str) -> Dict[str, Any]:
     sched = CATEGORY_DIM_SCHEDULE.get(category)
     if not sched:
-        # Unknown category → no dim hints, frontend treats as always-on.
-        return {"peak": [], "off": [], "weekday_only": False}
+        # Unknown category → no dim hints, frontend treats as always-on
+        # and never pulses (empty prime).
+        return {"peak": [], "off": [], "weekday_only": False, "prime": []}
     return {
         "peak": [list(r) for r in sched["peak"]],
         "off": [list(r) for r in sched["off"]],
         "weekday_only": bool(sched["weekday_only"]),
+        "prime": [list(r) for r in sched.get("prime", [])],
+    }
+
+
+def hotspot_runtime_meta(
+    dominant_category: str, members: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Time-of-day + rationale fields for a stored hotspot, recomputed at
+    read time from its dominant category and member list.
+
+    These are all pure functions of the static category tables above, so
+    GET /long_trip_hotspots recomputes them on read instead of persisting
+    them: no DB column/migration, the dim + pulse signal works for
+    already-stored rows, and editing a schedule takes effect on the next
+    request without an admin rebuild.
+
+    Returns: best_hours, dim_schedule (peak/off/weekday_only/prime),
+    rationale, category_counts.
+    """
+    cats = [str(m.get("category", "")) for m in members] if members else []
+    counts, rationale = summarize_categories(cats)
+    return {
+        "best_hours": _best_hours_for(dominant_category),
+        "dim_schedule": _dim_schedule_for(dominant_category),
+        "rationale": rationale,
+        "category_counts": counts,
     }
 
 
