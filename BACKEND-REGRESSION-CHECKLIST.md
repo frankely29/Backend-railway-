@@ -54,3 +54,8 @@
 - [x] `build_long_trip_hotspots()` yields clusters in all five boroughs, each with 3+ members
 - [x] every POI in `NYC_LONG_TRIP_POIS` has a `POI_ADDRESSES` entry and a category supported by all category maps
 - [x] `POST /admin/long_trip_hotspots/rebuild` then `GET /long_trip_hotspots` returns the rebuilt pins
+
+## Pickup zone hotspots
+- [x] `_shape_hotspot_component` shrinks hotspot polygons in small zones and leaves zones >= ~1 km^2 unchanged
+- [x] no single zone hotspot covers more than `PICKUP_ZONE_HOTSPOT_MAX_ZONE_COVERAGE` of its zone
+- [x] shaped polygons remain valid and non-empty across the zone-size range
