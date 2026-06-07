@@ -58,3 +58,8 @@
 - [x] every category's `prime` window is a subset of its `peak` window (a pulsing flag is always at full brightness)
 - [x] `hotspot_runtime_meta()` and the build path produce identical `rationale` wording (shared `summarize_categories()`)
 - [x] schedule fields are recomputed on read — no new DB column, no migration, no admin rebuild required
+
+## Pickup zone hotspots
+- [x] `_shape_hotspot_component` shrinks hotspot polygons in small zones and leaves zones >= ~1 km^2 unchanged
+- [x] no single zone hotspot covers more than `PICKUP_ZONE_HOTSPOT_MAX_ZONE_COVERAGE` of its zone
+- [x] shaped polygons remain valid and non-empty across the zone-size range

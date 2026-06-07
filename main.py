@@ -271,6 +271,15 @@ PICKUP_ZONE_HOTSPOT_CELL_SIZE_M = 135
 PICKUP_ZONE_HOTSPOT_RADIUS_M = 240
 PICKUP_ZONE_HOTSPOT_SIGMA_M = 155
 PICKUP_ZONE_HOTSPOT_SIMPLIFY_M = 18
+# Zone-size-aware hotspot footprint controls. Small NYC taxi zones were
+# getting hotspot polygons sized for big zones, so a single cluster could
+# cover a large fraction of the zone. The shaping buffers are scaled down
+# for small zones, and one hotspot is hard-capped to a fraction of its zone
+# area. Areas are EPSG:3857 m^2 — same units as zone_proj.area used
+# elsewhere (e.g. _micro_top_n_for_zone_area).
+PICKUP_ZONE_HOTSPOT_SCALE_REFERENCE_M2 = 1_000_000.0  # zones >= ~1 km^2 keep full-size hotspots
+PICKUP_ZONE_HOTSPOT_SMALL_ZONE_MIN_SCALE = 0.5        # floor on the small-zone buffer shrink
+PICKUP_ZONE_HOTSPOT_MAX_ZONE_COVERAGE = 0.38          # one hotspot may cover <= this fraction of its zone
 PICKUP_ZONE_SECOND_HOTSPOT_MIN_POINTS = 8
 PICKUP_ZONE_SECOND_COMPONENT_MIN_POINTS = 3
 PICKUP_ZONE_SECOND_COMPONENT_MIN_SCORE_RATIO = 0.45
@@ -9915,8 +9924,19 @@ def _shape_hotspot_component(component: Dict[str, Any], zone_proj: Any) -> Optio
     point_factor = max(0.8, min(1.7, 0.75 + (point_count / 9.0)))
     score_factor = max(0.75, min(1.4, math.sqrt(comp_score) / 2.2))
 
-    expand = 38.0 * point_factor * spread_factor
-    smooth = 17.0 * intensity_factor * score_factor
+    # Zone-size-aware shrink: in a small zone a single cluster's outward
+    # buffers would swallow a big share of the zone. Scale the expand/
+    # smooth buffers down smoothly for small zones (~1.0 once the zone is
+    # at/above the reference area, floored so the shape never collapses).
+    # Large zones are unaffected.
+    zone_area = max(1.0, float(getattr(zone_proj, "area", 0.0) or 0.0))
+    zone_scale = max(
+        PICKUP_ZONE_HOTSPOT_SMALL_ZONE_MIN_SCALE,
+        min(1.0, math.sqrt(zone_area / PICKUP_ZONE_HOTSPOT_SCALE_REFERENCE_M2)),
+    )
+
+    expand = 38.0 * point_factor * spread_factor * zone_scale
+    smooth = 17.0 * intensity_factor * score_factor * zone_scale
     contract = min(expand * 0.55, smooth * 0.65)
 
     shaped = base_geom.buffer(expand).buffer(smooth).buffer(-contract)
@@ -9925,6 +9945,24 @@ def _shape_hotspot_component(component: Dict[str, Any], zone_proj: Any) -> Optio
     clipped = shaped.intersection(zone_proj)
     if clipped.is_empty:
         return None
+
+    # Hard cap: never let one hotspot cover more than
+    # PICKUP_ZONE_HOTSPOT_MAX_ZONE_COVERAGE of its zone. Erode inward in
+    # bounded steps until under the cap. No-op for large zones, where the
+    # hotspot is already a small fraction of the area.
+    max_cover_area = PICKUP_ZONE_HOTSPOT_MAX_ZONE_COVERAGE * zone_area
+    cap_guard = 0
+    while (not clipped.is_empty) and clipped.area > max_cover_area and cap_guard < 4:
+        cap_guard += 1
+        over_ratio = clipped.area / max_cover_area
+        erode = math.sqrt(clipped.area) * 0.10 * min(2.0, over_ratio)
+        eroded = clipped.buffer(-erode)
+        if eroded.is_empty:
+            break
+        eroded = eroded.intersection(zone_proj)
+        if eroded.is_empty:
+            break
+        clipped = eroded
 
     simplified = clipped.simplify(PICKUP_ZONE_HOTSPOT_SIMPLIFY_M, preserve_topology=True)
     if not simplified.is_empty:

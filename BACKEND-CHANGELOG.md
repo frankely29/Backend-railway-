@@ -10,6 +10,15 @@
 - **Fixed a latent gap**: `GET /long_trip_hotspots` previously served only `id/lat/lng/label/dominant_category/member_count/total_weight/members`, so the frontend never received `dim_schedule`, `best_hours`, or `rationale` — the time-of-day dim was dormant and the popup's "Best hours"/"Why this is a hotspot" rows rendered blank. Added `hotspot_runtime_meta()` (shared with the build path via the new `summarize_categories()`), and the endpoint now recomputes and serves `dim_schedule` (incl. `prime`), `best_hours`, `rationale`, and `category_counts` per row.
 - Recompute-on-read by design: these are pure functions of the static category tables, so there is **no DB column or migration**, the signal works for already-stored rows, and editing a schedule takes effect on the next request without an admin rebuild. No change to the table schema, the rebuild path, or the POI list.
 
+## Current pass: Zone-size-aware pickup hotspot footprint (backend)
+
+### Pickup zone hotspot polygons scale down for small zones
+- Shrank pickup-zone hotspot polygons in small NYC taxi zones so a single cluster no longer covers a large fraction of the zone. Previously the shaping buffers in `_shape_hotspot_component` were a fixed absolute size, so the same hotspot footprint that is a small slice of a big zone swallowed most of a small one.
+- Added a zone-area-aware `zone_scale` (in `_shape_hotspot_component`, main.py) that scales the `expand`/`smooth` buffers down for small zones and leaves zones at/above the reference area (~1 km²) unchanged, floored at `PICKUP_ZONE_HOTSPOT_SMALL_ZONE_MIN_SCALE` so the shape never collapses.
+- Added a hard per-hotspot coverage cap (`PICKUP_ZONE_HOTSPOT_MAX_ZONE_COVERAGE`, default 0.38): if a hotspot still exceeds that fraction of its zone, it is eroded inward in bounded steps until under the cap.
+- New tunable constants: `PICKUP_ZONE_HOTSPOT_SCALE_REFERENCE_M2` (1,000,000), `PICKUP_ZONE_HOTSPOT_SMALL_ZONE_MIN_SCALE` (0.5), `PICKUP_ZONE_HOTSPOT_MAX_ZONE_COVERAGE` (0.38). Areas are EPSG:3857 m², matching `zone_proj.area` used elsewhere.
+- Offline geometry check (single 135 m density cell): small-zone coverage drops from ~86%/69%/46% (0.08/0.10/0.15 km²) to ~26%/24%/24%; zones ≥1 km² are unchanged; all output polygons stay valid and non-empty. Frontend needs no change — it renders whatever polygon geometry the backend sends.
+
 ## Current pass: Outer-borough long-trip hotspot expansion (backend)
 
 ### long_trip_hotspot_builder POI list — outer-borough clusters
