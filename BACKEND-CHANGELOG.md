@@ -1,5 +1,19 @@
 # BACKEND CHANGELOG
 
+## Current pass: Pickup-window correction + holiday/school calendar (backend)
+
+### Time windows corrected to pickups (people leaving), not arrivals
+- A dollar-flag pickup is someone *leaving* a building for a long trip, so the arrival-side windows were wrong:
+  - **Hotels** — dropped the 3–7pm check-in window (arrivals are drop-offs, not pickups). Now `peak [[6,12]]`, `prime [[7,11]]`: the morning checkout → airport wave. `best_hours`: "Checkout 7am–noon — airport runs (check-in isn't a pickup)".
+  - **Corporate** — dropped the 8–10am window (morning is people arriving at the office). Now `peak [[16,20]]`, `prime [[16,19]]`: end-of-day departures. `best_hours`: "Weekday end-of-day 4–8pm (esp. Thu/Fri); closed holidays".
+  - Transit (station arrivals → onward rides), hospital (discharges), and school (parent pickup) were already departure-based and are unchanged. `prime ⊆ peak` re-verified for all 12 categories.
+
+### New `holiday_calendar.py` — federal holidays + school recesses, served per request
+- Added `holiday_calendar.py`: computes US federal holidays for any year (with the observed Sat→Fri / Sun→Mon shift) from date arithmetic — no external service, deterministic, offline. Also defines recurring NYC-DOE-style school recess ranges (summer, winter, midwinter, spring).
+- `GET /long_trip_hotspots` now also returns a `calendar`: `{tz, holidays: [current + next year], seasonal_closures: {private_school: [["MM-DD","MM-DD"], ...]}}`. Computed per request (recompute-on-read, nothing persisted, no migration).
+- The frontend matches its NYC date against this to **close** (dim off, never pulse) the weekday-only flags (offices, schools) on weekends + holidays, and the school flag across summer/recess. Hotels, transit, and hospitals keep running — holiday travel lifts hotel checkouts & transit, and hospitals are 24/7.
+- Verified: 2026 federal dates match the official list (incl. Jul 4 Sat → observed Jul 3); a closure simulation darkens the corporate flag on Christmas/holidays and the school flag all summer, while hotels still pulse.
+
 ## Current pass: Dollar-flag prime-time pulse signal (backend)
 
 ### Per-category `prime` window + read-path schedule/rationale plumbing
