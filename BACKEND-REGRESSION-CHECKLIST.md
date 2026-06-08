@@ -54,6 +54,10 @@
 - [x] `build_long_trip_hotspots()` yields clusters in all five boroughs, each with 3+ members
 - [x] every POI in `NYC_LONG_TRIP_POIS` has a `POI_ADDRESSES` entry and a category supported by all category maps
 - [x] `POST /admin/long_trip_hotspots/rebuild` then `GET /long_trip_hotspots` returns the rebuilt pins
+- [x] `GET /long_trip_hotspots` now serves `dim_schedule` (peak/off/weekday_only/prime), `best_hours`, `rationale`, and `category_counts` per hotspot
+- [x] every category's `prime` window is a subset of its `peak` window (a pulsing flag is always at full brightness)
+- [x] `hotspot_runtime_meta()` and the build path produce identical `rationale` wording (shared `summarize_categories()`)
+- [x] schedule fields are recomputed on read — no new DB column, no migration, no admin rebuild required
 
 ## Pickup zone hotspots
 - [x] `_shape_hotspot_component` shrinks hotspot polygons in small zones and leaves zones >= ~1 km^2 unchanged

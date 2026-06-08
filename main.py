@@ -9345,20 +9345,32 @@ def long_trip_hotspots_list(user: sqlite3.Row = Depends(require_user)):
         "total_weight, members_json, generated_at_unix "
         "FROM long_trip_hotspots ORDER BY total_weight DESC"
     )
+    # Time-of-day (dim + pulse) and rationale fields are recomputed here
+    # from each row's dominant_category + members rather than persisted —
+    # they're pure functions of static category tables, so this keeps the
+    # signal working for already-stored rows with no DB migration. See
+    # hotspot_runtime_meta in long_trip_hotspot_builder.
+    from long_trip_hotspot_builder import hotspot_runtime_meta
     out = []
     for r in rows:
         try:
             members = json.loads(r["members_json"] or "[]")
         except Exception:
             members = []
+        dom = str(r["dominant_category"] or "")
+        meta = hotspot_runtime_meta(dom, members)
         out.append({
             "id": int(r["id"]),
             "lat": float(r["lat"]),
             "lng": float(r["lng"]),
             "label": str(r["label"] or ""),
-            "dominant_category": str(r["dominant_category"] or ""),
+            "dominant_category": dom,
             "member_count": int(r["member_count"] or 0),
             "total_weight": float(r["total_weight"] or 0.0),
+            "best_hours": meta["best_hours"],
+            "rationale": meta["rationale"],
+            "dim_schedule": meta["dim_schedule"],
+            "category_counts": meta["category_counts"],
             "members": members,
             "generated_at_unix": int(r["generated_at_unix"] or 0),
         })
