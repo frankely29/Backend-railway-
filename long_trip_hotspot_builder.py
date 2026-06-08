@@ -345,10 +345,10 @@ _CATEGORY_PRIORITY: List[str] = [
 BEST_HOURS_BY_CATEGORY: Dict[str, str] = {
     "airport":         "24/7 — peaks 5–8am, 4–9pm",
     "hospital":        "24/7 — discharges peak 10am–4pm",
-    "hotel_luxury":    "Checkout 7–11am, check-in 3–7pm",
+    "hotel_luxury":    "Checkout 7am–noon — airport runs (check-in isn't a pickup)",
     "transit_hub":     "Weekday rush 7–9am, 5–7pm",
-    "corporate":       "Weekday 8–10am, 5–7pm",
-    "private_school":  "Drop-off 7:30–8:30am, pickup 2:30–4pm",
+    "corporate":       "Weekday end-of-day 4–8pm (esp. Thu/Fri); closed holidays",
+    "private_school":  "Weekday pickup 2:30–4pm; closed weekends, holidays & summer",
     "private_club":    "Lunch 12–2pm, dinner 6–9pm",
     "luxury_condo":    "Weekday morning 7–9am",
     "luxury_shopping": "11am–7pm, peak Sat 1–6pm",
@@ -670,18 +670,26 @@ def _best_hours_for(category: str) -> str:
 # - `weekday_only`: if true, weekends count as "off" (and never prime)
 #   regardless of hour (corporate towers, schools, conventions — none of
 #   those generate trips on a Sunday at 3pm even though the clock is
-#   "midday").
+#   "midday"). Federal holidays count the same way — see holiday_calendar.
 #
 # Hour ranges can wrap past midnight ([23, 5] = 11pm to 5am).
 # Anything not in `peak` and not in `off` is "medium" — neither dimmed
 # nor highlighted. Hospitals + airports have no off hours: they
 # generate trips 24/7.
+#
+# Every window is a *pickup* window — when someone LEAVES the building
+# for a trip (hotel checkout, office end-of-day, hospital discharge),
+# never when they arrive. Arrivals (hotel check-in, the morning office /
+# school drop-off) are someone else's drop-off, not a pickup here, so
+# they are deliberately NOT peak/prime. The date dimension (holidays +
+# the school year) lives in holiday_calendar.py and is applied per the
+# weekday_only rule above plus per-category seasonal closures.
 CATEGORY_DIM_SCHEDULE: Dict[str, Dict[str, Any]] = {
     "airport":         {"peak": [[5, 9], [16, 22]],  "off": [],          "weekday_only": False, "prime": [[6, 9], [16, 21]]},
     "hospital":        {"peak": [[10, 17]],          "off": [],          "weekday_only": False, "prime": [[13, 17]]},
-    "hotel_luxury":    {"peak": [[7, 11], [15, 19]], "off": [[23, 5]],   "weekday_only": False, "prime": [[7, 11]]},
+    "hotel_luxury":    {"peak": [[6, 12]],           "off": [[23, 6]],   "weekday_only": False, "prime": [[7, 11]]},
     "transit_hub":     {"peak": [[7, 10], [16, 20]], "off": [[23, 5]],   "weekday_only": False, "prime": [[7, 9], [17, 20]]},
-    "corporate":       {"peak": [[8, 10], [16, 19]], "off": [[20, 6]],   "weekday_only": True,  "prime": [[16, 19]]},
+    "corporate":       {"peak": [[16, 20]],          "off": [[20, 7]],   "weekday_only": True,  "prime": [[16, 19]]},
     "private_school":  {"peak": [[7, 9], [14, 16]],  "off": [[19, 6]],   "weekday_only": True,  "prime": [[14, 16]]},
     "private_club":    {"peak": [[12, 14], [18, 22]], "off": [[0, 10]],  "weekday_only": False, "prime": [[19, 22]]},
     "luxury_condo":    {"peak": [[7, 9]],             "off": [[22, 6]],  "weekday_only": False, "prime": [[7, 9]]},
@@ -722,7 +730,7 @@ def hotspot_runtime_meta(
     Returns: best_hours, dim_schedule (peak/off/weekday_only/prime),
     rationale, category_counts.
     """
-    cats = [str(m.get("category", "")) for m in members] if members else []
+    cats = [str(m.get("category", "")) for m in members if isinstance(m, dict)]
     counts, rationale = summarize_categories(cats)
     return {
         "best_hours": _best_hours_for(dominant_category),

@@ -1,5 +1,25 @@
 # BACKEND CHANGELOG
 
+## Current pass: Pickup-window correction + holiday/school calendar (backend)
+
+### Time windows corrected to pickups (people leaving), not arrivals
+- A dollar-flag pickup is someone *leaving* a building for a long trip, so the arrival-side windows were wrong:
+  - **Hotels** — dropped the 3–7pm check-in window (arrivals are drop-offs, not pickups). Now `peak [[6,12]]`, `prime [[7,11]]`: the morning checkout → airport wave. `best_hours`: "Checkout 7am–noon — airport runs (check-in isn't a pickup)".
+  - **Corporate** — dropped the 8–10am window (morning is people arriving at the office). Now `peak [[16,20]]`, `prime [[16,19]]`: end-of-day departures. `best_hours`: "Weekday end-of-day 4–8pm (esp. Thu/Fri); closed holidays".
+  - Transit (station arrivals → onward rides), hospital (discharges), and school (parent pickup) were already departure-based and are unchanged. `prime ⊆ peak` re-verified for all 12 categories.
+
+### New `holiday_calendar.py` — federal holidays + school recesses, served per request
+- Added `holiday_calendar.py`: computes US federal holidays for any year (with the observed Sat→Fri / Sun→Mon shift) from date arithmetic — no external service, deterministic, offline. Also defines recurring NYC-DOE-style school recess ranges (summer, winter, midwinter, spring).
+- `GET /long_trip_hotspots` now also returns a `calendar`: `{tz, holidays: [...], seasonal_closures: {private_school: [["YYYY-MM-DD","YYYY-MM-DD"], ...]}}`. Computed per request (recompute-on-read, nothing persisted, no migration).
+- The frontend matches its NYC date against this to **close** (dim off, never pulse) the weekday-only flags (offices, schools) on weekends + holidays, and the school flag across summer/recess. Hotels, transit, and hospitals keep running — holiday travel lifts hotel checkouts & transit, and hospitals are 24/7.
+- Verified: 2026 federal dates match the official list (incl. Jul 4 Sat → observed Jul 3); a closure simulation darkens the corporate flag on Christmas/holidays and the school flag all summer, while hotels still pulse.
+
+### Hardening + 20-year accuracy (review follow-up)
+- School recesses are now computed **per year** (not fixed dates) and served as explicit `[start, end]` ISO ranges: summer anchored to Labor Day, winter, midwinter on the Presidents'-Day week, and spring on the Good-Friday week (Gregorian Computus). Published NYC DOE spring dates are pinned as exact overrides (2025, 2026), since NYC ties spring to Passover/Easter and the computed proxy can't always catch the extended breaks.
+- Added `test_holiday_calendar.py`: asserts the federal holidays are correct for **every year 2026–2045** (count, weekday rules, observed shifts), plus Easter/Computus dates and school-range invariants — locking the "accurate for the next 20 years" guarantee into CI.
+- Widened the served holiday window to year+2 so a payload stays valid across the New-Year boundary (an observed New-Year's-Day that lands on Dec 31 of the following year).
+- Hardened the endpoint against a malformed stored `members_json` row (non-list, or non-dict elements) so it can't 500: coerce to a list, and skip non-dict members in `hotspot_runtime_meta`.
+
 ## Current pass: Dollar-flag prime-time pulse signal (backend)
 
 ### Per-category `prime` window + read-path schedule/rationale plumbing

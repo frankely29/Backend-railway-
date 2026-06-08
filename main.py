@@ -9351,11 +9351,14 @@ def long_trip_hotspots_list(user: sqlite3.Row = Depends(require_user)):
     # signal working for already-stored rows with no DB migration. See
     # hotspot_runtime_meta in long_trip_hotspot_builder.
     from long_trip_hotspot_builder import hotspot_runtime_meta
+    from holiday_calendar import calendar_payload
     out = []
     for r in rows:
         try:
             members = json.loads(r["members_json"] or "[]")
         except Exception:
+            members = []
+        if not isinstance(members, list):
             members = []
         dom = str(r["dominant_category"] or "")
         meta = hotspot_runtime_meta(dom, members)
@@ -9374,7 +9377,17 @@ def long_trip_hotspots_list(user: sqlite3.Row = Depends(require_user)):
             "members": members,
             "generated_at_unix": int(r["generated_at_unix"] or 0),
         })
-    return {"hotspots": out}
+    # Built-in closure calendar (federal holidays + school recesses). The
+    # frontend matches its NYC date against this to dark/de-pulse weekday-
+    # only and seasonal flags. Computed, not persisted — see holiday_calendar.
+    try:
+        import datetime as _dt
+        from zoneinfo import ZoneInfo as _ZoneInfo
+        _today = _dt.datetime.now(_ZoneInfo("America/New_York")).date()
+    except Exception:
+        import datetime as _dt
+        _today = _dt.date.today()
+    return {"hotspots": out, "calendar": calendar_payload(_today)}
 
 
 @app.post("/long_trip_flags")
