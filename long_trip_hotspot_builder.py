@@ -730,7 +730,7 @@ def hotspot_runtime_meta(
     Returns: best_hours, dim_schedule (peak/off/weekday_only/prime),
     rationale, category_counts.
     """
-    cats = [str(m.get("category", "")) for m in members] if members else []
+    cats = [str(m.get("category", "")) for m in members if isinstance(m, dict)]
     counts, rationale = summarize_categories(cats)
     return {
         "best_hours": _best_hours_for(dominant_category),

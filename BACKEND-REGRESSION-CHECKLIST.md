@@ -61,6 +61,9 @@
 - [x] hotel/corporate windows are pickup-only (checkout / end-of-day); no arrival windows; `prime ⊆ peak` still holds
 - [x] `holiday_calendar.federal_holidays(2026)` matches the observed federal dates (incl. Jul 4 → observed Jul 3)
 - [x] `GET /long_trip_hotspots` returns a `calendar` (holidays + per-category `seasonal_closures`); closure sim darkens offices/school on holidays/summer while hotels keep running
+- [x] `test_holiday_calendar.py` passes: federal holidays correct for every year 2026–2045 (rules + observed shifts), Easter/Computus, school-range invariants
+- [x] school recesses computed per year (Labor-Day summer, Presidents' midwinter, Good-Friday/Computus spring + published overrides), served as ISO `[start,end]` ranges
+- [x] endpoint can't 500 on a malformed `members_json` row (coerced to list; non-dict members skipped)
 
 ## Pickup zone hotspots
 - [x] `_shape_hotspot_component` shrinks hotspot polygons in small zones and leaves zones >= ~1 km^2 unchanged

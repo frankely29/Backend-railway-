@@ -9358,6 +9358,8 @@ def long_trip_hotspots_list(user: sqlite3.Row = Depends(require_user)):
             members = json.loads(r["members_json"] or "[]")
         except Exception:
             members = []
+        if not isinstance(members, list):
+            members = []
         dom = str(r["dominant_category"] or "")
         meta = hotspot_runtime_meta(dom, members)
         out.append({
