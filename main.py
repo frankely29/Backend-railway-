@@ -5168,6 +5168,26 @@ def _db_init() -> None:
             """
         )
 
+        # nightlife_districts: curated dining + nightlife clusters (see
+        # nightlife_hotspot_builder.py). One icon per district; the frontend
+        # pulses it during the dinner-let-out / last-call window. Built via
+        # /admin/nightlife_districts/rebuild and seeded if empty on startup.
+        _db_exec(
+            """
+            CREATE TABLE IF NOT EXISTS nightlife_districts (
+              id INTEGER PRIMARY KEY,
+              lat DOUBLE PRECISION NOT NULL,
+              lng DOUBLE PRECISION NOT NULL,
+              label TEXT NOT NULL,
+              dominant_category TEXT NOT NULL,
+              member_count INTEGER NOT NULL,
+              total_weight DOUBLE PRECISION NOT NULL,
+              members_json TEXT NOT NULL DEFAULT '[]',
+              generated_at_unix BIGINT NOT NULL DEFAULT 0
+            );
+            """
+        )
+
         _db_exec(
             """
             CREATE TABLE IF NOT EXISTS pickup_logs (
@@ -5663,6 +5683,23 @@ def _db_init() -> None:
     _db_exec(
         """
         CREATE TABLE IF NOT EXISTS long_trip_hotspots (
+          id INTEGER PRIMARY KEY,
+          lat REAL NOT NULL,
+          lng REAL NOT NULL,
+          label TEXT NOT NULL,
+          dominant_category TEXT NOT NULL,
+          member_count INTEGER NOT NULL,
+          total_weight REAL NOT NULL,
+          members_json TEXT NOT NULL DEFAULT '[]',
+          generated_at_unix INTEGER NOT NULL DEFAULT 0
+        );
+        """
+    )
+
+    # SQLite mirror of nightlife_districts (see nightlife_hotspot_builder.py).
+    _db_exec(
+        """
+        CREATE TABLE IF NOT EXISTS nightlife_districts (
           id INTEGER PRIMARY KEY,
           lat REAL NOT NULL,
           lng REAL NOT NULL,
@@ -6457,6 +6494,11 @@ def startup():
         print("[warn] city_events schema ensure failed (non-fatal)")
         traceback.print_exc()
     _ensure_admin_seed()
+    try:
+        _seed_nightlife_districts_if_empty()
+    except Exception:
+        print("[warn] nightlife districts seed failed (non-fatal)")
+        traceback.print_exc()
     try:
         replayed_count = replay_unprocessed_events_on_startup()
         print(f"Paddle webhook startup replay processed {replayed_count} unprocessed events")
@@ -9405,6 +9447,73 @@ def long_trip_hotspots_list(user: sqlite3.Row = Depends(require_user)):
         import datetime as _dt
         _today = _dt.date.today()
     return {"hotspots": out, "calendar": calendar_payload(_today)}
+
+
+@app.post("/admin/nightlife_districts/rebuild")
+def nightlife_districts_rebuild(admin: sqlite3.Row = Depends(require_admin)):
+    """
+    One-shot rebuild of the nightlife_districts table from the curated POI
+    list in nightlife_hotspot_builder.py. Clusters venues within a ~5-min
+    walk and keeps districts of 3+ that mix dining AND nightlife. Idempotent
+    (deletes + re-inserts). Run once per deploy that edits the POI list.
+    """
+    _ = admin
+    from nightlife_hotspot_builder import write_nightlife_districts
+    summary = write_nightlife_districts(_db_exec)
+    return {"ok": True, **summary}
+
+
+@app.get("/nightlife_districts")
+def nightlife_districts_list(user: sqlite3.Row = Depends(require_user)):
+    """
+    Returns the persisted nightlife/dining districts. The frontend drops one
+    cocktail-glass pin per row and pulses it during the let-out window. The
+    dim_schedule (prime = weeknight, prime_weekend = Fri/Sat, both wrapping
+    past midnight) + best_hours are recomputed here from the stored members,
+    so schedule edits take effect on the next GET without a rebuild.
+    """
+    _ = user
+    from nightlife_hotspot_builder import district_runtime_meta
+    rows = _db_query_all(
+        "SELECT id, lat, lng, label, dominant_category, member_count, "
+        "total_weight, members_json, generated_at_unix "
+        "FROM nightlife_districts ORDER BY total_weight DESC"
+    )
+    out = []
+    for r in rows:
+        try:
+            members = json.loads(r["members_json"] or "[]")
+        except Exception:
+            members = []
+        meta = district_runtime_meta(members)
+        out.append({
+            "id": int(r["id"]),
+            "lat": float(r["lat"]),
+            "lng": float(r["lng"]),
+            "label": str(r["label"] or ""),
+            "dominant_category": str(r["dominant_category"] or ""),
+            "member_count": int(r["member_count"] or 0),
+            "total_weight": float(r["total_weight"] or 0.0),
+            "members": members,
+            "best_hours": meta["best_hours"],
+            "dim_schedule": meta["dim_schedule"],
+            "rationale": meta["rationale"],
+            "category_counts": meta["category_counts"],
+            "generated_at_unix": int(r["generated_at_unix"] or 0),
+        })
+    return {"districts": out}
+
+
+def _seed_nightlife_districts_if_empty() -> None:
+    """Populate nightlife_districts on startup if empty so the map has data
+    without a manual admin rebuild (the list is static + curated)."""
+    rows = _db_query_all("SELECT id FROM nightlife_districts LIMIT 1")
+    if rows:
+        return
+    from nightlife_hotspot_builder import write_nightlife_districts
+    summary = write_nightlife_districts(_db_exec)
+    print(f"[nightlife] seeded {summary.get('districts_count')} districts from "
+          f"{summary.get('poi_count')} curated venues")
 
 
 @app.post("/long_trip_flags")
