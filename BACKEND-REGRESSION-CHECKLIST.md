@@ -55,6 +55,11 @@
 - [x] every POI in `NYC_LONG_TRIP_POIS` has a `POI_ADDRESSES` entry and a category supported by all category maps
 - [x] `POST /admin/long_trip_hotspots/rebuild` then `GET /long_trip_hotspots` returns the rebuilt pins
 
+## Nightlife districts
+- [x] `tests/test_nightlife_hotspots.py` passes (9/9): builds 8 mixed districts; every district pulses at the dinner let-out; club districts run latest on weekends; qualification rejects pure-dining / pure-nightlife / undersized clusters; members within `CLUSTER_RADIUS_MI`; coords in NYC; runtime-meta + write path.
+- [x] `build_nightlife_districts()` clusters `NIGHTLIFE_POIS` at 0.25 mi and keeps only 3+ clusters that mix dining AND nightlife (>=1 each).
+- [x] `POST /admin/nightlife_districts/rebuild` then `GET /nightlife_districts` returns districts with a `dim_schedule` (prime + prime_weekend) per row; startup seeds the table if empty.
+
 ## Pickup zone hotspots
 - [x] `_shape_hotspot_component` shrinks hotspot polygons in small zones and leaves zones >= ~1 km^2 unchanged
 - [x] no single zone hotspot covers more than `PICKUP_ZONE_HOTSPOT_MAX_ZONE_COVERAGE` of its zone
