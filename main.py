@@ -6397,9 +6397,16 @@ from pickup_recording_feature import (
     register_pickup_write_cache_invalidation_hook,
 )
 
+from city_events import (
+    router as city_events_router,
+    ensure_city_events_schema,
+    start_city_events_refresh,
+)
+
 app.include_router(chat_router)
 app.include_router(leaderboard_router)
 app.include_router(pickup_recording_router)
+app.include_router(city_events_router)
 app.include_router(games_router)
 app.include_router(work_battles_router)
 app.include_router(subscription_router)
@@ -6444,6 +6451,11 @@ def startup():
     ensure_pickup_recording_schema()
     ensure_games_schema()
     ensure_work_battles_schema()
+    try:
+        ensure_city_events_schema()
+    except Exception:
+        print("[warn] city_events schema ensure failed (non-fatal)")
+        traceback.print_exc()
     _ensure_admin_seed()
     try:
         replayed_count = replay_unprocessed_events_on_startup()
@@ -6461,6 +6473,11 @@ def startup():
     try:
         _start_avatar_asset_backfill()
     except Exception:
+        traceback.print_exc()
+    try:
+        start_city_events_refresh()
+    except Exception:
+        print("[warn] city_events refresh startup failed (non-fatal)")
         traceback.print_exc()
     global _cleanup_last_startup_removed_count, _cleanup_last_startup_freed_bytes_estimate
     try:

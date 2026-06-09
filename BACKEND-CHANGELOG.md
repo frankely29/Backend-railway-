@@ -1,5 +1,14 @@
 # BACKEND CHANGELOG
 
+## Current pass: City events feed (Ticketmaster → map)
+
+### New `city_events.py` + `GET /city_events`
+- Added a **city-events** system: a background daemon thread fetches today's major NYC events (concerts/music, sports, conventions/expos) from the **Ticketmaster Discovery API** and caches them in a new `city_events` table; `GET /city_events` (auth) serves them so the frontend can pin them and highlight the **let-out** surge (best pickup time).
+- `city_events.py` (new, self-contained router): `fetch_nyc_events_today()` (httpx, NYC DMA, today window, Music/Sports/Miscellaneous segments), pure `normalize_event()` (→ name/venue/lat/lng/start/category; skips coordinate-less or non-requested events; small NYC-venue coordinate fallback), `ensure_city_events_schema()` (dual SQLite/Postgres, `UNIQUE(source, source_id)`), upsert (`ON CONFLICT … DO UPDATE`) + prune-past, `select_events_for_today()` (keeps events still letting out from earlier today), and a daemon refresh worker (`CITY_EVENTS_REFRESH_SECONDS`, default 1800).
+- `POST /admin/city_events/refresh` (admin) forces an immediate refresh for ops/testing.
+- `main.py`: import + `include_router`, `ensure_city_events_schema()` + `start_city_events_refresh()` wired into `startup()` (both guarded/non-fatal). `httpx` already in `requirements.txt` (imported lazily inside the fetch).
+- **Setup:** set `TICKETMASTER_API_KEY` (free key) on Railway. **Dormant without it** — the worker skips and the endpoint returns an empty list, so it's safe to deploy before the key is set.
+
 ## Current pass: Pickup-window correction + holiday/school calendar (backend)
 
 ### Time windows corrected to pickups (people leaving), not arrivals
