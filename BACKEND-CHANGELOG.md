@@ -1,5 +1,15 @@
 # BACKEND CHANGELOG
 
+## Current pass: Keyless sports sources for city events (no key, no account)
+
+### MLB / NHL / NBA home games feed the map without any API key
+- The city-events map feature was Ticketmaster-only, but the operator can't create a Ticketmaster account. Added three **keyless, no-account** official league schedule sources so the map shows events out of the box: **MLB** (`statsapi.mlb.com`), **NHL** (`api-web.nhle.com`), **NBA** (`cdn.nba.com` static schedule). Only **home games** of the NYC-metro teams are kept (Yankees/Mets, Rangers/Islanders/Devils, Knicks/Nets), so every kept game lands at a venue already in the coordinate-fallback table.
+- `city_events.py`: new pure normalizers `normalize_mlb_game()` / `normalize_nhl_game()` / `normalize_nba_game()` (mirror `normalize_event` — `.get()`-guarded, never raise, return `None` to skip away games, postponed/cancelled/suspended games, unknown venues, or missing fields; every kept game maps to `category="sports"`), new fetchers `fetch_mlb_today()` / `fetch_nhl_today()` / `fetch_nba_today()` (lazy `httpx`, browser UA, today-NYC window), a `_parse_iso_utc()` helper, and a `_BROWSER_UA` (the league CDNs 403 non-browser agents).
+- `refresh_city_events_once()` now aggregates **all** sources (Ticketmaster + MLB + NHL + NBA), each isolated in its own try/except so one failing feed can't sink the batch, de-dups on `(source, source_id)`, and returns per-source counts (`src_mlb`, `src_nhl`, `src_nba`, `src_ticketmaster`).
+- `start_city_events_refresh()` **always** starts the daemon now (it previously skipped without a Ticketmaster key); `POST /admin/city_events/refresh` dropped its `TICKETMASTER_API_KEY` 503 guard. Ticketmaster stays in the code but **dormant** (returns `[]` without a key) — if the operator ever gets a key, concerts/conventions light up with no rebuild.
+- **No frontend change:** the merged `city-events.feature.js` already renders `category="sports"` (orange sprite at the venue + gold let-out pulse) and never reads the `source` field.
+- **Setup:** none — the sports feeds run with **no env vars and no account**. `TICKETMASTER_API_KEY` stays optional (for concerts/conventions). Safe to deploy with no keys at all.
+
 ## Current pass: City events feed (Ticketmaster → map)
 
 ### New `city_events.py` + `GET /city_events`

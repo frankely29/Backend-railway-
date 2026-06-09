@@ -1,12 +1,14 @@
 """
-City Events — big NYC events (concerts, sports, conventions) for the map.
+City Events — big NYC events for the map (sports games + optional Ticketmaster).
 
-Fetches today's major events from the Ticketmaster Discovery API on a
-background thread, caches them in the `city_events` table, and serves them
-via GET /city_events. The frontend draws a pin per event and derives the
-upcoming / in-progress / "letting out" (best-pickup surge) state from each
-event's start time + category — so the heavy let-out logic lives client-side
-and the backend just supplies the facts.
+Fetches today's games from the free, keyless league schedule APIs (MLB / NHL /
+NBA — Yankees, Mets, Knicks, Nets, Rangers, Islanders, Devils home games) on a
+background thread, caches them in the `city_events` table, and serves them via
+GET /city_events. Ticketmaster is an optional extra source (dormant without a
+key). The frontend draws a pin per event and derives the upcoming / in-progress
+/ "letting out" (best-pickup surge) state from each event's start time +
+category — so the heavy let-out logic lives client-side and the backend just
+supplies the facts.
 
 Mirrors the codebase conventions:
   - external HTTP + secrets like paddle_client.py (httpx.Client + os.environ
@@ -14,8 +16,9 @@ Mirrors the codebase conventions:
   - a per-feature APIRouter + `ensure_*_schema()` like pickup_recording_feature.py,
   - a daemon refresh thread like main.py's `_start_avatar_asset_backfill`.
 
-No API key configured => the feature is dormant (no fetch, empty endpoint),
-so it is safe to deploy before TICKETMASTER_API_KEY is set.
+No API key configured => Ticketmaster is dormant, but the keyless sports
+sources still run with no account, so the map has events out of the box.
+Safe to deploy with no keys at all.
 """
 from __future__ import annotations
 
@@ -59,6 +62,28 @@ CITY_EVENTS_REFRESH_SECONDS = int(os.environ.get("CITY_EVENTS_REFRESH_SECONDS", 
 MAX_EVENT_SPAN_SECONDS = int(os.environ.get("CITY_EVENTS_MAX_SPAN_SECONDS", str(6 * 3600)))
 _MAX_PAGES = 3
 _HTTP_TIMEOUT = 10.0
+
+# ---------------------------------------------------------------------------
+# Keyless sports sources (no API key / no account — official league schedule
+# feeds). We keep only HOME games of the NYC-metro teams, so every kept game
+# lands at a venue already present in _VENUE_FALLBACK below.
+# ---------------------------------------------------------------------------
+MLB_SCHEDULE_URL = "https://statsapi.mlb.com/api/v1/schedule"
+NHL_SCHEDULE_URL = "https://api-web.nhle.com/v1/schedule"   # + /<YYYY-MM-DD>
+NBA_SCHEDULE_URL = "https://cdn.nba.com/static/json/staticData/scheduleLeagueV2.json"
+
+MLB_TEAM_IDS = {147, 121}                    # Yankees, Mets
+NHL_TEAM_ABBREVS = {"NYR", "NYI", "NJD"}     # Rangers, Islanders, Devils
+NBA_TEAM_TRICODES = {"NYK", "BKN"}           # Knicks, Nets
+
+# League CDNs 403 non-browser agents, so every request carries a browser UA.
+_BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+
+# Lowercased status markers (across leagues) that mean "not happening" -> skip.
+_SKIP_STATUS_MARKERS = ("postpon", "cancel", "suspend", "ppd", "cncl", "susp")
 
 # Coordinate fallback for the rare event whose venue has no lat/lng in the
 # API response. Top NYC-area venues only — Ticketmaster supplies coordinates
@@ -171,6 +196,30 @@ def _parse_start_unix(start: Dict[str, Any]) -> Optional[int]:
         except Exception:
             pass
     return None
+
+
+def _parse_iso_utc(value: Any) -> Optional[int]:
+    """ISO-8601 timestamp ('...Z' or with a UTC offset) -> unix seconds.
+    Used by the sports feeds (MLB gameDate, NHL startTimeUTC, NBA
+    gameDateTimeUTC). Returns None on anything unparseable; never raises."""
+    if not value:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:  # fast path: the common "....Z" form, no fractional seconds
+        return int(datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ")
+                   .replace(tzinfo=timezone.utc).timestamp())
+    except Exception:
+        pass
+    try:  # general path: offsets and/or fractional seconds
+        iso = text[:-1] + "+00:00" if text.endswith("Z") else text
+        dt = datetime.fromisoformat(iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp())
+    except Exception:
+        return None
 
 
 def _venue_coords_fallback(venue_name: str) -> Optional[Tuple[float, float]]:
@@ -299,6 +348,252 @@ def fetch_nyc_events_today() -> List[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# Keyless sports feeds (MLB / NHL / NBA) — normalize + fetch
+#
+# Each normalizer mirrors normalize_event: .get()-guarded, never raises, and
+# returns None to skip (away game, postponed/cancelled, unknown venue, or a
+# missing field). Every kept game maps to the same row shape with
+# category="sports", so the existing upsert/select/frontend path serves it
+# unchanged. We keep only HOME games of the in-scope teams; a venue miss in
+# _venue_coords_fallback safely skips the game.
+# ---------------------------------------------------------------------------
+def _status_is_skippable(status: Any) -> bool:
+    s = str(status or "").strip().lower()
+    return any(marker in s for marker in _SKIP_STATUS_MARKERS)
+
+
+def _join_team_name(*parts: Any) -> str:
+    return " ".join(p for p in (str(x or "").strip() for x in parts) if p)
+
+
+def _nhl_team_name(team: Dict[str, Any]) -> str:
+    """Readable name across NHL api-web shapes: placeName + commonName
+    ('New York' + 'Rangers'), else a flat name field, else the abbrev."""
+    def _d(v: Any) -> str:
+        return str((v.get("default") if isinstance(v, dict) else v) or "").strip()
+    name = _join_team_name(_d(team.get("placeName")), _d(team.get("commonName")))
+    if name:
+        return name
+    for key in ("name", "fullName"):
+        flat = _d(team.get(key))
+        if flat:
+            return flat
+    return str(team.get("abbrev") or "").strip()
+
+
+def normalize_mlb_game(game: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """One MLB statsapi game -> our sports row, or None to skip."""
+    try:
+        source_id = str(game.get("gamePk") or "").strip()
+        if not source_id:
+            return None
+        if _status_is_skippable((game.get("status") or {}).get("detailedState")):
+            return None
+        teams = game.get("teams") or {}
+        home = (teams.get("home") or {}).get("team") or {}
+        away = (teams.get("away") or {}).get("team") or {}
+        try:
+            home_id = int(home.get("id"))
+        except (TypeError, ValueError):
+            return None
+        if home_id not in MLB_TEAM_IDS:            # keep only our home games
+            return None
+        home_name = str(home.get("name") or "").strip()
+        away_name = str(away.get("name") or "").strip()
+        if not home_name or not away_name:
+            return None
+        venue_name = str((game.get("venue") or {}).get("name") or "").strip()
+        coords = _venue_coords_fallback(venue_name)
+        if not coords:
+            return None
+        start_at = _parse_iso_utc(game.get("gameDate"))
+        if start_at is None:
+            return None
+        return {
+            "source": "mlb",
+            "source_id": source_id,
+            "name": f"{away_name} at {home_name}",
+            "category": "sports",
+            "venue": venue_name,
+            "lat": coords[0],
+            "lng": coords[1],
+            "start_at": start_at,
+            "end_at": None,
+            "url": "",
+        }
+    except Exception:
+        logger.exception("[city_events] normalize_mlb_game failed")
+        return None
+
+
+def normalize_nhl_game(game: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """One NHL api-web game -> our sports row, or None to skip."""
+    try:
+        source_id = str(game.get("id") or "").strip()
+        if not source_id:
+            return None
+        if _status_is_skippable(game.get("gameScheduleState")):
+            return None
+        home = game.get("homeTeam") or {}
+        away = game.get("awayTeam") or {}
+        if str(home.get("abbrev") or "").strip().upper() not in NHL_TEAM_ABBREVS:
+            return None
+        venue_name = str((game.get("venue") or {}).get("default") or "").strip()
+        coords = _venue_coords_fallback(venue_name)
+        if not coords:
+            return None
+        start_at = _parse_iso_utc(game.get("startTimeUTC"))
+        if start_at is None:
+            return None
+        home_name = _nhl_team_name(home)
+        away_name = _nhl_team_name(away)
+        if not home_name or not away_name:
+            return None
+        return {
+            "source": "nhl",
+            "source_id": source_id,
+            "name": f"{away_name} at {home_name}",
+            "category": "sports",
+            "venue": venue_name,
+            "lat": coords[0],
+            "lng": coords[1],
+            "start_at": start_at,
+            "end_at": None,
+            "url": "",
+        }
+    except Exception:
+        logger.exception("[city_events] normalize_nhl_game failed")
+        return None
+
+
+def normalize_nba_game(game: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """One NBA scheduleLeagueV2 game -> our sports row, or None to skip."""
+    try:
+        source_id = str(game.get("gameId") or "").strip()
+        if not source_id:
+            return None
+        if _status_is_skippable(game.get("gameStatusText")):
+            return None
+        home = game.get("homeTeam") or {}
+        away = game.get("awayTeam") or {}
+        if str(home.get("teamTricode") or "").strip().upper() not in NBA_TEAM_TRICODES:
+            return None
+        venue_name = str(game.get("arenaName") or "").strip()
+        coords = _venue_coords_fallback(venue_name)
+        if not coords:
+            return None
+        start_at = _parse_iso_utc(game.get("gameDateTimeUTC"))
+        if start_at is None:
+            return None
+        home_name = _join_team_name(home.get("teamCity"), home.get("teamName"))
+        away_name = _join_team_name(away.get("teamCity"), away.get("teamName"))
+        if not home_name or not away_name:
+            return None
+        return {
+            "source": "nba",
+            "source_id": source_id,
+            "name": f"{away_name} at {home_name}",
+            "category": "sports",
+            "venue": venue_name,
+            "lat": coords[0],
+            "lng": coords[1],
+            "start_at": start_at,
+            "end_at": None,
+            "url": "",
+        }
+    except Exception:
+        logger.exception("[city_events] normalize_nba_game failed")
+        return None
+
+
+def _within_today_window(start_at: int, now_utc: datetime) -> bool:
+    """True if a game falls in the same [now-MAX_SPAN, end_of_today_NYC] window
+    select_events_for_today serves — drops games already long over."""
+    now = int(now_utc.timestamp())
+    return (now - MAX_EVENT_SPAN_SECONDS) <= start_at <= _end_of_today_nyc_unix(now_utc)
+
+
+def _collect_sports(raw_games, normalizer, now_utc: datetime) -> List[Dict[str, Any]]:
+    """Normalize a league's games; drop skips, out-of-window games, and dupes."""
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for g in raw_games or []:
+        n = normalizer(g if isinstance(g, dict) else {})
+        if not n or not _within_today_window(n["start_at"], now_utc):
+            continue
+        key = (n["source"], n["source_id"])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(n)
+    return out
+
+
+def _get_json(url: str, params: Optional[Dict[str, str]] = None) -> Optional[Any]:
+    """GET JSON with a browser UA + timeout. None on any error or 4xx/5xx."""
+    import httpx  # lazy: keeps the module importable without httpx installed
+    try:
+        with httpx.Client(timeout=_HTTP_TIMEOUT, headers={"User-Agent": _BROWSER_UA}) as client:
+            resp = client.get(url, params=params)
+            if resp.status_code >= 400:
+                logger.warning("[city_events] GET %s -> %s: %s", url, resp.status_code, resp.text[:200])
+                return None
+            return resp.json()
+    except Exception:
+        logger.exception("[city_events] GET %s failed", url)
+        return None
+
+
+def fetch_mlb_today() -> List[Dict[str, Any]]:
+    """Today's Yankees/Mets home games from MLB statsapi (keyless). [] on error."""
+    now_utc = datetime.now(timezone.utc)
+    today = now_utc.astimezone(NYC_TZ).strftime("%Y-%m-%d")
+    data = _get_json(MLB_SCHEDULE_URL, {
+        "sportId": "1",
+        "teamId": ",".join(str(t) for t in sorted(MLB_TEAM_IDS)),
+        "startDate": today,
+        "endDate": today,
+    })
+    if not data:
+        return []
+    games: List[Dict[str, Any]] = []
+    for date_block in (data.get("dates") or []):
+        games.extend((date_block or {}).get("games") or [])
+    return _collect_sports(games, normalize_mlb_game, now_utc)
+
+
+def fetch_nhl_today() -> List[Dict[str, Any]]:
+    """Today's Rangers/Islanders/Devils home games from NHL api-web (keyless)."""
+    now_utc = datetime.now(timezone.utc)
+    today = now_utc.astimezone(NYC_TZ).strftime("%Y-%m-%d")
+    data = _get_json(f"{NHL_SCHEDULE_URL}/{today}")
+    if not data:
+        return []
+    games: List[Dict[str, Any]] = []
+    for block in (data.get("gameWeek") or []):       # a week of days; keep today
+        block_date = str((block or {}).get("date") or "")
+        if block_date and block_date != today:
+            continue
+        games.extend((block or {}).get("games") or [])
+    return _collect_sports(games, normalize_nhl_game, now_utc)
+
+
+def fetch_nba_today() -> List[Dict[str, Any]]:
+    """Today's Knicks/Nets home games from the NBA static schedule JSON."""
+    now_utc = datetime.now(timezone.utc)
+    bucket = now_utc.astimezone(NYC_TZ).strftime("%m/%d/%Y")  # NBA gameDate prefix
+    data = _get_json(NBA_SCHEDULE_URL)
+    if not data:
+        return []
+    games: List[Dict[str, Any]] = []
+    for date_block in ((data.get("leagueSchedule") or {}).get("gameDates") or []):
+        if bucket not in str((date_block or {}).get("gameDate") or ""):  # pre-filter by day
+            continue
+        games.extend((date_block or {}).get("games") or [])
+    return _collect_sports(games, normalize_nba_game, now_utc)
+
+
+# ---------------------------------------------------------------------------
 # DB write / read
 # ---------------------------------------------------------------------------
 def upsert_events(events: List[Dict[str, Any]]) -> int:
@@ -327,11 +622,37 @@ def prune_old_events() -> None:
 
 
 def refresh_city_events_once() -> Dict[str, int]:
-    """Fetch -> upsert -> prune. Used by the worker and the admin endpoint."""
-    events = fetch_nyc_events_today()
-    stored = upsert_events(events)
+    """Fetch every source -> merge -> upsert -> prune. Used by the worker and
+    the admin endpoint. Each source runs in its own try/except so one failing
+    feed can't sink the batch. Ticketmaster stays dormant (returns [] without a
+    key); the MLB/NHL/NBA feeds are keyless. Returns per-source counts."""
+    sources = (
+        ("ticketmaster", fetch_nyc_events_today),
+        ("mlb", fetch_mlb_today),
+        ("nhl", fetch_nhl_today),
+        ("nba", fetch_nba_today),
+    )
+    counts: Dict[str, int] = {}
+    merged: List[Dict[str, Any]] = []
+    seen = set()
+    for name, fetch in sources:
+        try:
+            rows = fetch()
+        except Exception:
+            logger.exception("[city_events] %s fetch raised", name)
+            rows = []
+        counts[f"src_{name}"] = len(rows)
+        for r in rows:
+            key = (r["source"], r["source_id"])
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(r)
+    stored = upsert_events(merged)
     prune_old_events()
-    return {"fetched": len(events), "stored": stored}
+    counts["fetched"] = len(merged)
+    counts["stored"] = stored
+    return counts
 
 
 def select_events_for_today() -> Dict[str, Any]:
@@ -381,10 +702,9 @@ def start_city_events_refresh() -> None:
     global _city_events_started
     if _city_events_started:
         return
-    if not events_api_is_configured():
-        logger.info("[city_events] TICKETMASTER_API_KEY not set — events refresh disabled")
-        return
     _city_events_started = True
+    if not events_api_is_configured():
+        logger.info("[city_events] no TICKETMASTER_API_KEY — running keyless sports sources only")
     threading.Thread(target=_city_events_worker, name="city-events-refresh", daemon=True).start()
 
 
@@ -410,9 +730,8 @@ def city_events_list(user: Any = Depends(require_user)):
 
 @router.post("/admin/city_events/refresh")
 def city_events_refresh(user: Any = Depends(_require_admin)):
-    """Force an immediate Ticketmaster refresh (ops/testing)."""
+    """Force an immediate refresh of all sources (ops/testing). Keyless sports
+    always run; Ticketmaster contributes only when a key is set."""
     _ = user
-    if not events_api_is_configured():
-        raise HTTPException(status_code=503, detail="TICKETMASTER_API_KEY is not configured")
     result = refresh_city_events_once()
     return {"ok": True, **result}
