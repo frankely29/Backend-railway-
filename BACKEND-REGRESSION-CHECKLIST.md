@@ -5,11 +5,12 @@
 - [x] Postgres mode fails clearly when requested without `psycopg2`.
 - [x] Postgres helper path still uses a threaded connection pool wrapper.
 
-## City events (Ticketmaster)
-- [x] `tests/test_city_events.py` passes: `normalize_event` (concert/sports/fallback/skip), start-time parsing, schema→upsert→select→prune roundtrip, no-key fetch returns `[]` (7/7).
-- [x] `ensure_city_events_schema()` creates the `city_events` table on both SQLite and Postgres (`UNIQUE(source, source_id)`); upsert uses `ON CONFLICT … DO UPDATE`.
-- [x] Feature is dormant without `TICKETMASTER_API_KEY` — worker skips, `GET /city_events` returns an empty list (safe to deploy before the key is set).
-- [ ] live: with `TICKETMASTER_API_KEY` set, `POST /admin/city_events/refresh` populates rows and `GET /city_events` returns today's NYC events.
+## City events (keyless sports feeds + optional Ticketmaster)
+- [x] `tests/test_city_events.py` passes (13/13): `normalize_event` (concert/sports/fallback/skip) + TM start-time parsing; `normalize_mlb_game` / `normalize_nhl_game` / `normalize_nba_game` (home game → `category="sports"` with correct venue coords + exact `start_at`; away / postponed / unknown-venue / empty → `None`); `_parse_iso_utc` (Z / fractional / offset / garbage); schema→upsert→select→prune roundtrip for both TM and sports rows; no-key TM fetch returns `[]`.
+- [x] `ensure_city_events_schema()` creates the `city_events` table on both SQLite and Postgres (`UNIQUE(source, source_id)`); upsert uses `ON CONFLICT … DO UPDATE`; sports rows reuse the same source-agnostic row shape.
+- [x] **Keyless by default** — MLB/NHL/NBA home games run with no API key and no account; the worker always starts and `refresh_city_events_once()` isolates each source so one failing feed can't sink the batch. Ticketmaster stays dormant without `TICKETMASTER_API_KEY` (contributes `[]`, no crash).
+- [ ] live: `POST /admin/city_events/refresh` returns per-source counts (`src_mlb > 0` on a Yankees/Mets home day in season) and `GET /city_events` returns today's games with `category="sports"` + venue coords; the map shows the sports sprite + gold let-out pulse. NHL/NBA return 0 out of season without error.
+- [ ] live (optional): with `TICKETMASTER_API_KEY` set, concerts/conventions also populate.
 
 ## Auth / account control
 - [x] signup works
