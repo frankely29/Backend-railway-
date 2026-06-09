@@ -5,6 +5,12 @@
 - [x] Postgres mode fails clearly when requested without `psycopg2`.
 - [x] Postgres helper path still uses a threaded connection pool wrapper.
 
+## City events (Ticketmaster)
+- [x] `tests/test_city_events.py` passes: `normalize_event` (concert/sports/fallback/skip), start-time parsing, schema→upsert→select→prune roundtrip, no-key fetch returns `[]` (7/7).
+- [x] `ensure_city_events_schema()` creates the `city_events` table on both SQLite and Postgres (`UNIQUE(source, source_id)`); upsert uses `ON CONFLICT … DO UPDATE`.
+- [x] Feature is dormant without `TICKETMASTER_API_KEY` — worker skips, `GET /city_events` returns an empty list (safe to deploy before the key is set).
+- [ ] live: with `TICKETMASTER_API_KEY` set, `POST /admin/city_events/refresh` populates rows and `GET /city_events` returns today's NYC events.
+
 ## Auth / account control
 - [x] signup works
 - [x] login works
