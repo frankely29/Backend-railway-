@@ -6434,9 +6434,16 @@ from pickup_recording_feature import (
     register_pickup_write_cache_invalidation_hook,
 )
 
+from city_events import (
+    router as city_events_router,
+    ensure_city_events_schema,
+    start_city_events_refresh,
+)
+
 app.include_router(chat_router)
 app.include_router(leaderboard_router)
 app.include_router(pickup_recording_router)
+app.include_router(city_events_router)
 app.include_router(games_router)
 app.include_router(work_battles_router)
 app.include_router(subscription_router)
@@ -6481,6 +6488,11 @@ def startup():
     ensure_pickup_recording_schema()
     ensure_games_schema()
     ensure_work_battles_schema()
+    try:
+        ensure_city_events_schema()
+    except Exception:
+        print("[warn] city_events schema ensure failed (non-fatal)")
+        traceback.print_exc()
     _ensure_admin_seed()
     try:
         _seed_nightlife_districts_if_empty()
@@ -6503,6 +6515,11 @@ def startup():
     try:
         _start_avatar_asset_backfill()
     except Exception:
+        traceback.print_exc()
+    try:
+        start_city_events_refresh()
+    except Exception:
+        print("[warn] city_events refresh startup failed (non-fatal)")
         traceback.print_exc()
     global _cleanup_last_startup_removed_count, _cleanup_last_startup_freed_bytes_estimate
     try:
@@ -9387,24 +9404,49 @@ def long_trip_hotspots_list(user: sqlite3.Row = Depends(require_user)):
         "total_weight, members_json, generated_at_unix "
         "FROM long_trip_hotspots ORDER BY total_weight DESC"
     )
+    # Time-of-day (dim + pulse) and rationale fields are recomputed here
+    # from each row's dominant_category + members rather than persisted —
+    # they're pure functions of static category tables, so this keeps the
+    # signal working for already-stored rows with no DB migration. See
+    # hotspot_runtime_meta in long_trip_hotspot_builder.
+    from long_trip_hotspot_builder import hotspot_runtime_meta
+    from holiday_calendar import calendar_payload
     out = []
     for r in rows:
         try:
             members = json.loads(r["members_json"] or "[]")
         except Exception:
             members = []
+        if not isinstance(members, list):
+            members = []
+        dom = str(r["dominant_category"] or "")
+        meta = hotspot_runtime_meta(dom, members)
         out.append({
             "id": int(r["id"]),
             "lat": float(r["lat"]),
             "lng": float(r["lng"]),
             "label": str(r["label"] or ""),
-            "dominant_category": str(r["dominant_category"] or ""),
+            "dominant_category": dom,
             "member_count": int(r["member_count"] or 0),
             "total_weight": float(r["total_weight"] or 0.0),
+            "best_hours": meta["best_hours"],
+            "rationale": meta["rationale"],
+            "dim_schedule": meta["dim_schedule"],
+            "category_counts": meta["category_counts"],
             "members": members,
             "generated_at_unix": int(r["generated_at_unix"] or 0),
         })
-    return {"hotspots": out}
+    # Built-in closure calendar (federal holidays + school recesses). The
+    # frontend matches its NYC date against this to dark/de-pulse weekday-
+    # only and seasonal flags. Computed, not persisted — see holiday_calendar.
+    try:
+        import datetime as _dt
+        from zoneinfo import ZoneInfo as _ZoneInfo
+        _today = _dt.datetime.now(_ZoneInfo("America/New_York")).date()
+    except Exception:
+        import datetime as _dt
+        _today = _dt.date.today()
+    return {"hotspots": out, "calendar": calendar_payload(_today)}
 
 
 @app.post("/admin/nightlife_districts/rebuild")

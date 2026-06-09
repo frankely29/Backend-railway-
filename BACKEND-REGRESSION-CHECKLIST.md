@@ -5,6 +5,13 @@
 - [x] Postgres mode fails clearly when requested without `psycopg2`.
 - [x] Postgres helper path still uses a threaded connection pool wrapper.
 
+## City events (keyless sports feeds + optional Ticketmaster)
+- [x] `tests/test_city_events.py` passes (13/13): `normalize_event` (concert/sports/fallback/skip) + TM start-time parsing; `normalize_mlb_game` / `normalize_nhl_game` / `normalize_nba_game` (home game → `category="sports"` with correct venue coords + exact `start_at`; away / postponed / unknown-venue / empty → `None`); `_parse_iso_utc` (Z / fractional / offset / garbage); schema→upsert→select→prune roundtrip for both TM and sports rows; no-key TM fetch returns `[]`.
+- [x] `ensure_city_events_schema()` creates the `city_events` table on both SQLite and Postgres (`UNIQUE(source, source_id)`); upsert uses `ON CONFLICT … DO UPDATE`; sports rows reuse the same source-agnostic row shape.
+- [x] **Keyless by default** — MLB/NHL/NBA home games run with no API key and no account; the worker always starts and `refresh_city_events_once()` isolates each source so one failing feed can't sink the batch. Ticketmaster stays dormant without `TICKETMASTER_API_KEY` (contributes `[]`, no crash).
+- [ ] live: `POST /admin/city_events/refresh` returns per-source counts (`src_mlb > 0` on a Yankees/Mets home day in season) and `GET /city_events` returns today's games with `category="sports"` + venue coords; the map shows the sports sprite + gold let-out pulse. NHL/NBA return 0 out of season without error.
+- [ ] live (optional): with `TICKETMASTER_API_KEY` set, concerts/conventions also populate.
+
 ## Auth / account control
 - [x] signup works
 - [x] login works
@@ -54,6 +61,16 @@
 - [x] `build_long_trip_hotspots()` yields clusters in all five boroughs, each with 3+ members
 - [x] every POI in `NYC_LONG_TRIP_POIS` has a `POI_ADDRESSES` entry and a category supported by all category maps
 - [x] `POST /admin/long_trip_hotspots/rebuild` then `GET /long_trip_hotspots` returns the rebuilt pins
+- [x] `GET /long_trip_hotspots` now serves `dim_schedule` (peak/off/weekday_only/prime), `best_hours`, `rationale`, and `category_counts` per hotspot
+- [x] every category's `prime` window is a subset of its `peak` window (a pulsing flag is always at full brightness)
+- [x] `hotspot_runtime_meta()` and the build path produce identical `rationale` wording (shared `summarize_categories()`)
+- [x] schedule fields are recomputed on read — no new DB column, no migration, no admin rebuild required
+- [x] hotel/corporate windows are pickup-only (checkout / end-of-day); no arrival windows; `prime ⊆ peak` still holds
+- [x] `holiday_calendar.federal_holidays(2026)` matches the observed federal dates (incl. Jul 4 → observed Jul 3)
+- [x] `GET /long_trip_hotspots` returns a `calendar` (holidays + per-category `seasonal_closures`); closure sim darkens offices/school on holidays/summer while hotels keep running
+- [x] `test_holiday_calendar.py` passes: federal holidays correct for every year 2026–2045 (rules + observed shifts), Easter/Computus, school-range invariants
+- [x] school recesses computed per year (Labor-Day summer, Presidents' midwinter, Good-Friday/Computus spring + published overrides), served as ISO `[start,end]` ranges
+- [x] endpoint can't 500 on a malformed `members_json` row (coerced to list; non-dict members skipped)
 
 ## Nightlife districts
 - [x] `tests/test_nightlife_hotspots.py` passes (9/9): builds 8 mixed districts; every district pulses at the dinner let-out; club districts run latest on weekends; qualification rejects pure-dining / pure-nightlife / undersized clusters; members within `CLUSTER_RADIUS_MI`; coords in NYC; runtime-meta + write path.

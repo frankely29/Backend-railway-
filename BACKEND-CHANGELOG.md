@@ -9,6 +9,55 @@
 - `main.py`: new `nightlife_districts` table (SQLite + Postgres, same shape as `long_trip_hotspots`), `GET /nightlife_districts` (user) returning districts + per-district `dim_schedule`, `POST /admin/nightlife_districts/rebuild` (admin), and a startup **seed-if-empty** so the map has data on first boot with no manual admin call.
 - **Keyless / no account** — the data is curated and baked in (no Places API key, sidestepping the Ticketmaster-style account blocker). `tests/test_nightlife_hotspots.py` (9 offline tests): clustering, the mixed-qualification rule (rejects pure-dining / pure-nightlife / undersized), the let-out schedules, `district_runtime_meta`, and the write path.
 
+## Current pass: Keyless sports sources for city events (no key, no account)
+
+### MLB / NHL / NBA home games feed the map without any API key
+- The city-events map feature was Ticketmaster-only, but the operator can't create a Ticketmaster account. Added three **keyless, no-account** official league schedule sources so the map shows events out of the box: **MLB** (`statsapi.mlb.com`), **NHL** (`api-web.nhle.com`), **NBA** (`cdn.nba.com` static schedule). Only **home games** of the NYC-metro teams are kept (Yankees/Mets, Rangers/Islanders/Devils, Knicks/Nets), so every kept game lands at a venue already in the coordinate-fallback table.
+- `city_events.py`: new pure normalizers `normalize_mlb_game()` / `normalize_nhl_game()` / `normalize_nba_game()` (mirror `normalize_event` — `.get()`-guarded, never raise, return `None` to skip away games, postponed/cancelled/suspended games, unknown venues, or missing fields; every kept game maps to `category="sports"`), new fetchers `fetch_mlb_today()` / `fetch_nhl_today()` / `fetch_nba_today()` (lazy `httpx`, browser UA, today-NYC window), a `_parse_iso_utc()` helper, and a `_BROWSER_UA` (the league CDNs 403 non-browser agents).
+- `refresh_city_events_once()` now aggregates **all** sources (Ticketmaster + MLB + NHL + NBA), each isolated in its own try/except so one failing feed can't sink the batch, de-dups on `(source, source_id)`, and returns per-source counts (`src_mlb`, `src_nhl`, `src_nba`, `src_ticketmaster`).
+- `start_city_events_refresh()` **always** starts the daemon now (it previously skipped without a Ticketmaster key); `POST /admin/city_events/refresh` dropped its `TICKETMASTER_API_KEY` 503 guard. Ticketmaster stays in the code but **dormant** (returns `[]` without a key) — if the operator ever gets a key, concerts/conventions light up with no rebuild.
+- **No frontend change:** the merged `city-events.feature.js` already renders `category="sports"` (orange sprite at the venue + gold let-out pulse) and never reads the `source` field.
+- **Setup:** none — the sports feeds run with **no env vars and no account**. `TICKETMASTER_API_KEY` stays optional (for concerts/conventions). Safe to deploy with no keys at all.
+
+## Current pass: City events feed (Ticketmaster → map)
+
+### New `city_events.py` + `GET /city_events`
+- Added a **city-events** system: a background daemon thread fetches today's major NYC events (concerts/music, sports, conventions/expos) from the **Ticketmaster Discovery API** and caches them in a new `city_events` table; `GET /city_events` (auth) serves them so the frontend can pin them and highlight the **let-out** surge (best pickup time).
+- `city_events.py` (new, self-contained router): `fetch_nyc_events_today()` (httpx, NYC DMA, today window, Music/Sports/Miscellaneous segments), pure `normalize_event()` (→ name/venue/lat/lng/start/category; skips coordinate-less or non-requested events; small NYC-venue coordinate fallback), `ensure_city_events_schema()` (dual SQLite/Postgres, `UNIQUE(source, source_id)`), upsert (`ON CONFLICT … DO UPDATE`) + prune-past, `select_events_for_today()` (keeps events still letting out from earlier today), and a daemon refresh worker (`CITY_EVENTS_REFRESH_SECONDS`, default 1800).
+- `POST /admin/city_events/refresh` (admin) forces an immediate refresh for ops/testing.
+- `main.py`: import + `include_router`, `ensure_city_events_schema()` + `start_city_events_refresh()` wired into `startup()` (both guarded/non-fatal). `httpx` already in `requirements.txt` (imported lazily inside the fetch).
+- **Setup:** set `TICKETMASTER_API_KEY` (free key) on Railway. **Dormant without it** — the worker skips and the endpoint returns an empty list, so it's safe to deploy before the key is set.
+
+## Current pass: Pickup-window correction + holiday/school calendar (backend)
+
+### Time windows corrected to pickups (people leaving), not arrivals
+- A dollar-flag pickup is someone *leaving* a building for a long trip, so the arrival-side windows were wrong:
+  - **Hotels** — dropped the 3–7pm check-in window (arrivals are drop-offs, not pickups). Now `peak [[6,12]]`, `prime [[7,11]]`: the morning checkout → airport wave. `best_hours`: "Checkout 7am–noon — airport runs (check-in isn't a pickup)".
+  - **Corporate** — dropped the 8–10am window (morning is people arriving at the office). Now `peak [[16,20]]`, `prime [[16,19]]`: end-of-day departures. `best_hours`: "Weekday end-of-day 4–8pm (esp. Thu/Fri); closed holidays".
+  - Transit (station arrivals → onward rides), hospital (discharges), and school (parent pickup) were already departure-based and are unchanged. `prime ⊆ peak` re-verified for all 12 categories.
+
+### New `holiday_calendar.py` — federal holidays + school recesses, served per request
+- Added `holiday_calendar.py`: computes US federal holidays for any year (with the observed Sat→Fri / Sun→Mon shift) from date arithmetic — no external service, deterministic, offline. Also defines recurring NYC-DOE-style school recess ranges (summer, winter, midwinter, spring).
+- `GET /long_trip_hotspots` now also returns a `calendar`: `{tz, holidays: [...], seasonal_closures: {private_school: [["YYYY-MM-DD","YYYY-MM-DD"], ...]}}`. Computed per request (recompute-on-read, nothing persisted, no migration).
+- The frontend matches its NYC date against this to **close** (dim off, never pulse) the weekday-only flags (offices, schools) on weekends + holidays, and the school flag across summer/recess. Hotels, transit, and hospitals keep running — holiday travel lifts hotel checkouts & transit, and hospitals are 24/7.
+- Verified: 2026 federal dates match the official list (incl. Jul 4 Sat → observed Jul 3); a closure simulation darkens the corporate flag on Christmas/holidays and the school flag all summer, while hotels still pulse.
+
+### Hardening + 20-year accuracy (review follow-up)
+- School recesses are now computed **per year** (not fixed dates) and served as explicit `[start, end]` ISO ranges: summer anchored to Labor Day, winter, midwinter on the Presidents'-Day week, and spring on the Good-Friday week (Gregorian Computus). Published NYC DOE spring dates are pinned as exact overrides (2025, 2026), since NYC ties spring to Passover/Easter and the computed proxy can't always catch the extended breaks.
+- Added `test_holiday_calendar.py`: asserts the federal holidays are correct for **every year 2026–2045** (count, weekday rules, observed shifts), plus Easter/Computus dates and school-range invariants — locking the "accurate for the next 20 years" guarantee into CI.
+- Widened the served holiday window to year+2 so a payload stays valid across the New-Year boundary (an observed New-Year's-Day that lands on Dec 31 of the following year).
+- Hardened the endpoint against a malformed stored `members_json` row (non-list, or non-dict elements) so it can't 500: coerce to a list, and skip non-dict members in `hotspot_runtime_meta`.
+
+## Current pass: Dollar-flag prime-time pulse signal (backend)
+
+### Per-category `prime` window + read-path schedule/rationale plumbing
+- Added a researched `prime` hour-window per category to `CATEGORY_DIM_SCHEDULE` in `long_trip_hotspot_builder.py` — the tightest "best time to be near it" window(s), a strict subset of `peak`. Drives the new pulsing ring at each dollar flag's pole base. Grounded in building busy-hour patterns: airport arrival banks (5–9am / 4–9pm), hospital discharges peaking ~4pm, hotel morning airport runs (7–11am), transit + corporate evening rush (5:30–6:30pm), school pickup (2:30–4pm). Heuristics, not measured trip data.
+- Of the 25 live clusters, only 5 dominant categories actually occur (`hotel_luxury` ×12, `transit_hub` ×8, `hospital` ×3, `private_school` ×1, `corporate` ×1), so those are the windows that drive the pulse in practice.
+- Nudged two `peak` ranges to keep `prime ⊆ peak`: hospital `[[10,16]] → [[10,17]]` (afternoon discharge peak at 4pm) and corporate `[[8,10],[17,19]] → [[8,10],[16,19]]` (evening rush starts 4pm). Verified `prime ⊆ peak` for all 12 categories.
+- `_dim_schedule_for` now emits `prime` alongside `peak`/`off`/`weekday_only`.
+- **Fixed a latent gap**: `GET /long_trip_hotspots` previously served only `id/lat/lng/label/dominant_category/member_count/total_weight/members`, so the frontend never received `dim_schedule`, `best_hours`, or `rationale` — the time-of-day dim was dormant and the popup's "Best hours"/"Why this is a hotspot" rows rendered blank. Added `hotspot_runtime_meta()` (shared with the build path via the new `summarize_categories()`), and the endpoint now recomputes and serves `dim_schedule` (incl. `prime`), `best_hours`, `rationale`, and `category_counts` per row.
+- Recompute-on-read by design: these are pure functions of the static category tables, so there is **no DB column or migration**, the signal works for already-stored rows, and editing a schedule takes effect on the next request without an admin rebuild. No change to the table schema, the rebuild path, or the POI list.
+
 ## Current pass: Zone-size-aware pickup hotspot footprint (backend)
 
 ### Pickup zone hotspot polygons scale down for small zones
