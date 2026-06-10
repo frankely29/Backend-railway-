@@ -1,5 +1,13 @@
 # BACKEND CHANGELOG
 
+## Current pass: Restore pickup trips from a backup — owner-only (`POST /admin/pickups/import`)
+
+### New `POST /admin/pickups/import` — owner-only restore from an export backup
+- Lets the **account owner** re-import the trips produced by `/admin/pickups/export_all`, so a backup can actually be loaded back into Railway Postgres after data loss. Multipart upload (`file`); the server accepts the backup **`.zip`** (unzipped server-side with `zipfile`) **or** a raw `.json`. Gated by `Depends(require_admin)` **plus** `is_account_owner(viewer)` (403 otherwise).
+- **Non-destructive:** rows are inserted preserving the original `id` with `ON CONFLICT(id) DO NOTHING`, so trips that still exist are left untouched and only missing ones are re-added (re-running is a safe no-op). Trips whose `user_id` no longer exists are **skipped and reported** (the FK to `users` can't be satisfied) rather than aborting the restore.
+- After inserting, advances the Postgres `id` sequence past the restored rows (`setval(pg_get_serial_sequence('pickup_logs','id'), MAX(id))`) so brand-new pickups don't collide with restored ids. All inserts run in one transaction via `_db_run_in_transaction`.
+- Returns a summary: `received`, `inserted`, `skipped_existing`, `skipped_missing_user`, `missing_user_ids`, `invalid`. Validated end-to-end against a real 952-trip export (fresh restore inserts all 952 incl. 12 voided; re-run inserts 0; a missing user's trips are skipped and reported).
+
 ## Current pass: Export ALL pickup trips — owner-only (`GET /admin/pickups/export_all`)
 
 ### New `GET /admin/pickups/export_all` — owner-only backup of every user's pickup trips
