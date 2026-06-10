@@ -128,19 +128,19 @@ _CATEGORY_LABEL = {
 # nightlife district's window is computed from its whole member set so the
 # pulse spans dinner let-out -> the district's latest close. `prime` is the
 # weeknight window; `prime_weekend` runs later (Fri/Sat). Hour ranges wrap
-# past midnight (e.g. [21, 2] = 9pm-2am), which the frontend handles.
+# past midnight (e.g. [20, 2] = 8pm-2am), which the frontend handles.
 # ---------------------------------------------------------------------------
 def _dim_schedule_for_members(categories: List[str]) -> Dict[str, Any]:
     cats = set(categories)
     if "nightclub" in cats:
         peak, off = [[18, 4]], [[5, 17]]
-        prime, prime_weekend = [[21, 2]], [[21, 4]]
+        prime, prime_weekend = [[20, 2]], [[20, 4]]
     elif cats & {"lounge", "rooftop_bar"}:
         peak, off = [[17, 2]], [[3, 16]]
-        prime, prime_weekend = [[21, 2]], [[21, 3]]
+        prime, prime_weekend = [[20, 2]], [[20, 3]]
     elif "cocktail_bar" in cats:
         peak, off = [[17, 1]], [[2, 16]]
-        prime, prime_weekend = [[21, 1]], [[21, 2]]
+        prime, prime_weekend = [[20, 1]], [[20, 2]]
     else:  # wine bar / restaurant only — dinner-forward
         peak, off = [[17, 0]], [[1, 16]]
         prime, prime_weekend = [[20, 23]], [[20, 0]]
@@ -156,11 +156,11 @@ def _dim_schedule_for_members(categories: List[str]) -> Dict[str, Any]:
 def _best_hours_for_members(categories: List[str]) -> str:
     cats = set(categories)
     if "nightclub" in cats:
-        return "Dinner let-out ~9pm; last call 1-3am (latest Fri/Sat)"
+        return "Dinner let-out ~8pm; last call 1-3am (latest Fri/Sat)"
     if cats & {"lounge", "rooftop_bar"}:
-        return "Dinner let-out ~9pm through ~2am (later Fri/Sat)"
+        return "Dinner let-out ~8pm through ~2am (later Fri/Sat)"
     if "cocktail_bar" in cats:
-        return "Dinner let-out ~9pm to ~1am (later Fri/Sat)"
+        return "Dinner let-out ~8pm to ~1am (later Fri/Sat)"
     return "Dinner let-out ~8-11pm (later Fri/Sat)"
 
 
