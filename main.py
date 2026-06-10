@@ -17,6 +17,9 @@ import threading
 import time
 import traceback
 import uuid
+import csv
+import io
+import zipfile
 from collections import defaultdict, deque
 from decimal import Decimal
 from datetime import datetime, date, timezone
@@ -518,7 +521,7 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["Content-Type", "Content-Length", "Accept-Ranges", "Content-Range"],
+    expose_headers=["Content-Type", "Content-Length", "Accept-Ranges", "Content-Range", "Content-Disposition"],
 )
 app.add_middleware(SelectiveGZipMiddleware)
 
@@ -13700,6 +13703,91 @@ def get_recent_pickups(
         max_lat=max_lat,
         max_lng=max_lng,
         viewer=viewer,
+    )
+
+
+@app.get("/me/pickups/export")
+def export_my_pickup_trips(viewer: sqlite3.Row = Depends(require_user)):
+    """Download all of the signed-in user's (non-voided) pickup trips as a ZIP
+    containing both a CSV and a JSON file, so they can keep an external backup.
+    Users can only export their own trips."""
+    user_id = int(viewer["id"])
+    rows = _db_query_all(
+        f"""
+        SELECT id, created_at, lat, lng, zone_id, zone_name, borough, frame_time
+        FROM pickup_logs
+        WHERE user_id = ? AND {pickup_log_not_voided_sql('pickup_logs')}
+        ORDER BY created_at ASC
+        """,
+        (user_id,),
+    )
+
+    nyc = ZoneInfo("America/New_York")
+
+    def _nyc_iso(ts: Any) -> str:
+        try:
+            ts_int = int(ts)
+            return datetime.fromtimestamp(ts_int, tz=nyc).isoformat() if ts_int else ""
+        except Exception:
+            return ""
+
+    trips: List[Dict[str, Any]] = []
+    for r in rows:
+        d = dict(r)
+        ts = int(d.get("created_at") or 0)
+        trips.append({
+            "id": d.get("id"),
+            "created_at_unix": ts,
+            "created_at_nyc": _nyc_iso(ts),
+            "lat": d.get("lat"),
+            "lng": d.get("lng"),
+            "zone_id": d.get("zone_id"),
+            "zone_name": d.get("zone_name") or "",
+            "borough": d.get("borough") or "",
+            "frame_time": d.get("frame_time") or "",
+        })
+
+    exported_at = int(time.time())
+    export_date = datetime.fromtimestamp(exported_at, tz=nyc).strftime("%Y-%m-%d")
+
+    json_bytes = json.dumps(
+        {
+            "export_version": 1,
+            "exported_at_unix": exported_at,
+            "exported_at_nyc": _nyc_iso(exported_at),
+            "user_id": user_id,
+            "trip_count": len(trips),
+            "trips": trips,
+        },
+        indent=2,
+        default=str,
+    ).encode("utf-8")
+
+    csv_buf = io.StringIO()
+    writer = csv.writer(csv_buf)
+    writer.writerow(
+        ["id", "created_at_unix", "created_at_nyc", "lat", "lng", "zone_id", "zone_name", "borough", "frame_time"]
+    )
+    for t in trips:
+        writer.writerow([
+            t["id"], t["created_at_unix"], t["created_at_nyc"], t["lat"], t["lng"],
+            t["zone_id"], t["zone_name"], t["borough"], t["frame_time"],
+        ])
+    csv_bytes = csv_buf.getvalue().encode("utf-8")
+
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("pickup-trips.csv", csv_bytes)
+        zf.writestr("pickup-trips.json", json_bytes)
+
+    filename = f"pickup-trips-{export_date}.zip"
+    return Response(
+        content=zip_buf.getvalue(),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store",
+        },
     )
 
 

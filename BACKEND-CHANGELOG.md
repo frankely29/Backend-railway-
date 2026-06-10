@@ -1,5 +1,12 @@
 # BACKEND CHANGELOG
 
+## Current pass: Export my pickup trips (`GET /me/pickups/export`)
+
+### New `GET /me/pickups/export` — downloadable backup of a user's pickup trips
+- Lets a signed-in driver download **all of their own (non-voided) pickup trips** as a single ZIP containing both a `pickup-trips.csv` (Excel/Sheets-friendly) and a `pickup-trips.json` (full-fidelity), so they can keep an external backup that survives a database reset. Auth is `Depends(require_user)` and the query is scoped to `WHERE user_id = ? AND <not voided>`, so a user can only ever export their own trips.
+- Each trip row carries `id`, `created_at_unix`, `created_at_nyc` (ISO in America/New_York), `lat`, `lng`, `zone_id`, `zone_name`, `borough`, `frame_time`; the JSON also wraps an `export_version`, `exported_at`, `user_id`, and `trip_count`. Built in-memory with `csv` + `zipfile` and returned as `application/zip` with a dated `Content-Disposition` filename (`pickup-trips-YYYY-MM-DD.zip`). Uses the existing `(user_id, created_at)` index, so it's a single cheap query.
+- Added `Content-Disposition` to the CORS `expose_headers` so the cross-origin frontend can read the server-provided filename.
+
 ## Current pass: Nightlife & dining district pickup pulse (backend)
 
 ### New `nightlife_hotspot_builder.py` + `GET /nightlife_districts`
