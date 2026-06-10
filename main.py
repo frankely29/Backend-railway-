@@ -13720,7 +13720,8 @@ def export_all_pickup_trips(viewer: sqlite3.Row = Depends(require_admin)):
         """
         SELECT pl.id, pl.user_id, u.email AS user_email, u.display_name AS user_display_name,
                pl.created_at, pl.lat, pl.lng, pl.zone_id, pl.zone_name, pl.borough, pl.frame_time,
-               pl.is_voided
+               pl.is_voided, pl.voided_at, pl.voided_by_admin_user_id, pl.void_reason,
+               pl.counted_for_pickup_stats, pl.guard_reason
         FROM pickup_logs pl
         LEFT JOIN users u ON u.id = pl.user_id
         ORDER BY pl.created_at ASC
@@ -13742,6 +13743,7 @@ def export_all_pickup_trips(viewer: sqlite3.Row = Depends(require_admin)):
         d = dict(r)
         ts = int(d.get("created_at") or 0)
         voided_raw = d.get("is_voided")
+        counted_raw = d.get("counted_for_pickup_stats")
         trips.append({
             "id": d.get("id"),
             "user_id": d.get("user_id"),
@@ -13756,6 +13758,40 @@ def export_all_pickup_trips(viewer: sqlite3.Row = Depends(require_admin)):
             "borough": d.get("borough") or "",
             "frame_time": d.get("frame_time") or "",
             "is_voided": bool(_flag_to_int(voided_raw)) if voided_raw is not None else False,
+            "counted_for_pickup_stats": bool(_flag_to_int(counted_raw)) if counted_raw is not None else True,
+            "voided_at": d.get("voided_at"),
+            "voided_by_admin_user_id": d.get("voided_by_admin_user_id"),
+            "void_reason": d.get("void_reason"),
+            "guard_reason": d.get("guard_reason"),
+        })
+
+    # Leaderboard daily aggregates (miles/hours/pickups per driver per day) live
+    # in a separate table; include them so a full restore brings stats back too.
+    stat_rows = _db_query_all(
+        """
+        SELECT s.user_id, u.email AS user_email, u.display_name AS user_display_name,
+               s.nyc_date, s.miles_worked, s.hours_worked, s.trips_recorded,
+               s.pickups_recorded, s.heartbeat_count, s.updated_at
+        FROM driver_daily_stats s
+        LEFT JOIN users u ON u.id = s.user_id
+        ORDER BY s.user_id ASC, s.nyc_date ASC
+        """,
+        (),
+    )
+    daily_stats: List[Dict[str, Any]] = []
+    for r in stat_rows:
+        d = dict(r)
+        daily_stats.append({
+            "user_id": d.get("user_id"),
+            "user_email": d.get("user_email") or "",
+            "user_display_name": d.get("user_display_name") or "",
+            "nyc_date": str(d.get("nyc_date")) if d.get("nyc_date") is not None else "",
+            "miles_worked": d.get("miles_worked"),
+            "hours_worked": d.get("hours_worked"),
+            "trips_recorded": d.get("trips_recorded"),
+            "pickups_recorded": d.get("pickups_recorded"),
+            "heartbeat_count": d.get("heartbeat_count"),
+            "updated_at": d.get("updated_at"),
         })
 
     exported_at = int(time.time())
@@ -13763,13 +13799,15 @@ def export_all_pickup_trips(viewer: sqlite3.Row = Depends(require_admin)):
 
     json_bytes = json.dumps(
         {
-            "export_version": 1,
+            "export_version": 3,
             "scope": "all_users",
             "exported_at_unix": exported_at,
             "exported_at_nyc": _nyc_iso(exported_at),
             "exported_by_user_id": int(viewer["id"]),
             "trip_count": len(trips),
             "trips": trips,
+            "daily_stats_count": len(daily_stats),
+            "daily_stats": daily_stats,
         },
         indent=2,
         default=str,
@@ -13778,6 +13816,7 @@ def export_all_pickup_trips(viewer: sqlite3.Row = Depends(require_admin)):
     fieldnames = [
         "id", "user_id", "user_email", "user_display_name", "created_at_unix", "created_at_nyc",
         "lat", "lng", "zone_id", "zone_name", "borough", "frame_time", "is_voided",
+        "counted_for_pickup_stats", "voided_at", "voided_by_admin_user_id", "void_reason", "guard_reason",
     ]
     csv_buf = io.StringIO()
     writer = csv.writer(csv_buf)
@@ -13786,10 +13825,22 @@ def export_all_pickup_trips(viewer: sqlite3.Row = Depends(require_admin)):
         writer.writerow([t.get(k, "") for k in fieldnames])
     csv_bytes = csv_buf.getvalue().encode("utf-8")
 
+    stats_fieldnames = [
+        "user_id", "user_email", "user_display_name", "nyc_date", "miles_worked",
+        "hours_worked", "trips_recorded", "pickups_recorded", "heartbeat_count", "updated_at",
+    ]
+    stats_csv_buf = io.StringIO()
+    stats_writer = csv.writer(stats_csv_buf)
+    stats_writer.writerow(stats_fieldnames)
+    for s in daily_stats:
+        stats_writer.writerow([s.get(k, "") for k in stats_fieldnames])
+    stats_csv_bytes = stats_csv_buf.getvalue().encode("utf-8")
+
     zip_buf = io.BytesIO()
     with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("all-pickup-trips.csv", csv_bytes)
         zf.writestr("all-pickup-trips.json", json_bytes)
+        zf.writestr("driver-daily-stats.csv", stats_csv_bytes)
 
     filename = f"all-pickup-trips-{export_date}.zip"
     return Response(
@@ -13855,6 +13906,15 @@ def import_all_pickup_trips(file: UploadFile = File(...), viewer: sqlite3.Row = 
     invalid = 0
     skipped_missing_user = 0
     missing_user_ids = set()
+
+    def _opt_int(v):
+        if v is None or v == "":
+            return None
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+
     for t in raw_trips:
         if not isinstance(t, dict):
             invalid += 1
@@ -13879,15 +13939,60 @@ def import_all_pickup_trips(file: UploadFile = File(...), viewer: sqlite3.Row = 
             zone_id = None
         voided_raw = t.get("is_voided")
         is_voided = bool(_flag_to_int(voided_raw)) if voided_raw is not None else False
+        # counted_for_pickup_stats wasn't captured by v1 backups; for those a
+        # voided trip was always uncounted (its stat was reversed on void), so
+        # derive it from is_voided. v2 backups carry the real value.
+        counted_raw = t.get("counted_for_pickup_stats")
+        counted = (not is_voided) if counted_raw is None else bool(_flag_to_int(counted_raw))
         insertable.append((
             tid, uid, lat, lng, zone_id,
             (t.get("zone_name") or None), (t.get("borough") or None),
             (t.get("frame_time") or None), created, is_voided,
+            _opt_int(t.get("voided_at")), _opt_int(t.get("voided_by_admin_user_id")),
+            t.get("void_reason"), counted, t.get("guard_reason"),
         ))
 
+    # Leaderboard daily aggregates (export v3+). Older backups omit these.
+    raw_stats = payload.get("daily_stats") if isinstance(payload, dict) else None
+    stats_insertable = []
+    stats_invalid = 0
+    stats_skipped_missing_user = 0
+    if isinstance(raw_stats, list):
+        for s in raw_stats:
+            if not isinstance(s, dict):
+                stats_invalid += 1
+                continue
+            try:
+                s_uid = int(s["user_id"])
+                s_date = str(s["nyc_date"]).strip()
+                if not s_date:
+                    raise ValueError("missing nyc_date")
+                s_miles = float(s.get("miles_worked") or 0)
+                s_hours = float(s.get("hours_worked") or 0)
+                s_trips = int(s.get("trips_recorded") or 0)
+                s_pickups = int(s.get("pickups_recorded") or 0)
+                s_heartbeats = int(s.get("heartbeat_count") or 0)
+                s_updated = int(s.get("updated_at") or 0)
+            except (KeyError, TypeError, ValueError):
+                stats_invalid += 1
+                continue
+            if s_uid not in existing_user_ids:
+                stats_skipped_missing_user += 1
+                missing_user_ids.add(s_uid)
+                continue
+            stats_insertable.append(
+                (s_uid, s_date, s_miles, s_hours, s_trips, s_pickups, s_heartbeats, s_updated)
+            )
+
     insert_sql = (
-        "INSERT INTO pickup_logs(id, user_id, lat, lng, zone_id, zone_name, borough, frame_time, created_at, is_voided) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING"
+        "INSERT INTO pickup_logs(id, user_id, lat, lng, zone_id, zone_name, borough, frame_time, created_at, "
+        "is_voided, voided_at, voided_by_admin_user_id, void_reason, counted_for_pickup_stats, guard_reason) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING"
+    )
+    stats_sql = (
+        "INSERT INTO driver_daily_stats(user_id, nyc_date, miles_worked, hours_worked, "
+        "trips_recorded, pickups_recorded, heartbeat_count, updated_at) "
+        "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(user_id, nyc_date) DO NOTHING"
     )
 
     def _run(conn, cur):
@@ -13899,19 +14004,27 @@ def import_all_pickup_trips(file: UploadFile = File(...), viewer: sqlite3.Row = 
                 inserted_n += 1
             else:
                 skipped_existing_n += 1
-        if DB_BACKEND == "postgres":
+        if DB_BACKEND == "postgres" and insertable:
             # Inserting explicit ids does not advance the BIGSERIAL sequence, so
             # bump it past the restored rows or the next new pickup would collide.
             cur.execute(
                 "SELECT setval(pg_get_serial_sequence('pickup_logs','id'), "
                 "GREATEST((SELECT COALESCE(MAX(id), 0) FROM pickup_logs), 1))"
             )
-        return inserted_n, skipped_existing_n
+        stats_inserted_n = 0
+        stats_skipped_existing_n = 0
+        for params in stats_insertable:
+            cur.execute(_sql(stats_sql), params)
+            if cur.rowcount and cur.rowcount > 0:
+                stats_inserted_n += 1
+            else:
+                stats_skipped_existing_n += 1
+        return inserted_n, skipped_existing_n, stats_inserted_n, stats_skipped_existing_n
 
-    if insertable:
-        inserted, skipped_existing = _db_run_in_transaction(_run)
+    if insertable or stats_insertable:
+        inserted, skipped_existing, stats_inserted, stats_skipped_existing = _db_run_in_transaction(_run)
     else:
-        inserted, skipped_existing = 0, 0
+        inserted, skipped_existing, stats_inserted, stats_skipped_existing = 0, 0, 0, 0
 
     return {
         "ok": True,
@@ -13921,6 +14034,10 @@ def import_all_pickup_trips(file: UploadFile = File(...), viewer: sqlite3.Row = 
         "skipped_missing_user": skipped_missing_user,
         "missing_user_ids": sorted(missing_user_ids),
         "invalid": invalid,
+        "daily_stats_received": len(raw_stats) if isinstance(raw_stats, list) else 0,
+        "daily_stats_inserted": stats_inserted,
+        "daily_stats_skipped_existing": stats_skipped_existing,
+        "daily_stats_skipped_missing_user": stats_skipped_missing_user,
     }
 
 
