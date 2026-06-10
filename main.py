@@ -8676,6 +8676,24 @@ def auth_login(payload: LoginPayload):
     # Successful login: clear the rolling failure window for this email.
     _login_clear_failures(email)
 
+    # Self-heal admin: the configured account owner (ADMIN_EMAIL) is always an
+    # admin. This restores admin access on login if the flag was ever cleared —
+    # no server restart or ADMIN_PASSWORD needed. Same trust model as signup and
+    # the startup seed (owner identity == email matches ADMIN_EMAIL).
+    if ADMIN_EMAIL and email == ADMIN_EMAIL and _flag_to_int(row["is_admin"]) != 1:
+        try:
+            admin_is_bool = _is_bool_column("users", "is_admin")
+            disabled_is_bool = _is_bool_column("users", "is_disabled")
+            _db_exec(
+                "UPDATE users SET is_admin=?, is_disabled=? WHERE id=?",
+                (True if admin_is_bool else 1, False if disabled_is_bool else 0, int(row["id"])),
+            )
+            refreshed = _db_query_one("SELECT * FROM users WHERE id=? LIMIT 1", (int(row["id"]),))
+            if refreshed:
+                row = refreshed
+        except Exception:
+            pass
+
     if matched_legacy:
         _, upgraded_hash = _hash_password(payload.password, salt_b64=salt)
         _db_exec("UPDATE users SET pass_hash=? WHERE id=?", (upgraded_hash, int(row["id"])))
@@ -14164,13 +14182,33 @@ def export_my_stats(viewer: sqlite3.Row = Depends(require_user)):
 
 
 @app.get("/admin/stats/export")
-def export_all_stats(user_id: Optional[int] = None, viewer: sqlite3.Row = Depends(require_admin)):
+def export_all_stats(
+    user_id: Optional[int] = None,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    viewer: sqlite3.Row = Depends(require_admin),
+):
     """Owner-only: download every driver's work stats (miles, hours, pickups,
     trips, heartbeats) summed by day / week / month / year as a ZIP of CSVs +
-    JSON. Optional `?user_id=` narrows to one driver. For review / archival /
-    building future systems."""
+    JSON. Optional `?user_id=` narrows to one driver; optional `?start=`/`?end=`
+    (YYYY-MM-DD, inclusive) narrow to a date range — set both to the same day to
+    export a single specific date. For review / archival / future systems."""
     if not is_account_owner(viewer):
         raise HTTPException(status_code=403, detail="Only the account owner can export all stats.")
+
+    def _norm_date(label, value):
+        v = (value or "").strip()[:10]
+        if not v:
+            return None
+        try:
+            datetime.strptime(v, "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(status_code=422, detail=f"{label} must be a date in YYYY-MM-DD format.")
+        return v
+    start = _norm_date("start", start)
+    end = _norm_date("end", end)
+    if start and end and start > end:
+        start, end = end, start
 
     numeric = ["miles_worked", "hours_worked", "trips_recorded", "pickups_recorded", "heartbeat_count"]
     base_sql = (
@@ -14183,6 +14221,20 @@ def export_all_stats(user_id: Optional[int] = None, viewer: sqlite3.Row = Depend
     else:
         rows = _db_query_all(base_sql + "ORDER BY s.user_id ASC, s.nyc_date ASC", ())
     rows = [dict(r) for r in rows]
+
+    # Date filtering in Python keeps the SQL portable across Postgres/SQLite
+    # (nyc_date is ISO YYYY-MM-DD, so a string compare is chronological).
+    if start or end:
+        def _in_range(r):
+            d = str(r.get("nyc_date") or "")[:10]
+            if not d:
+                return False
+            if start and d < start:
+                return False
+            if end and d > end:
+                return False
+            return True
+        rows = [r for r in rows if _in_range(r)]
 
     by_user: Dict[int, Dict[str, Any]] = {}
     for r in rows:
@@ -14219,6 +14271,9 @@ def export_all_stats(user_id: Optional[int] = None, viewer: sqlite3.Row = Depend
         "kind": "all_driver_stats",
         "version": 1,
         "scope": "single_user" if user_id is not None else "all_users",
+        "filter_user_id": user_id,
+        "filter_start": start,
+        "filter_end": end,
         "generated_at_unix": generated_at,
         "generated_by_user_id": int(viewer["id"]),
         "yearly": combined["yearly"],
@@ -14249,8 +14304,13 @@ def export_all_stats(user_id: Optional[int] = None, viewer: sqlite3.Row = Depend
         zf.writestr("daily.csv", _admin_csv(combined["daily"]))
         zf.writestr("all-driver-stats.json", json_bytes)
 
-    suffix = f"-user{user_id}" if user_id is not None else ""
-    filename = f"driver-stats{suffix}-{gen_date}.zip"
+    parts = ["driver-stats"]
+    if user_id is not None:
+        parts.append(f"user{user_id}")
+    if start or end:
+        parts.append(f"{start or 'start'}_to_{end or 'end'}")
+    parts.append(gen_date)
+    filename = "-".join(parts) + ".zip"
     return Response(
         content=zip_buf.getvalue(),
         media_type="application/zip",

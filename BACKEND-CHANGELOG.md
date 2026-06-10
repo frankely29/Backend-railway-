@@ -1,5 +1,13 @@
 # BACKEND CHANGELOG
 
+## Current pass: Owner admin self-heal on login + specific-user/specific-date stats export
+
+### Admin lockout fix — the account owner is auto-restored to admin on login
+- `POST /auth/login` now self-heals admin rights: if the signing-in email matches the configured `ADMIN_EMAIL`, the account is ensured `is_admin=1` (and `is_disabled=0`) on **every login** — no server restart and no `ADMIN_PASSWORD` needed (the startup seed `_ensure_admin_seed` required **both** env vars, so an owner whose flag got cleared could be locked out until a correctly-configured restart). Same trust model as signup and the startup seed (owner identity = email matches `ADMIN_EMAIL`). **Requires the `ADMIN_EMAIL` env var to be set to the owner's email** (e.g. on Railway).
+
+### `GET /admin/stats/export` — now filterable by specific user **and/or** specific date(s)
+- Added `?start=` / `?end=` (YYYY-MM-DD, inclusive) alongside the existing `?user_id=`. Set both dates to the same day to export a **single specific date**; leave blank for all time. Dates are validated (422 on bad format) and applied in Python (portable across Postgres/SQLite; `nyc_date` is ISO so string compare = chronological). The active filter is echoed in the JSON payload (`filter_user_id`/`filter_start`/`filter_end`) and the download filename.
+
 ## Current pass: Stats export by day/week/month/year — per-user (own) and owner-wide
 
 ### New `GET /me/stats/export` — a driver's own miles/hours by period (tax-friendly)
