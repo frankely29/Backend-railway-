@@ -9471,35 +9471,73 @@ def nightlife_districts_list(user: sqlite3.Row = Depends(require_user)):
     dim_schedule (prime = weeknight, prime_weekend = Fri/Sat, both wrapping
     past midnight) + best_hours are recomputed here from the stored members,
     so schedule edits take effect on the next GET without a rebuild.
+
+    Self-healing: the curated list is static, so an empty table means the
+    startup seed never ran or failed — not that there are no districts. Rather
+    than return a blank overlay (which leaves the map with nothing to pulse at
+    let-out time), seed on demand and, if that write does not take, serve an
+    in-memory build so the districts always reach the map.
     """
     _ = user
-    from nightlife_hotspot_builder import district_runtime_meta
-    rows = _db_query_all(
+    from nightlife_hotspot_builder import district_runtime_meta, build_nightlife_districts
+
+    select_sql = (
         "SELECT id, lat, lng, label, dominant_category, member_count, "
         "total_weight, members_json, generated_at_unix "
         "FROM nightlife_districts ORDER BY total_weight DESC"
     )
-    out = []
-    for r in rows:
+
+    def _records_from_rows(rows):
+        recs = []
+        for r in rows:
+            try:
+                members = json.loads(r["members_json"] or "[]")
+            except Exception:
+                members = []
+            recs.append({
+                "id": int(r["id"]), "lat": float(r["lat"]), "lng": float(r["lng"]),
+                "label": str(r["label"] or ""),
+                "dominant_category": str(r["dominant_category"] or ""),
+                "member_count": int(r["member_count"] or 0),
+                "total_weight": float(r["total_weight"] or 0.0),
+                "members": members,
+                "generated_at_unix": int(r["generated_at_unix"] or 0),
+            })
+        return recs
+
+    records = _records_from_rows(_db_query_all(select_sql))
+    if not records:
         try:
-            members = json.loads(r["members_json"] or "[]")
-        except Exception:
-            members = []
-        meta = district_runtime_meta(members)
+            from nightlife_hotspot_builder import write_nightlife_districts
+            write_nightlife_districts(_db_exec)
+            records = _records_from_rows(_db_query_all(select_sql))
+        except Exception as exc:
+            print(f"[nightlife] on-demand seed failed; serving in-memory: {exc}")
+        if not records:
+            records = [{
+                "id": int(d["id"]), "lat": float(d["lat"]), "lng": float(d["lng"]),
+                "label": str(d["label"]), "dominant_category": str(d["dominant_category"]),
+                "member_count": int(d["member_count"]), "total_weight": float(d["total_weight"]),
+                "members": d["members"], "generated_at_unix": 0,
+            } for d in build_nightlife_districts()]
+
+    out = []
+    for rec in records:
+        meta = district_runtime_meta(rec["members"])
         out.append({
-            "id": int(r["id"]),
-            "lat": float(r["lat"]),
-            "lng": float(r["lng"]),
-            "label": str(r["label"] or ""),
-            "dominant_category": str(r["dominant_category"] or ""),
-            "member_count": int(r["member_count"] or 0),
-            "total_weight": float(r["total_weight"] or 0.0),
-            "members": members,
+            "id": rec["id"],
+            "lat": rec["lat"],
+            "lng": rec["lng"],
+            "label": rec["label"],
+            "dominant_category": rec["dominant_category"],
+            "member_count": rec["member_count"],
+            "total_weight": rec["total_weight"],
+            "members": rec["members"],
             "best_hours": meta["best_hours"],
             "dim_schedule": meta["dim_schedule"],
             "rationale": meta["rationale"],
             "category_counts": meta["category_counts"],
-            "generated_at_unix": int(r["generated_at_unix"] or 0),
+            "generated_at_unix": rec["generated_at_unix"],
         })
     return {"districts": out}
 
