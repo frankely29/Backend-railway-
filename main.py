@@ -102,6 +102,7 @@ from core import (
     _db_lock,
     _db_query_all,
     _db_query_one,
+    _db_run_in_transaction,
     _enforce_user_not_blocked,
     _hash_password,
     _sql,
@@ -13799,6 +13800,128 @@ def export_all_pickup_trips(viewer: sqlite3.Row = Depends(require_admin)):
             "Cache-Control": "no-store",
         },
     )
+
+
+@app.post("/admin/pickups/import")
+def import_all_pickup_trips(file: UploadFile = File(...), viewer: sqlite3.Row = Depends(require_admin)):
+    """Restore pickup trips from a backup produced by /admin/pickups/export_all.
+
+    Owner-only. Accepts the backup .zip (the server unzips it) or a raw .json.
+    Non-destructive: rows are inserted with ON CONFLICT(id) DO NOTHING, so any
+    trip that still exists is left untouched and only missing trips are re-added.
+    Trips whose user no longer exists are skipped and reported (the FK to users
+    can't be satisfied). After inserting, the Postgres id sequence is advanced
+    past the restored rows so brand-new pickups don't collide with old ids."""
+    if not is_account_owner(viewer):
+        raise HTTPException(status_code=403, detail="Only the account owner can restore trips.")
+
+    try:
+        data = file.file.read()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Could not read the uploaded file.")
+    if not data:
+        raise HTTPException(status_code=400, detail="The uploaded file is empty.")
+
+    # Accept either the backup .zip (unzip and read the JSON inside) or a raw .json.
+    if zipfile.is_zipfile(io.BytesIO(data)):
+        try:
+            with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                json_name = next((n for n in zf.namelist() if n.lower().endswith(".json")), None)
+                if not json_name:
+                    raise HTTPException(status_code=400, detail="Backup zip has no .json file inside.")
+                payload = json.loads(zf.read(json_name).decode("utf-8"))
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(status_code=400, detail="Could not read the backup zip.")
+    else:
+        try:
+            payload = json.loads(data.decode("utf-8"))
+        except Exception:
+            raise HTTPException(status_code=400, detail="Upload must be a backup .zip or .json file.")
+
+    if isinstance(payload, dict):
+        raw_trips = payload.get("trips")
+    elif isinstance(payload, list):
+        raw_trips = payload
+    else:
+        raw_trips = None
+    if not isinstance(raw_trips, list):
+        raise HTTPException(status_code=400, detail="Backup has no trips list.")
+
+    existing_user_ids = {int(r["id"]) for r in _db_query_all("SELECT id FROM users")}
+
+    insertable = []
+    invalid = 0
+    skipped_missing_user = 0
+    missing_user_ids = set()
+    for t in raw_trips:
+        if not isinstance(t, dict):
+            invalid += 1
+            continue
+        try:
+            tid = int(t["id"])
+            uid = int(t["user_id"])
+            lat = float(t["lat"])
+            lng = float(t["lng"])
+            created = int(t.get("created_at_unix", t.get("created_at")))
+        except (KeyError, TypeError, ValueError):
+            invalid += 1
+            continue
+        if uid not in existing_user_ids:
+            skipped_missing_user += 1
+            missing_user_ids.add(uid)
+            continue
+        zone_id_raw = t.get("zone_id")
+        try:
+            zone_id = int(zone_id_raw) if zone_id_raw not in (None, "") else None
+        except (TypeError, ValueError):
+            zone_id = None
+        voided_raw = t.get("is_voided")
+        is_voided = bool(_flag_to_int(voided_raw)) if voided_raw is not None else False
+        insertable.append((
+            tid, uid, lat, lng, zone_id,
+            (t.get("zone_name") or None), (t.get("borough") or None),
+            (t.get("frame_time") or None), created, is_voided,
+        ))
+
+    insert_sql = (
+        "INSERT INTO pickup_logs(id, user_id, lat, lng, zone_id, zone_name, borough, frame_time, created_at, is_voided) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING"
+    )
+
+    def _run(conn, cur):
+        inserted_n = 0
+        skipped_existing_n = 0
+        for params in insertable:
+            cur.execute(_sql(insert_sql), params)
+            if cur.rowcount and cur.rowcount > 0:
+                inserted_n += 1
+            else:
+                skipped_existing_n += 1
+        if DB_BACKEND == "postgres":
+            # Inserting explicit ids does not advance the BIGSERIAL sequence, so
+            # bump it past the restored rows or the next new pickup would collide.
+            cur.execute(
+                "SELECT setval(pg_get_serial_sequence('pickup_logs','id'), "
+                "GREATEST((SELECT COALESCE(MAX(id), 0) FROM pickup_logs), 1))"
+            )
+        return inserted_n, skipped_existing_n
+
+    if insertable:
+        inserted, skipped_existing = _db_run_in_transaction(_run)
+    else:
+        inserted, skipped_existing = 0, 0
+
+    return {
+        "ok": True,
+        "received": len(raw_trips),
+        "inserted": inserted,
+        "skipped_existing": skipped_existing,
+        "skipped_missing_user": skipped_missing_user,
+        "missing_user_ids": sorted(missing_user_ids),
+        "invalid": invalid,
+    }
 
 
 # =========================================================
