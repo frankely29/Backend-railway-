@@ -13720,7 +13720,8 @@ def export_all_pickup_trips(viewer: sqlite3.Row = Depends(require_admin)):
         """
         SELECT pl.id, pl.user_id, u.email AS user_email, u.display_name AS user_display_name,
                pl.created_at, pl.lat, pl.lng, pl.zone_id, pl.zone_name, pl.borough, pl.frame_time,
-               pl.is_voided
+               pl.is_voided, pl.voided_at, pl.voided_by_admin_user_id, pl.void_reason,
+               pl.counted_for_pickup_stats, pl.guard_reason
         FROM pickup_logs pl
         LEFT JOIN users u ON u.id = pl.user_id
         ORDER BY pl.created_at ASC
@@ -13742,6 +13743,7 @@ def export_all_pickup_trips(viewer: sqlite3.Row = Depends(require_admin)):
         d = dict(r)
         ts = int(d.get("created_at") or 0)
         voided_raw = d.get("is_voided")
+        counted_raw = d.get("counted_for_pickup_stats")
         trips.append({
             "id": d.get("id"),
             "user_id": d.get("user_id"),
@@ -13756,6 +13758,11 @@ def export_all_pickup_trips(viewer: sqlite3.Row = Depends(require_admin)):
             "borough": d.get("borough") or "",
             "frame_time": d.get("frame_time") or "",
             "is_voided": bool(_flag_to_int(voided_raw)) if voided_raw is not None else False,
+            "counted_for_pickup_stats": bool(_flag_to_int(counted_raw)) if counted_raw is not None else True,
+            "voided_at": d.get("voided_at"),
+            "voided_by_admin_user_id": d.get("voided_by_admin_user_id"),
+            "void_reason": d.get("void_reason"),
+            "guard_reason": d.get("guard_reason"),
         })
 
     exported_at = int(time.time())
@@ -13763,7 +13770,7 @@ def export_all_pickup_trips(viewer: sqlite3.Row = Depends(require_admin)):
 
     json_bytes = json.dumps(
         {
-            "export_version": 1,
+            "export_version": 2,
             "scope": "all_users",
             "exported_at_unix": exported_at,
             "exported_at_nyc": _nyc_iso(exported_at),
@@ -13778,6 +13785,7 @@ def export_all_pickup_trips(viewer: sqlite3.Row = Depends(require_admin)):
     fieldnames = [
         "id", "user_id", "user_email", "user_display_name", "created_at_unix", "created_at_nyc",
         "lat", "lng", "zone_id", "zone_name", "borough", "frame_time", "is_voided",
+        "counted_for_pickup_stats", "voided_at", "voided_by_admin_user_id", "void_reason", "guard_reason",
     ]
     csv_buf = io.StringIO()
     writer = csv.writer(csv_buf)
@@ -13855,6 +13863,15 @@ def import_all_pickup_trips(file: UploadFile = File(...), viewer: sqlite3.Row = 
     invalid = 0
     skipped_missing_user = 0
     missing_user_ids = set()
+
+    def _opt_int(v):
+        if v is None or v == "":
+            return None
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+
     for t in raw_trips:
         if not isinstance(t, dict):
             invalid += 1
@@ -13879,15 +13896,23 @@ def import_all_pickup_trips(file: UploadFile = File(...), viewer: sqlite3.Row = 
             zone_id = None
         voided_raw = t.get("is_voided")
         is_voided = bool(_flag_to_int(voided_raw)) if voided_raw is not None else False
+        # counted_for_pickup_stats wasn't captured by v1 backups; for those a
+        # voided trip was always uncounted (its stat was reversed on void), so
+        # derive it from is_voided. v2 backups carry the real value.
+        counted_raw = t.get("counted_for_pickup_stats")
+        counted = (not is_voided) if counted_raw is None else bool(_flag_to_int(counted_raw))
         insertable.append((
             tid, uid, lat, lng, zone_id,
             (t.get("zone_name") or None), (t.get("borough") or None),
             (t.get("frame_time") or None), created, is_voided,
+            _opt_int(t.get("voided_at")), _opt_int(t.get("voided_by_admin_user_id")),
+            t.get("void_reason"), counted, t.get("guard_reason"),
         ))
 
     insert_sql = (
-        "INSERT INTO pickup_logs(id, user_id, lat, lng, zone_id, zone_name, borough, frame_time, created_at, is_voided) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING"
+        "INSERT INTO pickup_logs(id, user_id, lat, lng, zone_id, zone_name, borough, frame_time, created_at, "
+        "is_voided, voided_at, voided_by_admin_user_id, void_reason, counted_for_pickup_stats, guard_reason) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING"
     )
 
     def _run(conn, cur):

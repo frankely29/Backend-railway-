@@ -1,5 +1,13 @@
 # BACKEND CHANGELOG
 
+## Current pass: Backup/restore now round-trips every `pickup_logs` column (export v2)
+
+### Export + restore are now lossless for the full `pickup_logs` schema
+- Audited `pickup_logs` and found it has **15 columns**, but the export/restore only carried **10** — the rest fell back to column defaults on restore. For a normal (non-voided) trip the defaults happened to match, but a **voided** trip did **not** round-trip exactly: `counted_for_pickup_stats` was restored as `TRUE` (default) when it should be `FALSE`, and the void audit fields were dropped.
+- The export (`/admin/pickups/export_all`) now also captures `counted_for_pickup_stats`, `voided_at`, `voided_by_admin_user_id`, `void_reason`, and `guard_reason` (added to the SQL, the JSON trips, and the CSV header). Bumped `export_version` to **2**.
+- The restore (`/admin/pickups/import`) now inserts all 15 columns. **Backward compatible:** v1 backups (which lack these fields) still restore — `counted_for_pickup_stats` is derived from `is_voided` (a voided trip was always uncounted), and the missing void-audit fields restore as `NULL`. Verified with an exact 15-column round-trip test (normal + fully-voided rows match byte-for-byte) and against the real 952-trip v1 backup (952 restored, 12 voided, all 12 correctly uncounted).
+- **Out of scope (documented):** leaderboard daily aggregates live in a separate `driver_daily_stats` table (miles/hours/pickups), which this trip backup does not cover. Restoring trips brings back the trip rows and everything derived from them on-the-fly (map dots, recent pickups, hotspots, history), but not the `driver_daily_stats` miles/hours numbers.
+
 ## Current pass: Restore pickup trips from a backup — owner-only (`POST /admin/pickups/import`)
 
 ### New `POST /admin/pickups/import` — owner-only restore from an export backup
