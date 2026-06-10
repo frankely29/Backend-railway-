@@ -31,9 +31,9 @@ def test_every_district_pulses_at_dinner_letout():
         s = d["dim_schedule"]
         assert s["weekday_only"] is False          # nightlife never "closes"
         assert s["prime"] and s["prime_weekend"]
-        # Prime starts in the dinner-let-out evening (8-9pm).
-        assert s["prime"][0][0] in (20, 21)
-        assert s["prime_weekend"][0][0] in (20, 21)
+        # Prime starts at the 8pm dinner let-out.
+        assert s["prime"][0][0] == 20
+        assert s["prime_weekend"][0][0] == 20
 
 
 def test_club_districts_run_latest_on_weekends():
@@ -124,8 +124,8 @@ def test_runtime_meta_recomputes_schedule_from_members():
         {"name": "Some Club", "category": "nightclub"},
     ]
     meta = nb.district_runtime_meta(members)
-    assert meta["dim_schedule"]["prime"] == [[21, 2]]
-    assert meta["dim_schedule"]["prime_weekend"] == [[21, 4]]   # club -> 4am
+    assert meta["dim_schedule"]["prime"] == [[20, 2]]
+    assert meta["dim_schedule"]["prime_weekend"] == [[20, 4]]   # club -> 4am
     assert "last call" in meta["best_hours"]
     assert meta["category_counts"] == {"upscale_restaurant": 1, "nightclub": 1}
     assert "1 upscale restaurant" in meta["rationale"]
