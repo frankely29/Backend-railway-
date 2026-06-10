@@ -1,5 +1,14 @@
 # BACKEND CHANGELOG
 
+## Current pass: Stats export by day/week/month/year — per-user (own) and owner-wide
+
+### New `GET /me/stats/export` — a driver's own miles/hours by period (tax-friendly)
+- Any signed-in driver can download **their own** work stats summed by **day, week, month and year** as a ZIP: `yearly.csv` / `monthly.csv` / `weekly.csv` / `daily.csv` + a `driver-stats.json` + a `README.txt`, plus lifetime totals. **Miles + hours only** (no pickup trips) — a clean personal record (e.g. for taxes). Strictly scoped to the caller (`WHERE user_id = viewer.id`), `Depends(require_user)`.
+
+### New `GET /admin/stats/export` — owner-only, every driver's full stats by period
+- Owner-only (`Depends(require_admin)` + `is_account_owner`, else 403). Downloads **every** driver's stats (`miles_worked`, `hours_worked`, `trips_recorded`, `pickups_recorded`, `heartbeat_count`) summed by day/week/month/year, grouped per user, as a ZIP of CSVs + JSON. Optional `?user_id=` narrows to one driver. For review / archival / building future systems.
+- Both endpoints roll the per-day `driver_daily_stats` rows up in Python (portable across Postgres/SQLite) using ISO week numbering (`YYYY-Www`). Verified the grouping and sums, including ISO weeks that cross a year boundary (e.g. 2024-12-31 → 2025-W01) and lifetime totals.
+
 ## Current pass: Backup/restore is now complete & lossless — all trip columns + leaderboard daily stats (export v3)
 
 ### Export + restore are now lossless for the full `pickup_logs` schema
