@@ -14041,6 +14041,226 @@ def import_all_pickup_trips(file: UploadFile = File(...), viewer: sqlite3.Row = 
     }
 
 
+def _rollup_stats_buckets(rows, numeric_fields):
+    """Group per-day stat rows into day/week/month/year buckets, summing the
+    given numeric fields. Each `rows` item is a dict with `nyc_date` plus the
+    numeric fields. Returns {"daily":[...], "weekly":[...], "monthly":[...],
+    "yearly":[...]} where each item is {"period": label, "days_worked": n,
+    <field>: sum, ...}, sorted by period."""
+    grans = ("daily", "weekly", "monthly", "yearly")
+    buckets: Dict[str, Dict[str, Dict[str, Any]]] = {g: {} for g in grans}
+    for r in rows:
+        ds = str(r.get("nyc_date") or "").strip()[:10]
+        if not ds:
+            continue
+        try:
+            day = datetime.strptime(ds, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        iso_year, iso_week, _ = day.isocalendar()
+        keys = {
+            "daily": ds,
+            "weekly": f"{iso_year:04d}-W{iso_week:02d}",
+            "monthly": f"{day.year:04d}-{day.month:02d}",
+            "yearly": f"{day.year:04d}",
+        }
+        for gran, key in keys.items():
+            b = buckets[gran].get(key)
+            if b is None:
+                b = {"period": key, "days_worked": 0}
+                for f in numeric_fields:
+                    b[f] = 0
+                buckets[gran][key] = b
+            b["days_worked"] += 1
+            for f in numeric_fields:
+                try:
+                    b[f] += (r.get(f) or 0)
+                except TypeError:
+                    pass
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for gran in grans:
+        items = [buckets[gran][k] for k in sorted(buckets[gran])]
+        for it in items:
+            for f in ("miles_worked", "hours_worked"):
+                if isinstance(it.get(f), float):
+                    it[f] = round(it[f], 2)
+        out[gran] = items
+    return out
+
+
+@app.get("/me/stats/export")
+def export_my_stats(viewer: sqlite3.Row = Depends(require_user)):
+    """Download the signed-in driver's own work stats (miles + hours) organized
+    by day / week / month / year, as a ZIP of CSVs + JSON. Handy as a personal
+    record (e.g. for taxes). Scoped to the caller's own data only."""
+    user_id = int(viewer["id"])
+    rows = [
+        dict(r)
+        for r in _db_query_all(
+            "SELECT nyc_date, miles_worked, hours_worked FROM driver_daily_stats "
+            "WHERE user_id = ? ORDER BY nyc_date ASC",
+            (user_id,),
+        )
+    ]
+    rollup = _rollup_stats_buckets(rows, ["miles_worked", "hours_worked"])
+
+    lifetime = {
+        "miles_worked": round(sum(float(r.get("miles_worked") or 0) for r in rows), 2),
+        "hours_worked": round(sum(float(r.get("hours_worked") or 0) for r in rows), 2),
+        "days_worked": len(rows),
+    }
+
+    nyc = ZoneInfo("America/New_York")
+    generated_at = int(time.time())
+    gen_date = datetime.fromtimestamp(generated_at, tz=nyc).strftime("%Y-%m-%d")
+
+    payload = {
+        "kind": "driver_stats",
+        "version": 1,
+        "user_id": user_id,
+        "user_email": viewer["email"] if "email" in viewer.keys() else None,
+        "generated_at_unix": generated_at,
+        "lifetime": lifetime,
+        "yearly": rollup["yearly"],
+        "monthly": rollup["monthly"],
+        "weekly": rollup["weekly"],
+        "daily": rollup["daily"],
+    }
+    json_bytes = json.dumps(payload, indent=2, default=str).encode("utf-8")
+
+    def _stats_csv(items, period_label):
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow([period_label, "days_worked", "miles_worked", "hours_worked"])
+        for it in items:
+            w.writerow([it["period"], it["days_worked"], it.get("miles_worked", 0), it.get("hours_worked", 0)])
+        return buf.getvalue().encode("utf-8")
+
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("yearly.csv", _stats_csv(rollup["yearly"], "year"))
+        zf.writestr("monthly.csv", _stats_csv(rollup["monthly"], "month"))
+        zf.writestr("weekly.csv", _stats_csv(rollup["weekly"], "iso_week"))
+        zf.writestr("daily.csv", _stats_csv(rollup["daily"], "date"))
+        zf.writestr("driver-stats.json", json_bytes)
+        zf.writestr(
+            "README.txt",
+            (
+                "Your driving stats (miles and hours), summed by day, week, month and year.\n"
+                "Weeks use ISO week numbering (YYYY-Www). Days are America/New_York business days.\n"
+                "Keep this as a personal record (e.g. for taxes).\n"
+            ).encode("utf-8"),
+        )
+
+    filename = f"my-driving-stats-{gen_date}.zip"
+    return Response(
+        content=zip_buf.getvalue(),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+@app.get("/admin/stats/export")
+def export_all_stats(user_id: Optional[int] = None, viewer: sqlite3.Row = Depends(require_admin)):
+    """Owner-only: download every driver's work stats (miles, hours, pickups,
+    trips, heartbeats) summed by day / week / month / year as a ZIP of CSVs +
+    JSON. Optional `?user_id=` narrows to one driver. For review / archival /
+    building future systems."""
+    if not is_account_owner(viewer):
+        raise HTTPException(status_code=403, detail="Only the account owner can export all stats.")
+
+    numeric = ["miles_worked", "hours_worked", "trips_recorded", "pickups_recorded", "heartbeat_count"]
+    base_sql = (
+        "SELECT s.user_id, u.email AS user_email, u.display_name AS user_display_name, "
+        "s.nyc_date, s.miles_worked, s.hours_worked, s.trips_recorded, s.pickups_recorded, s.heartbeat_count "
+        "FROM driver_daily_stats s LEFT JOIN users u ON u.id = s.user_id "
+    )
+    if user_id is not None:
+        rows = _db_query_all(base_sql + "WHERE s.user_id = ? ORDER BY s.user_id ASC, s.nyc_date ASC", (int(user_id),))
+    else:
+        rows = _db_query_all(base_sql + "ORDER BY s.user_id ASC, s.nyc_date ASC", ())
+    rows = [dict(r) for r in rows]
+
+    by_user: Dict[int, Dict[str, Any]] = {}
+    for r in rows:
+        uid = int(r.get("user_id"))
+        u = by_user.get(uid)
+        if u is None:
+            u = {
+                "user_email": r.get("user_email") or "",
+                "user_display_name": r.get("user_display_name") or "",
+                "rows": [],
+            }
+            by_user[uid] = u
+        u["rows"].append(r)
+
+    grans = ("daily", "weekly", "monthly", "yearly")
+    combined: Dict[str, List[Dict[str, Any]]] = {g: [] for g in grans}
+    for uid in sorted(by_user):
+        u = by_user[uid]
+        rollup = _rollup_stats_buckets(u["rows"], numeric)
+        for gran in grans:
+            for it in rollup[gran]:
+                combined[gran].append({
+                    "user_id": uid,
+                    "user_email": u["user_email"],
+                    "user_display_name": u["user_display_name"],
+                    **it,
+                })
+
+    nyc = ZoneInfo("America/New_York")
+    generated_at = int(time.time())
+    gen_date = datetime.fromtimestamp(generated_at, tz=nyc).strftime("%Y-%m-%d")
+
+    payload = {
+        "kind": "all_driver_stats",
+        "version": 1,
+        "scope": "single_user" if user_id is not None else "all_users",
+        "generated_at_unix": generated_at,
+        "generated_by_user_id": int(viewer["id"]),
+        "yearly": combined["yearly"],
+        "monthly": combined["monthly"],
+        "weekly": combined["weekly"],
+        "daily": combined["daily"],
+    }
+    json_bytes = json.dumps(payload, indent=2, default=str).encode("utf-8")
+
+    header = [
+        "user_id", "user_email", "user_display_name", "period", "days_worked",
+        "miles_worked", "hours_worked", "trips_recorded", "pickups_recorded", "heartbeat_count",
+    ]
+
+    def _admin_csv(items):
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(header)
+        for it in items:
+            w.writerow([it.get(k, "") for k in header])
+        return buf.getvalue().encode("utf-8")
+
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("yearly.csv", _admin_csv(combined["yearly"]))
+        zf.writestr("monthly.csv", _admin_csv(combined["monthly"]))
+        zf.writestr("weekly.csv", _admin_csv(combined["weekly"]))
+        zf.writestr("daily.csv", _admin_csv(combined["daily"]))
+        zf.writestr("all-driver-stats.json", json_bytes)
+
+    suffix = f"-user{user_id}" if user_id is not None else ""
+    filename = f"driver-stats{suffix}-{gen_date}.zip"
+    return Response(
+        content=zip_buf.getvalue(),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store",
+        },
+    )
+
+
 # =========================================================
 # ADMIN (manage all accounts)
 # =========================================================
