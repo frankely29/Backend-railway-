@@ -1,11 +1,12 @@
 # BACKEND CHANGELOG
 
-## Current pass: Export my pickup trips (`GET /me/pickups/export`)
+## Current pass: Export ALL pickup trips — owner-only (`GET /admin/pickups/export_all`)
 
-### New `GET /me/pickups/export` — downloadable backup of a user's pickup trips
-- Lets a signed-in driver download **all of their own (non-voided) pickup trips** as a single ZIP containing both a `pickup-trips.csv` (Excel/Sheets-friendly) and a `pickup-trips.json` (full-fidelity), so they can keep an external backup that survives a database reset. Auth is `Depends(require_user)` and the query is scoped to `WHERE user_id = ? AND <not voided>`, so a user can only ever export their own trips.
-- Each trip row carries `id`, `created_at_unix`, `created_at_nyc` (ISO in America/New_York), `lat`, `lng`, `zone_id`, `zone_name`, `borough`, `frame_time`; the JSON also wraps an `export_version`, `exported_at`, `user_id`, and `trip_count`. Built in-memory with `csv` + `zipfile` and returned as `application/zip` with a dated `Content-Disposition` filename (`pickup-trips-YYYY-MM-DD.zip`). Uses the existing `(user_id, created_at)` index, so it's a single cheap query.
-- Added `Content-Disposition` to the CORS `expose_headers` so the cross-origin frontend can read the server-provided filename.
+### New `GET /admin/pickups/export_all` — owner-only backup of every user's pickup trips
+- Lets the **account owner (main admin)** download **every user's pickup trips** as a single ZIP containing both `all-pickup-trips.csv` (Excel/Sheets-friendly) and `all-pickup-trips.json` (full-fidelity), so the whole app's trip data can be backed up externally and survive a database reset. Gated by `Depends(require_admin)` **plus** an explicit `is_account_owner(viewer)` check (403 otherwise), since it exposes all users' data — a regular admin can't pull it.
+- Exports **all** rows from `pickup_logs` (including voided, flagged with `is_voided`) joined to `users` for `user_id` / `user_email` / `user_display_name`, plus `created_at_unix`, `created_at_nyc` (America/New_York ISO), `lat`, `lng`, `zone_id`, `zone_name`, `borough`, `frame_time`. JSON wraps `scope: "all_users"`, `exported_at`, `exported_by_user_id`, `trip_count`. Built in-memory with `csv` + `zipfile`, returned as `application/zip` with a dated `Content-Disposition` (`all-pickup-trips-YYYY-MM-DD.zip`).
+- `/me` now returns `is_account_owner` so the frontend can show the backup button only to the owner. `Content-Disposition` stays in the CORS `expose_headers`.
+- Replaces the earlier per-user `GET /me/pickups/export` (the backup is now an owner-only, all-users admin action per the product decision).
 
 ## Current pass: Nightlife & dining district pickup pulse (backend)
 

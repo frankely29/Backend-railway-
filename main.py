@@ -8727,6 +8727,7 @@ def me(user: sqlite3.Row = Depends(require_user_basic)):
         "map_identity_mode": map_identity_mode,
         "ghost_mode": ghost,
         "is_admin": bool(_flag_to_int(user["is_admin"])),
+        "is_account_owner": is_account_owner(user),
         "trial_expires_at": int(user["trial_expires_at"]),
         "leaderboard_badge_code": best_badge.get("leaderboard_badge_code"),
         "subscription": build_subscription_response(user),
@@ -13706,20 +13707,24 @@ def get_recent_pickups(
     )
 
 
-@app.get("/me/pickups/export")
-def export_my_pickup_trips(viewer: sqlite3.Row = Depends(require_user)):
-    """Download all of the signed-in user's (non-voided) pickup trips as a ZIP
-    containing both a CSV and a JSON file, so they can keep an external backup.
-    Users can only export their own trips."""
-    user_id = int(viewer["id"])
+@app.get("/admin/pickups/export_all")
+def export_all_pickup_trips(viewer: sqlite3.Row = Depends(require_admin)):
+    """Download EVERY user's pickup trips as a ZIP (CSV + JSON) for an external
+    backup that survives a database reset. Restricted to the account owner (the
+    main admin), since it exposes all users' trip data."""
+    if not is_account_owner(viewer):
+        raise HTTPException(status_code=403, detail="Only the account owner can export all trips.")
+
     rows = _db_query_all(
-        f"""
-        SELECT id, created_at, lat, lng, zone_id, zone_name, borough, frame_time
-        FROM pickup_logs
-        WHERE user_id = ? AND {pickup_log_not_voided_sql('pickup_logs')}
-        ORDER BY created_at ASC
+        """
+        SELECT pl.id, pl.user_id, u.email AS user_email, u.display_name AS user_display_name,
+               pl.created_at, pl.lat, pl.lng, pl.zone_id, pl.zone_name, pl.borough, pl.frame_time,
+               pl.is_voided
+        FROM pickup_logs pl
+        LEFT JOIN users u ON u.id = pl.user_id
+        ORDER BY pl.created_at ASC
         """,
-        (user_id,),
+        (),
     )
 
     nyc = ZoneInfo("America/New_York")
@@ -13735,8 +13740,12 @@ def export_my_pickup_trips(viewer: sqlite3.Row = Depends(require_user)):
     for r in rows:
         d = dict(r)
         ts = int(d.get("created_at") or 0)
+        voided_raw = d.get("is_voided")
         trips.append({
             "id": d.get("id"),
+            "user_id": d.get("user_id"),
+            "user_email": d.get("user_email") or "",
+            "user_display_name": d.get("user_display_name") or "",
             "created_at_unix": ts,
             "created_at_nyc": _nyc_iso(ts),
             "lat": d.get("lat"),
@@ -13745,6 +13754,7 @@ def export_my_pickup_trips(viewer: sqlite3.Row = Depends(require_user)):
             "zone_name": d.get("zone_name") or "",
             "borough": d.get("borough") or "",
             "frame_time": d.get("frame_time") or "",
+            "is_voided": bool(_flag_to_int(voided_raw)) if voided_raw is not None else False,
         })
 
     exported_at = int(time.time())
@@ -13753,9 +13763,10 @@ def export_my_pickup_trips(viewer: sqlite3.Row = Depends(require_user)):
     json_bytes = json.dumps(
         {
             "export_version": 1,
+            "scope": "all_users",
             "exported_at_unix": exported_at,
             "exported_at_nyc": _nyc_iso(exported_at),
-            "user_id": user_id,
+            "exported_by_user_id": int(viewer["id"]),
             "trip_count": len(trips),
             "trips": trips,
         },
@@ -13763,24 +13774,23 @@ def export_my_pickup_trips(viewer: sqlite3.Row = Depends(require_user)):
         default=str,
     ).encode("utf-8")
 
+    fieldnames = [
+        "id", "user_id", "user_email", "user_display_name", "created_at_unix", "created_at_nyc",
+        "lat", "lng", "zone_id", "zone_name", "borough", "frame_time", "is_voided",
+    ]
     csv_buf = io.StringIO()
     writer = csv.writer(csv_buf)
-    writer.writerow(
-        ["id", "created_at_unix", "created_at_nyc", "lat", "lng", "zone_id", "zone_name", "borough", "frame_time"]
-    )
+    writer.writerow(fieldnames)
     for t in trips:
-        writer.writerow([
-            t["id"], t["created_at_unix"], t["created_at_nyc"], t["lat"], t["lng"],
-            t["zone_id"], t["zone_name"], t["borough"], t["frame_time"],
-        ])
+        writer.writerow([t.get(k, "") for k in fieldnames])
     csv_bytes = csv_buf.getvalue().encode("utf-8")
 
     zip_buf = io.BytesIO()
     with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("pickup-trips.csv", csv_bytes)
-        zf.writestr("pickup-trips.json", json_bytes)
+        zf.writestr("all-pickup-trips.csv", csv_bytes)
+        zf.writestr("all-pickup-trips.json", json_bytes)
 
-    filename = f"pickup-trips-{export_date}.zip"
+    filename = f"all-pickup-trips-{export_date}.zip"
     return Response(
         content=zip_buf.getvalue(),
         media_type="application/zip",
