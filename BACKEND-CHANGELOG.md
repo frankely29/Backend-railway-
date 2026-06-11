@@ -1,5 +1,13 @@
 # BACKEND CHANGELOG
 
+## Current pass: Strategic Points audit — drop double-counts + short-trip school spots
+
+Audited every long-trip-hotspot cluster ("strategic point") against the goal — **fast money via long trips, high-end / quality customers, 3+ important buildings within ~5 min**. All clusters already satisfied the structural rule (`MIN_MEMBERS_PER_HOTSPOT = 3`, `CLUSTER_RADIUS_MI = 0.25` complete-link → every member within ~5 min of every other). Two value problems found and fixed in `long_trip_hotspot_builder.py`:
+
+- **Removed 2 duplicate buildings** that double-counted cluster value: `1 Hotel Brooklyn (DUMBO)` (= `1 Hotel Brooklyn Bridge`) and `Brooklyn Bridge Marriott` (= `Brooklyn Marriott Bridge`, both 333 Adams St). Each affected cluster still holds **3+ real members** after removal.
+- **Removed the `private_school` POIs** (the one weak cluster — 4 UES schools). The pickup window is 2:30–4pm **dismissal**, which yields short kid→home runs, not the long fares this map targets. The original "frequent long trips to weekend homes / airports" rationale doesn't hold — those trips originate from **homes**, not the school at dismissal.
+- Result: **25 → 24 strategic points**, every one anchored by hotels / hospitals / transit hubs / corporate towers / airports, with ≥3 co-located important buildings. Borough coverage intact (Manhattan ×16, Brooklyn ×3, Queens ×2, Bronx ×2, Staten Island ×1). The 11 other "near" building pairs (St Regis/Peninsula, Penn/MSG, …) are genuinely distinct adjacent landmarks and were kept. No category/calendar machinery changed (`private_school` windows + school-recess closures left intact, just unused); `test_holiday_calendar` passes.
+
 ## Current pass: Owner admin self-heal on login + specific-user/specific-date stats export
 
 ### Admin lockout fix — the account owner is auto-restored to admin on login
