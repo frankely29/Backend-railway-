@@ -105,7 +105,6 @@ NYC_LONG_TRIP_POIS: List[Tuple[str, float, float, str, float]] = [
     ("Lincoln Center",            40.7725, -73.9835, "performance", 1.5),
     ("Carnegie Hall",             40.7651, -73.9799, "performance", 1.5),
     ("Citi Field",                40.7571, -73.8458, "stadium", 1.8),
-    ("Yankee Stadium",            40.8296, -73.9262, "stadium", 1.8),
     ("USTA Billie Jean King",     40.7500, -73.8458, "stadium", 1.8),
     ("Barclays Center",           40.6826, -73.9754, "stadium", 1.8),
 
@@ -194,9 +193,8 @@ NYC_LONG_TRIP_POIS: List[Tuple[str, float, float, str, float]] = [
     ("SUNY Downstate Medical",    40.6557, -73.9472, "hospital", 2.5),
 
 
-    # Queens — Long Island Jewish + Northwell hospitals (huge medical
-    # campuses with constant car-service traffic). Dropped Forest Hills
-    # Tower — single medium office building, no special wealth.
+    # Nassau/LI — Long Island Jewish + Northwell hospitals (huge medical
+    # campuses, but spread too far apart to cluster — stay filtered POIs).
     ("Long Island Jewish Hospital", 40.7587, -73.7079, "hospital", 2.8),
     ("Northwell North Shore Univ", 40.7766, -73.7045, "hospital", 2.5),
     ("Northwell Imaging Manhasset", 40.7798, -73.7028, "hospital", 1.8),
@@ -265,10 +263,6 @@ NYC_LONG_TRIP_POIS: List[Tuple[str, float, float, str, float]] = [
     ("Tangram (Flushing)",        40.7570, -73.8281, "luxury_shopping", 1.5),
     ("One Fulton Square (Flushing)", 40.7605, -73.8287, "corporate", 1.4),
 
-    # Queens — Forest Hills (LIRR + subway + Forest Hills Stadium)
-    ("Forest Hills LIRR",         40.7213, -73.8447, "transit_hub", 1.9),
-    ("71 Av-Continental (subway)", 40.7186, -73.8449, "transit_hub", 1.8),
-    ("Forest Hills Stadium",      40.7197, -73.8455, "performance", 1.5),
 
     # Brooklyn — Atlantic Yards (completes Atlantic Terminal + Barclays)
     ("1 Hanson Place (Brooklyn)", 40.6846, -73.9776, "luxury_condo", 1.5),
@@ -285,14 +279,7 @@ NYC_LONG_TRIP_POIS: List[Tuple[str, float, float, str, float]] = [
     ("149 St-Grand Concourse (subway)", 40.8183, -73.9268, "transit_hub", 2.0),
     ("Bronx General Post Office", 40.8167, -73.9266, "corporate", 1.3),
 
-    # Bronx — 161 St / Yankee Stadium (completes Yankee Stadium)
-    ("161 St-Yankee Stadium (subway)", 40.8276, -73.9257, "transit_hub", 2.0),
-    ("Bronx County Courthouse",   40.8275, -73.9229, "corporate", 1.5),
 
-    # Staten Island — St. George (ferry + outlet mall + waterfront hotel)
-    ("Staten Island Ferry - St. George", 40.6437, -74.0735, "transit_hub", 2.3),
-    ("Movenpick Lighthouse Point", 40.6432, -74.0721, "hotel_luxury", 1.8),
-    ("Empire Outlets",            40.6448, -74.0759, "luxury_shopping", 1.6),
 
     # ---------------- Hudson Yards / Manhattan West (gives the existing
     # "Hudson Yards" corporate POI its district: HQ towers, Equinox hotel,
@@ -339,12 +326,7 @@ NYC_LONG_TRIP_POIS: List[Tuple[str, float, float, str, float]] = [
     ("Hotel Indigo Downtown Bklyn", 40.6899, -73.9821, "hotel_luxury", 1.7),
     ("Ava DoBro",                 40.6917, -73.9836, "luxury_condo", 1.5),
 
-    # Queens — Long Island City waterfront (Hunters Point / Gantry): luxury
     # condo towers + East River state park + the Hunters Point library.
-    ("Gantry Plaza State Park",   40.7470, -73.9583, "tourist", 1.4),
-    ("The View at East Coast (4540 Center)", 40.7457, -73.9587, "luxury_condo", 1.5),
-    ("4610 Center Blvd (LIC)",    40.7466, -73.9580, "luxury_condo", 1.4),
-    ("Hunters Point Library",     40.7448, -73.9585, "tourist", 1.3),
 ]
 
 
@@ -427,10 +409,6 @@ POI_ADDRESSES: Dict[str, str] = {
     "Hotel Indigo Downtown Bklyn": "229 Duffield St, Brooklyn 11201",
     "Ava DoBro": "100 Willoughby St, Brooklyn 11201",
     # Queens — LIC waterfront
-    "Gantry Plaza State Park": "47-01 Center Blvd, LIC 11109",
-    "The View at East Coast (4540 Center)": "4540 Center Blvd, LIC 11109",
-    "4610 Center Blvd (LIC)": "4610 Center Blvd, LIC 11109",
-    "Hunters Point Library": "47-40 Center Blvd, LIC 11109",
     # Airports
     "JFK Airport (central)": "JFK Airport, Jamaica, NY 11430",
     "LaGuardia Airport": "LaGuardia Airport, Flushing, NY 11371",
@@ -550,7 +528,6 @@ POI_ADDRESSES: Dict[str, str] = {
     "Lincoln Center": "10 Lincoln Center Plaza, NY 10023",
     "Carnegie Hall": "881 7th Ave, NY 10019",
     "Citi Field": "41 Seaver Way, Flushing 11368",
-    "Yankee Stadium": "1 E 161st St, Bronx 10451",
     "USTA Billie Jean King": "Flushing Meadows-Corona Park, Flushing 11368",
     "Barclays Center": "620 Atlantic Ave, Brooklyn 11217",
     "Cipriani Wall Street": "55 Wall St, NY 10005",
@@ -618,9 +595,6 @@ POI_ADDRESSES: Dict[str, str] = {
     "New World Mall (Flushing)": "136-20 Roosevelt Ave, Flushing 11354",
     "Tangram (Flushing)": "133-27 39th Ave, Flushing 11354",
     "One Fulton Square (Flushing)": "39-16 Prince St, Flushing 11354",
-    "Forest Hills LIRR": "Station Sq, Forest Hills 11375",
-    "71 Av-Continental (subway)": "Queens Blvd & 71st Ave, Forest Hills 11375",
-    "Forest Hills Stadium": "1 Tennis Pl, Forest Hills 11375",
     "1 Hanson Place (Brooklyn)": "1 Hanson Pl, Brooklyn 11217",
     "Atlantic Center (mall)": "625 Atlantic Ave, Brooklyn 11217",
     "Olympia Dumbo (condos)": "30 Front St, Brooklyn 11201",
@@ -628,11 +602,6 @@ POI_ADDRESSES: Dict[str, str] = {
     "University Hospital of Brooklyn": "445 Lenox Rd, Brooklyn 11203",
     "149 St-Grand Concourse (subway)": "E 149th St & Grand Concourse, Bronx 10451",
     "Bronx General Post Office": "558 Grand Concourse, Bronx 10451",
-    "161 St-Yankee Stadium (subway)": "E 161st St & River Ave, Bronx 10451",
-    "Bronx County Courthouse": "851 Grand Concourse, Bronx 10451",
-    "Staten Island Ferry - St. George": "1 Bay St, Staten Island 10301",
-    "Movenpick Lighthouse Point": "8 Navy Pier Ct, Staten Island 10301",
-    "Empire Outlets": "55 Richmond Terrace, Staten Island 10301",
 }
 
 

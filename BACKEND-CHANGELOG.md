@@ -1,5 +1,15 @@
 # BACKEND CHANGELOG
 
+## Current pass: Strategic Points — enforce "no weak points" (remove 4 weak clusters)
+
+Per directive ("no weak points allowed"), removed the 4 strategic points that don't reliably produce **long, lucrative trips with quality customers**:
+- **LIC waterfront** — residential luxury condos + park + library; short commutes, no long-trip anchor.
+- **Forest Hills LIRR** — commuter rail into the city + a seasonal stadium; riders take the train, not cabs.
+- **Staten Island Ferry – St. George** — the ferry is **free**, so almost no cab demand; SI volume is minimal.
+- **161 St – Yankee Stadium** — **event-only**; off-days the subway + courthouse generate little.
+
+Kept the major transit hubs a crude weight-heuristic over-flagged (**Penn Station**, **Atlantic Terminal** — among the busiest hubs in the country) and the **hospital** clusters (discharges = real long trips). Result: **35 → 31 strategic points**, every one anchored by luxury hotels, premium hospitals, a major transit hub, corporate towers, or a dense high-end district. 0 duplicate names, 0 clusters < 3 members; `test_holiday_calendar` passes (8/8).
+
 ## Current pass: Strategic Points — Brooklyn & Queens expansion (+2 clusters)
 
 Manhattan is set, so this pass focused the hunt on the **outer boroughs**. The BK/Queens singleton + near-miss scan confirmed most outer-borough high-value POIs (hospitals, stadiums) are isolated and too spread for the 0.25-mi cap — the real opportunities are **new dense districts**:
