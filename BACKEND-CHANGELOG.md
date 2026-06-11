@@ -1,5 +1,11 @@
 # BACKEND CHANGELOG
 
+## Current pass: Strategic Points — event venues no longer drive a false nightly pulse
+
+Fix (per report): **Rockefeller Center** pulsed at ~10–11pm (Radio City "post-show") **every** night — but Radio City is **dark most nights**, so on a no-show night the pulse falsely signaled a surge at an empty plaza (worse than useless: it sends drivers to a dead spot). Root cause: `performance`/`stadium` (event-dependent) outranked `corporate` in the dominant-category priority that drives a cluster's pulse window.
+- Moved `performance` + `stadium` to the **lowest** priority in `_CATEGORY_PRIORITY`. An event category now drives the pulse only if a cluster has nothing else; a reliable **daily** category (corporate / hotel / transit / hospital / shopping) wins when present.
+- Result: Rockefeller Center now pulses on the reliable **corporate end-of-day** window (4–7pm, when the offices + Saks flagship empty out), not the event-night show let-out. **0 clusters remain event-dominant → no false pulses.** All 31 points unchanged in count, every one pulsing on a reliable daily window. `test_holiday_calendar` passes (8/8).
+
 ## Current pass: Strategic Points — enforce "no weak points" (remove 4 weak clusters)
 
 Per directive ("no weak points allowed"), removed the 4 strategic points that don't reliably produce **long, lucrative trips with quality customers**:
