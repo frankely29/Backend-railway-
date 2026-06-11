@@ -136,18 +136,6 @@ NYC_LONG_TRIP_POIS: List[Tuple[str, float, float, str, float]] = [
     ("Bloomingdale's flagship",   40.7625, -73.9684, "luxury_shopping", 1.3),
     ("Apple Fifth Ave",           40.7637, -73.9728, "luxury_shopping", 1.2),
 
-    # ---------------- UES private schools (wealthy parents,
-    # frequent long trips to weekend homes / airports). E 80s-90s
-    # form a real walking cluster. ----------------
-    ("Dalton School",             40.7787, -73.9569, "private_school", 1.6),
-    ("Spence School",             40.7766, -73.9583, "private_school", 1.6),
-    ("Brearley School",           40.7726, -73.9460, "private_school", 1.6),
-    ("Chapin School",             40.7714, -73.9485, "private_school", 1.6),
-    ("Buckley School",            40.7708, -73.9577, "private_school", 1.6),
-    ("Trinity School (UWS)",      40.7864, -73.9788, "private_school", 1.5),
-    ("Collegiate School",         40.7754, -73.9889, "private_school", 1.5),
-    ("Nightingale-Bamford",       40.7795, -73.9568, "private_school", 1.5),
-    ("Marymount School NY",       40.7785, -73.9612, "private_school", 1.5),
 
     # ---------------- Park Ave / Midtown East corporate row
     # — institutional wealth, lots of car-service-out-of-town. ----------------
@@ -173,14 +161,13 @@ NYC_LONG_TRIP_POIS: List[Tuple[str, float, float, str, float]] = [
     ("Brooklyn Marriott Bridge",  40.6951, -73.9893, "hotel_luxury", 2.0),
     ("Aloft Brooklyn",            40.6928, -73.9854, "hotel_luxury", 1.8),
     ("Sheraton Brooklyn",         40.6918, -73.9890, "hotel_luxury", 1.9),
-    ("Brooklyn Bridge Marriott",  40.6948, -73.9892, "hotel_luxury", 2.0),
 
-    # DUMBO — Etsy HQ corporate + Dock 72 corporate + 1 Hotel DUMBO.
+    # DUMBO — Etsy HQ + Dock 72 corporate (they join the 1 Hotel Brooklyn
+    # Bridge waterfront cluster; the duplicate "1 Hotel DUMBO" entry was removed).
     # Dropped Empire Stores / Time Out Market / St Ann's — they're tourist
     # foot-traffic or niche performance, not wealth or car-service volume.
     ("Etsy HQ (DUMBO)",           40.7045, -73.9870, "corporate", 1.6),
     ("Dock 72 (Brooklyn Navy Yard)", 40.7036, -73.9711, "corporate", 1.5),
-    ("1 Hotel Brooklyn (DUMBO)",  40.7034, -73.9931, "hotel_luxury", 2.0),
 
     # Williamsburg — boutique hotels + nightlife wealth
     ("William Vale Hotel",        40.7218, -73.9568, "hotel_luxury", 2.0),
@@ -206,9 +193,6 @@ NYC_LONG_TRIP_POIS: List[Tuple[str, float, float, str, float]] = [
     ("Kings County Hospital",     40.6585, -73.9460, "hospital", 2.5),
     ("SUNY Downstate Medical",    40.6557, -73.9472, "hospital", 2.5),
 
-    # Bronx — Riverdale wealthy enclave
-    ("Riverdale Country School",  40.9023, -73.9133, "private_school", 1.5),
-    ("Horace Mann School (Bronx)", 40.9012, -73.9100, "private_school", 1.5),
 
     # Queens — Long Island Jewish + Northwell hospitals (huge medical
     # campuses with constant car-service traffic). Dropped Forest Hills
@@ -269,7 +253,7 @@ NYC_LONG_TRIP_POIS: List[Tuple[str, float, float, str, float]] = [
     # ---------------- Outer-borough cluster expansion ----------------
     # The earlier outer-borough POIs left the Bronx and Staten Island
     # with zero flags and several lone landmarks (Yankee Stadium, Lincoln/
-    # Kings County hospitals, Atlantic Terminal/Barclays, 1 Hotel DUMBO)
+    # Kings County hospitals, Atlantic Terminal/Barclays, 1 Hotel Brooklyn Bridge)
     # stranded as singletons/pairs. These additions complete those into
     # genuine 3+ clusters using the "busy buildings" bar where outright
     # wealth is sparse — major transit, medical complexes, civic/retail.
