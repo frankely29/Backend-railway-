@@ -128,6 +128,21 @@ POSITION('manhattan' IN LOWER(COALESCE(borough_name, ''))) > 0
 AND COALESCE(centroid_latitude, 999.0) <= 40.795
 AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
 """.strip()
+    # Regions where dark-blue-or-higher (citywide rating >= 60) zones take an
+    # extra +10% market-saturation penalty: Brooklyn, Queens, and UPTOWN
+    # Manhattan (centroid_latitude > 40.795 — the inverse of the Manhattan-core
+    # latitude band above). The Bronx/Wash-Heights corridor is excluded from the
+    # uptown branch so those zones keep being treated as Bronx/Wash-Heights,
+    # consistent with how the Manhattan-core guard handles them.
+    dark_blue_saturation_surcharge_region_sql = f"""(
+  POSITION('brooklyn' IN LOWER(COALESCE(borough_name, ''))) > 0
+  OR POSITION('queens' IN LOWER(COALESCE(borough_name, ''))) > 0
+  OR (
+    POSITION('manhattan' IN LOWER(COALESCE(borough_name, ''))) > 0
+    AND COALESCE(centroid_latitude, -999.0) > 40.795
+    AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
+  )
+)""".strip()
     citywide_v3_positive_pre_tier_sql = f"""
         {nullable_weighted_average_sql([
           (f"{c3_busy_now_weight:.8f}", "busy_now_base_n"),
@@ -170,6 +185,17 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
             THEN
               0.360 * manhattan_core_saturation_penalty_n +
               0.110 * citywide_manhattan_short_trip_trap_penalty_n
+            ELSE 0.0
+          END +
+          -- Dark-blue-or-higher saturation surcharge: zones that are already
+          -- rating >= 60 (gated on the non-circular pre-tier rating) in
+          -- Brooklyn / Queens / uptown Manhattan take +10% of their existing
+          -- market-saturation penalty contribution. Everything below dark blue,
+          -- and every other region, is left exactly as-is.
+          CASE
+            WHEN earnings_shadow_rating_citywide_v3_pre_tier >= 60
+             AND {dark_blue_saturation_surcharge_region_sql}
+            THEN 0.10 * citywide_v3_effective_saturation_weight * COALESCE(market_saturation_penalty_n, 0.0)
             ELSE 0.0
           END
         )"""
