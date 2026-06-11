@@ -309,6 +309,17 @@ NYC_LONG_TRIP_POIS: List[Tuple[str, float, float, str, float]] = [
     # High Line + Gansevoort with the Whitney + luxury retail) ---------------
     ("Whitney Museum",            40.7395, -74.0090, "tourist", 1.3),
     ("RH Meatpacking",            40.7404, -74.0072, "luxury_shopping", 1.3),
+
+    # ---------------- "Near-miss" completions: a single addition that turns an
+    # existing 2-building pair into a genuine 3+ Strategic Point ----------------
+    # UES elite medical: completes Memorial Sloan Kettering + Hospital for Special Surgery
+    ("NewYork-Presbyterian/Weill Cornell", 40.7648, -73.9543, "hospital", 3.0),
+    # UES elite hotels: completes The Pierre + Loews Regency
+    ("The Lowell Hotel",          40.7656, -73.9690, "hotel_luxury", 2.3),
+    # Penn district transit: completes Penn Station + Madison Square Garden
+    ("Moynihan Train Hall",       40.7506, -73.9968, "transit_hub", 2.5),
+    # UWS: completes Hotel Beacon + NYU Langone UWS
+    ("Beacon Theatre",            40.7800, -73.9817, "performance", 1.6),
 ]
 
 
@@ -375,6 +386,11 @@ POI_ADDRESSES: Dict[str, str] = {
     # Meatpacking / High Line
     "Whitney Museum": "99 Gansevoort St, NY 10014",
     "RH Meatpacking": "9-19 9th Ave, NY 10014",
+    # Near-miss completions
+    "NewYork-Presbyterian/Weill Cornell": "525 E 68th St, NY 10065",
+    "The Lowell Hotel": "28 E 63rd St, NY 10065",
+    "Moynihan Train Hall": "351 W 31st St, NY 10001",
+    "Beacon Theatre": "2124 Broadway, NY 10023",
     # Airports
     "JFK Airport (central)": "JFK Airport, Jamaica, NY 11430",
     "LaGuardia Airport": "LaGuardia Airport, Flushing, NY 11371",
