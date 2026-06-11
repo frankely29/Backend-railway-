@@ -350,8 +350,16 @@ MIN_MEMBERS_PER_HOTSPOT = 3
 # about airports → hospitals → transit → hotels, so airports win the
 # label if any airport POI is in the cluster.
 _CATEGORY_PRIORITY: List[str] = [
+    # Event-dependent venues are kept LOWEST. A theater/arena is dark most
+    # nights, so its "post-show" window must never drive a nightly pulse when a
+    # reliable daily category is present — otherwise a cluster like Rockefeller
+    # Center would falsely pulse at show-let-out time on nights with no show.
+    # A reliable daily category (corporate / hotel / transit / hospital /
+    # shopping) wins instead; an event category only dominates a cluster that
+    # has nothing else (and such pure-event clusters are intentionally dropped).
+    "performance", "stadium",
     "tourist", "luxury_shopping", "luxury_condo", "private_club",
-    "private_school", "corporate", "performance", "stadium", "convention",
+    "private_school", "corporate", "convention",
     "hotel_luxury", "transit_hub", "hospital", "airport",
 ]
 
