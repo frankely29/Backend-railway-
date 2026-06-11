@@ -1,5 +1,13 @@
 # BACKEND CHANGELOG
 
+## Current pass: Zone earnings — +10% saturation penalty for dark-blue+ zones in Brooklyn / Queens / uptown Manhattan
+
+Per directive: increase the driver market-saturation penalty **only** for zones colored **dark blue or higher** (citywide rating ≥ 60 — Blue/Indigo/Purple/Green) **and** located in **Brooklyn, Queens, or uptown Manhattan**. Everything below dark blue (Sky Blue ≤ 59 and down), and every other borough, is left exactly as-is.
+- New region predicate `dark_blue_saturation_surcharge_region_sql` in `zone_earnings_engine.py` (mirrors the existing `manhattan_core_citywide_guard_sql` style): Brooklyn OR Queens OR (Manhattan AND `centroid_latitude > 40.795` — uptown/Harlem & up, the inverse of the Manhattan-core latitude band), with the Bronx/Wash-Heights corridor excluded for consistency with the core guard.
+- Added a gated term to the **citywide_v3 effective** negative score: `+10%` of the zone's existing market-saturation contribution (`0.10 * citywide_v3_effective_saturation_weight * market_saturation_penalty_n`), gated on `earnings_shadow_rating_citywide_v3_pre_tier >= 60`. The gate uses the **pre-tier (base)** rating, so it is **non-circular**; the surcharge only enters the **effective** score that drives the visible citywide map color, nudging those hot/saturated zones down slightly.
+- Scope: applied to the **citywide_v3** path — the default map color, and the *only* color uptown-Manhattan zones get (they're excluded from `manhattan_v3`). Brooklyn/Queens *borough-mode* colors are left unchanged for now (can extend on request). The rating-logic version token auto-bumps (it hashes engine source), so frame caches invalidate and rebuild.
+- Tests: `tests/test_hotspot_popup_metrics.py` (the SQL-execution guard) passes — 4 passed, 1 xfailed; the generated SQL still compiles and runs. Full suite run before push.
+
 ## Current pass: Strategic Points — event venues no longer drive a false nightly pulse
 
 Fix (per report): **Rockefeller Center** pulsed at ~10–11pm (Radio City "post-show") **every** night — but Radio City is **dark most nights**, so on a no-show night the pulse falsely signaled a surge at an empty plaza (worse than useless: it sends drivers to a dead spot). Root cause: `performance`/`stadium` (event-dependent) outranked `corporate` in the dominant-category priority that drives a cluster's pulse window.
