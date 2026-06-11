@@ -1,5 +1,12 @@
 # BACKEND CHANGELOG
 
+## Current pass: Strategic Points — Brooklyn & Queens expansion (+2 clusters)
+
+Manhattan is set, so this pass focused the hunt on the **outer boroughs**. The BK/Queens singleton + near-miss scan confirmed most outer-borough high-value POIs (hospitals, stadiums) are isolated and too spread for the 0.25-mi cap — the real opportunities are **new dense districts**:
+- **Brooklyn — Downtown Brooklyn East** (5 members, **w=8.2**) — `City Point` retail + `The Brooklyn Tower` (supertall luxury condo) + `DeKalb Av (B/Q/R)` subway hub + `Hotel Indigo` + `Ava DoBro`. Distinct from the Borough Hall / MetroTech cluster ~0.4 mi west; a strong business/residential/transit hub.
+- **Queens — LIC waterfront** (4 members, w=5.6) — `The View` + `4610 Center Blvd` luxury condos + `Gantry Plaza State Park` + `Hunters Point Library`, on the East River — a high-density wealthy residential district.
+- Result: **33 → 35 strategic points**. 0 duplicate names, 0 clusters < 3 members, addresses added; `test_holiday_calendar` passes (8/8). (Confirmed the outer boroughs are genuinely sparser than Manhattan — Flushing, LIC Court Sq, Forest Hills, Atlantic Terminal, the Kings County hospital corridor, and now these two are the dense high-value spots; the rest of BK/Queens lacks tight 3+ clusters.)
+
 ## Current pass: Strategic Points — +2 Midtown clusters (Rockefeller Center, Bryant Park)
 
 Airports confirmed **intentionally excluded** (per the user) — left untouched (no change to the 3-member rule). Continued the near-miss hunt and added 2 clean high-end Midtown clusters in `long_trip_hotspot_builder.py`:

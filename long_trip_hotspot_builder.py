@@ -328,6 +328,23 @@ NYC_LONG_TRIP_POIS: List[Tuple[str, float, float, str, float]] = [
     ("New York Public Library",   40.7532, -73.9822, "tourist", 1.4),
     ("Bryant Park Hotel",         40.7521, -73.9836, "hotel_luxury", 1.9),
     ("Refinery Hotel",            40.7516, -73.9844, "hotel_luxury", 1.8),
+
+    # ================= BROOKLYN & QUEENS expansion =================
+    # Brooklyn — Downtown Brooklyn East (City Point / DeKalb): dense retail +
+    # supertall luxury condo + subway hub + hotel, distinct from the Borough
+    # Hall / MetroTech cluster ~0.4 mi west.
+    ("City Point Brooklyn",       40.6904, -73.9826, "luxury_shopping", 1.5),
+    ("The Brooklyn Tower",        40.6900, -73.9831, "luxury_condo", 1.7),
+    ("DeKalb Av (B/Q/R)",         40.6905, -73.9819, "transit_hub", 1.8),
+    ("Hotel Indigo Downtown Bklyn", 40.6899, -73.9821, "hotel_luxury", 1.7),
+    ("Ava DoBro",                 40.6917, -73.9836, "luxury_condo", 1.5),
+
+    # Queens — Long Island City waterfront (Hunters Point / Gantry): luxury
+    # condo towers + East River state park + the Hunters Point library.
+    ("Gantry Plaza State Park",   40.7470, -73.9583, "tourist", 1.4),
+    ("The View at East Coast (4540 Center)", 40.7457, -73.9587, "luxury_condo", 1.5),
+    ("4610 Center Blvd (LIC)",    40.7466, -73.9580, "luxury_condo", 1.4),
+    ("Hunters Point Library",     40.7448, -73.9585, "tourist", 1.3),
 ]
 
 
@@ -403,6 +420,17 @@ POI_ADDRESSES: Dict[str, str] = {
     "New York Public Library": "476 5th Ave, NY 10018",
     "Bryant Park Hotel": "40 W 40th St, NY 10018",
     "Refinery Hotel": "63 W 38th St, NY 10018",
+    # Brooklyn — Downtown Brooklyn East
+    "City Point Brooklyn": "445 Albee Square W, Brooklyn 11201",
+    "The Brooklyn Tower": "9 DeKalb Ave, Brooklyn 11201",
+    "DeKalb Av (B/Q/R)": "DeKalb Ave & Flatbush Ave Ext, Brooklyn 11201",
+    "Hotel Indigo Downtown Bklyn": "229 Duffield St, Brooklyn 11201",
+    "Ava DoBro": "100 Willoughby St, Brooklyn 11201",
+    # Queens — LIC waterfront
+    "Gantry Plaza State Park": "47-01 Center Blvd, LIC 11109",
+    "The View at East Coast (4540 Center)": "4540 Center Blvd, LIC 11109",
+    "4610 Center Blvd (LIC)": "4610 Center Blvd, LIC 11109",
+    "Hunters Point Library": "47-40 Center Blvd, LIC 11109",
     # Airports
     "JFK Airport (central)": "JFK Airport, Jamaica, NY 11430",
     "LaGuardia Airport": "LaGuardia Airport, Flushing, NY 11371",
