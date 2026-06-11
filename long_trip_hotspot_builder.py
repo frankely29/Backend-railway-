@@ -293,6 +293,33 @@ NYC_LONG_TRIP_POIS: List[Tuple[str, float, float, str, float]] = [
     ("Staten Island Ferry - St. George", 40.6437, -74.0735, "transit_hub", 2.3),
     ("Movenpick Lighthouse Point", 40.6432, -74.0721, "hotel_luxury", 1.8),
     ("Empire Outlets",            40.6448, -74.0759, "luxury_shopping", 1.6),
+
+    # ---------------- Hudson Yards / Manhattan West (gives the existing
+    # "Hudson Yards" corporate POI its district: HQ towers, Equinox hotel,
+    # 7-train terminus — heavy business-traveler + airport volume) -----------
+    ("Equinox Hotel Hudson Yards", 40.7540, -74.0014, "hotel_luxury", 2.3),
+    ("30 Hudson Yards",           40.7538, -74.0008, "corporate", 1.7),
+    ("55 Hudson Yards",           40.7531, -74.0001, "corporate", 1.6),
+
+    # ---------------- Battery Park City / Brookfield Place (anchors the
+    # existing Conrad + Goldman Sachs HQ with the Brookfield luxury mall) -----
+    ("Brookfield Place",          40.7128, -74.0155, "luxury_shopping", 1.6),
+
+    # ---------------- Meatpacking / High Line (completes the existing Standard
+    # High Line + Gansevoort with the Whitney + luxury retail) ---------------
+    ("Whitney Museum",            40.7395, -74.0090, "tourist", 1.3),
+    ("RH Meatpacking",            40.7404, -74.0072, "luxury_shopping", 1.3),
+
+    # ---------------- "Near-miss" completions: a single addition that turns an
+    # existing 2-building pair into a genuine 3+ Strategic Point ----------------
+    # UES elite medical: completes Memorial Sloan Kettering + Hospital for Special Surgery
+    ("NewYork-Presbyterian/Weill Cornell", 40.7648, -73.9543, "hospital", 3.0),
+    # UES elite hotels: completes The Pierre + Loews Regency
+    ("The Lowell Hotel",          40.7656, -73.9690, "hotel_luxury", 2.3),
+    # Penn district transit: completes Penn Station + Madison Square Garden
+    ("Moynihan Train Hall",       40.7506, -73.9968, "transit_hub", 2.5),
+    # UWS: completes Hotel Beacon + NYU Langone UWS
+    ("Beacon Theatre",            40.7800, -73.9817, "performance", 1.6),
 ]
 
 
@@ -350,6 +377,20 @@ BEST_HOURS_BY_CATEGORY: Dict[str, str] = {
 # Drivers using the popup should treat the address as a navigation hint,
 # not gospel.
 POI_ADDRESSES: Dict[str, str] = {
+    # Hudson Yards / Manhattan West
+    "Equinox Hotel Hudson Yards": "33 Hudson Yards, NY 10001",
+    "30 Hudson Yards": "30 Hudson Yards, NY 10001",
+    "55 Hudson Yards": "550 W 34th St, NY 10001",
+    # Battery Park City / Brookfield Place
+    "Brookfield Place": "230 Vesey St, NY 10281",
+    # Meatpacking / High Line
+    "Whitney Museum": "99 Gansevoort St, NY 10014",
+    "RH Meatpacking": "9-19 9th Ave, NY 10014",
+    # Near-miss completions
+    "NewYork-Presbyterian/Weill Cornell": "525 E 68th St, NY 10065",
+    "The Lowell Hotel": "28 E 63rd St, NY 10065",
+    "Moynihan Train Hall": "351 W 31st St, NY 10001",
+    "Beacon Theatre": "2124 Broadway, NY 10023",
     # Airports
     "JFK Airport (central)": "JFK Airport, Jamaica, NY 11430",
     "LaGuardia Airport": "LaGuardia Airport, Flushing, NY 11371",

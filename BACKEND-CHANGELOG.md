@@ -1,5 +1,15 @@
 # BACKEND CHANGELOG
 
+## Current pass: Strategic Points — investigate each + add 7 new clusters (24 → 31)
+
+Investigated all 24 existing strategic points one-by-one (each qualifies — high-end, 3+ co-located important buildings within ~5 min, anchored by hotels / hospitals / transit hubs / corporate towers / airports) and added **3 high-value districts that were missing**, in `long_trip_hotspot_builder.py`:
+- **Hudson Yards** (4 members, w=7.4) — the existing `Hudson Yards` corporate POI finally gets its district: `Equinox Hotel Hudson Yards` + `30`/`55 Hudson Yards`. (Javits Center is adjacent but the district is too elongated N–S for the 0.25-mi complete-link cap to hold as one cluster.)
+- **Battery Park City / Brookfield Place** (3 members, w=5.7) — `Brookfield Place` luxury mall completes the existing `Conrad NY Downtown` + `Goldman Sachs HQ`.
+- **Meatpacking / High Line** (4 members, w=6.6) — `Whitney Museum` + `RH Meatpacking` complete the existing `Standard High Line` + `Gansevoort Meatpacking` hotels.
+- Mid-add, the duplicate audit caught **self-introduced duplicates**: `Hudson Yards` / `Goldman Sachs HQ` / `Standard High Line` / `Gansevoort Meatpacking` were already in the list as sub-3 singletons/pairs (which is why they weren't strategic points yet). The new POIs give them their **3rd members** instead of duplicating them.
+- **Near-miss completions** — a 2-member-group scan of the clusterer surfaced existing pairs needing just a 3rd member; one addition each turned them into Strategic Points: `NewYork-Presbyterian/Weill Cornell` → an **elite UES medical** cluster with Memorial Sloan Kettering + Hospital for Special Surgery (**w=9.0**, the new top-tier point); `Moynihan Train Hall` → Penn Station + MSG transit hub; `The Lowell Hotel` → The Pierre + Loews Regency UES hotels; `Beacon Theatre` → NYU Langone UWS + Hotel Beacon. (A 5th, Smyth Tribeca, was dropped — Four Seasons Tribeca + Greenwich are already 0.247 mi apart, so nothing completes them within the 0.25-mi cap.)
+- Result: **24 → 31 strategic points**. 0 duplicate names, 0 clusters < 3 members, addresses added for all new POIs; `test_holiday_calendar` passes (8/8).
+
 ## Current pass: Strategic Points audit — drop double-counts + short-trip school spots
 
 Audited every long-trip-hotspot cluster ("strategic point") against the goal — **fast money via long trips, high-end / quality customers, 3+ important buildings within ~5 min**. All clusters already satisfied the structural rule (`MIN_MEMBERS_PER_HOTSPOT = 3`, `CLUSTER_RADIUS_MI = 0.25` complete-link → every member within ~5 min of every other). Two value problems found and fixed in `long_trip_hotspot_builder.py`:
