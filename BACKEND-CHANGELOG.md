@@ -1,5 +1,12 @@
 # BACKEND CHANGELOG
 
+## Current pass: Strategic Points — +2 Midtown clusters (Rockefeller Center, Bryant Park)
+
+Airports confirmed **intentionally excluded** (per the user) — left untouched (no change to the 3-member rule). Continued the near-miss hunt and added 2 clean high-end Midtown clusters in `long_trip_hotspot_builder.py`:
+- **Rockefeller Center** (3 members, w=4.4) — `Radio City Music Hall` completes the existing `Rockefeller Center` + `Saks Fifth Ave` pair (corporate + shopping + performance; heavy tourist + business volume).
+- **Bryant Park** (3 members, w=5.1) — `New York Public Library` + `Bryant Park Hotel` + `Refinery Hotel`. (The existing `Bryant Park (corporate)` POI is greedily taken by the adjacent Algonquin, so this 40th-St trio is built to stand on its own.)
+- Result: **31 → 33 strategic points**. 0 duplicate names, 0 clusters < 3 members, addresses added; `test_holiday_calendar` passes (8/8).
+
 ## Current pass: Strategic Points — investigate each + add 7 new clusters (24 → 31)
 
 Investigated all 24 existing strategic points one-by-one (each qualifies — high-end, 3+ co-located important buildings within ~5 min, anchored by hotels / hospitals / transit hubs / corporate towers / airports) and added **3 high-value districts that were missing**, in `long_trip_hotspot_builder.py`:

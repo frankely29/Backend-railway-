@@ -320,6 +320,14 @@ NYC_LONG_TRIP_POIS: List[Tuple[str, float, float, str, float]] = [
     ("Moynihan Train Hall",       40.7506, -73.9968, "transit_hub", 2.5),
     # UWS: completes Hotel Beacon + NYU Langone UWS
     ("Beacon Theatre",            40.7800, -73.9817, "performance", 1.6),
+    # Rockefeller Center: completes Rockefeller Center + Saks Fifth Ave
+    ("Radio City Music Hall",     40.7600, -73.9800, "performance", 1.6),
+    # Bryant Park: NYPL + 2 hotels on the 40th-St side (the existing Bryant
+    # Park corporate POI is greedily taken by the Algonquin, so this trio
+    # stands on its own)
+    ("New York Public Library",   40.7532, -73.9822, "tourist", 1.4),
+    ("Bryant Park Hotel",         40.7521, -73.9836, "hotel_luxury", 1.9),
+    ("Refinery Hotel",            40.7516, -73.9844, "hotel_luxury", 1.8),
 ]
 
 
@@ -391,6 +399,10 @@ POI_ADDRESSES: Dict[str, str] = {
     "The Lowell Hotel": "28 E 63rd St, NY 10065",
     "Moynihan Train Hall": "351 W 31st St, NY 10001",
     "Beacon Theatre": "2124 Broadway, NY 10023",
+    "Radio City Music Hall": "1260 6th Ave, NY 10020",
+    "New York Public Library": "476 5th Ave, NY 10018",
+    "Bryant Park Hotel": "40 W 40th St, NY 10018",
+    "Refinery Hotel": "63 W 38th St, NY 10018",
     # Airports
     "JFK Airport (central)": "JFK Airport, Jamaica, NY 11430",
     "LaGuardia Airport": "LaGuardia Airport, Flushing, NY 11371",
