@@ -1585,6 +1585,75 @@ def _prune_inactive_month_frame_caches(keep_recent: int = WARM_MONTH_FRAME_CACHE
     }
 
 
+def _dir_size_bytes(path: Path) -> int:
+    total = 0
+    try:
+        for child in path.rglob("*"):
+            try:
+                if child.is_file():
+                    total += int(child.stat().st_size)
+            except Exception:
+                continue
+    except Exception:
+        return total
+    return total
+
+
+def _reclaim_orphan_month_dirs() -> Dict[str, Any]:
+    """Delete derived per-month directories under exact_history/months/ that are
+    NOT referenced by the month manifest -- leftovers from past builds of other
+    months. These are the dominant *unaccounted* volume consumer (each holds an
+    ~0.8 GB exact_shadow.duckdb store + frame cache + timeline) and nothing else
+    prunes them, because the existing retention only iterates manifest months.
+
+    Each orphan is fully rebuildable from the protected source parquets, so this
+    is safe: it never touches source parquet files (which live in the data-dir
+    root), the month manifest, community_v2.db, or any user data. It iterates
+    the FILESYSTEM and keeps every manifest month (plus the resolved active
+    month). Conservative guard: if the manifest lists no months, nothing is
+    deleted (we never risk removing the only/served month).
+    """
+    removed_month_dirs: List[str] = []
+    bytes_freed_estimate = 0
+    try:
+        if not (EXACT_HISTORY_MONTHS_DIR.exists() and EXACT_HISTORY_MONTHS_DIR.is_dir()):
+            return {"removed_month_dirs": [], "bytes_freed_estimate": 0}
+        manifest = _load_month_manifest()
+        manifest_months = {
+            str(mk) for mk in (manifest.get("available_month_keys") or []) if _safe_parse_month_key(str(mk))
+        }
+        if not manifest_months:
+            # Nothing trusted to keep -> do not delete anything.
+            return {"removed_month_dirs": [], "bytes_freed_estimate": 0}
+        keep = set(manifest_months)
+        active = resolve_active_month_key(datetime.now(timezone.utc).astimezone(NYC_TZ), sorted(manifest_months))
+        if active:
+            keep.add(str(active))
+        for child in EXACT_HISTORY_MONTHS_DIR.iterdir():
+            if not child.is_dir():
+                continue
+            mk = child.name
+            if not _safe_parse_month_key(mk) or mk in keep:
+                continue
+            size = _dir_size_bytes(child)
+            try:
+                shutil.rmtree(child, ignore_errors=False)
+            except Exception:
+                traceback.print_exc()
+                continue
+            if not child.exists():
+                removed_month_dirs.append(mk)
+                bytes_freed_estimate += int(size)
+        if removed_month_dirs:
+            print(
+                f"reclaim_orphan_month_dirs_done removed={removed_month_dirs} "
+                f"kept_manifest={sorted(keep)} freed_bytes_estimate={bytes_freed_estimate}"
+            )
+    except Exception:
+        traceback.print_exc()
+    return {"removed_month_dirs": removed_month_dirs, "bytes_freed_estimate": int(bytes_freed_estimate)}
+
+
 def _available_source_month_keys() -> List[str]:
     grouped = _group_parquets_by_month(_list_parquets())
     return sorted(grouped.keys())
@@ -2780,14 +2849,17 @@ def _start_storage_cleanup_sweeper() -> None:
                 legacy_prune = _prune_legacy_frame_files_after_monthly_ready()
                 obsolete_month_prune = _prune_obsolete_month_derived_artifacts()
                 inactive_cache_prune = _prune_inactive_month_frame_caches()
+                orphan_month_reclaim = _reclaim_orphan_month_dirs()
                 removed_count = int(cleanup_result.get("removed_count") or 0) + int(prune_result.get("removed_count") or 0)
                 removed_count += int(stale_build_prune.get("removed_count") or 0)
                 removed_count += int(stale_backup_prune.get("removed_count") or 0)
                 removed_count += int(legacy_prune.get("removed_count") or 0)
                 removed_count += int(obsolete_month_prune.get("removed_count") or 0)
                 removed_count += int(inactive_cache_prune.get("removed_frame_count") or 0)
+                removed_count += len(orphan_month_reclaim.get("removed_month_dirs") or [])
                 bytes_freed = int(cleanup_result.get("bytes_freed_estimate") or 0) + int(prune_result.get("bytes_freed_estimate") or 0)
                 bytes_freed += int(inactive_cache_prune.get("bytes_freed_estimate") or 0)
+                bytes_freed += int(orphan_month_reclaim.get("bytes_freed_estimate") or 0)
                 _cleanup_last_periodic_removed_count = removed_count
                 _cleanup_last_periodic_freed_bytes_estimate = bytes_freed
                 _cleanup_last_periodic_ran_at_unix = int(time.time())
@@ -4472,6 +4544,10 @@ def start_generate(
             cleanup_result = cleanup_artifact_storage(DATA_DIR, FRAMES_DIR)
             _prune_stale_month_build_dirs()
             _prune_stale_month_backup_dirs()
+            # Reclaim orphaned per-month dirs so a rebuild has the headroom it
+            # needs (the "No space left on device" build failures are caused by
+            # these leftovers filling the volume).
+            _reclaim_orphan_month_dirs()
             if force_clear_lock and lock_present:
                 _clear_lock()
                 lock_cleared = True
@@ -6627,14 +6703,19 @@ def startup():
         # Reclaim old months' served frame caches (the dominant volume consumer)
         # before the version-token rebuild below may run, so it has headroom.
         inactive_cache_prune = _prune_inactive_month_frame_caches()
+        # Reclaim orphaned per-month build dirs (not in the manifest) -- the
+        # ~GBs of leftover stores that fill the volume and block rebuilds.
+        orphan_month_reclaim = _reclaim_orphan_month_dirs()
         removed_count = int(cleanup_result.get("removed_count") or 0) + int(prune_result.get("removed_count") or 0)
         removed_count += int(stale_build_prune.get("removed_count") or 0)
         removed_count += int(stale_backup_prune.get("removed_count") or 0)
         removed_count += int(legacy_prune.get("removed_count") or 0)
         removed_count += int(obsolete_month_prune.get("removed_count") or 0)
         removed_count += int(inactive_cache_prune.get("removed_frame_count") or 0)
+        removed_count += len(orphan_month_reclaim.get("removed_month_dirs") or [])
         bytes_freed = int(cleanup_result.get("bytes_freed_estimate") or 0) + int(prune_result.get("bytes_freed_estimate") or 0)
         bytes_freed += int(inactive_cache_prune.get("bytes_freed_estimate") or 0)
+        bytes_freed += int(orphan_month_reclaim.get("bytes_freed_estimate") or 0)
         _cleanup_last_startup_removed_count = removed_count
         _cleanup_last_startup_freed_bytes_estimate = bytes_freed
         print(f"[storage-cleanup] removed={removed_count} freed_bytes_estimate={bytes_freed}")

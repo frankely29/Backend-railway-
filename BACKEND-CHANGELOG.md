@@ -1,5 +1,16 @@
 # BACKEND CHANGELOG
 
+## Current pass: Reclaim orphaned month build dirs — the actual 100%-full culprit
+
+Live `/status` on the full volume showed the truth: parquets were only **6.0 GB** of the 19.2 GB used; **~11.7 GB was unaccounted** — sitting in `exact_history/months/` as **orphaned per-month build directories** (each ~0.8 GB `exact_shadow.duckdb` store + frame cache) left over from building all 12 months, while the manifest tracked only **one** month (`2025-06`). The earlier frame-cache retention only iterated *manifest* months, so it kept the single active month and freed nothing — and the full disk was blocking every rebuild (`No space left on device` on `CHECKPOINT`).
+
+- New `_reclaim_orphan_month_dirs()`: deletes per-month dirs under `exact_history/months/` that are **not referenced by the manifest** (plus the resolved active month is always kept). Each is fully rebuildable from the protected parquets. Safe: never touches source parquets, the manifest, `community_v2.db`, or user data. Conservative guard — if the manifest lists no months, it deletes nothing.
+- Wired into **startup cleanup**, the **periodic sweeper**, and the **pre-rebuild cleanup in `start_generate`** (so a triggered rebuild frees the headroom it needs and stops failing on no-space).
+- `get_artifact_storage_report` now itemizes the previously-blind `exact_history` (months total + dir names/count, `__building__`, `__backup__`, chat media, and an `unaccounted_bytes_estimate`) so `/status` reveals where the volume actually goes.
+- Tests: `test_reclaim_orphan_month_dirs_removes_unmanifested` (orphans gone, manifest/active month protected) + no-op-without-manifest guard.
+
+Recovery on the full volume, no resize: deploy → startup reclaim deletes the orphaned month dirs → ~11 GB freed → rebuilds unblocked → bounded.
+
 ## Current pass: Bound /data volume growth — prune old months' served frame caches
 
 Railway volume hit 100% and crashed `web`. Root cause: `exact_history/months/` is **append-only**. The cleanup sweeper only swept temp/build leftovers; there was **no month-retention policy**, so every calendar month's **served frame cache** (`frame_*.json`, ~1–2 GB/month) was kept forever — unbounded growth. (A rating-logic version bump that rebuilds caches was the acute trigger on an already-near-full disk.)

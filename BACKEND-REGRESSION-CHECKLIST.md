@@ -91,6 +91,13 @@
 - [x] `_rating_logic_version_token()` hashes `build_hotspot` so a deploy of this change rotates the frame etag and triggers the startup regenerate/purge.
 - [ ] live: after deploy, a previously-spiky blue zone reads lower/steadier in **every** mode (toggle citywide, a borough, 45+ trips); a reliably-busy zone is unchanged; `/frame/{idx}` cache-miss latency stays acceptable (then cached).
 
+## Storage — reclaim orphaned month dirs (acute 100%-full fix)
+- [x] `test_reclaim_orphan_month_dirs_removes_unmanifested` + no-op-without-manifest guard pass.
+- [x] `_reclaim_orphan_month_dirs` wired into startup cleanup, periodic sweeper, and `start_generate` pre-rebuild cleanup.
+- [x] `/status` `storage_report` now itemizes `exact_history_months_bytes` + `exact_history_months_dir_names/count`, `__building__`/`__backup__`, chat media, `unaccounted_bytes_estimate`.
+- [ ] live: after deploy, logs show `reclaim_orphan_month_dirs_done removed=[...]`; `/status` `exact_history_months_dir_count` drops to the manifest months; `disk_percent_used` falls well below 100%; the `No space left` rebuild error clears.
+- [ ] live: served active month (e.g. 2025-06) still renders; source parquets (12) and user data intact.
+
 ## Storage — bound /data growth (month frame-cache retention)
 - [x] `tests/test_month_frame_cache_retention.py` passes: active month kept warm, older months' `frame_*.json` reclaimed, exact stores + source parquets untouched, no-op without a manifest.
 - [x] `_prune_inactive_month_frame_caches` wired into startup cleanup (before the version-token rebuild), the periodic sweeper, and post-publish in the generate worker.
