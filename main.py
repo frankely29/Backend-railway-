@@ -190,6 +190,12 @@ AVATAR_THUMB_IMMUTABLE_CACHE_SECONDS = int(os.environ.get("AVATAR_THUMB_IMMUTABL
 AVATAR_BACKFILL_BATCH_SIZE = int(os.environ.get("AVATAR_BACKFILL_BATCH_SIZE", "25"))
 STORAGE_CLEANUP_INTERVAL_SECONDS = int(os.environ.get("STORAGE_CLEANUP_INTERVAL_SECONDS", "21600"))
 MONTH_BUILD_STALE_DIR_MAX_AGE_SEC = int(os.environ.get("MONTH_BUILD_STALE_DIR_MAX_AGE_SEC", "1800"))
+# How many recent months keep their SERVED frame cache (frame_*.json) warm. The
+# active month is always kept on top of this. Older months' frame caches are the
+# dominant volume consumer (~1-2 GB/month) and are reclaimable -- they rebuild
+# per-frame on demand -- so they are pruned. Source parquets, exact stores,
+# timelines, community.db and all user data are NEVER touched by this.
+WARM_MONTH_FRAME_CACHE_COUNT = int(os.environ.get("WARM_MONTH_FRAME_CACHE_COUNT", "1"))
 MONTH_BUILD_FAILURE_BACKOFF_SEC = int(os.environ.get("MONTH_BUILD_FAILURE_BACKOFF_SEC", "30"))
 
 # Auto-rebuild backoff is persisted to disk so Railway redeploys during development
@@ -1520,6 +1526,65 @@ def _prune_obsolete_month_derived_artifacts() -> Dict[str, Any]:
     return {"removed_paths": removed_paths, "removed_count": int(removed_count)}
 
 
+def _prune_inactive_month_frame_caches(keep_recent: int = WARM_MONTH_FRAME_CACHE_COUNT) -> Dict[str, Any]:
+    """Reclaim the dominant volume consumer: the per-month SERVED frame caches
+    (frame_*.json) for months outside the warm window.
+
+    Keeps the active month warm (plus the newest `keep_recent` months as a
+    safety net); every older month's frame cache is purged. Pruned months stay
+    fully viewable -- their frames rebuild per-frame on demand (cache miss ->
+    build worker) using current logic. Deletes ONLY derived frame payloads via
+    _purge_month_frame_cache; it never removes source parquet files, exact
+    stores, timelines/manifest, community.db, or any user data (trips,
+    leaderboard). This is what bounds /data growth to a fixed footprint.
+    """
+    pruned_months: List[str] = []
+    removed_frame_count = 0
+    bytes_freed_estimate = 0
+    try:
+        manifest = _load_month_manifest()
+        month_keys = sorted(
+            {str(mk) for mk in (manifest.get("available_month_keys") or []) if _safe_parse_month_key(str(mk))}
+        )
+        if not month_keys:
+            return {"pruned_months": [], "removed_frame_count": 0, "bytes_freed_estimate": 0}
+        # Never prune the newest month(s); always keep the active month warm.
+        keep = set(month_keys[-max(1, int(keep_recent)):])
+        active = resolve_active_month_key(datetime.now(timezone.utc).astimezone(NYC_TZ), month_keys)
+        if active:
+            keep.add(str(active))
+        for mk in month_keys:
+            if mk in keep:
+                continue
+            cache_dir = _month_frame_cache_dir(mk)
+            if not (cache_dir.exists() and cache_dir.is_dir()):
+                continue
+            frame_files = list(cache_dir.glob("frame_*.json"))
+            if not frame_files:
+                continue
+            for frame_file in frame_files:
+                try:
+                    bytes_freed_estimate += int(frame_file.stat().st_size)
+                except Exception:
+                    pass
+            removed = _purge_month_frame_cache(mk)
+            if removed > 0:
+                removed_frame_count += int(removed)
+                pruned_months.append(mk)
+        if pruned_months:
+            print(
+                f"inactive_month_frame_cache_prune_done pruned_months={pruned_months} "
+                f"removed_frames={removed_frame_count} freed_bytes_estimate={bytes_freed_estimate}"
+            )
+    except Exception:
+        traceback.print_exc()
+    return {
+        "pruned_months": pruned_months,
+        "removed_frame_count": int(removed_frame_count),
+        "bytes_freed_estimate": int(bytes_freed_estimate),
+    }
+
+
 def _available_source_month_keys() -> List[str]:
     grouped = _group_parquets_by_month(_list_parquets())
     return sorted(grouped.keys())
@@ -2714,12 +2779,15 @@ def _start_storage_cleanup_sweeper() -> None:
                 stale_backup_prune = _prune_stale_month_backup_dirs()
                 legacy_prune = _prune_legacy_frame_files_after_monthly_ready()
                 obsolete_month_prune = _prune_obsolete_month_derived_artifacts()
+                inactive_cache_prune = _prune_inactive_month_frame_caches()
                 removed_count = int(cleanup_result.get("removed_count") or 0) + int(prune_result.get("removed_count") or 0)
                 removed_count += int(stale_build_prune.get("removed_count") or 0)
                 removed_count += int(stale_backup_prune.get("removed_count") or 0)
                 removed_count += int(legacy_prune.get("removed_count") or 0)
                 removed_count += int(obsolete_month_prune.get("removed_count") or 0)
+                removed_count += int(inactive_cache_prune.get("removed_frame_count") or 0)
                 bytes_freed = int(cleanup_result.get("bytes_freed_estimate") or 0) + int(prune_result.get("bytes_freed_estimate") or 0)
+                bytes_freed += int(inactive_cache_prune.get("bytes_freed_estimate") or 0)
                 _cleanup_last_periodic_removed_count = removed_count
                 _cleanup_last_periodic_freed_bytes_estimate = bytes_freed
                 _cleanup_last_periodic_ran_at_unix = int(time.time())
@@ -4116,6 +4184,7 @@ def _generate_worker(
     build_review_artifacts: bool = False,
     month_key: Optional[str] = None,
     build_all_months: bool = False,
+    commit_rating_logic_version: bool = False,
 ) -> None:
     from build_hotspot import ensure_zones_geojson, build_hotspots_frames
 
@@ -4227,6 +4296,10 @@ def _generate_worker(
             build_results[mk] = month_result
         manifest_payload = _persist_month_manifest(months_manifest)
         _prune_legacy_frame_files_after_monthly_ready()
+        # Reclaim non-warm months' served frame caches right after publish so a
+        # multi-month build never leaves the volume holding every month's cache
+        # until the next periodic sweep.
+        _prune_inactive_month_frame_caches()
         rebuilt_day_tendency_result: Dict[str, Any] = {
             "ok": False,
             "skipped": True,
@@ -4301,13 +4374,17 @@ def _generate_worker(
             print("generate_worker_post_rebuild_auto_run_tests_failed")
             traceback.print_exc()
 
-        # Persist rating-logic version token only after a successful full rebuild.
+        # Persist rating-logic version token only after a successful rebuild.
         # The startup hook used to write this before the worker ran, which meant a
         # crashed worker would still advance the token and silently skip regen on
-        # the next restart. build_all_months=True is the only path that rebuilds
-        # every duckdb store the engine reads from, so this is the correct
-        # success boundary for marking the token as committed.
-        if bool(build_all_months):
+        # the next restart. Under the month-retention policy the ACTIVE month is
+        # the success boundary for a version change (commit_rating_logic_version
+        # is passed by the startup trigger): old months' frame caches are pruned
+        # and rebuild lazily per-frame with current logic on access, and stale
+        # old stores are retired by attestation -- so no all-months rebuild (a
+        # full-volume write burst) is needed. build_all_months also commits, as
+        # a full rebuild is a superset.
+        if bool(build_all_months) or bool(commit_rating_logic_version):
             try:
                 _write_stored_rating_logic_version(_rating_logic_version_token())
                 print("generate_worker_rating_logic_version_committed")
@@ -4355,6 +4432,7 @@ def start_generate(
     build_review_artifacts: bool = False,
     month_key: Optional[str] = None,
     build_all_months: bool = False,
+    commit_rating_logic_version: bool = False,
 ) -> Dict[str, Any]:
     global _generate_thread
     with _generate_control_lock:
@@ -4453,6 +4531,7 @@ def start_generate(
                 bool(build_review_artifacts),
                 requested_month_key,
                 bool(build_all_months),
+                bool(commit_rating_logic_version),
             ),
             daemon=True,
         )
@@ -6545,12 +6624,17 @@ def startup():
         stale_backup_prune = _prune_stale_month_backup_dirs()
         legacy_prune = _prune_legacy_frame_files_after_monthly_ready()
         obsolete_month_prune = _prune_obsolete_month_derived_artifacts()
+        # Reclaim old months' served frame caches (the dominant volume consumer)
+        # before the version-token rebuild below may run, so it has headroom.
+        inactive_cache_prune = _prune_inactive_month_frame_caches()
         removed_count = int(cleanup_result.get("removed_count") or 0) + int(prune_result.get("removed_count") or 0)
         removed_count += int(stale_build_prune.get("removed_count") or 0)
         removed_count += int(stale_backup_prune.get("removed_count") or 0)
         removed_count += int(legacy_prune.get("removed_count") or 0)
         removed_count += int(obsolete_month_prune.get("removed_count") or 0)
+        removed_count += int(inactive_cache_prune.get("removed_frame_count") or 0)
         bytes_freed = int(cleanup_result.get("bytes_freed_estimate") or 0) + int(prune_result.get("bytes_freed_estimate") or 0)
+        bytes_freed += int(inactive_cache_prune.get("bytes_freed_estimate") or 0)
         _cleanup_last_startup_removed_count = removed_count
         _cleanup_last_startup_freed_bytes_estimate = bytes_freed
         print(f"[storage-cleanup] removed={removed_count} freed_bytes_estimate={bytes_freed}")
@@ -6564,9 +6648,16 @@ def startup():
         if stored_version != current_version:
             print(
                 f"[rating-logic] version changed (stored={stored_version!r} current={current_version!r}); "
-                f"triggering background frame-cache regeneration via start_generate(build_all_months=True)"
+                f"triggering background ACTIVE-month regeneration (old months heal lazily; "
+                f"no all-months rebuild, so no full-volume write burst)"
             )
             try:
+                # Scoped to the active month on purpose: a build_all_months
+                # rebuild rewrites every month's store + frame cache in one run,
+                # which on a near-full volume is exactly what tips it to 100%.
+                # Old months need no eager rebuild -- their served frame caches
+                # are pruned by retention and rebuild per-frame on demand with
+                # current logic, and stale stores are retired by attestation.
                 start_generate(
                     DEFAULT_BIN_MINUTES,
                     DEFAULT_MIN_TRIPS_PER_WINDOW,
@@ -6574,7 +6665,8 @@ def startup():
                     include_day_tendency=False,
                     build_review_artifacts=False,
                     month_key=None,
-                    build_all_months=True,
+                    build_all_months=False,
+                    commit_rating_logic_version=True,
                 )
                 # Token is now persisted by the worker on successful completion,
                 # not here. This keeps a crashed/aborted worker from advancing the

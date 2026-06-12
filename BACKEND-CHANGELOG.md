@@ -1,5 +1,21 @@
 # BACKEND CHANGELOG
 
+## Current pass: Bound /data volume growth — prune old months' served frame caches
+
+Railway volume hit 100% and crashed `web`. Root cause: `exact_history/months/` is **append-only**. The cleanup sweeper only swept temp/build leftovers; there was **no month-retention policy**, so every calendar month's **served frame cache** (`frame_*.json`, ~1–2 GB/month) was kept forever — unbounded growth. (A rating-logic version bump that rebuilds caches was the acute trigger on an already-near-full disk.)
+
+- New `_prune_inactive_month_frame_caches()`: keeps the **active month** warm (plus the newest `WARM_MONTH_FRAME_CACHE_COUNT`, default 1) and reclaims every older month's served frame cache via the existing `_purge_month_frame_cache`. Pruned months stay fully viewable — their frames rebuild per-frame on demand using current logic.
+- **Protects everything irreplaceable:** deletes ONLY derived `frame_*.json`. Never touches source parquet files (kept for years), exact stores, timelines/manifest, `community.db`, or any user data (trips, leaderboard miles).
+- Wired into both the **startup cleanup** (runs *before* the version-token rebuild, so it frees headroom first) and the **6-hour periodic sweeper**; freed bytes/counts roll into the existing `/status` cleanup metrics.
+- Tunable via `WARM_MONTH_FRAME_CACHE_COUNT` (env) without code — bump it to keep more recent months warm.
+- Tests: `tests/test_month_frame_cache_retention.py` — active month kept, old months reclaimed, stores + parquets untouched, no-op without a manifest.
+
+**Zero-growth hardening (no volume resize needed; works at 100% full):**
+- **Version-change regen is now scoped to the ACTIVE month** (was `build_all_months=True`). The all-months rebuild rewrote every month's store + frame cache in one run — on a near-full volume that write burst is exactly what tipped it to 100% (and it retried on every restart). Old months need no eager rebuild: their caches are pruned by retention and rebuild per-frame on demand with current logic; stale stores are retired by attestation.
+- The rating-logic token commit boundary moved with it: a new `commit_rating_logic_version` flag (threaded through `start_generate` → `_generate_worker`) commits the token after the **active month** succeeds, so the regen doesn't re-trigger forever. `build_all_months` still commits too (superset).
+- The generate worker now calls `_prune_inactive_month_frame_caches()` right after publish, so multi-month admin builds never leave every month's cache stacked until the next 6-hour sweep.
+- Recovery sequence on a 100%-full volume, with NO resize: boot → startup prune deletes old caches (deletion needs no free space) → regen rebuilds only the active month → bounded forever. Railway bills by GB used, so the prune directly lowers the storage bill.
+
 ## Current pass: Next-bin demand trend — surface each zone's upcoming 20-minute change
 
 Per directive: warn drivers when a zone that's hot **now** is about to cool (or heat up) in the **next** 20-minute bin, with the exact clock time — so they know whether to stay or move. Drivers don't linger, so this is **next-bin only**.
