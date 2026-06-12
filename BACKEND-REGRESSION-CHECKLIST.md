@@ -81,3 +81,12 @@
 - [x] `_shape_hotspot_component` shrinks hotspot polygons in small zones and leaves zones >= ~1 km^2 unchanged
 - [x] no single zone hotspot covers more than `PICKUP_ZONE_HOTSPOT_MAX_ZONE_COVERAGE` of its zone
 - [x] shaped polygons remain valid and non-empty across the zone-size range
+
+## Map zone colors — same-weekday blend + volatility damping (system-wide)
+- [x] `tests/test_same_weekday_blend_damping.py` passes (9/9): pure blend/damp math, real-SQL column contract, and end-to-end spiky-below-steady.
+- [x] The same per-zone damp factor is applied uniformly across multiple modes' damp targets (citywide score, a borough raw score, the trips_45plus rating), and confidence fields are never damped.
+- [x] `SAME_WEEKDAY_BLEND_COLUMNS` and `SAME_WEEKDAY_DAMP_TARGET_COLUMNS` (derived from `V3_PROFILE_CONFIG`) every one exist in the real engine SQL output (contract test) — guards against a renamed/removed mode score field.
+- [x] Cold start: a zone with `< 2` same-weekday samples (today-only) is returned unchanged and undamped; `None`/zero samples never produce `NaN`/`inf`.
+- [x] `build_single_frame_for_month` (driver serve path) applies the blend+damp; `build_single_frame_from_exact_store` uses the SAME shared helper so attestation stays apples-to-apples.
+- [x] `_rating_logic_version_token()` hashes `build_hotspot` so a deploy of this change rotates the frame etag and triggers the startup regenerate/purge.
+- [ ] live: after deploy, a previously-spiky blue zone reads lower/steadier in **every** mode (toggle citywide, a borough, 45+ trips); a reliably-busy zone is unchanged; `/frame/{idx}` cache-miss latency stays acceptable (then cached).
