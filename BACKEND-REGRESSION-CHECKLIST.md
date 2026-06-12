@@ -91,6 +91,13 @@
 - [x] `_rating_logic_version_token()` hashes `build_hotspot` so a deploy of this change rotates the frame etag and triggers the startup regenerate/purge.
 - [ ] live: after deploy, a previously-spiky blue zone reads lower/steadier in **every** mode (toggle citywide, a borough, 45+ trips); a reliably-busy zone is unchanged; `/frame/{idx}` cache-miss latency stays acceptable (then cached).
 
+## Storage — bound /data growth (month frame-cache retention)
+- [x] `tests/test_month_frame_cache_retention.py` passes: active month kept warm, older months' `frame_*.json` reclaimed, exact stores + source parquets untouched, no-op without a manifest.
+- [x] `_prune_inactive_month_frame_caches` wired into startup cleanup (before the version-token rebuild) and the periodic sweeper.
+- [ ] live: after deploy, `[storage-cleanup] ...` / `inactive_month_frame_cache_prune_done` logs show old months pruned; `/status` `cleanup_last_*` byte counts increase; volume usage drops.
+- [ ] live: an older month still renders on demand (frames rebuild on first access); source parquets + leaderboard/user data intact.
+- [ ] tune `WARM_MONTH_FRAME_CACHE_COUNT` if drivers browse older months frequently.
+
 ## Map zone colors — next-bin demand trend
 - [x] `tests/test_same_weekday_blend_damping.py::test_next_bin_trend_surfaces_cooling_zone` passes: a zone busy now but quiet next bin gets a lower `earnings_shadow_rating_citywide_v3_next`; the frame carries `next_time`.
 - [x] The next bin is extracted from the SAME same-weekday windows (no extra parquet scan) and scored via the shared `_build_recalibrated_features` (identical blend + damping as the current bin).
