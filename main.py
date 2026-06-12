@@ -10359,7 +10359,7 @@ def _shape_hotspot_component(component: Dict[str, Any], zone_proj: Any) -> Optio
     return clipped
 
 
-def _hotspot_merge_decision(candidate_components: List[Dict[str, Any]], selected_cells: set[Tuple[int, int]]) -> Tuple[bool, str]:
+def _hotspot_merge_decision(candidate_components: List[Dict[str, Any]], selected_cells: set[Tuple[int, int]], keep_separate_bias: bool = False) -> Tuple[bool, str]:
     if len(candidate_components) < 2:
         return False, "single_candidate"
 
@@ -10371,11 +10371,15 @@ def _hotspot_merge_decision(candidate_components: List[Dict[str, Any]], selected
         return False, "missing_polygon"
 
     area_scale = max(40.0, math.sqrt(max(ga.area, 1.0)), math.sqrt(max(gb.area, 1.0)))
+    # When this zone already showed two hotspots last cycle, bias toward keeping
+    # them separate (halve the proximity thresholds) so normal pickup wobble
+    # can't flicker them back into one. True overlap / contiguity still merges.
+    bias = 0.5 if keep_separate_bias else 1.0
     # Reduced from 0.32 / cap 130 so two genuinely distinct nearby clusters stay
     # separate (we want to surface a 2nd hotspot, not absorb it). The cell
     # corridor / density bridge checks below still merge clusters that are truly
     # contiguous, so this only stops over-eager proximity merges.
-    merge_buffer = max(20.0, min(95.0, area_scale * 0.24))
+    merge_buffer = max(20.0, min(95.0, area_scale * 0.24)) * bias
     if ga.buffer(merge_buffer).intersects(gb.buffer(merge_buffer)):
         return True, "buffer_intersection"
 
@@ -10383,7 +10387,7 @@ def _hotspot_merge_decision(candidate_components: List[Dict[str, Any]], selected
     cb = gb.centroid
     centroid_distance = ca.distance(cb)
     # Reduced from 1.75 / cap 420 for the same reason.
-    size_threshold = max(95.0, min(320.0, area_scale * 1.3))
+    size_threshold = max(95.0, min(320.0, area_scale * 1.3)) * bias
     if centroid_distance <= size_threshold:
         return True, "centroid_proximity"
 
@@ -10436,6 +10440,7 @@ def _build_zone_hotspot_components(
     point_rows: List[Dict[str, Any]],
     fallback: bool = False,
     hotspot_limit: int = 2,
+    prev_emitted_count: int = 0,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     debug: Dict[str, Any] = {
         "candidate_component_count": 0,
@@ -10525,13 +10530,21 @@ def _build_zone_hotspot_components(
     debug["candidate_component_count"] = len(components)
     debug["component_point_counts"] = [int(c.get("point_count") or 0) for c in components[:hotspot_limit]]
 
+    # Hysteresis (Schmitt trigger): a 2nd hotspot must clear the normal ADD bar
+    # to first appear, but once this zone showed two last cycle we only require a
+    # lower KEEP bar to retain it -- so ordinary pickup wobble around the add bar
+    # can't flicker the 2nd hotspot on and off between polls.
+    keep_two = int(prev_emitted_count) >= 2
+    second_zone_min = 5 if keep_two else PICKUP_ZONE_SECOND_HOTSPOT_MIN_POINTS
+    second_ratio_min = 0.25 if keep_two else PICKUP_ZONE_SECOND_COMPONENT_MIN_SCORE_RATIO
+
     strongest = components[0]
     top_components: List[Dict[str, Any]] = [strongest]
     if len(components) > 1:
         second = components[1]
         second_ok = True
         second_reason = ""
-        if len(point_entries) < PICKUP_ZONE_SECOND_HOTSPOT_MIN_POINTS:
+        if len(point_entries) < second_zone_min:
             second_ok = False
             second_reason = "zone_points_below_second_threshold"
         elif int(second.get("point_count") or 0) < PICKUP_ZONE_SECOND_COMPONENT_MIN_POINTS:
@@ -10540,7 +10553,7 @@ def _build_zone_hotspot_components(
         else:
             s0 = max(0.0001, float(strongest.get("component_score") or 0.0001))
             s1 = float(second.get("component_score") or 0.0)
-            if (s1 / s0) < PICKUP_ZONE_SECOND_COMPONENT_MIN_SCORE_RATIO:
+            if (s1 / s0) < second_ratio_min:
                 second_ok = False
                 second_reason = "second_component_low_strength"
         if second_ok:
@@ -10550,19 +10563,21 @@ def _build_zone_hotspot_components(
             debug["second_hotspot_rejected_reason"] = second_reason
 
     if hotspot_limit >= 3 and len(components) > 2:
+        # Same hysteresis for a 3rd hotspot: relaxed KEEP bar once three showed.
+        keep_three = int(prev_emitted_count) >= 3
         third = components[2]
         third_ok = True
         third_reason = ""
-        if len(point_entries) < 12:
+        if len(point_entries) < (9 if keep_three else 12):
             third_ok = False
             third_reason = "zone_points_below_third_threshold"
-        elif int(third.get("point_count") or 0) < 4:
+        elif int(third.get("point_count") or 0) < (3 if keep_three else 4):
             third_ok = False
             third_reason = "third_component_low_point_count"
         else:
             s0 = max(0.0001, float(strongest.get("component_score") or 0.0001))
             s2 = float(third.get("component_score") or 0.0)
-            if (s2 / s0) < 0.35:
+            if (s2 / s0) < (0.25 if keep_three else 0.35):
                 third_ok = False
                 third_reason = "third_component_low_strength"
         if third_ok:
@@ -10587,7 +10602,9 @@ def _build_zone_hotspot_components(
         return [], debug
 
     merge_candidates = shaped_candidates[:2]
-    merged, merge_reason = _hotspot_merge_decision(merge_candidates, selected_cells)
+    merged, merge_reason = _hotspot_merge_decision(
+        merge_candidates, selected_cells, keep_separate_bias=int(prev_emitted_count) >= 2
+    )
     debug["merged"] = merged
     debug["merge_reason"] = merge_reason
 
@@ -13098,12 +13115,16 @@ def _pickup_zone_hotspots_with_debug(
             zone_debug["cached_hit"] = True
             zone_debug["hotspot_method"] = "cache"
 
+        # Previous emission count for this zone (hysteresis hint). Read even when
+        # the signature changed and we're rebuilding, so a 2nd hotspot already
+        # shown stays put instead of flickering as new pickups shift the border.
+        prev_emitted_count = len(cached.get("features") or []) if cached else 0
         zone_component_debug: Dict[str, Any] = {}
         if not zone_features and qualified:
             if zone_debug is not None:
                 zone_debug["primary_attempted"] = True
             try:
-                zone_features, zone_component_debug = _build_zone_hotspot_components(zone_id, zone_data, pts, fallback=False, hotspot_limit=hotspot_limit)
+                zone_features, zone_component_debug = _build_zone_hotspot_components(zone_id, zone_data, pts, fallback=False, hotspot_limit=hotspot_limit, prev_emitted_count=prev_emitted_count)
                 if zone_debug is not None:
                     zone_debug["primary_ok"] = bool(zone_features)
                     if zone_features:
@@ -13117,7 +13138,7 @@ def _pickup_zone_hotspots_with_debug(
             if zone_debug is not None:
                 zone_debug["fallback_attempted"] = True
             try:
-                zone_features, zone_component_debug = _build_zone_hotspot_components(zone_id, zone_data, pts, fallback=True, hotspot_limit=hotspot_limit)
+                zone_features, zone_component_debug = _build_zone_hotspot_components(zone_id, zone_data, pts, fallback=True, hotspot_limit=hotspot_limit, prev_emitted_count=prev_emitted_count)
                 if zone_debug is not None:
                     zone_debug["fallback_ok"] = bool(zone_features)
                     if zone_features:
