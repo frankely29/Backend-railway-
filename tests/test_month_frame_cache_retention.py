@@ -64,6 +64,49 @@ def test_prune_noop_without_manifest(monkeypatch):
     assert result == {"pruned_months": [], "removed_frame_count": 0, "bytes_freed_estimate": 0}
 
 
+def _seed_month_dir(month_key: str):
+    """A published month dir: store + a frame cache file."""
+    d = main._month_dir(month_key)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "exact_shadow.duckdb").write_text("X" * 2048, encoding="utf-8")
+    fc = main._month_frame_cache_dir(month_key)
+    fc.mkdir(parents=True, exist_ok=True)
+    (fc / "frame_00000_t.json").write_text("{}", encoding="utf-8")
+    return d
+
+
+def test_reclaim_orphan_month_dirs_removes_unmanifested(monkeypatch):
+    current = _current_month_key()  # in manifest + active -> keep
+    orphan_a, orphan_b = "2017-03", "2017-04"  # on disk, NOT in manifest -> reclaim
+    monkeypatch.setattr(main, "_load_month_manifest", lambda: {"available_month_keys": [current]})
+    months = [current, orphan_a, orphan_b]
+    try:
+        for mk in months:
+            _seed_month_dir(mk)
+        result = main._reclaim_orphan_month_dirs()
+        assert not main._month_dir(orphan_a).exists()
+        assert not main._month_dir(orphan_b).exists()
+        assert main._month_dir(current).exists()  # manifest/active month protected
+        assert set(result["removed_month_dirs"]) >= {orphan_a, orphan_b}
+        assert result["bytes_freed_estimate"] > 0
+    finally:
+        for mk in months:
+            shutil.rmtree(main._month_dir(mk), ignore_errors=True)
+
+
+def test_reclaim_orphan_month_dirs_noop_without_manifest(monkeypatch):
+    # Empty manifest -> never delete (don't risk removing the only/served month).
+    orphan = "2017-05"
+    monkeypatch.setattr(main, "_load_month_manifest", lambda: {})
+    try:
+        _seed_month_dir(orphan)
+        result = main._reclaim_orphan_month_dirs()
+        assert main._month_dir(orphan).exists()
+        assert result["removed_month_dirs"] == []
+    finally:
+        shutil.rmtree(main._month_dir(orphan), ignore_errors=True)
+
+
 def test_prune_keeps_only_active_when_it_is_newest(monkeypatch):
     # keep_recent=1 means only the newest (== active) month survives.
     current = _current_month_key()

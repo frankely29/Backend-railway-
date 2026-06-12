@@ -122,8 +122,35 @@ def get_artifact_storage_report(data_dir: Path, frames_dir: Path) -> Dict[str, A
     can_stage_rebuild = free_bytes >= recommended_free_bytes
 
     cleanup_candidates = [str(p) for p in _cleanup_candidates(data_dir, frames_dir) if p.exists()]
+    # Itemize exact_history (the previously-unmeasured directory that dominates
+    # volume use via per-month exact_shadow.duckdb stores + frame caches).
+    exact_history_dir = data_dir / "exact_history"
+    exact_history_months_dir = exact_history_dir / "months"
+    exact_history_months_bytes = _safe_size(exact_history_months_dir)
+    exact_history_building_bytes = _safe_size(exact_history_dir / "months.__building__")
+    exact_history_backup_bytes = _safe_size(exact_history_dir / "months.__backup__")
+    try:
+        month_dir_names = sorted(
+            c.name for c in exact_history_months_dir.iterdir() if c.is_dir()
+        ) if exact_history_months_dir.exists() else []
+    except Exception:
+        month_dir_names = []
+    accounted = (
+        _sum_sizes(parquet_files) + frames_dir_bytes + exact_history_months_bytes
+        + exact_history_building_bytes + exact_history_backup_bytes
+        + _safe_size(data_dir / "day_tendency") + _safe_size(data_dir / "chat_audio")
+        + _safe_size(data_dir / "chat_images")
+    )
     return {
         "data_dir": str(data_dir),
+        "exact_history_months_bytes": exact_history_months_bytes,
+        "exact_history_months_dir_names": month_dir_names,
+        "exact_history_months_dir_count": len(month_dir_names),
+        "exact_history_building_bytes": exact_history_building_bytes,
+        "exact_history_backup_bytes": exact_history_backup_bytes,
+        "chat_audio_bytes": _safe_size(data_dir / "chat_audio"),
+        "chat_images_bytes": _safe_size(data_dir / "chat_images"),
+        "unaccounted_bytes_estimate": max(0, int(usage.used) - int(accounted)),
         "frames_dir": str(frames_dir),
         "build_tmp_dir": str(build_tmp_dir),
         "build_tmp_on_data_volume": build_tmp_on_data_volume,
