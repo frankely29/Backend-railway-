@@ -290,9 +290,13 @@ PICKUP_ZONE_HOTSPOT_SIMPLIFY_M = 18
 PICKUP_ZONE_HOTSPOT_SCALE_REFERENCE_M2 = 1_000_000.0  # zones >= ~1 km^2 keep full-size hotspots
 PICKUP_ZONE_HOTSPOT_SMALL_ZONE_MIN_SCALE = 0.5        # floor on the small-zone buffer shrink
 PICKUP_ZONE_HOTSPOT_MAX_ZONE_COVERAGE = 0.38          # one hotspot may cover <= this fraction of its zone
-PICKUP_ZONE_SECOND_HOTSPOT_MIN_POINTS = 8
+# Loosened so a real 2nd cluster surfaces more readily: a zone needs >= 6
+# points (was 8) and the 2nd component only has to be >= 35% as strong as the
+# 1st (was 45%). The 2nd component still needs >= 3 of its own points as a noise
+# floor. Pairs with the reduced merge thresholds in _hotspot_merge_decision.
+PICKUP_ZONE_SECOND_HOTSPOT_MIN_POINTS = 6
 PICKUP_ZONE_SECOND_COMPONENT_MIN_POINTS = 3
-PICKUP_ZONE_SECOND_COMPONENT_MIN_SCORE_RATIO = 0.45
+PICKUP_ZONE_SECOND_COMPONENT_MIN_SCORE_RATIO = 0.35
 HOTSPOT_RECENT_LOOKBACK_SECONDS = 6 * 3600
 HOTSPOT_TIMESLOT_BIN_MINUTES = 20
 
@@ -10367,14 +10371,19 @@ def _hotspot_merge_decision(candidate_components: List[Dict[str, Any]], selected
         return False, "missing_polygon"
 
     area_scale = max(40.0, math.sqrt(max(ga.area, 1.0)), math.sqrt(max(gb.area, 1.0)))
-    merge_buffer = max(24.0, min(130.0, area_scale * 0.32))
+    # Reduced from 0.32 / cap 130 so two genuinely distinct nearby clusters stay
+    # separate (we want to surface a 2nd hotspot, not absorb it). The cell
+    # corridor / density bridge checks below still merge clusters that are truly
+    # contiguous, so this only stops over-eager proximity merges.
+    merge_buffer = max(20.0, min(95.0, area_scale * 0.24))
     if ga.buffer(merge_buffer).intersects(gb.buffer(merge_buffer)):
         return True, "buffer_intersection"
 
     ca = ga.centroid
     cb = gb.centroid
     centroid_distance = ca.distance(cb)
-    size_threshold = max(120.0, min(420.0, area_scale * 1.75))
+    # Reduced from 1.75 / cap 420 for the same reason.
+    size_threshold = max(95.0, min(320.0, area_scale * 1.3))
     if centroid_distance <= size_threshold:
         return True, "centroid_proximity"
 
@@ -10795,6 +10804,54 @@ def _micro_top_n_for_zone_area(area_m2: float) -> int:
     return 3
 
 
+def _trimmed_weighted_centroid(
+    cell_pts: List[Tuple[float, float, float]],
+) -> Tuple[float, float]:
+    """Recency-weighted centroid with outlier rejection.
+
+    A plain weighted mean is sensitive to stray pickups (mis-GPS, a point at the
+    far corner of the cell), which drag the dot off the true cluster. We take a
+    provisional weighted mean, measure each point's planar distance to it, and
+    drop points beyond 1.5x the median distance before recomputing. With too few
+    points to judge spread (< 4) we return the plain weighted mean unchanged.
+    """
+    total_w = sum(w for _, _, w in cell_pts)
+    if total_w <= 0:
+        n = max(1, len(cell_pts))
+        return (
+            sum(p[0] for p in cell_pts) / n,
+            sum(p[1] for p in cell_pts) / n,
+        )
+    lat0 = sum(lat * w for lat, _, w in cell_pts) / total_w
+    lng0 = sum(lng * w for _, lng, w in cell_pts) / total_w
+    if len(cell_pts) < 4:
+        return (lat0, lng0)
+    # Approximate planar distance in meters from the provisional center.
+    coslat = math.cos(math.radians(lat0)) or 1e-6
+    dists = [
+        math.hypot((lng - lng0) * coslat * 111320.0, (lat - lat0) * 110540.0)
+        for lat, lng, _w in cell_pts
+    ]
+    ordered = sorted(dists)
+    mid = len(ordered) // 2
+    median = ordered[mid] if len(ordered) % 2 else 0.5 * (ordered[mid - 1] + ordered[mid])
+    # Keep points within 1.5x the median distance, with a small floor so a tight,
+    # legitimately-spread cluster is never trimmed.
+    threshold = max(20.0, 1.5 * median)
+    kept = [
+        (lat, lng, w)
+        for (lat, lng, w), d in zip(cell_pts, dists)
+        if d <= threshold
+    ]
+    kept_w = sum(w for _, _, w in kept)
+    if len(kept) < 2 or kept_w <= 0:
+        return (lat0, lng0)
+    return (
+        sum(lat * w for lat, _, w in kept) / kept_w,
+        sum(lng * w for _, lng, w in kept) / kept_w,
+    )
+
+
 def _build_zone_micro_hotspots_payload(
     zone_id: int,
     zone_meta: Dict[str, Any],
@@ -10890,10 +10947,10 @@ def _build_zone_micro_hotspots_payload(
         total_w = sum(w for _, _, w in cell_pts)
         if total_w <= 0:
             continue
-        # Weighted-mean centroid of actual points in the cell — drifts smoothly
-        # toward the real cluster mass instead of snapping to cell center.
-        center_lat = sum(lat * w for lat, _, w in cell_pts) / total_w
-        center_lng = sum(lng * w for _, lng, w in cell_pts) / total_w
+        # Outlier-trimmed, recency-weighted centroid of the actual points in the
+        # cell — drifts smoothly toward the real cluster mass instead of snapping
+        # to the cell center, and ignores a stray pickup at the cell's edge.
+        center_lat, center_lng = _trimmed_weighted_centroid(cell_pts)
         event_count = int(raw_counts.get((gx, gy), 0))
         bucket_weight = weighted_buckets[(gx, gy)]
         intensity = round(min(1.0, max(0.2, bucket_weight / 7.5)), 3)
