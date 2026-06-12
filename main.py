@@ -708,7 +708,8 @@ def _rating_logic_version_token() -> str:
     try:
         import zone_earnings_engine as _zee
         import zone_mode_profiles as _zmp
-        for mod in (_zee, _zmp):
+        import build_hotspot as _bh
+        for mod in (_zee, _zmp, _bh):
             try:
                 digest.update(inspect.getsource(mod).encode("utf-8"))
             except (OSError, TypeError):
@@ -2014,6 +2015,13 @@ def _build_single_frame_for_month(month_key: str, frame_time: str) -> Dict[str, 
     parquets = _source_parquets_for_month(month_key)
     if not parquets:
         raise RuntimeError(f"No source parquet files for month_key={month_key}")
+    # NOTE: only the active month's parquet is used here, intentionally. The
+    # same-weekday blend therefore degrades to today-only for early-month
+    # frames whose prior weeks fall in the previous month -- exactly matching
+    # the exact-store path (_build_single_frame_from_exact_store reads a
+    # current-month-only store), so the attestation comparison stays
+    # apples-to-apples. Widening BOTH paths to the prior month is a future
+    # enhancement that must move together to avoid spurious store retirement.
     zones_path = ensure_zones_geojson(DATA_DIR, force=False)
     return build_single_frame_for_month(
         parquet_files=parquets,

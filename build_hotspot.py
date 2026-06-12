@@ -133,14 +133,20 @@ SAME_WEEKDAY_BLEND_TODAY_WEIGHT = 0.40
 SAME_WEEKDAY_BLEND_PRIOR_WEIGHT = 0.20
 SAME_WEEKDAY_BLEND_PRIOR_TARGET_COUNT = 3
 SAME_WEEKDAY_BLEND_MAX_LOOKBACK_WEEKS = 12
-SAME_WEEKDAY_BLEND_COLUMNS: Tuple[str, ...] = (
-    "earnings_shadow_score_citywide_v3",
-    "earnings_shadow_score_citywide_v3_anchor_shadow",
-    "earnings_shadow_score_citywide_v3_trap_candidate",
-    "earnings_shadow_confidence_citywide_v3",
-    "earnings_shadow_confidence_citywide_v3_trap_candidate",
-    "earnings_shadow_rating_citywide_v3",
-)
+
+# Per-zone demand-volatility damping (system-wide). The blend above removes
+# single-day noise; this additionally shaves up to MAX_DAMP off a zone's
+# score/rating when its same-weekday demand is inconsistent (busy some weeks,
+# dead others), so a "busy" color means *reliably* busy. The signal is the
+# coefficient of variation (CoV) of pickups_now across the same-weekday
+# samples; it is mode-independent, so one damp factor per zone is applied to
+# every mode's score. The blend/damp COLUMN sets are derived from
+# V3_PROFILE_CONFIG below (so all user-visible colors are covered) — see
+# SAME_WEEKDAY_BLEND_COLUMNS / SAME_WEEKDAY_DAMP_TARGET_COLUMNS.
+SAME_WEEKDAY_CONSISTENCY_COLUMN = "pickups_now"
+SAME_WEEKDAY_CONSISTENCY_MAX_DAMP = 0.20
+SAME_WEEKDAY_CONSISTENCY_CV_LO = 0.50  # CoV <= LO -> no damping (reliable zone)
+SAME_WEEKDAY_CONSISTENCY_CV_HI = 1.50  # CoV >= HI -> full MAX_DAMP (spiky zone)
 V3_PROFILE_CONFIG = {
     "citywide_v3": {
         "score": "earnings_shadow_score_citywide_v3_anchor_shadow",
@@ -167,6 +173,44 @@ V3_PROFILE_CONFIG = {
         "confidence": "earnings_shadow_confidence_staten_island_v3",
     },
 }
+
+# trips_45plus_v3 is NOT in V3_PROFILE_CONFIG: its rating is emitted directly by
+# the shadow SQL and is served as-is (not recomputed by
+# _recalibrate_visible_v3_fields), so it must be damped at its rating field. It
+# emits only a rating and a raw score (no confidence column).
+_TRIPS_45PLUS_SCORE_FIELD = "earnings_shadow_score_raw_trips_45plus_v3"
+_TRIPS_45PLUS_RATING_FIELD = "earnings_shadow_rating_trips_45plus_v3"
+
+# Borough v3 score/confidence fields, derived from V3_PROFILE_CONFIG so a new
+# mode added there is automatically covered by the blend + damping.
+_V3_BOROUGH_SCORE_FIELDS: Tuple[str, ...] = tuple(
+    fields["score"] for name, fields in V3_PROFILE_CONFIG.items() if name != "citywide_v3"
+)
+_V3_BOROUGH_CONF_FIELDS: Tuple[str, ...] = tuple(
+    fields["confidence"] for name, fields in V3_PROFILE_CONFIG.items() if name != "citywide_v3"
+)
+
+# Columns multiplied by (1 - damp): the rank/score field each visible color is
+# ranked on (so dimming these lowers a spiky zone's rank in every mode), plus
+# the trips_45plus rating which is served straight from the SQL.
+SAME_WEEKDAY_DAMP_TARGET_COLUMNS: Tuple[str, ...] = (
+    CITYWIDE_BASELINE_SCORE_FIELD,            # earnings_shadow_score_citywide_v3_anchor_shadow
+    CITYWIDE_TRAP_CANDIDATE_SCORE_FIELD,      # earnings_shadow_score_citywide_v3_trap_candidate
+    "earnings_shadow_score_citywide_v3",      # citywide eligibility/score
+    *_V3_BOROUGH_SCORE_FIELDS,                # manhattan/bronx/queens/brooklyn/staten raw scores
+    _TRIPS_45PLUS_RATING_FIELD,
+    _TRIPS_45PLUS_SCORE_FIELD,
+)
+
+# Columns blended (weighted same-weekday average) but not damped: the damp
+# targets above, plus every mode's confidence (data-sufficiency, not demand
+# volatility — denoised but never penalized).
+SAME_WEEKDAY_BLEND_COLUMNS: Tuple[str, ...] = (
+    *SAME_WEEKDAY_DAMP_TARGET_COLUMNS,
+    CITYWIDE_BASELINE_CONF_FIELD,             # earnings_shadow_confidence_citywide_v3
+    CITYWIDE_TRAP_CANDIDATE_CONF_FIELD,       # earnings_shadow_confidence_citywide_v3_trap_candidate
+    *_V3_BOROUGH_CONF_FIELDS,                  # trips_45plus_v3 has no confidence column
+)
 
 TRAP_CANDIDATE_REVIEW_PROFILE_CONFIG: Dict[str, Dict[str, str]] = {
     "citywide_v3_trap_candidate": {
@@ -1026,12 +1070,19 @@ def build_single_frame_for_month(
     else:
         frame_local_dt = frame_local_dt.astimezone(NYC_TZ)
     window_padding_minutes = max(int(bin_minutes), 20)
-    pickup_utc_start = (
-        frame_local_dt - timedelta(minutes=(window_padding_minutes * 3))
-    ).astimezone(UTC_TZ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-    pickup_utc_end = (
-        frame_local_dt + timedelta(minutes=(window_padding_minutes * 3))
-    ).astimezone(UTC_TZ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+    # Same-weekday targets: today plus up to N prior weeks at the same
+    # weekday/time. Each target is scanned with its OWN narrow ±(padding*3)
+    # window inside the loop below, so the parquet scan stays cheap (a few
+    # short windows rather than a contiguous multi-week span). Blending these
+    # same-weekday samples is what turns one noisy day into a stable signal.
+    target_local_dts: List[datetime] = [frame_local_dt]
+    target_times: List[str] = [requested_frame_time]
+    for _week in range(1, SAME_WEEKDAY_BLEND_PRIOR_TARGET_COUNT + 1):
+        prior_dt = frame_local_dt - timedelta(weeks=_week)
+        target_local_dts.append(prior_dt)
+        target_times.append(prior_dt.strftime("%Y-%m-%dT%H:%M:%S"))
+
     zones = json.loads(zones_geojson_path.read_text(encoding="utf-8"))
     geom_by_id: Dict[int, Any] = {}
     name_by_id: Dict[int, str] = {}
@@ -1070,50 +1121,110 @@ def build_single_frame_for_month(
         zone_geometry_rows=zone_geometry_rows,
         zone_metadata_rows=zone_metadata_rows,
     )
+    # Blend columns + the pickups_now volatility signal, fetched per window.
+    blend_fetch_columns = tuple(SAME_WEEKDAY_BLEND_COLUMNS) + (SAME_WEEKDAY_CONSISTENCY_COLUMN,)
+    blend_cols_sql = ", ".join(blend_fetch_columns)
+    today_rows: List[Tuple[Any, ...]] = []
+    today_columns: List[str] = []
+    by_zone: Dict[int, List[Tuple[str, Tuple[Any, ...]]]] = {}
     try:
         schema_rows = con.execute(f"DESCRIBE SELECT * FROM read_parquet([{first_parquet_sql}])").fetchall()
         available_columns = {str(row[0]) for row in schema_rows}
-        shadow_sql = build_zone_earnings_shadow_sql(
-            parquet_sql_files,
-            bin_minutes=int(bin_minutes),
-            min_trips_per_window=int(min_trips_per_window),
-            pickup_utc_start=pickup_utc_start,
-            pickup_utc_end=pickup_utc_end,
-            profile=ZONE_MODE_PROFILES["citywide_v2"],
-            citywide_v3_profile=ZONE_MODE_PROFILES["citywide_v3"],
-            manhattan_profile=ZONE_MODE_PROFILES["manhattan_v2"],
-            bronx_wash_heights_profile=ZONE_MODE_PROFILES["bronx_wash_heights_v2"],
-            queens_profile=ZONE_MODE_PROFILES["queens_v2"],
-            brooklyn_profile=ZONE_MODE_PROFILES["brooklyn_v2"],
-            staten_island_profile=ZONE_MODE_PROFILES["staten_island_v2"],
-            manhattan_v3_profile=ZONE_MODE_PROFILES["manhattan_v3"],
-            bronx_wash_heights_v3_profile=ZONE_MODE_PROFILES["bronx_wash_heights_v3"],
-            queens_v3_profile=ZONE_MODE_PROFILES["queens_v3"],
-            brooklyn_v3_profile=ZONE_MODE_PROFILES["brooklyn_v3"],
-            staten_island_v3_profile=ZONE_MODE_PROFILES["staten_island_v3"],
-            trips_45plus_v3_profile=ZONE_MODE_PROFILES["trips_45plus_v3"],
-            available_columns=available_columns,
-        )
-        cursor = con.execute(
-            f"""
-            WITH exact_shadow_rows AS (
-                {shadow_sql}
+
+        def _shadow_sql_for_window(win_start: str, win_end: str) -> str:
+            return build_zone_earnings_shadow_sql(
+                parquet_sql_files,
+                bin_minutes=int(bin_minutes),
+                min_trips_per_window=int(min_trips_per_window),
+                pickup_utc_start=win_start,
+                pickup_utc_end=win_end,
+                profile=ZONE_MODE_PROFILES["citywide_v2"],
+                citywide_v3_profile=ZONE_MODE_PROFILES["citywide_v3"],
+                manhattan_profile=ZONE_MODE_PROFILES["manhattan_v2"],
+                bronx_wash_heights_profile=ZONE_MODE_PROFILES["bronx_wash_heights_v2"],
+                queens_profile=ZONE_MODE_PROFILES["queens_v2"],
+                brooklyn_profile=ZONE_MODE_PROFILES["brooklyn_v2"],
+                staten_island_profile=ZONE_MODE_PROFILES["staten_island_v2"],
+                manhattan_v3_profile=ZONE_MODE_PROFILES["manhattan_v3"],
+                bronx_wash_heights_v3_profile=ZONE_MODE_PROFILES["bronx_wash_heights_v3"],
+                queens_v3_profile=ZONE_MODE_PROFILES["queens_v3"],
+                brooklyn_v3_profile=ZONE_MODE_PROFILES["brooklyn_v3"],
+                staten_island_v3_profile=ZONE_MODE_PROFILES["staten_island_v3"],
+                trips_45plus_v3_profile=ZONE_MODE_PROFILES["trips_45plus_v3"],
+                available_columns=available_columns,
             )
-            SELECT *
-            FROM exact_shadow_rows
-            WHERE exact_bin_local_ts = ?
-            ORDER BY PULocationID
-            """,
-            [requested_frame_time],
-        )
-        rows = cursor.fetchall()
-        columns = [str(desc[0]) for desc in (cursor.description or [])]
+
+        for tgt_local_dt, tgt_time in zip(target_local_dts, target_times):
+            win_start = (
+                tgt_local_dt - timedelta(minutes=(window_padding_minutes * 3))
+            ).astimezone(UTC_TZ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            win_end = (
+                tgt_local_dt + timedelta(minutes=(window_padding_minutes * 3))
+            ).astimezone(UTC_TZ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            shadow_sql = _shadow_sql_for_window(win_start, win_end)
+            if tgt_time == requested_frame_time:
+                # Today: fetch the full row (all mode columns) to build features.
+                cursor = con.execute(
+                    f"""
+                    WITH exact_shadow_rows AS (
+                        {shadow_sql}
+                    )
+                    SELECT *
+                    FROM exact_shadow_rows
+                    WHERE exact_bin_local_ts = ?
+                    ORDER BY PULocationID
+                    """,
+                    [tgt_time],
+                )
+                today_rows = cursor.fetchall()
+                today_columns = [str(desc[0]) for desc in (cursor.description or [])]
+                col_index = {name: idx for idx, name in enumerate(today_columns)}
+                loc_idx = col_index.get("PULocationID")
+                if loc_idx is not None:
+                    for row in today_rows:
+                        try:
+                            zid = int(row[loc_idx])
+                        except Exception:
+                            continue
+                        sample = tuple(
+                            row[col_index[col]] if col in col_index else None
+                            for col in blend_fetch_columns
+                        )
+                        by_zone.setdefault(zid, []).append((tgt_time, sample))
+            else:
+                # Prior week: only the blend columns + pickups_now are needed.
+                cursor = con.execute(
+                    f"""
+                    WITH exact_shadow_rows AS (
+                        {shadow_sql}
+                    )
+                    SELECT PULocationID, exact_bin_local_ts, {blend_cols_sql}
+                    FROM exact_shadow_rows
+                    WHERE exact_bin_local_ts = ?
+                    """,
+                    [tgt_time],
+                )
+                for row in cursor.fetchall():
+                    try:
+                        zid = int(row[0])
+                    except Exception:
+                        continue
+                    sample = tuple(row[2 : 2 + len(blend_fetch_columns)])
+                    by_zone.setdefault(zid, []).append((str(row[1]), sample))
     finally:
         con.close()
 
+    blended_by_zone = _blend_same_weekday_rows(
+        by_zone,
+        requested_frame_time,
+        tuple(SAME_WEEKDAY_BLEND_COLUMNS),
+        consistency_index=len(SAME_WEEKDAY_BLEND_COLUMNS),
+        damp_columns=SAME_WEEKDAY_DAMP_TARGET_COLUMNS,
+    )
+
     features: List[Dict[str, Any]] = []
-    for row in rows:
-        row_map = {columns[idx]: row[idx] for idx in range(len(columns))}
+    for row in today_rows:
+        row_map = {today_columns[idx]: row[idx] for idx in range(len(today_columns))}
         try:
             zid = int(row_map.get("PULocationID"))
         except Exception:
@@ -1121,6 +1232,7 @@ def build_single_frame_for_month(
         geom = geom_by_id.get(zid)
         if not geom:
             continue
+        _apply_blended_columns_to_row_map(row_map, blended_by_zone.get(zid))
         features.append(
             {
                 "type": "Feature",
@@ -1137,50 +1249,56 @@ def build_single_frame_for_month(
     return {"time": requested_frame_time, "polygons": {"type": "FeatureCollection", "features": features}}
 
 
-def _same_weekday_blended_scores(
-    con: "duckdb.DuckDBPyConnection",
+def _same_weekday_consistency_damp(demand_samples: List[float]) -> float:
+    """Map the coefficient of variation of a zone's same-weekday demand to a
+    [0, SAME_WEEKDAY_CONSISTENCY_MAX_DAMP] damp factor. Fewer than 2 samples or
+    a non-positive/non-finite mean returns 0.0 (cold-start safe). Reliable
+    zones (CoV <= CV_LO) return 0.0; spiky zones (CoV >= CV_HI) return
+    MAX_DAMP; in between scales linearly."""
+    if len(demand_samples) < 2:
+        return 0.0
+    try:
+        mean = statistics.mean(demand_samples)
+        stdev = statistics.pstdev(demand_samples)
+    except statistics.StatisticsError:
+        return 0.0
+    if not math.isfinite(mean) or mean <= 0.0:
+        return 0.0
+    if not math.isfinite(stdev) or stdev <= 0.0:
+        return 0.0
+    cv = stdev / mean
+    if not math.isfinite(cv):
+        return 0.0
+    span = SAME_WEEKDAY_CONSISTENCY_CV_HI - SAME_WEEKDAY_CONSISTENCY_CV_LO
+    if span <= 0.0:
+        frac = 1.0 if cv >= SAME_WEEKDAY_CONSISTENCY_CV_HI else 0.0
+    else:
+        frac = _clamp01((cv - SAME_WEEKDAY_CONSISTENCY_CV_LO) / span)
+    return SAME_WEEKDAY_CONSISTENCY_MAX_DAMP * frac
+
+
+def _blend_same_weekday_rows(
+    by_zone: Dict[int, List[Tuple[str, Tuple[Any, ...]]]],
     requested_frame_time: str,
     columns: Tuple[str, ...],
+    *,
+    consistency_index: int | None = None,
+    damp_columns: Tuple[str, ...] = (),
 ) -> Dict[int, Dict[str, float]]:
-    """For each zone present in the requested frame, blend its score columns
-    with the same weekday/time from the previous 3 weeks. Looks back up to
-    SAME_WEEKDAY_BLEND_MAX_LOOKBACK_WEEKS to find SAME_WEEKDAY_BLEND_PRIOR_
-    TARGET_COUNT valid priors. Returns {zone_id: {column: blended_value}}.
+    """Pure same-weekday blend + volatility damping over already-fetched rows.
 
-    Weights: today contributes SAME_WEEKDAY_BLEND_TODAY_WEIGHT, each found
-    prior contributes SAME_WEEKDAY_BLEND_PRIOR_WEIGHT. Weights are
-    re-normalized over present samples so zones with fewer priors aren't
-    diluted (e.g., today-only zones return today's value unchanged).
+    `by_zone[zid]` is a list of (exact_bin_local_ts, value_tuple); each
+    value_tuple holds the blend `columns` in order, and — when
+    `consistency_index` is set — value_tuple[consistency_index] additionally
+    holds that sample's pickups_now, used to damp `damp_columns`.
+
+    Weights: today SAME_WEEKDAY_BLEND_TODAY_WEIGHT, each of up to
+    SAME_WEEKDAY_BLEND_PRIOR_TARGET_COUNT priors
+    SAME_WEEKDAY_BLEND_PRIOR_WEIGHT, re-normalized over present samples (so a
+    today-only zone returns today's value unchanged and undamped). Shared by
+    the parquet serve path and the exact-store path so both agree exactly.
     """
-    try:
-        req_dt = datetime.strptime(requested_frame_time, "%Y-%m-%dT%H:%M:%S")
-    except ValueError:
-        return {}
-
-    candidate_priors_iso: List[str] = []
-    for k in range(1, SAME_WEEKDAY_BLEND_MAX_LOOKBACK_WEEKS + 1):
-        candidate_priors_iso.append((req_dt - timedelta(weeks=k)).strftime("%Y-%m-%dT%H:%M:%S"))
-    all_times = [requested_frame_time] + candidate_priors_iso
-    placeholders = ",".join(["?"] * len(all_times))
-    score_cols_sql = ", ".join(columns)
-    cursor = con.execute(
-        f"""
-        SELECT PULocationID, exact_bin_local_ts, {score_cols_sql}
-        FROM exact_shadow_rows
-        WHERE exact_bin_local_ts IN ({placeholders})
-        """,
-        all_times,
-    )
-    by_zone: Dict[int, List[Tuple[str, Tuple[Any, ...]]]] = {}
-    for row in cursor.fetchall():
-        try:
-            zid = int(row[0])
-        except Exception:
-            continue
-        ts = str(row[1])
-        score_values = row[2 : 2 + len(columns)]
-        by_zone.setdefault(zid, []).append((ts, score_values))
-
+    damp_set = set(damp_columns)
     blended_by_zone: Dict[int, Dict[str, float]] = {}
     for zid, entries in by_zone.items():
         today_entry: Tuple[str, Tuple[Any, ...]] | None = None
@@ -1198,12 +1316,32 @@ def _same_weekday_blended_scores(
         for entry in prior_entries:
             weighted_samples.append((SAME_WEEKDAY_BLEND_PRIOR_WEIGHT, entry[1]))
 
+        # Per-zone demand-volatility damp factor (mode-independent): CoV of
+        # pickups_now across today + present priors. A zone that spikes one
+        # week but is dead the others has a high CoV and is dimmed; a reliably
+        # busy zone has a low CoV and is left alone.
+        damp = 0.0
+        if consistency_index is not None and damp_set:
+            demand_samples: List[float] = []
+            for _weight, value_tuple in weighted_samples:
+                if 0 <= consistency_index < len(value_tuple):
+                    raw = value_tuple[consistency_index]
+                    if raw is None:
+                        continue
+                    try:
+                        num = float(raw)
+                    except (TypeError, ValueError):
+                        continue
+                    if math.isfinite(num):
+                        demand_samples.append(num)
+            damp = _same_weekday_consistency_damp(demand_samples)
+
         blended_cols: Dict[str, float] = {}
         for col_idx, col_name in enumerate(columns):
             total_weight = 0.0
             weighted_sum = 0.0
-            for weight, score_values in weighted_samples:
-                value = score_values[col_idx]
+            for weight, value_tuple in weighted_samples:
+                value = value_tuple[col_idx]
                 if value is None:
                     continue
                 try:
@@ -1214,10 +1352,91 @@ def _same_weekday_blended_scores(
                 total_weight += weight
             if total_weight <= 0.0:
                 continue
-            blended_cols[col_name] = weighted_sum / total_weight
+            blended_value = weighted_sum / total_weight
+            if damp > 0.0 and col_name in damp_set:
+                blended_value *= (1.0 - damp)
+            blended_cols[col_name] = blended_value
         if blended_cols:
             blended_by_zone[zid] = blended_cols
     return blended_by_zone
+
+
+def _apply_blended_columns_to_row_map(
+    row_map: Dict[str, Any], blended_cols: Dict[str, float] | None
+) -> None:
+    """Write blended/damped values back onto a shadow row. Rating columns are
+    rounded to int to honor the SQL's integer-rating contract."""
+    if not blended_cols:
+        return
+    for col_name, blended_value in blended_cols.items():
+        if col_name.startswith("earnings_shadow_rating_"):
+            row_map[col_name] = int(round(blended_value))
+        else:
+            row_map[col_name] = blended_value
+
+
+def _same_weekday_blended_scores(
+    con: "duckdb.DuckDBPyConnection",
+    requested_frame_time: str,
+    columns: Tuple[str, ...],
+) -> Dict[int, Dict[str, float]]:
+    """For each zone present in the requested frame, blend its score columns
+    with the same weekday/time from the previous 3 weeks and damp spiky zones.
+    Looks back up to SAME_WEEKDAY_BLEND_MAX_LOOKBACK_WEEKS to find
+    SAME_WEEKDAY_BLEND_PRIOR_TARGET_COUNT valid priors. Returns
+    {zone_id: {column: blended_value}}. Reads the same-weekday rows from the
+    exact_shadow_rows table on `con` (also fetching pickups_now for the
+    volatility signal); the pure blend/damp math lives in
+    _blend_same_weekday_rows, shared with the parquet serve path.
+    """
+    try:
+        req_dt = datetime.strptime(requested_frame_time, "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        return {}
+
+    candidate_priors_iso: List[str] = []
+    for k in range(1, SAME_WEEKDAY_BLEND_MAX_LOOKBACK_WEEKS + 1):
+        candidate_priors_iso.append((req_dt - timedelta(weeks=k)).strftime("%Y-%m-%dT%H:%M:%S"))
+    all_times = [requested_frame_time] + candidate_priors_iso
+    placeholders = ",".join(["?"] * len(all_times))
+    fetch_columns = tuple(columns) + (SAME_WEEKDAY_CONSISTENCY_COLUMN,)
+    score_cols_sql = ", ".join(fetch_columns)
+    # Derive the bin key in the SAME local "%Y-%m-%dT%H:%M:%S" shape as
+    # requested_frame_time / the prior candidates. exact_bin_local_ts is a
+    # TIMESTAMPTZ whose UTC wall clock IS the NY-local bin time, so
+    # `AT TIME ZONE 'UTC'` recovers that wall clock independent of the session
+    # timezone. Using raw str(exact_bin_local_ts) here would yield
+    # "... 18:00:00+00:00" and never equal requested_frame_time, silently
+    # dropping the "today" sample (no blend) -- which must match the parquet
+    # serve path so attestation stays consistent.
+    cursor = con.execute(
+        f"""
+        SELECT
+            PULocationID,
+            strftime(exact_bin_local_ts AT TIME ZONE 'UTC', '%Y-%m-%dT%H:%M:%S') AS bin_key,
+            {score_cols_sql}
+        FROM exact_shadow_rows
+        WHERE exact_bin_local_ts IN ({placeholders})
+        """,
+        all_times,
+    )
+    by_zone: Dict[int, List[Tuple[str, Tuple[Any, ...]]]] = {}
+    for row in cursor.fetchall():
+        try:
+            zid = int(row[0])
+        except Exception:
+            continue
+        ts = str(row[1])
+        values = row[2 : 2 + len(fetch_columns)]
+        by_zone.setdefault(zid, []).append((ts, values))
+
+    return _blend_same_weekday_rows(
+        by_zone,
+        requested_frame_time,
+        tuple(columns),
+        consistency_index=len(columns),
+        damp_columns=SAME_WEEKDAY_DAMP_TARGET_COLUMNS,
+    )
 
 
 def build_single_frame_from_exact_store(
@@ -1277,13 +1496,7 @@ def build_single_frame_from_exact_store(
         geom = geom_by_id.get(zid)
         if not geom:
             continue
-        blended_cols = blended_by_zone.get(zid)
-        if blended_cols:
-            for col_name, blended_value in blended_cols.items():
-                if col_name == "earnings_shadow_rating_citywide_v3":
-                    row_map[col_name] = int(round(blended_value))
-                else:
-                    row_map[col_name] = blended_value
+        _apply_blended_columns_to_row_map(row_map, blended_by_zone.get(zid))
         features.append(
             {
                 "type": "Feature",
