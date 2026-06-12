@@ -90,3 +90,10 @@
 - [x] `build_single_frame_for_month` (driver serve path) applies the blend+damp; `build_single_frame_from_exact_store` uses the SAME shared helper so attestation stays apples-to-apples.
 - [x] `_rating_logic_version_token()` hashes `build_hotspot` so a deploy of this change rotates the frame etag and triggers the startup regenerate/purge.
 - [ ] live: after deploy, a previously-spiky blue zone reads lower/steadier in **every** mode (toggle citywide, a borough, 45+ trips); a reliably-busy zone is unchanged; `/frame/{idx}` cache-miss latency stays acceptable (then cached).
+
+## Map zone colors — next-bin demand trend
+- [x] `tests/test_same_weekday_blend_damping.py::test_next_bin_trend_surfaces_cooling_zone` passes: a zone busy now but quiet next bin gets a lower `earnings_shadow_rating_citywide_v3_next`; the frame carries `next_time`.
+- [x] The next bin is extracted from the SAME same-weekday windows (no extra parquet scan) and scored via the shared `_build_recalibrated_features` (identical blend + damping as the current bin).
+- [x] Frames with no next-bin data degrade gracefully (no `_next` fields, no `next_time`).
+- [x] `_normalize_frame_payload_for_compare` skips `_next` keys, so the exact-store attestation comparison is unaffected (the store path produces no `_next`).
+- [ ] live: every served zone carries `earnings_shadow_rating_<mode>_next` for citywide + the 5 boroughs + 45+; `next_time` is the next 20-min clock; payload size increase is acceptable.

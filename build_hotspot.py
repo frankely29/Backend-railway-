@@ -212,6 +212,19 @@ SAME_WEEKDAY_BLEND_COLUMNS: Tuple[str, ...] = (
     *_V3_BOROUGH_CONF_FIELDS,                  # trips_45plus_v3 has no confidence column
 )
 
+# Visible per-mode rating fields whose NEXT 20-minute bin value is surfaced on
+# each served frame (suffixed "_next") to drive the on-map demand-trend label
+# ("about to cool / heat up at HH:MM"). The next bin is blended + recalibrated
+# exactly like the current one; the frontend derives the next bucket/color from
+# the rating for the selected mode, just as it does for the current bin. These
+# are computed only on the served (parquet) path, so the attestation comparison
+# skips "_next" keys.
+SAME_WEEKDAY_TREND_RATING_FIELDS: Tuple[str, ...] = (
+    "earnings_shadow_rating_citywide_v3",
+    *(f"earnings_shadow_rating_{name}" for name in V3_PROFILE_CONFIG if name != "citywide_v3"),
+    _TRIPS_45PLUS_RATING_FIELD,
+)
+
 TRAP_CANDIDATE_REVIEW_PROFILE_CONFIG: Dict[str, Dict[str, str]] = {
     "citywide_v3_trap_candidate": {
         "live_score_field": "earnings_shadow_score_citywide_v3",
@@ -1052,6 +1065,44 @@ def build_month_timeline_bootstrap(month_key: str, bin_minutes: int = 20) -> Dic
     }
 
 
+def _build_recalibrated_features(
+    rows: List[Tuple[Any, ...]],
+    columns: List[str],
+    blended_by_zone: Dict[int, Dict[str, float]],
+    geom_by_id: Dict[int, Any],
+    name_by_id: Dict[int, str],
+    borough_by_id: Dict[int, str],
+) -> List[Dict[str, Any]]:
+    """Build GeoJSON zone features from shadow rows, apply the same-weekday
+    blend/damp, and recalibrate the visible v3 colors. Shared by the current
+    frame and the next-bin trend build so both are scored identically."""
+    features: List[Dict[str, Any]] = []
+    for row in rows:
+        row_map = {columns[idx]: row[idx] for idx in range(len(columns))}
+        try:
+            zid = int(row_map.get("PULocationID"))
+        except Exception:
+            continue
+        geom = geom_by_id.get(zid)
+        if not geom:
+            continue
+        _apply_blended_columns_to_row_map(row_map, blended_by_zone.get(zid))
+        features.append(
+            {
+                "type": "Feature",
+                "geometry": geom,
+                "properties": build_feature_properties_from_shadow_row(
+                    row_map=row_map,
+                    zone_name=str(name_by_id.get(zid) or ""),
+                    borough=str(borough_by_id.get(zid) or ""),
+                    geometry_area_sq_miles=None,
+                ),
+            }
+        )
+    _recalibrate_visible_v3_fields(features)
+    return features
+
+
 def build_single_frame_for_month(
     parquet_files: List[Path],
     zones_geojson_path: Path,
@@ -1082,6 +1133,16 @@ def build_single_frame_for_month(
         prior_dt = frame_local_dt - timedelta(weeks=_week)
         target_local_dts.append(prior_dt)
         target_times.append(prior_dt.strftime("%Y-%m-%dT%H:%M:%S"))
+
+    # The NEXT 20-minute bin (for the on-map demand-trend label). It falls inside
+    # the same ±window we already scan for each same-weekday target, so it costs
+    # no extra scan -- we just extract and recalibrate it too. Each target has a
+    # parallel "+1 bin" time.
+    next_frame_time = (frame_local_dt + timedelta(minutes=int(bin_minutes))).strftime("%Y-%m-%dT%H:%M:%S")
+    target_next_times: List[str] = [
+        (dt + timedelta(minutes=int(bin_minutes))).strftime("%Y-%m-%dT%H:%M:%S")
+        for dt in target_local_dts
+    ]
 
     zones = json.loads(zones_geojson_path.read_text(encoding="utf-8"))
     geom_by_id: Dict[int, Any] = {}
@@ -1127,6 +1188,8 @@ def build_single_frame_for_month(
     today_rows: List[Tuple[Any, ...]] = []
     today_columns: List[str] = []
     by_zone: Dict[int, List[Tuple[str, Tuple[Any, ...]]]] = {}
+    next_rows: List[Tuple[Any, ...]] = []
+    by_zone_next: Dict[int, List[Tuple[str, Tuple[Any, ...]]]] = {}
     try:
         schema_rows = con.execute(f"DESCRIBE SELECT * FROM read_parquet([{first_parquet_sql}])").fetchall()
         available_columns = {str(row[0]) for row in schema_rows}
@@ -1154,7 +1217,7 @@ def build_single_frame_for_month(
                 available_columns=available_columns,
             )
 
-        for tgt_local_dt, tgt_time in zip(target_local_dts, target_times):
+        for tgt_local_dt, tgt_time, tgt_next_time in zip(target_local_dts, target_times, target_next_times):
             win_start = (
                 tgt_local_dt - timedelta(minutes=(window_padding_minutes * 3))
             ).astimezone(UTC_TZ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -1163,54 +1226,72 @@ def build_single_frame_for_month(
             ).astimezone(UTC_TZ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
             shadow_sql = _shadow_sql_for_window(win_start, win_end)
             if tgt_time == requested_frame_time:
-                # Today: fetch the full row (all mode columns) to build features.
+                # Current bin + next bin: full rows (all mode columns) for both,
+                # split by a timezone-independent bin key (the next bin already
+                # falls inside this same window, so no extra scan).
                 cursor = con.execute(
                     f"""
                     WITH exact_shadow_rows AS (
                         {shadow_sql}
                     )
-                    SELECT *
+                    SELECT *,
+                           strftime(exact_bin_local_ts AT TIME ZONE 'UTC', '%Y-%m-%dT%H:%M:%S') AS __bin_key
                     FROM exact_shadow_rows
-                    WHERE exact_bin_local_ts = ?
+                    WHERE exact_bin_local_ts IN (?, ?)
                     ORDER BY PULocationID
                     """,
-                    [tgt_time],
+                    [tgt_time, tgt_next_time],
                 )
-                today_rows = cursor.fetchall()
-                today_columns = [str(desc[0]) for desc in (cursor.description or [])]
+                fetched = cursor.fetchall()
+                full_columns = [str(desc[0]) for desc in (cursor.description or [])]
+                today_columns = full_columns[:-1]  # drop the trailing __bin_key
                 col_index = {name: idx for idx, name in enumerate(today_columns)}
                 loc_idx = col_index.get("PULocationID")
                 if loc_idx is not None:
-                    for row in today_rows:
+                    for row in fetched:
+                        bin_key = row[-1]
+                        feature_row = row[:-1]
                         try:
-                            zid = int(row[loc_idx])
+                            zid = int(feature_row[loc_idx])
                         except Exception:
                             continue
                         sample = tuple(
-                            row[col_index[col]] if col in col_index else None
+                            feature_row[col_index[col]] if col in col_index else None
                             for col in blend_fetch_columns
                         )
-                        by_zone.setdefault(zid, []).append((tgt_time, sample))
+                        if bin_key == requested_frame_time:
+                            today_rows.append(feature_row)
+                            by_zone.setdefault(zid, []).append((requested_frame_time, sample))
+                        elif bin_key == next_frame_time:
+                            next_rows.append(feature_row)
+                            by_zone_next.setdefault(zid, []).append((next_frame_time, sample))
             else:
-                # Prior week: only the blend columns + pickups_now are needed.
+                # Prior week: blend columns + pickups_now for the bin AND its +1,
+                # so the next bin is blended over the same same-weekday history.
                 cursor = con.execute(
                     f"""
                     WITH exact_shadow_rows AS (
                         {shadow_sql}
                     )
-                    SELECT PULocationID, exact_bin_local_ts, {blend_cols_sql}
+                    SELECT PULocationID,
+                           strftime(exact_bin_local_ts AT TIME ZONE 'UTC', '%Y-%m-%dT%H:%M:%S') AS bin_key,
+                           {blend_cols_sql}
                     FROM exact_shadow_rows
-                    WHERE exact_bin_local_ts = ?
+                    WHERE exact_bin_local_ts IN (?, ?)
                     """,
-                    [tgt_time],
+                    [tgt_time, tgt_next_time],
                 )
                 for row in cursor.fetchall():
                     try:
                         zid = int(row[0])
                     except Exception:
                         continue
+                    bin_key = str(row[1])
                     sample = tuple(row[2 : 2 + len(blend_fetch_columns)])
-                    by_zone.setdefault(zid, []).append((str(row[1]), sample))
+                    if bin_key == tgt_time:
+                        by_zone.setdefault(zid, []).append((bin_key, sample))
+                    elif bin_key == tgt_next_time:
+                        by_zone_next.setdefault(zid, []).append((bin_key, sample))
     finally:
         con.close()
 
@@ -1221,32 +1302,55 @@ def build_single_frame_for_month(
         consistency_index=len(SAME_WEEKDAY_BLEND_COLUMNS),
         damp_columns=SAME_WEEKDAY_DAMP_TARGET_COLUMNS,
     )
+    features = _build_recalibrated_features(
+        today_rows, today_columns, blended_by_zone, geom_by_id, name_by_id, borough_by_id
+    )
 
-    features: List[Dict[str, Any]] = []
-    for row in today_rows:
-        row_map = {today_columns[idx]: row[idx] for idx in range(len(today_columns))}
-        try:
-            zid = int(row_map.get("PULocationID"))
-        except Exception:
-            continue
-        geom = geom_by_id.get(zid)
-        if not geom:
-            continue
-        _apply_blended_columns_to_row_map(row_map, blended_by_zone.get(zid))
-        features.append(
-            {
-                "type": "Feature",
-                "geometry": geom,
-                "properties": build_feature_properties_from_shadow_row(
-                    row_map=row_map,
-                    zone_name=str(name_by_id.get(zid) or ""),
-                    borough=str(borough_by_id.get(zid) or ""),
-                    geometry_area_sq_miles=None,
-                ),
-            }
+    # Next-bin demand trend: blend + recalibrate the +1 bin the same way, then
+    # surface each zone's next-bin visible rating per mode as "<field>_next".
+    # The frontend compares it to the current rating to draw the on-map "about
+    # to cool / heat up at HH:MM" label.
+    next_time_out = None
+    if next_rows:
+        blended_by_zone_next = _blend_same_weekday_rows(
+            by_zone_next,
+            next_frame_time,
+            tuple(SAME_WEEKDAY_BLEND_COLUMNS),
+            consistency_index=len(SAME_WEEKDAY_BLEND_COLUMNS),
+            damp_columns=SAME_WEEKDAY_DAMP_TARGET_COLUMNS,
         )
-    _recalibrate_visible_v3_fields(features)
-    return {"time": requested_frame_time, "polygons": {"type": "FeatureCollection", "features": features}}
+        next_features = _build_recalibrated_features(
+            next_rows, today_columns, blended_by_zone_next, geom_by_id, name_by_id, borough_by_id
+        )
+        next_props_by_zone: Dict[int, Dict[str, Any]] = {}
+        for nf in next_features:
+            nprops = nf.get("properties") or {}
+            try:
+                next_props_by_zone[int(nprops.get("LocationID"))] = nprops
+            except Exception:
+                continue
+        for feature in features:
+            props = feature.get("properties") or {}
+            try:
+                zid = int(props.get("LocationID"))
+            except Exception:
+                continue
+            nprops = next_props_by_zone.get(zid)
+            if not nprops:
+                continue
+            for field in SAME_WEEKDAY_TREND_RATING_FIELDS:
+                value = nprops.get(field)
+                if value is not None:
+                    props[f"{field}_next"] = value
+        next_time_out = next_frame_time
+
+    result: Dict[str, Any] = {
+        "time": requested_frame_time,
+        "polygons": {"type": "FeatureCollection", "features": features},
+    }
+    if next_time_out is not None:
+        result["next_time"] = next_time_out
+    return result
 
 
 def _same_weekday_consistency_damp(demand_samples: List[float]) -> float:
