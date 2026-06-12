@@ -1,5 +1,16 @@
 # BACKEND CHANGELOG
 
+## Current pass: Next-bin demand trend — surface each zone's upcoming 20-minute change
+
+Per directive: warn drivers when a zone that's hot **now** is about to cool (or heat up) in the **next** 20-minute bin, with the exact clock time — so they know whether to stay or move. Drivers don't linger, so this is **next-bin only**.
+
+- `build_single_frame_for_month` now also blends + recalibrates the **next 20-minute bin** for every zone, reusing the *same* scan windows (the +1 bin already falls inside each same-weekday `±60 min` window, so there is **no extra parquet scan** — just an in-memory second recalibration). Refactored the current-frame feature build into a shared `_build_recalibrated_features` helper used for both the current and next bins.
+- Each served zone now carries its next-bin visible rating per mode as `earnings_shadow_rating_<mode>_next` (citywide + 5 boroughs + 45+ trips, from `SAME_WEEKDAY_TREND_RATING_FIELDS`), and the frame carries `next_time` (the next bin's local clock). The frontend compares current vs next bucket for the selected mode and draws an on-map ▲/▼ label at the exact time.
+- The next bin is scored **identically** to the current one (same blend weights + volatility damping), so the trend rides on the denoised signal rather than one-day noise. Bins with no data degrade gracefully (no `_next`, no `next_time`).
+- Split current vs next rows by a timezone-independent `strftime(exact_bin_local_ts AT TIME ZONE 'UTC', …)` bin key (same normalization as the store path).
+- `_normalize_frame_payload_for_compare` now **skips `_next` keys**: the next-bin fields are produced only on the served path, so the exact-store attestation comparison ignores them (no spurious store retirement).
+- Tests: `tests/test_same_weekday_blend_damping.py` gains a next-bin trend test (a zone busy now but quiet next bin gets a lower `…_v3_next` rating and the frame carries `next_time`; a steady reference zone barely moves). Full suite green.
+
 ## Current pass: Map colors — wire the same-weekday blend into the served path + volatility damping (system-wide: all zones, all colors)
 
 Fix (per report): a zone could show **blue or higher**, a driver would go there, and find **few/no trips**. Root cause: each served map frame is computed for **one specific calendar timestamp**, and a zone's demand is `COUNT(*)` of trips in that single 20-minute window **on that one day** (`zone_earnings_engine.py` `zone_bin_actual`, grouped by `exact_bin_local_ts`). A one-day spike paints a zone busy even when it's a fluke. The 20-minute refresh cadence is not the problem — each frame reflecting a single day is.

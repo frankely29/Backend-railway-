@@ -979,7 +979,9 @@ def _normalize_frame_payload_for_compare(frame_payload: Dict[str, Any]) -> Dict[
             if not isinstance(key, str):
                 continue
             if key.startswith("earnings_shadow_rating_") or key.startswith("earnings_shadow_bucket_") or key.startswith("earnings_shadow_color_"):
-                if "_v3" in key:
+                # Skip serve-only next-bin trend fields ("..._v3_next"); the
+                # exact-store comparison path does not produce them.
+                if "_v3" in key and not key.endswith("_next"):
                     normalized[key] = value
         rows[location_id] = normalized
     return rows

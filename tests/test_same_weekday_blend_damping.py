@@ -320,8 +320,10 @@ def _write_multiweek_parquet(path: Path, *, zone46_prior_count: int, per_bin: in
     con.close()
 
 
-def _discover_zone_today_bin(parquet_path: Path, geojson_path: Path, location_id: int) -> str:
-    """Run the engine SQL (no window) and return zone's latest exact_bin_local_ts.
+def _discover_zone_today_bin(parquet_path: Path, geojson_path: Path, location_id: int, index: int = -1) -> str:
+    """Run the engine SQL (no window) and return one of a zone's bin keys
+    (default the latest; pass index=-2 for the penultimate, i.e. a bin that
+    still has a "next bin" after it).
 
     Done under the same DuckDB defaults build_single_frame_for_month uses, so
     the discovered bin matches what the serve path will look back from.
@@ -354,7 +356,7 @@ def _discover_zone_today_bin(parquet_path: Path, geojson_path: Path, location_id
     finally:
         con.close()
     assert bins, "expected at least one bin for the zone"
-    return bins[-1]
+    return bins[index]
 
 
 def _citywide_rating_for_zone(frame: dict, location_id: int) -> int:
@@ -451,3 +453,68 @@ def test_store_path_blends_after_tz_normalization(tmp_path: Path) -> None:
     # value is genuinely moved off raw today -- proving it is not a no-op.
     assert raw_today is not None
     assert blended[46][anchor_col] != pytest.approx(float(raw_today[0]))
+
+
+# today + 3 prior weeks, each with a CURRENT bin (18:05 -> bin :00) and a NEXT
+# bin 20 min later (18:25 -> bin :20), so the served frame can look one bin ahead.
+_TREND_TIMES = {
+    "today": ("2025-01-29 18:05:00", "2025-01-29 18:25:00"),
+    "w1": ("2025-01-22 18:05:00", "2025-01-22 18:25:00"),
+    "w2": ("2025-01-15 18:05:00", "2025-01-15 18:25:00"),
+    "w3": ("2025-01-08 18:05:00", "2025-01-08 18:25:00"),
+}
+
+
+def _write_trend_parquet(path: Path, *, z46_now: int, z46_next: int, ref: int = 10) -> None:
+    rows: list[tuple] = []
+
+    def add(zone: int, do: int, ts: str, n: int) -> None:
+        for _ in range(n):
+            rows.append((zone, do, ts, ts, 20.0, 900.0, 4.0, 0, 0))
+
+    for cur_ts, next_ts in _TREND_TIMES.values():
+        add(46, 50, cur_ts, z46_now)   # zone 46: this bin
+        add(46, 50, next_ts, z46_next)  # zone 46: next bin
+        add(50, 46, cur_ts, ref)        # reference zone keeps both bins alive
+        add(50, 46, next_ts, ref)
+
+    con = duckdb.connect(database=":memory:")
+    con.execute(
+        "CREATE TABLE trips (PULocationID INTEGER, DOLocationID INTEGER, pickup_datetime TIMESTAMP, "
+        "request_datetime TIMESTAMP, driver_pay DOUBLE, trip_time DOUBLE, trip_miles DOUBLE, "
+        "shared_match_flag INTEGER, shared_request_flag INTEGER)"
+    )
+    con.executemany("INSERT INTO trips VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+    con.execute(f"COPY trips TO '{path.as_posix()}' (FORMAT PARQUET)")
+    con.close()
+
+
+def test_next_bin_trend_surfaces_cooling_zone(tmp_path: Path) -> None:
+    """A zone that is busy now but quiet in the next 20-min bin gets a lower
+    `..._next` rating + the frame carries `next_time`, so the map can warn the
+    driver it is about to cool. The steady reference zone barely moves."""
+    geojson = tmp_path / "z.geojson"
+    _write_three_zone_geojson(geojson)
+    parquet = tmp_path / "trend.parquet"
+    _write_trend_parquet(parquet, z46_now=15, z46_next=1)
+    # Build at the CURRENT bin (penultimate), so the +1 bin exists.
+    frame_time = _discover_zone_today_bin(parquet, geojson, 46, index=-2)
+
+    frame = bh.build_single_frame_for_month(
+        parquet_files=[parquet], zones_geojson_path=geojson, frame_time=frame_time,
+        bin_minutes=20, min_trips_per_window=1,
+    )
+
+    assert frame.get("next_time"), "frame should carry the next bin's time"
+    props = {int(f["properties"]["LocationID"]): f["properties"] for f in frame["polygons"]["features"]}
+
+    cur46 = props[46]["earnings_shadow_rating_citywide_v3"]
+    next46 = props[46].get("earnings_shadow_rating_citywide_v3_next")
+    assert next46 is not None, "cooling zone must carry a next-bin rating"
+    assert next46 < cur46, "zone 46 is quiet next bin -> next rating must be lower"
+
+    # Steady reference zone: next ~ current (no big swing).
+    cur50 = props[50]["earnings_shadow_rating_citywide_v3"]
+    next50 = props[50].get("earnings_shadow_rating_citywide_v3_next")
+    assert next50 is not None
+    assert abs(next50 - cur50) <= 20
