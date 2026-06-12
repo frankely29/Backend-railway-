@@ -4184,6 +4184,7 @@ def _generate_worker(
     build_review_artifacts: bool = False,
     month_key: Optional[str] = None,
     build_all_months: bool = False,
+    commit_rating_logic_version: bool = False,
 ) -> None:
     from build_hotspot import ensure_zones_geojson, build_hotspots_frames
 
@@ -4295,6 +4296,10 @@ def _generate_worker(
             build_results[mk] = month_result
         manifest_payload = _persist_month_manifest(months_manifest)
         _prune_legacy_frame_files_after_monthly_ready()
+        # Reclaim non-warm months' served frame caches right after publish so a
+        # multi-month build never leaves the volume holding every month's cache
+        # until the next periodic sweep.
+        _prune_inactive_month_frame_caches()
         rebuilt_day_tendency_result: Dict[str, Any] = {
             "ok": False,
             "skipped": True,
@@ -4369,13 +4374,17 @@ def _generate_worker(
             print("generate_worker_post_rebuild_auto_run_tests_failed")
             traceback.print_exc()
 
-        # Persist rating-logic version token only after a successful full rebuild.
+        # Persist rating-logic version token only after a successful rebuild.
         # The startup hook used to write this before the worker ran, which meant a
         # crashed worker would still advance the token and silently skip regen on
-        # the next restart. build_all_months=True is the only path that rebuilds
-        # every duckdb store the engine reads from, so this is the correct
-        # success boundary for marking the token as committed.
-        if bool(build_all_months):
+        # the next restart. Under the month-retention policy the ACTIVE month is
+        # the success boundary for a version change (commit_rating_logic_version
+        # is passed by the startup trigger): old months' frame caches are pruned
+        # and rebuild lazily per-frame with current logic on access, and stale
+        # old stores are retired by attestation -- so no all-months rebuild (a
+        # full-volume write burst) is needed. build_all_months also commits, as
+        # a full rebuild is a superset.
+        if bool(build_all_months) or bool(commit_rating_logic_version):
             try:
                 _write_stored_rating_logic_version(_rating_logic_version_token())
                 print("generate_worker_rating_logic_version_committed")
@@ -4423,6 +4432,7 @@ def start_generate(
     build_review_artifacts: bool = False,
     month_key: Optional[str] = None,
     build_all_months: bool = False,
+    commit_rating_logic_version: bool = False,
 ) -> Dict[str, Any]:
     global _generate_thread
     with _generate_control_lock:
@@ -4521,6 +4531,7 @@ def start_generate(
                 bool(build_review_artifacts),
                 requested_month_key,
                 bool(build_all_months),
+                bool(commit_rating_logic_version),
             ),
             daemon=True,
         )
@@ -6637,9 +6648,16 @@ def startup():
         if stored_version != current_version:
             print(
                 f"[rating-logic] version changed (stored={stored_version!r} current={current_version!r}); "
-                f"triggering background frame-cache regeneration via start_generate(build_all_months=True)"
+                f"triggering background ACTIVE-month regeneration (old months heal lazily; "
+                f"no all-months rebuild, so no full-volume write burst)"
             )
             try:
+                # Scoped to the active month on purpose: a build_all_months
+                # rebuild rewrites every month's store + frame cache in one run,
+                # which on a near-full volume is exactly what tips it to 100%.
+                # Old months need no eager rebuild -- their served frame caches
+                # are pruned by retention and rebuild per-frame on demand with
+                # current logic, and stale stores are retired by attestation.
                 start_generate(
                     DEFAULT_BIN_MINUTES,
                     DEFAULT_MIN_TRIPS_PER_WINDOW,
@@ -6647,7 +6665,8 @@ def startup():
                     include_day_tendency=False,
                     build_review_artifacts=False,
                     month_key=None,
-                    build_all_months=True,
+                    build_all_months=False,
+                    commit_rating_logic_version=True,
                 )
                 # Token is now persisted by the worker on successful completion,
                 # not here. This keeps a crashed/aborted worker from advancing the

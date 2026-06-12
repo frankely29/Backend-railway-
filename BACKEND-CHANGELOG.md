@@ -10,7 +10,11 @@ Railway volume hit 100% and crashed `web`. Root cause: `exact_history/months/` i
 - Tunable via `WARM_MONTH_FRAME_CACHE_COUNT` (env) without code — bump it to keep more recent months warm.
 - Tests: `tests/test_month_frame_cache_retention.py` — active month kept, old months reclaimed, stores + parquets untouched, no-op without a manifest.
 
-Operational note: on deploy this prunes the accumulated old-month caches at startup and self-heals; growing the volume slightly still gives headroom for the rebuild to run.
+**Zero-growth hardening (no volume resize needed; works at 100% full):**
+- **Version-change regen is now scoped to the ACTIVE month** (was `build_all_months=True`). The all-months rebuild rewrote every month's store + frame cache in one run — on a near-full volume that write burst is exactly what tipped it to 100% (and it retried on every restart). Old months need no eager rebuild: their caches are pruned by retention and rebuild per-frame on demand with current logic; stale stores are retired by attestation.
+- The rating-logic token commit boundary moved with it: a new `commit_rating_logic_version` flag (threaded through `start_generate` → `_generate_worker`) commits the token after the **active month** succeeds, so the regen doesn't re-trigger forever. `build_all_months` still commits too (superset).
+- The generate worker now calls `_prune_inactive_month_frame_caches()` right after publish, so multi-month admin builds never leave every month's cache stacked until the next 6-hour sweep.
+- Recovery sequence on a 100%-full volume, with NO resize: boot → startup prune deletes old caches (deletion needs no free space) → regen rebuilds only the active month → bounded forever. Railway bills by GB used, so the prune directly lowers the storage bill.
 
 ## Current pass: Next-bin demand trend — surface each zone's upcoming 20-minute change
 

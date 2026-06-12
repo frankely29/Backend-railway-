@@ -93,7 +93,9 @@
 
 ## Storage — bound /data growth (month frame-cache retention)
 - [x] `tests/test_month_frame_cache_retention.py` passes: active month kept warm, older months' `frame_*.json` reclaimed, exact stores + source parquets untouched, no-op without a manifest.
-- [x] `_prune_inactive_month_frame_caches` wired into startup cleanup (before the version-token rebuild) and the periodic sweeper.
+- [x] `_prune_inactive_month_frame_caches` wired into startup cleanup (before the version-token rebuild), the periodic sweeper, and post-publish in the generate worker.
+- [x] Version-change regen scoped to the ACTIVE month (`build_all_months=False`, `commit_rating_logic_version=True`): no all-months write burst on a full disk; token commits after the active month succeeds (no infinite regen retry).
+- [ ] live: deploy on the 100%-full volume WITHOUT resizing — boot logs show the prune freeing space, then `[rating-logic] ... ACTIVE-month regeneration`, and the volume % drops.
 - [ ] live: after deploy, `[storage-cleanup] ...` / `inactive_month_frame_cache_prune_done` logs show old months pruned; `/status` `cleanup_last_*` byte counts increase; volume usage drops.
 - [ ] live: an older month still renders on demand (frames rebuild on first access); source parquets + leaderboard/user data intact.
 - [ ] tune `WARM_MONTH_FRAME_CACHE_COUNT` if drivers browse older months frequently.
