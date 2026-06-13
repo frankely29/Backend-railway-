@@ -36,7 +36,7 @@ NYC_LONG_TRIP_POIS: List[Tuple[str, float, float, str, float]] = [
     ("Mt Sinai Morningside",      40.8044, -73.9609, "hospital", 3.0),
     ("Mt Sinai Beth Israel",      40.7325, -73.9824, "hospital", 3.0),
     ("NYU Langone Tisch",         40.7421, -73.9744, "hospital", 3.0),
-    ("NYU Langone Brooklyn",      40.6928, -73.9787, "hospital", 3.0),
+    ("NYU Langone Brooklyn",      40.6453, -74.0193, "hospital", 3.0),
     ("Bellevue Hospital",         40.7392, -73.9759, "hospital", 3.0),
     ("Memorial Sloan Kettering",  40.7644, -73.9568, "hospital", 3.0),
     ("Hospital for Special Surgery", 40.7649, -73.9560, "hospital", 3.0),
@@ -62,6 +62,15 @@ NYC_LONG_TRIP_POIS: List[Tuple[str, float, float, str, float]] = [
     ("Jamaica Station (LIRR/AirTrain)", 40.7028, -73.8087, "transit_hub", 2.5),
     ("Hunters Point LIRR",        40.7421, -73.9396, "transit_hub", 2.0),
     ("Newark Penn Station",       40.7345, -74.1645, "transit_hub", 2.5),
+
+    # Brooklyn — Sunset Park West waterfront (TLC zone 228). Quality
+    # earnings anchors validated against live map data: ferry + work
+    # campus that throw long, well-paid trips. (NYU Langone Brooklyn is
+    # in the hospital block above.) Costco is deliberately NOT here — it
+    # generates high pickup volume but short, cheap trips, so it reads as
+    # a demand trap, not an earnings anchor.
+    ("Brooklyn Army Terminal",    40.6447, -74.0238, "transit_hub", 2.0),
+    ("Industry City",             40.6557, -74.0096, "corporate", 2.0),
 
     # Hotels
     ("Plaza Hotel",               40.7644, -73.9743, "hotel_luxury", 2.5),
@@ -428,6 +437,8 @@ POI_ADDRESSES: Dict[str, str] = {
     "Mt Sinai Beth Israel": "281 1st Ave, NY 10003",
     "NYU Langone Tisch": "550 1st Ave, NY 10016",
     "NYU Langone Brooklyn": "150 55th St, Brooklyn 11220",
+    "Brooklyn Army Terminal": "140 58th St, Brooklyn 11220",
+    "Industry City": "220 36th St, Brooklyn 11232",
     "Bellevue Hospital": "462 1st Ave, NY 10016",
     "Memorial Sloan Kettering": "1275 York Ave, NY 10065",
     "Hospital for Special Surgery": "535 E 70th St, NY 10021",
