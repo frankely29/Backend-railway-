@@ -9628,6 +9628,103 @@ def long_trip_hotspots_rebuild(admin: sqlite3.Row = Depends(require_admin)):
     return {"ok": True, **summary}
 
 
+@app.get("/admin/long_trip_hotspots/poi_audit")
+def long_trip_hotspots_poi_audit(
+    start: int = 0,
+    count: int = 40,
+    admin: sqlite3.Row = Depends(require_admin),
+):
+    """
+    Audit POI coordinate accuracy: geocode each curated address (US Census
+    geocoder, Nominatim fallback for no-matches) and report how far the
+    stored hand-typed lat/lng sits from the geocoded address. Read-only —
+    proposes corrections, applies nothing. Call in slices (start/count) to
+    stay under request timeouts.
+    """
+    _ = admin
+    import math
+    import time
+    import httpx
+    from long_trip_hotspot_builder import NYC_LONG_TRIP_POIS, POI_ADDRESSES
+
+    def haversine_mi(la1, lo1, la2, lo2):
+        R = 3958.8
+        p1, p2 = math.radians(la1), math.radians(la2)
+        dp = math.radians(la2 - la1)
+        dl = math.radians(lo2 - lo1)
+        a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+        return 2 * R * math.asin(math.sqrt(a))
+
+    def geocode_census(client, address):
+        try:
+            r = client.get(
+                "https://geocoding.geo.census.gov/geocoder/locations/onelineaddress",
+                params={"address": address, "benchmark": "Public_AR_Current", "format": "json"},
+                timeout=8.0,
+            )
+            matches = r.json().get("result", {}).get("addressMatches", [])
+            if matches:
+                c = matches[0]["coordinates"]
+                return float(c["y"]), float(c["x"]), matches[0].get("matchedAddress", "")
+        except Exception:
+            pass
+        return None
+
+    def geocode_nominatim(client, query):
+        try:
+            r = client.get(
+                "https://nominatim.openstreetmap.org/search",
+                params={"q": query, "format": "json", "limit": 1, "countrycodes": "us"},
+                headers={"User-Agent": "team-joseo-poi-audit/1.0 (admin coordinate audit)"},
+                timeout=8.0,
+            )
+            arr = r.json()
+            if arr:
+                return float(arr[0]["lat"]), float(arr[0]["lon"]), arr[0].get("display_name", "")
+        except Exception:
+            pass
+        return None
+
+    pois = NYC_LONG_TRIP_POIS[start:start + count]
+    results = []
+    did_nominatim = False
+    with httpx.Client() as client:
+        for name, lat, lng, cat, w in pois:
+            addr = POI_ADDRESSES.get(name, "")
+            geo = geocode_census(client, addr) if addr else None
+            source = "census"
+            if geo is None:
+                if did_nominatim:
+                    time.sleep(1.1)  # respect Nominatim's 1 req/sec policy
+                did_nominatim = True
+                geo = geocode_nominatim(client, f"{name}, {addr}" if addr else name)
+                source = "nominatim"
+            if geo is None:
+                results.append({
+                    "name": name, "address": addr, "category": cat,
+                    "stored_lat": lat, "stored_lng": lng,
+                    "geo_lat": None, "geo_lng": None, "dist_mi": None,
+                    "source": "none", "status": "no_match",
+                })
+                continue
+            glat, glng, matched = geo
+            results.append({
+                "name": name, "address": addr, "category": cat,
+                "stored_lat": lat, "stored_lng": lng,
+                "geo_lat": round(glat, 6), "geo_lng": round(glng, 6),
+                "dist_mi": round(haversine_mi(lat, lng, glat, glng), 3),
+                "source": source, "matched": matched, "status": "ok",
+            })
+    return {
+        "ok": True,
+        "start": start,
+        "count": count,
+        "total_pois": len(NYC_LONG_TRIP_POIS),
+        "returned": len(results),
+        "results": results,
+    }
+
+
 @app.get("/long_trip_hotspots")
 def long_trip_hotspots_list(user: sqlite3.Row = Depends(require_user)):
     """
