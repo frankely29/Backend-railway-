@@ -193,6 +193,17 @@ NYC_LONG_TRIP_POIS: List[Tuple[str, float, float, str, float]] = [
     ("Boro Hotel LIC",            40.755106, -73.935397, "hotel_luxury", 1.7),
     ("Z NYC Hotel",               40.751855, -73.947948, "hotel_luxury", 1.6),
     ("Ravel Hotel LIC",           40.75411, -73.949273, "hotel_luxury", 1.5),
+    # LIC / Dutch Kills hotel district near Queens Plaza — a dense cluster
+    # of airport hotels (LaGuardia proximity), heavy on early-AM airport
+    # runs. Coordinates from OpenStreetMap.
+    ("Holiday Inn LIC",           40.753305, -73.934409, "hotel_luxury", 1.6),
+    ("Ramada LIC",                40.755235, -73.936721, "hotel_luxury", 1.5),
+    ("Home2 Suites LIC",          40.753022, -73.934104, "hotel_luxury", 1.5),
+    ("Fairfield Inn LIC",         40.751451, -73.935117, "hotel_luxury", 1.5),
+    ("Country Inn & Suites LIC",  40.753067, -73.938488, "hotel_luxury", 1.5),
+    ("Comfort Inn LIC",           40.757614, -73.938415, "hotel_luxury", 1.5),
+    ("Quality Inn LIC",           40.752017, -73.934476, "hotel_luxury", 1.5),
+    ("Best Western LIC",          40.755938, -73.941157, "hotel_luxury", 1.5),
 
     # Astoria — Mt Sinai Astoria (hospital, high-traffic). Dropped
     # Kaufman Studios + Museum of Moving Image — working soundstage and
@@ -525,6 +536,14 @@ POI_ADDRESSES: Dict[str, str] = {
     "Boro Hotel LIC": "38-28 27th St, LIC 11101",
     "Z NYC Hotel": "11-01 43rd Ave, LIC 11101",
     "Ravel Hotel LIC": "8-08 Queens Plaza S, LIC 11101",
+    "Holiday Inn LIC": "Dutch Kills, Long Island City 11101",
+    "Ramada LIC": "Dutch Kills, Long Island City 11101",
+    "Home2 Suites LIC": "Dutch Kills, Long Island City 11101",
+    "Fairfield Inn LIC": "Dutch Kills, Long Island City 11101",
+    "Country Inn & Suites LIC": "Dutch Kills, Long Island City 11101",
+    "Comfort Inn LIC": "Dutch Kills, Long Island City 11101",
+    "Quality Inn LIC": "Dutch Kills, Long Island City 11101",
+    "Best Western LIC": "Dutch Kills, Long Island City 11101",
     "W Hoboken": "225 River St, Hoboken, NJ 07030",
     "Hyatt Regency Jersey City": "2 Exchange Pl, Jersey City, NJ 07302",
     "W Hotel JC (Newport)": "541 Washington Blvd, Jersey City, NJ 07310",
