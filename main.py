@@ -5160,6 +5160,12 @@ def _db_init() -> None:
             "ALTER TABLE users ADD COLUMN is_suspended INTEGER NOT NULL DEFAULT 0;",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_suspended BOOLEAN NOT NULL DEFAULT FALSE;",
         )
+        # One-click token rotation: tokens carry this version; bumping it
+        # invalidates every token previously issued to the user.
+        _try_alter(
+            "ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0;",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS token_version INTEGER NOT NULL DEFAULT 0;",
+        )
         _ensure_column("users", "subscription_status", "TEXT")
         _ensure_column("users", "subscription_provider", "TEXT")
         _ensure_column("users", "subscription_customer_id", "TEXT")
@@ -8893,7 +8899,8 @@ def auth_login(payload: LoginPayload):
 
     now = int(time.time())
     exp = now + TOKEN_TTL_SECONDS
-    token = _make_token({"uid": int(row["id"]), "email": email, "exp": exp})
+    user_tv = int(row["token_version"]) if ("token_version" in row.keys() and row["token_version"] is not None) else 0
+    token = _make_token({"uid": int(row["id"]), "email": email, "exp": exp, "tv": user_tv})
 
     ghost = bool(_flag_to_int(row["ghost_mode"])) if "ghost_mode" in row.keys() and row["ghost_mode"] is not None else False
 
@@ -9144,6 +9151,25 @@ def me_update(payload: MeUpdatePayload, user: sqlite3.Row = Depends(require_user
         "ghost_mode": bool(_flag_to_int(row["ghost_mode"])) if row["ghost_mode"] is not None else False,
         "presence_cursor": change_cursor_ms,
     }
+
+
+@app.post("/me/rotate_token")
+def me_rotate_token(user: sqlite3.Row = Depends(require_user)):
+    # One-click token rotation: bump this user's token_version (invalidating every
+    # token previously issued to them -- e.g. one that was shared) and mint a fresh
+    # token for the caller to keep using. The old token, including the one in this
+    # request, stops working immediately.
+    uid = int(user["id"])
+    _db_exec("UPDATE users SET token_version = COALESCE(token_version, 0) + 1 WHERE id=?", (uid,))
+    refreshed = _db_query_one("SELECT * FROM users WHERE id=? LIMIT 1", (uid,))
+    new_tv = 0
+    if refreshed and ("token_version" in refreshed.keys()) and refreshed["token_version"] is not None:
+        new_tv = int(refreshed["token_version"])
+    email = (user["email"] or "").strip().lower()
+    now = int(time.time())
+    exp = now + TOKEN_TTL_SECONDS
+    token = _make_token({"uid": uid, "email": email, "exp": exp, "tv": new_tv})
+    return {"ok": True, "token": token, "exp": exp}
 
 
 @app.post("/me/change_password")

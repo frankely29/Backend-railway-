@@ -318,6 +318,19 @@ def _auth_user_from_request(req: Request) -> sqlite3.Row:
     row = _db_query_one("SELECT * FROM users WHERE id=? LIMIT 1", (uid,))
     if not row:
         raise HTTPException(status_code=401, detail="User not found")
+    # Per-user token rotation: a token carries the token_version it was minted
+    # with ("tv"). If the user later rotates (bumping token_version), older tokens
+    # no longer match and are rejected. A missing claim or column reads as 0, so
+    # every pre-existing token stays valid until the first rotation.
+    token_tv = int(payload.get("tv", 0) or 0)
+    user_tv = 0
+    if _row_has_key(row, "token_version") and row["token_version"] is not None:
+        try:
+            user_tv = int(row["token_version"])
+        except Exception:
+            user_tv = 0
+    if token_tv != user_tv:
+        raise HTTPException(status_code=401, detail="Token rotated; please sign in again")
     _enforce_user_not_blocked(row)
     return row
 
