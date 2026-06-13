@@ -9725,6 +9725,94 @@ def long_trip_hotspots_poi_audit(
     }
 
 
+@app.get("/admin/long_trip_hotspots/nearby_pois")
+def long_trip_hotspots_nearby_pois(
+    lat: float,
+    lng: float,
+    radius_m: int = 350,
+    kind: str = "hotel",
+    admin: sqlite3.Row = Depends(require_admin),
+):
+    """
+    Discovery helper: query OpenStreetMap (Overpass) for POIs of a given
+    kind near a point, flagging which are already in the curated list (by
+    proximity). Read-only — used to find nearby buildings worth adding
+    (e.g. the hotel cluster around a corrected hotel pin). kind in
+    {hotel, hospital, attraction, mall}.
+    """
+    _ = admin
+    import math
+    import httpx
+    from long_trip_hotspot_builder import NYC_LONG_TRIP_POIS
+
+    tag = {
+        "hotel": '["tourism"="hotel"]',
+        "hospital": '["amenity"="hospital"]',
+        "attraction": '["tourism"="attraction"]',
+        "mall": '["shop"="mall"]',
+    }.get(kind, '["tourism"="hotel"]')
+    q = (
+        "[out:json][timeout:25];("
+        f"node{tag}(around:{radius_m},{lat},{lng});"
+        f"way{tag}(around:{radius_m},{lat},{lng});"
+        ");out center tags;"
+    )
+
+    def haversine_mi(la1, lo1, la2, lo2):
+        R = 3958.8
+        p1, p2 = math.radians(la1), math.radians(la2)
+        dp = math.radians(la2 - la1)
+        dl = math.radians(lo2 - lo1)
+        a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+        return 2 * R * math.asin(math.sqrt(a))
+
+    try:
+        r = httpx.post(
+            "https://overpass-api.de/api/interpreter",
+            data={"data": q},
+            headers={"User-Agent": "team-joseo-poi-discovery/1.0 (admin densification)"},
+            timeout=30.0,
+        )
+        elements = r.json().get("elements", [])
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+    existing = [(n, la, lo) for n, la, lo, c, w in NYC_LONG_TRIP_POIS]
+    found = []
+    for el in elements:
+        tags = el.get("tags", {})
+        name = tags.get("name")
+        if not name:
+            continue
+        elat = el.get("lat")
+        elng = el.get("lon")
+        if elat is None:
+            ctr = el.get("center", {})
+            elat, elng = ctr.get("lat"), ctr.get("lon")
+        if elat is None or elng is None:
+            continue
+        elat, elng = float(elat), float(elng)
+        nearest = min((haversine_mi(elat, elng, la, lo) for _, la, lo in existing), default=9.9)
+        found.append({
+            "name": name,
+            "lat": round(elat, 6),
+            "lng": round(elng, 6),
+            "stars": tags.get("stars"),
+            "dist_to_center_mi": round(haversine_mi(lat, lng, elat, elng), 3),
+            "nearest_existing_mi": round(nearest, 3),
+            "already_listed": nearest < 0.06,
+        })
+    found.sort(key=lambda x: x["dist_to_center_mi"])
+    return {
+        "ok": True,
+        "center": [lat, lng],
+        "radius_m": radius_m,
+        "kind": kind,
+        "count": len(found),
+        "found": found,
+    }
+
+
 @app.get("/long_trip_hotspots")
 def long_trip_hotspots_list(user: sqlite3.Row = Depends(require_user)):
     """
