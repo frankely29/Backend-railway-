@@ -71,6 +71,8 @@ NYC_LONG_TRIP_POIS: List[Tuple[str, float, float, str, float]] = [
     # a demand trap, not an earnings anchor.
     ("Brooklyn Army Terminal",    40.6447, -74.0238, "transit_hub", 2.0),
     ("Industry City",             40.6557, -74.0096, "corporate", 2.0),
+    ("Industry City Food Hall",   40.6562, -74.0101, "luxury_shopping", 1.5),
+    ("Japan Village",             40.6549, -74.0083, "luxury_shopping", 1.5),
 
     # Hotels
     ("Plaza Hotel",               40.7644, -73.9743, "hotel_luxury", 2.5),
@@ -439,6 +441,8 @@ POI_ADDRESSES: Dict[str, str] = {
     "NYU Langone Brooklyn": "150 55th St, Brooklyn 11220",
     "Brooklyn Army Terminal": "140 58th St, Brooklyn 11220",
     "Industry City": "220 36th St, Brooklyn 11232",
+    "Industry City Food Hall": "254 36th St, Brooklyn 11232",
+    "Japan Village": "934 3rd Ave, Brooklyn 11232",
     "Bellevue Hospital": "462 1st Ave, NY 10016",
     "Memorial Sloan Kettering": "1275 York Ave, NY 10065",
     "Hospital for Special Surgery": "535 E 70th St, NY 10021",
@@ -701,6 +705,12 @@ def _poi_address(name: str) -> str:
     return POI_ADDRESSES.get(name, "Address not listed")
 
 
+def _cluster_has_hospital(member_indices: List[int]) -> bool:
+    """True if any POI in the cluster is a hospital — a 24/7 trip generator
+    that is a valid strategic point even when it stands nearly alone."""
+    return any(NYC_LONG_TRIP_POIS[i][3] == "hospital" for i in member_indices)
+
+
 def _best_hours_for(category: str) -> str:
     return BEST_HOURS_BY_CATEGORY.get(category, "Varies")
 
@@ -888,10 +898,18 @@ def build_long_trip_hotspots() -> List[Dict[str, Any]]:
     hotspots: List[Dict[str, Any]] = []
     next_id = 1
     for indices in groups:
-        # A hotspot requires MIN_MEMBERS_PER_HOTSPOT (3 by default)
+        # A hotspot normally requires MIN_MEMBERS_PER_HOTSPOT (3 by default)
         # POIs clustered together. Singletons and isolated pairs are
         # dropped — they're not significant enough to merit an icon.
-        if len(indices) < MIN_MEMBERS_PER_HOTSPOT:
+        # Exception: a 2-member cluster anchored by a hospital still
+        # renders. A major hospital is a 24/7 trip generator, so a hospital
+        # plus one real neighbor is a legitimate strategic point (e.g. NYU
+        # Langone Brooklyn + the ferry terminal on the Sunset Park West
+        # waterfront). Lone hospital singletons are still dropped to keep
+        # the map uncluttered.
+        if len(indices) < MIN_MEMBERS_PER_HOTSPOT and not (
+            _cluster_has_hospital(indices) and len(indices) >= 2
+        ):
             continue
         # Weighted centroid: sum(lat * weight) / sum(weight), same for lng.
         total_w = 0.0
