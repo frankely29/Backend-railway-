@@ -33,29 +33,29 @@ NYC_LONG_TRIP_POIS: List[Tuple[str, float, float, str, float]] = [
     # Hospitals
     ("Mt Sinai Hospital (Main)",  40.7894, -73.9529, "hospital", 3.0),
     ("Mt Sinai West",             40.7706, -73.9876, "hospital", 3.0),
-    ("Mt Sinai Morningside",      40.8044, -73.9609, "hospital", 3.0),
+    ("Mt Sinai Morningside",      40.805859, -73.961664, "hospital", 3.0),
     ("Mt Sinai Beth Israel",      40.7325, -73.9824, "hospital", 3.0),
     ("NYU Langone Tisch",         40.7421, -73.9744, "hospital", 3.0),
     ("NYU Langone Brooklyn",      40.6453, -74.0193, "hospital", 3.0),
     ("Bellevue Hospital",         40.7392, -73.9759, "hospital", 3.0),
     ("Memorial Sloan Kettering",  40.7644, -73.9568, "hospital", 3.0),
-    ("Hospital for Special Surgery", 40.7649, -73.9560, "hospital", 3.0),
+    ("Hospital for Special Surgery", 40.765284, -73.953927, "hospital", 3.0),
     ("Lenox Hill Hospital",       40.7740, -73.9601, "hospital", 3.0),
     ("Columbia Presbyterian",     40.8418, -73.9419, "hospital", 3.0),
-    ("NewYork-Presbyterian (LM)", 40.7102, -74.0033, "hospital", 3.0),
+    ("NewYork-Presbyterian (LM)", 40.710404, -74.005493, "hospital", 3.0),
     ("NewYork-Presbyterian Queens", 40.747512, -73.826009, "hospital", 3.0),
     ("Brooklyn Hospital Center",  40.689646, -73.972209, "hospital", 3.0),
     ("Maimonides Medical Center", 40.63942, -73.998107, "hospital", 3.0),
     ("Coney Island Hospital",     40.586631, -73.96579, "hospital", 3.0),
-    ("Elmhurst Hospital",         40.7448, -73.8829, "hospital", 3.0),
+    ("Elmhurst Hospital",         40.744775, -73.88565, "hospital", 3.0),
     ("Queens Hospital Center",    40.71749, -73.802239, "hospital", 3.0),
     ("Cohen Children's Medical",  40.752775, -73.707509, "hospital", 3.0),
     ("Montefiore Medical (Bronx)", 40.879983, -73.880739, "hospital", 3.0),
     ("Lincoln Hospital (Bronx)",  40.8175, -73.9251, "hospital", 3.0),
-    ("Staten Island Univ Hospital", 40.5832, -74.0884, "hospital", 3.0),
+    ("Staten Island Univ Hospital", 40.583752, -74.086436, "hospital", 3.0),
 
     # Transit hubs
-    ("Penn Station",              40.7506, -73.9935, "transit_hub", 2.5),
+    ("Penn Station",              40.749103, -73.992005, "transit_hub", 2.5),
     ("Grand Central Terminal",    40.7527, -73.9772, "transit_hub", 2.5),
     ("Port Authority Bus Terminal", 40.7570, -73.9893, "transit_hub", 2.5),
     ("Atlantic Terminal (Brooklyn)", 40.6841, -73.9772, "transit_hub", 2.5),
@@ -71,18 +71,18 @@ NYC_LONG_TRIP_POIS: List[Tuple[str, float, float, str, float]] = [
     # a demand trap, not an earnings anchor.
     ("Brooklyn Army Terminal",    40.6447, -74.0238, "transit_hub", 2.0),
     ("Industry City",             40.6557, -74.0096, "corporate", 2.0),
-    ("Industry City Food Hall",   40.6562, -74.0101, "luxury_shopping", 1.5),
-    ("Japan Village",             40.6549, -74.0083, "luxury_shopping", 1.5),
+    ("Industry City Food Hall",   40.656181, -74.00764, "luxury_shopping", 1.5),
+    ("Japan Village",             40.6557, -74.006619, "luxury_shopping", 1.5),
 
     # Hotels
     ("Plaza Hotel",               40.7644, -73.9743, "hotel_luxury", 2.5),
     ("St Regis NY",               40.7615, -73.9742, "hotel_luxury", 2.5),
     ("Waldorf Astoria NY",        40.7560, -73.9744, "hotel_luxury", 2.5),
-    ("The Pierre",                40.7676, -73.9719, "hotel_luxury", 2.3),
+    ("The Pierre",                40.765441, -73.972072, "hotel_luxury", 2.3),
     ("Mandarin Oriental NY",      40.7686, -73.9819, "hotel_luxury", 2.5),
     ("Park Hyatt NY",             40.765005, -73.978661, "hotel_luxury", 2.3),
     ("Lotte NY Palace",           40.7585, -73.9742, "hotel_luxury", 2.3),
-    ("Ritz-Carlton Central Park", 40.7659, -73.9776, "hotel_luxury", 2.5),
+    ("Ritz-Carlton Central Park", 40.765073, -73.974971, "hotel_luxury", 2.5),
     ("Ritz-Carlton Battery Park", 40.7048, -74.0177, "hotel_luxury", 2.3),
     ("Four Seasons Tribeca",      40.712489, -74.009016, "hotel_luxury", 2.3),
     ("Marriott Marquis Times Sq", 40.7589, -73.9854, "hotel_luxury", 2.5),
@@ -93,27 +93,27 @@ NYC_LONG_TRIP_POIS: List[Tuple[str, float, float, str, float]] = [
     ("W Times Square",            40.7601, -73.9849, "hotel_luxury", 2.2),
     ("The Knickerbocker",         40.7563, -73.9854, "hotel_luxury", 2.2),
     ("The Edition Times Square",  40.759232, -73.984535, "hotel_luxury", 2.3),
-    ("Westin Times Square",       40.7589, -73.9892, "hotel_luxury", 2.2),
+    ("Westin Times Square",       40.757501, -73.988493, "hotel_luxury", 2.2),
     ("Hilton Garden Inn Times Sq", 40.761059, -73.986911, "hotel_luxury", 2.0),
-    ("Crowne Plaza Times Square", 40.7596, -73.9869, "hotel_luxury", 2.0),
+    ("Crowne Plaza Times Square", 40.760553, -73.984657, "hotel_luxury", 2.0),
     ("Westin NY Grand Central",   40.750581, -73.974162, "hotel_luxury", 2.2),
     ("The Peninsula NY",          40.7616, -73.9744, "hotel_luxury", 2.5),
     ("The Whitby Hotel",          40.7619, -73.9758, "hotel_luxury", 2.3),
-    ("The Algonquin Hotel",       40.7569, -73.9837, "hotel_luxury", 2.0),
+    ("The Algonquin Hotel",       40.755631, -73.981799, "hotel_luxury", 2.0),
     ("Trump Tower",               40.7625, -73.9744, "hotel_luxury", 2.0),
     ("Trump International Hotel", 40.7685, -73.9819, "hotel_luxury", 2.3),
     ("Loews Regency NY",          40.764296, -73.968875, "hotel_luxury", 2.2),
     ("The Carlyle",               40.7747, -73.9633, "hotel_luxury", 2.5),
-    ("The Mark Hotel",            40.7740, -73.9618, "hotel_luxury", 2.5),
+    ("The Mark Hotel",            40.775364, -73.963783, "hotel_luxury", 2.5),
     ("The Surrey",                40.7752, -73.9627, "hotel_luxury", 2.3),
     ("The Beekman Hotel",         40.7113, -74.0064, "hotel_luxury", 2.3),
-    ("Four Seasons Downtown",     40.7105, -74.0096, "hotel_luxury", 2.3),
+    ("Four Seasons Downtown",     40.712489, -74.009016, "hotel_luxury", 2.3),
     ("11 Howard",                 40.7202, -73.9988, "hotel_luxury", 2.0),
 
     # Convention / performance / stadium
     ("Javits Center",             40.7577, -74.0024, "convention", 2.2),
     ("Madison Square Garden",     40.7505, -73.9934, "performance", 1.8),
-    ("Lincoln Center",            40.7725, -73.9835, "performance", 1.5),
+    ("Lincoln Center",            40.77104, -73.981479, "performance", 1.5),
     ("Carnegie Hall",             40.7651, -73.9799, "performance", 1.5),
     ("Citi Field",                40.7571, -73.8458, "stadium", 1.8),
     ("USTA Billie Jean King",     40.7500, -73.8458, "stadium", 1.8),
@@ -126,7 +126,7 @@ NYC_LONG_TRIP_POIS: List[Tuple[str, float, float, str, float]] = [
     ("Rockefeller Center",        40.7587, -73.9787, "corporate", 1.5),
     ("Bryant Park (corporate)",   40.7536, -73.9832, "corporate", 1.3),
     ("Bloomberg Tower",           40.762147, -73.968157, "corporate", 1.3),
-    ("One Vanderbilt",            40.7546, -73.9778, "corporate", 1.5),
+    ("One Vanderbilt",            40.752974, -73.97854, "corporate", 1.5),
     ("Citigroup Center (601 Lex)", 40.7589, -73.9714, "corporate", 1.5),
     ("Time Warner Center",        40.7686, -73.9831, "corporate", 1.5),
 
@@ -137,7 +137,7 @@ NYC_LONG_TRIP_POIS: List[Tuple[str, float, float, str, float]] = [
 
     # Luxury condos (high-end residents who take long trips out of town)
     ("432 Park Ave",              40.7616, -73.9716, "luxury_condo", 1.5),
-    ("15 Central Park West",      40.7705, -73.9824, "luxury_condo", 1.5),
+    ("15 Central Park West",      40.769667, -73.980823, "luxury_condo", 1.5),
     ("220 Central Park South",    40.7662, -73.9803, "luxury_condo", 1.5),
 
     # Luxury shopping (high-net-worth shoppers heading home)
@@ -149,7 +149,7 @@ NYC_LONG_TRIP_POIS: List[Tuple[str, float, float, str, float]] = [
 
     # ---------------- Park Ave / Midtown East corporate row
     # — institutional wealth, lots of car-service-out-of-town. ----------------
-    ("JP Morgan HQ (270 Park)",   40.7572, -73.9743, "corporate", 1.8),
+    ("JP Morgan HQ (270 Park)",   40.755849, -73.975037, "corporate", 1.8),
     ("MetLife Building (200 Park)", 40.7546, -73.9763, "corporate", 1.7),
     ("Seagram Building (375 Park)", 40.7585, -73.9722, "corporate", 1.6),
     ("Lever House (390 Park)",    40.7593, -73.9716, "corporate", 1.6),
@@ -183,13 +183,13 @@ NYC_LONG_TRIP_POIS: List[Tuple[str, float, float, str, float]] = [
     ("William Vale Hotel",        40.7218, -73.9568, "hotel_luxury", 2.0),
     ("Wythe Hotel",               40.7223, -73.9577, "hotel_luxury", 2.0),
     ("Hoxton Williamsburg",       40.7210, -73.9573, "hotel_luxury", 1.9),
-    ("McCarren Hotel & Pool",     40.7204, -73.9527, "hotel_luxury", 1.8),
+    ("McCarren Hotel & Pool",     40.720874, -73.955312, "hotel_luxury", 1.8),
 
     # LIC corporate (Citi tower, JetBlue HQ, JACX) — actual finance + tech wealth
     ("Citigroup Tower (LIC)",     40.7475, -73.9420, "corporate", 1.8),
     ("JetBlue HQ (Brewster Bldg)", 40.750627, -73.939341, "corporate", 1.7),
-    ("JACX Queens Plaza",         40.7491, -73.9414, "corporate", 1.6),
-    ("Court Square (LIC)",        40.7475, -73.9450, "transit_hub", 1.8),
+    ("JACX Queens Plaza",         40.748355, -73.939134, "corporate", 1.6),
+    ("Court Square (LIC)",        40.745818, -73.94565, "transit_hub", 1.8),
     ("Boro Hotel LIC",            40.755106, -73.935397, "hotel_luxury", 1.7),
     ("Z NYC Hotel",               40.751855, -73.947948, "hotel_luxury", 1.6),
     ("Ravel Hotel LIC",           40.75411, -73.949273, "hotel_luxury", 1.5),
@@ -212,7 +212,7 @@ NYC_LONG_TRIP_POIS: List[Tuple[str, float, float, str, float]] = [
 
     # Brooklyn — Crown Heights / Bed-Stuy hospitals (real medical volume).
     ("Kings County Hospital",     40.655772, -73.945226, "hospital", 2.5),
-    ("SUNY Downstate Medical",    40.6557, -73.9472, "hospital", 2.5),
+    ("SUNY Downstate Medical",    40.655674, -73.944953, "hospital", 2.5),
 
 
     # Nassau/LI — Long Island Jewish + Northwell hospitals (huge medical
@@ -225,13 +225,13 @@ NYC_LONG_TRIP_POIS: List[Tuple[str, float, float, str, float]] = [
     # Dropped Pier 13 — outdoor open-air beer garden, summer-only,
     # not a building.
     ("Hoboken Terminal",          40.7359, -74.0291, "transit_hub", 2.3),
-    ("W Hoboken",                 40.7368, -74.0276, "hotel_luxury", 2.0),
+    ("W Hoboken",                 40.738688, -74.028269, "hotel_luxury", 2.0),
 
     # Jersey City — Exchange Place financial cluster
     ("Goldman Sachs Tower (JC)",  40.712772, -74.034695, "corporate", 1.8),
     ("Hyatt Regency Jersey City", 40.7166, -74.0339, "hotel_luxury", 2.0),
     ("Exchange Place PATH",       40.7162, -74.0335, "transit_hub", 2.2),
-    ("Harborside Plaza",          40.7173, -74.0335, "corporate", 1.6),
+    ("Harborside Plaza",          40.718824, -74.033906, "corporate", 1.6),
     ("Newport Centre / PATH",     40.726798, -74.0387, "transit_hub", 2.0),
     ("W Hotel JC (Newport)",      40.7271, -74.0354, "hotel_luxury", 2.0),
 
@@ -241,7 +241,7 @@ NYC_LONG_TRIP_POIS: List[Tuple[str, float, float, str, float]] = [
     ("Mr C Seaport",              40.708098, -74.001631, "hotel_luxury", 1.8),
     ("Crosby Street Hotel",       40.7233, -73.9989, "hotel_luxury", 2.1),
     ("Mercer Hotel",              40.7242, -73.9989, "hotel_luxury", 2.0),
-    ("Soho Grand Hotel",          40.7223, -74.0027, "hotel_luxury", 1.9),
+    ("Soho Grand Hotel",          40.721693, -74.00444, "hotel_luxury", 1.9),
 
     # Manhattan — Chelsea / Meatpacking luxury hotels. Dropped The High
     # Line (public elevated park, not a building). Hotel Chelsea kept —
@@ -256,7 +256,7 @@ NYC_LONG_TRIP_POIS: List[Tuple[str, float, float, str, float]] = [
     ("Flatiron Building",         40.7411, -73.9897, "corporate", 1.4),
     ("Ace Hotel NY",              40.7464, -73.9883, "hotel_luxury", 1.9),
     ("NoMad Hotel",               40.7444, -73.9879, "hotel_luxury", 2.0),
-    ("The James NoMad",           40.7438, -73.9874, "hotel_luxury", 1.8),
+    ("The James NoMad",           40.744664, -73.985478, "hotel_luxury", 1.8),
     ("Marriott Edition Madison",  40.741174, -73.987688, "hotel_luxury", 1.9),
 
     # Manhattan — UWS hotels + Lincoln Center cluster densifier
@@ -281,7 +281,7 @@ NYC_LONG_TRIP_POIS: List[Tuple[str, float, float, str, float]] = [
     # Queens — Downtown Flushing (transit hub + malls + hotel + office)
     ("Flushing-Main St (7 train)", 40.7596, -73.8302, "transit_hub", 2.3),
     ("Sheraton LaGuardia East",   40.759748, -73.831895, "hotel_luxury", 1.8),
-    ("New World Mall (Flushing)", 40.7590, -73.8270, "luxury_shopping", 1.5),
+    ("New World Mall (Flushing)", 40.7597, -73.829377, "luxury_shopping", 1.5),
     ("Tangram (Flushing)",        40.759238, -73.833945, "luxury_shopping", 1.5),
     ("One Fulton Square (Flushing)", 40.7595, -73.832325, "corporate", 1.4),
 
@@ -295,7 +295,7 @@ NYC_LONG_TRIP_POIS: List[Tuple[str, float, float, str, float]] = [
     ("10 Jay St (DUMBO offices)", 40.704506, -73.986635, "corporate", 1.4),
 
     # Brooklyn — Crown Heights medical (completes Kings County + Downstate)
-    ("University Hospital of Brooklyn", 40.6553, -73.9479, "hospital", 2.5),
+    ("University Hospital of Brooklyn", 40.654458, -73.946245, "hospital", 2.5),
 
     # Bronx — The Hub / South Bronx (completes Lincoln Hospital)
     ("149 St-Grand Concourse (subway)", 40.8183, -73.9268, "transit_hub", 2.0),
@@ -308,7 +308,7 @@ NYC_LONG_TRIP_POIS: List[Tuple[str, float, float, str, float]] = [
     # 7-train terminus — heavy business-traveler + airport volume) -----------
     ("Equinox Hotel Hudson Yards", 40.7540, -74.0014, "hotel_luxury", 2.3),
     ("30 Hudson Yards",           40.7538, -74.0008, "corporate", 1.7),
-    ("55 Hudson Yards",           40.7531, -74.0001, "corporate", 1.6),
+    ("55 Hudson Yards",           40.755144, -74.000628, "corporate", 1.6),
 
     # ---------------- Battery Park City / Brookfield Place (anchors the
     # existing Conrad + Goldman Sachs HQ with the Brookfield luxury mall) -----
