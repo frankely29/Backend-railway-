@@ -8169,6 +8169,11 @@ def _extract_zone_track_entry_from_point(point: Dict[str, Any], mode_flags: Dict
     return {"rating": 0.0, "bucket": None, "color": None}
 
 
+# Assumed average NYC rideshare speed for converting a candidate zone's
+# distance into an ETA, so we can score it at the driver's arrival time.
+GUIDANCE_TRAVEL_MPH = 12.0
+
+
 def _build_guidance_zone_context(
     *,
     frame_bucket: Dict[str, Any],
@@ -8194,7 +8199,6 @@ def _build_guidance_zone_context(
         points = (zone_payload or {}).get("points") or []
         if not points:
             continue
-        first = points[0]
         zone_id = int(zone_payload.get("location_id") or zone_id_raw)
         centroid_row = centroid_lookup.get(zone_id) or {}
         center_lat = centroid_row.get("centroid_lat")
@@ -8206,13 +8210,26 @@ def _build_guidance_zone_context(
         distance = _safe_haversine_miles(current_lat, current_lng, center_lat, center_lng)
         if distance > 3.0:
             continue
+        # Arrival-time scoring: a candidate is only worth what it will be by
+        # the time the driver gets there, not what it is right now. ETA =
+        # distance / assumed NYC speed; score the outlook bin nearest arrival
+        # (bins are 20 min apart) instead of points[0]. `rating` carries the
+        # arrival-time score so the existing move logic compares the right
+        # number; `rating_now` is kept for transparency.
+        eta_minutes = (distance / GUIDANCE_TRAVEL_MPH) * 60.0
+        arrival_bin = min(len(points) - 1, max(0, int(round(eta_minutes / 20.0))))
+        rating_now = _extract_zone_rating_from_point(points[0], mode_flags)
+        arrival_rating = _extract_zone_rating_from_point(points[arrival_bin], mode_flags)
         nearby_candidates.append(
             {
-                "zone_id": int(zone_payload.get("location_id") or zone_id_raw),
+                "zone_id": zone_id,
                 "zone_name": zone_payload.get("zone_name"),
                 "borough": zone_payload.get("borough"),
                 "distance_miles": round(float(distance), 3),
-                "rating": round(_extract_zone_rating_from_point(first, mode_flags), 2),
+                "eta_minutes": round(float(eta_minutes), 1),
+                "rating": round(float(arrival_rating), 2),
+                "rating_now": round(float(rating_now), 2),
+                "arrival_bin": int(arrival_bin),
             }
         )
     nearby_candidates.sort(key=lambda z: (-(z.get("rating") or 0.0), z.get("distance_miles") or 999.0))
