@@ -8416,6 +8416,7 @@ def assistant_guidance(
         current_lng=float(current_lng),
         db_query_one=_db_query_one,
         db_query_all=_db_query_all,
+        current_zone_id=current_zone_id,
     )
     zone_context = _build_guidance_zone_context(
         frame_bucket=frame_bucket,
@@ -8503,6 +8504,7 @@ def assistant_guidance(
         "tripless_minutes": guidance.get("tripless_minutes"),
         "stationary_minutes": guidance.get("stationary_minutes"),
         "movement_minutes": guidance.get("movement_minutes"),
+        "zone_dwell_minutes": guidance.get("zone_dwell_minutes"),
         "recent_saved_trip_count": guidance.get("recent_saved_trip_count"),
         "recent_move_attempts_without_trip": guidance.get("recent_move_attempts_without_trip"),
         "dispatch_uncertainty": guidance.get("dispatch_uncertainty"),

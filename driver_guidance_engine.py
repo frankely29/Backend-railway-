@@ -264,6 +264,7 @@ def load_driver_activity_snapshot(
     current_lng: Optional[float],
     db_query_one,
     db_query_all,
+    current_zone_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     presence_row = db_query_one(
         "SELECT lat, lng, updated_at FROM presence WHERE user_id=? LIMIT 1",
@@ -381,6 +382,28 @@ def load_driver_activity_snapshot(
             break
         recent_guidance_move_attempts_without_trip += 1
 
+    # Per-zone dwell: minutes since the driver was last seen in a DIFFERENT
+    # zone (i.e. how long they've been in the current one). Robust to gaps and
+    # uncapped within the 2h window. No schema change — reuses the outcomes log.
+    zone_dwell_minutes = 0.0
+    if current_zone_id is not None:
+        boundary_row = db_query_one(
+            "SELECT MAX(recommended_at) AS boundary FROM assistant_guidance_outcomes "
+            "WHERE user_id=? AND recommended_at >= ? "
+            "AND source_zone_id IS NOT NULL AND source_zone_id != ?",
+            (int(user_id), int(now_ts) - 7200, int(current_zone_id)),
+        )
+        boundary_ts = _safe_int((boundary_row or {}).get("boundary"), 0)
+        if boundary_ts <= 0:
+            earliest_row = db_query_one(
+                "SELECT MIN(recommended_at) AS earliest FROM assistant_guidance_outcomes "
+                "WHERE user_id=? AND recommended_at >= ? AND source_zone_id = ?",
+                (int(user_id), int(now_ts) - 7200, int(current_zone_id)),
+            )
+            boundary_ts = _safe_int((earliest_row or {}).get("earliest"), 0)
+        if boundary_ts > 0:
+            zone_dwell_minutes = max(0.0, (float(now_ts) - float(boundary_ts)) / 60.0)
+
     uncertainty = 0.2
     if tripless_minutes >= 25:
         uncertainty += 0.2
@@ -403,6 +426,7 @@ def load_driver_activity_snapshot(
         "tripless_minutes": round(tripless_minutes, 2),
         "stationary_minutes": round(stationary_minutes, 2),
         "movement_minutes": round(movement_minutes, 2),
+        "zone_dwell_minutes": round(zone_dwell_minutes, 2),
         "moved_since_last_saved_trip": bool(moved_since_last_saved_trip),
         "recent_saved_trip_count_30m": int(recent_saved_trip_count_30m),
         "recent_saved_trip_count_60m": int(recent_saved_trip_count_60m),
@@ -434,6 +458,7 @@ def build_driver_guidance(
     _ = user_id, frame_time, current_lat, current_lng, mode_flags, assistant_outlook_bucket
     tripless_minutes = _safe_float(activity_snapshot.get("tripless_minutes"))
     stationary_minutes = _safe_float(activity_snapshot.get("stationary_minutes"))
+    zone_dwell_minutes = _safe_float(activity_snapshot.get("zone_dwell_minutes"))
     movement_minutes = _safe_float(activity_snapshot.get("movement_minutes"))
     dispatch_uncertainty = _safe_float(activity_snapshot.get("dispatch_uncertainty"), 0.3)
     recent_move_attempts = _safe_int(activity_snapshot.get("recent_move_attempts_without_trip"), 0)
@@ -448,7 +473,13 @@ def build_driver_guidance(
     # more earnings given up en route). best_nearby.rating is already the
     # arrival-time score, so this only adds the travel cost on top.
     best_nearby_eta = _safe_float(best_nearby.get("eta_minutes"), 0.0) if best_nearby else 0.0
-    move_improvement_required = MOVE_NEARBY_STRONG_IMPROVEMENT + min(10.0, best_nearby_eta * 0.6)
+    # The longer the driver has sat in this zone without it producing, the
+    # lower the bar a candidate must clear — the engine monitors dwell and
+    # gets more willing to move them on.
+    dwell_discount = min(8.0, max(0.0, zone_dwell_minutes - 15.0) * 0.4)
+    move_improvement_required = max(
+        4.0, MOVE_NEARBY_STRONG_IMPROVEMENT + min(10.0, best_nearby_eta * 0.6) - dwell_discount
+    )
 
     current_rating = _safe_float(current_zone.get("rating"), 0.0)
     current_next_rating = _safe_float(current_zone.get("next_rating"), current_rating)
@@ -596,6 +627,7 @@ def build_driver_guidance(
         "tripless_minutes": round(tripless_minutes, 2),
         "stationary_minutes": round(stationary_minutes, 2),
         "movement_minutes": round(movement_minutes, 2),
+        "zone_dwell_minutes": round(zone_dwell_minutes, 2),
         "recent_move_attempts_without_trip": int(recent_move_attempts),
         "recent_saved_trip_count": int(recent_saved_60),
         "dispatch_uncertainty": max(0.0, min(1.0, round(dispatch_uncertainty, 3))),
