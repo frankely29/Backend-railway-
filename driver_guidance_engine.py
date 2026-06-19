@@ -15,6 +15,25 @@ MOVE_NEARBY_MIN_IMPROVEMENT = 10.0
 MOVE_NEARBY_STRONG_IMPROVEMENT = 13.0
 RECENT_WINDOW_SECONDS = 2 * 3600
 
+# Elevated-risk TLC zones — the highest violent-crime areas per NYPD CompStat
+# (South/Central Bronx, East Harlem, Brownsville / East New York). Used only
+# to surface a DRIVER-SAFETY tip (raise the minimum rider rating); it never
+# refuses the area and is based on crime statistics, not demographics.
+SAFETY_ELEVATED_RISK_ZONE_IDS = frozenset({
+    # Bronx (South / Central)
+    47, 59, 60, 69, 78, 119, 126, 147, 159, 167, 168, 169, 212, 213, 247,
+    # Brooklyn (Brownsville / East New York / Ocean Hill / Cypress Hills)
+    35, 63, 76, 77, 177,
+    # Manhattan (East Harlem)
+    74, 75,
+})
+SAFETY_MIN_RIDER_RATING = 4.7
+
+# A zone is a "low-trip trap" when it keeps pinging short, low-value trips
+# that strand the driver: high short-trip penalty AND market saturation.
+TRAP_SHORT_TRIP_PENALTY_MIN = 0.5
+TRAP_SATURATION_PENALTY_MIN = 0.35
+
 _zone_geometry_cache_lock = threading.Lock()
 _zone_geometry_cache_mtime: Optional[float] = None
 _zone_geometry_cache_path: Optional[str] = None
@@ -340,6 +359,11 @@ def build_driver_guidance(
     current_zone = zone_context.get("current_zone") or {}
     nearby_candidates = zone_context.get("nearby_candidates") or []
     best_nearby = nearby_candidates[0] if nearby_candidates else None
+    # Opportunity cost: a farther move must clear a higher bar (more driving,
+    # more earnings given up en route). best_nearby.rating is already the
+    # arrival-time score, so this only adds the travel cost on top.
+    best_nearby_eta = _safe_float(best_nearby.get("eta_minutes"), 0.0) if best_nearby else 0.0
+    move_improvement_required = MOVE_NEARBY_STRONG_IMPROVEMENT + min(10.0, best_nearby_eta * 0.6)
 
     current_rating = _safe_float(current_zone.get("rating"), 0.0)
     current_next_rating = _safe_float(current_zone.get("next_rating"), current_rating)
@@ -398,7 +422,7 @@ def build_driver_guidance(
         best_nearby is not None
         and current_rating < 55
         and current_next_rating < 58
-        and _safe_float(best_nearby.get("rating"), 0.0) >= current_rating + MOVE_NEARBY_STRONG_IMPROVEMENT
+        and _safe_float(best_nearby.get("rating"), 0.0) >= current_rating + move_improvement_required
         and not in_move_cooldown
         and recent_move_attempts < 3
         and _safe_float(best_nearby.get("distance_miles"), 999.0) <= 2.5
@@ -428,11 +452,50 @@ def build_driver_guidance(
     else:
         reason_codes.append("default_hold_bias")
 
+    # --- Safety overlay: elevated-risk zone -> raise the rider-rating filter.
+    safety_elevated_risk = current_zone_id in SAFETY_ELEVATED_RISK_ZONE_IDS
+    safety_advice: Optional[str] = None
+    if safety_elevated_risk:
+        safety_advice = (
+            f"Elevated-risk area — set your minimum rider rating to "
+            f"{SAFETY_MIN_RIDER_RATING:g}+ to screen for higher-rated riders."
+        )
+        reason_codes.append("elevated_risk_zone")
+
+    # --- Trap escape: stuck in a short-trip trap while being told to move.
+    current_short_trip_penalty = _safe_float(current_zone.get("short_trip_penalty"), 0.0)
+    trap_zone = (
+        current_short_trip_penalty >= TRAP_SHORT_TRIP_PENALTY_MIN
+        and current_saturation_penalty >= TRAP_SATURATION_PENALTY_MIN
+    )
+    offline_until_arrival = bool(
+        trap_zone and action in {"move_nearby", "micro_reposition"} and target_zone
+    )
+    trap_advice: Optional[str] = None
+    if offline_until_arrival:
+        trap_advice = (
+            f"This zone keeps pinging short, low-value trips — go offline until you reach "
+            f"{target_zone.get('zone_name')} so you reposition clean."
+        )
+        reason_codes.append("low_trip_trap_escape")
+    elif trap_zone:
+        reason_codes.append("low_trip_trap")
+
+    # Fold the trap + safety tips into the headline message.
+    message = " ".join([part for part in (message, trap_advice, safety_advice) if part])
+
     return {
         "action": action,
         "confidence": max(0.0, min(1.0, round(float(confidence), 3))),
         "message": message,
         "reason_codes": reason_codes,
+        "safety_elevated_risk": bool(safety_elevated_risk),
+        "safety_advice": safety_advice,
+        "safety_min_rider_rating": SAFETY_MIN_RIDER_RATING if safety_elevated_risk else None,
+        "trap_zone": bool(trap_zone),
+        "offline_until_arrival": bool(offline_until_arrival),
+        "trap_advice": trap_advice,
+        "nearby_candidates": nearby_candidates[:5],
         "current_zone": {
             "zone_id": current_zone_id,
             "zone_name": current_zone_name,
