@@ -66,6 +66,7 @@ from driver_guidance_engine import (
     build_zone_hotspot_index,
     zone_hotspot_hint,
 )
+from zone_live_anchor import select_zone_live_anchor, format_anchor_label
 from hotspot_models import MicroHotspotScoreResult
 from hotspot_scoring import score_zones
 from artifact_freshness import evaluate_artifact_freshness
@@ -8343,6 +8344,51 @@ def _persist_driver_guidance_state_and_outcome(
     )
 
 
+# Reverse-geocode cache for live pickup-anchor labels. Keyed by a ~110m grid
+# cell (lat/lng rounded to 3 decimals) so nearby anchors reuse one lookup.
+# Value is (label_or_None, expires_at). Successful labels are cached for a
+# week (street geometry is stable); misses are retried after 20 minutes so a
+# transient Nominatim hiccup doesn't poison a cell for the container's life.
+_REVERSE_GEOCODE_LABEL_CACHE: Dict[str, tuple] = {}
+_REVERSE_GEOCODE_OK_TTL = 7 * 24 * 3600
+_REVERSE_GEOCODE_MISS_TTL = 20 * 60
+
+
+def _reverse_geocode_anchor_label(lat: float, lng: float) -> Optional[str]:
+    """Short street/landmark label for a pickup anchor, or None on failure.
+
+    Network reverse-geocode (Nominatim) behind a TTL cache. Best-effort: any
+    failure or empty result returns None and the caller keeps generic wording.
+    """
+    try:
+        key = f"{round(float(lat), 3)},{round(float(lng), 3)}"
+    except Exception:
+        return None
+    now = time.time()
+    cached = _REVERSE_GEOCODE_LABEL_CACHE.get(key)
+    if cached is not None and cached[1] > now:
+        return cached[0]
+    label: Optional[str] = None
+    try:
+        import httpx
+        with httpx.Client() as client:
+            resp = client.get(
+                "https://nominatim.openstreetmap.org/reverse",
+                params={
+                    "lat": float(lat), "lon": float(lng),
+                    "format": "jsonv2", "zoom": 17, "addressdetails": 1,
+                },
+                headers={"User-Agent": "team-joseo-guidance/1.0 (live pickup anchor labels)"},
+                timeout=4.0,
+            )
+            label = format_anchor_label(resp.json())
+    except Exception:
+        label = None
+    ttl = _REVERSE_GEOCODE_OK_TTL if label else _REVERSE_GEOCODE_MISS_TTL
+    _REVERSE_GEOCODE_LABEL_CACHE[key] = (label, now + ttl)
+    return label
+
+
 @app.get("/assistant/guidance")
 def assistant_guidance(
     frame_time: str,
@@ -8450,6 +8496,7 @@ def assistant_guidance(
     # recommended zone — points the driver to the exact spot inside the zone
     # and whether it's peaking at their arrival time.
     hotspot_hint = None
+    pickup_anchor = None
     guidance_message = guidance.get("message") or ""
     try:
         from long_trip_hotspot_builder import hotspot_runtime_meta as _hrm
@@ -8497,15 +8544,58 @@ def assistant_guidance(
             _where = hotspot_hint["label"]
             if hotspot_hint.get("address"):
                 _where = f"{_where} ({hotspot_hint['address']})"
+        # Live pickup micro-anchor fallback: only ~36 zones carry a curated
+        # cluster, so when the recommended zone has none, name its busiest live
+        # pickup corner (same data the map paints) instead of a vague "good area".
+        pickup_anchor = None
+        _anchor_label = None
+        if not _where and _rec_zone is not None:
+            try:
+                _zg = (_load_pickup_zone_geometries().get(int(_rec_zone)) or {}).get("geometry")
+                if _zg is not None:
+                    pickup_anchor = select_zone_live_anchor(
+                        zone_id=int(_rec_zone),
+                        zone_geom=_zg,
+                        pickup_rows=_pickup_zone_long_run_points(int(_rec_zone), limit=2400),
+                        frame_time=now_ts,
+                    )
+                if pickup_anchor:
+                    _anchor_label = _reverse_geocode_anchor_label(
+                        pickup_anchor["lat"], pickup_anchor["lng"]
+                    )
+                    if _anchor_label:
+                        pickup_anchor["label"] = _anchor_label
+            except Exception:
+                pickup_anchor = None
+                _anchor_label = None
+        # Drop the anchor's "(neighbourhood)" suffix when it just echoes the
+        # zone we already name in the directive, so we never read "Stay in
+        # Sunnyside — work Skillman Ave (Sunnyside)".
+        if _anchor_label and _anchor_label.endswith(")") and "(" in _anchor_label:
+            _zname = ((_tz.get("zone_name") if _moving else None) or _cz.get("zone_name") or "")
+            _core, _area = _anchor_label[:-1].rsplit("(", 1)
+            _core, _area = _core.strip(), _area.strip()
+            if _core and _area and _zname and (
+                _area.lower() in _zname.lower() or _zname.lower() in _area.lower()
+            ):
+                _anchor_label = _core
         if _moving and _tz.get("zone_name"):
             _eta = _safe_float_value(_tz.get("eta_minutes"), 0.0)
             _eta_txt = f" (~{int(round(_eta))} min)" if _eta else ""
-            _directive = (f"Go to {_where} in {_tz['zone_name']}{_eta_txt}."
-                          if _where else f"Go to {_tz['zone_name']}{_eta_txt}.")
+            if _where:
+                _directive = f"Go to {_where} in {_tz['zone_name']}{_eta_txt}."
+            elif _anchor_label:
+                _directive = (f"Go to {_tz['zone_name']}{_eta_txt} — aim for "
+                              f"{_anchor_label}, the busiest pickup spot there.")
+            else:
+                _directive = f"Go to {_tz['zone_name']}{_eta_txt}."
         elif _where:
             _directive = f"Set up at {_where}" + (
                 "; busy right now." if hotspot_hint.get("prime_now") else " — best anchor here."
             )
+        elif _anchor_label:
+            _directive = (f"Stay in {_cz.get('zone_name') or 'this zone'} — work "
+                          f"{_anchor_label}, the busiest pickup spot right now.")
         else:
             _directive = f"Stay in {_cz.get('zone_name') or 'this zone'} — it's working."
         _tips = [t for t in (guidance.get("trap_advice"), guidance.get("safety_advice")) if t]
@@ -8544,6 +8634,7 @@ def assistant_guidance(
         "offline_until_arrival": guidance.get("offline_until_arrival"),
         "trap_advice": guidance.get("trap_advice"),
         "hotspot_hint": hotspot_hint,
+        "pickup_anchor": pickup_anchor,
     }
 
 
