@@ -10051,6 +10051,7 @@ def build_zone_ride_magnets(
     start: int = 0,
     count: int = 12,
     radius_m: int = 750,
+    only_missing: int = 0,
     admin: sqlite3.Row = Depends(require_admin),
 ):
     """
@@ -10064,7 +10065,9 @@ def build_zone_ride_magnets(
     import time as _t
     import httpx
     from shapely.geometry import Point as _Point
-    from zone_ride_magnet import build_ride_magnet_overpass_query, select_ride_magnet
+    from zone_ride_magnet import (
+        build_ride_magnet_overpass_query, select_ride_magnet, _haversine_mi,
+    )
 
     geoms = _load_pickup_zone_geometries()
     zone_ids = sorted(int(z) for z in geoms.keys())
@@ -10079,16 +10082,38 @@ def build_zone_ride_magnets(
             if geom is None:
                 results.append({"zone_id": zid, "status": "no_geometry"})
                 continue
+            if int(only_missing or 0):
+                _exists = _db_query_one(
+                    "SELECT 1 AS x FROM zone_ride_magnet WHERE zone_id=?", (int(zid),)
+                )
+                if _exists:
+                    results.append({"zone_id": zid, "status": "skip_existing"})
+                    continue
             try:
                 rp = geom.representative_point()
                 clat, clng = float(rp.y), float(rp.x)
             except Exception:
                 results.append({"zone_id": zid, "status": "no_point"})
                 continue
+            # Adaptive radius: large zones' stations sit far from the
+            # representative point, so an 800m fetch misses them (Sunnyside,
+            # Jackson Heights, Hunts Point). Cover the whole zone (bbox-corner
+            # distance + 10%), floored at the param and capped to bound load.
+            try:
+                _minx, _miny, _maxx, _maxy = geom.bounds
+                _circum_mi = max(
+                    _haversine_mi(clat, clng, _cy, _cx)
+                    for _cy, _cx in (
+                        (_miny, _minx), (_miny, _maxx), (_maxy, _minx), (_maxy, _maxx)
+                    )
+                )
+                eff_radius_m = int(min(2600.0, max(float(radius_m), _circum_mi * 1609.34 * 1.1)))
+            except Exception:
+                eff_radius_m = int(radius_m)
             if i > 0:
                 _t.sleep(1.1)  # Overpass politeness (1 req/sec)
             try:
-                q = build_ride_magnet_overpass_query(clat, clng, radius_m)
+                q = build_ride_magnet_overpass_query(clat, clng, eff_radius_m)
                 r = client.post(
                     "https://overpass-api.de/api/interpreter",
                     data={"data": q},
@@ -10100,7 +10125,8 @@ def build_zone_ride_magnets(
                 results.append({"zone_id": zid, "status": "overpass_error", "error": str(e)[:120]})
                 continue
             magnet = select_ride_magnet(
-                elements, center_lat=clat, center_lng=clng, zone_geom=geom
+                elements, center_lat=clat, center_lng=clng, zone_geom=geom,
+                radius_mi=(eff_radius_m / 1609.34),
             )
             if not magnet:
                 results.append({
