@@ -5390,6 +5390,25 @@ def _db_init() -> None:
         _db_exec("CREATE INDEX IF NOT EXISTS idx_pickup_logs_zone_time ON pickup_logs(zone_id, created_at DESC);")
         _db_exec("CREATE INDEX IF NOT EXISTS idx_pickup_logs_user_time ON pickup_logs(user_id, created_at DESC);")
 
+        # Per-zone structural ride magnet (subway hub / mall / hospital) from OSM,
+        # precomputed by /admin/zone_anchors/build and read by the guidance
+        # directive so zones without a curated cluster still name a real spot.
+        _db_exec(
+            """
+            CREATE TABLE IF NOT EXISTS zone_ride_magnet (
+              zone_id INTEGER PRIMARY KEY,
+              label TEXT NOT NULL,
+              lat DOUBLE PRECISION NOT NULL,
+              lng DOUBLE PRECISION NOT NULL,
+              kind TEXT NOT NULL,
+              descriptor TEXT NOT NULL,
+              score DOUBLE PRECISION NOT NULL DEFAULT 0,
+              source TEXT NOT NULL DEFAULT 'osm_overpass',
+              updated_at BIGINT NOT NULL DEFAULT 0
+            );
+            """
+        )
+
         _db_exec(
             """
             CREATE TABLE IF NOT EXISTS hotspot_experiment_bins (
@@ -8497,6 +8516,7 @@ def assistant_guidance(
     # and whether it's peaking at their arrival time.
     hotspot_hint = None
     pickup_anchor = None
+    ride_magnet = None
     guidance_message = guidance.get("message") or ""
     try:
         from long_trip_hotspot_builder import hotspot_runtime_meta as _hrm
@@ -8579,6 +8599,24 @@ def assistant_guidance(
                 _area.lower() in _zname.lower() or _zname.lower() in _area.lower()
             ):
                 _anchor_label = _core
+        # Tier 3 — structural OSM ride magnet (subway hub / mall / hospital /
+        # campus), precomputed per zone. Names a real spot even where we have
+        # neither a curated cluster nor live pickup density.
+        _magnet = None
+        if not _where and not _anchor_label and _rec_zone is not None:
+            try:
+                _mrow = _db_query_one(
+                    "SELECT label, descriptor, lat, lng, kind FROM zone_ride_magnet WHERE zone_id=?",
+                    (int(_rec_zone),),
+                )
+                if _mrow:
+                    _magnet = {
+                        "label": _mrow["label"], "descriptor": _mrow["descriptor"],
+                        "lat": _mrow["lat"], "lng": _mrow["lng"], "kind": _mrow["kind"],
+                    }
+            except Exception:
+                _magnet = None
+        ride_magnet = _magnet
         if _moving and _tz.get("zone_name"):
             _eta = _safe_float_value(_tz.get("eta_minutes"), 0.0)
             _eta_txt = f" (~{int(round(_eta))} min)" if _eta else ""
@@ -8587,6 +8625,9 @@ def assistant_guidance(
             elif _anchor_label:
                 _directive = (f"Go to {_tz['zone_name']}{_eta_txt} — aim for "
                               f"{_anchor_label}, the busiest pickup spot there.")
+            elif _magnet:
+                _directive = (f"Go to {_tz['zone_name']}{_eta_txt} — aim for "
+                              f"{_magnet['label']}, {_magnet['descriptor']}.")
             else:
                 _directive = f"Go to {_tz['zone_name']}{_eta_txt}."
         elif _where:
@@ -8596,6 +8637,9 @@ def assistant_guidance(
         elif _anchor_label:
             _directive = (f"Stay in {_cz.get('zone_name') or 'this zone'} — work "
                           f"{_anchor_label}, the busiest pickup spot right now.")
+        elif _magnet:
+            _directive = (f"Stay in {_cz.get('zone_name') or 'this zone'} — set up by "
+                          f"{_magnet['label']}, {_magnet['descriptor']}.")
         else:
             _directive = f"Stay in {_cz.get('zone_name') or 'this zone'} — it's working."
         _tips = [t for t in (guidance.get("trap_advice"), guidance.get("safety_advice")) if t]
@@ -8635,6 +8679,7 @@ def assistant_guidance(
         "trap_advice": guidance.get("trap_advice"),
         "hotspot_hint": hotspot_hint,
         "pickup_anchor": pickup_anchor,
+        "ride_magnet": ride_magnet,
     }
 
 
@@ -9998,6 +10043,104 @@ def long_trip_hotspots_nearby_pois(
         "kind": kind,
         "count": len(found),
         "found": found,
+    }
+
+
+@app.get("/admin/zone_anchors/build")
+def build_zone_ride_magnets(
+    start: int = 0,
+    count: int = 12,
+    radius_m: int = 750,
+    admin: sqlite3.Row = Depends(require_admin),
+):
+    """
+    Precompute each zone's structural ride magnet (subway hub / mall / hospital /
+    campus) from OpenStreetMap (Overpass) and UPSERT into zone_ride_magnet. The
+    guidance directive reads this so zones without a curated cluster still name a
+    real spot. Call in slices (start/count) to stay under request timeouts and to
+    respect Overpass's rate limits; re-run any time to adapt to map changes.
+    """
+    _ = admin
+    import time as _t
+    import httpx
+    from shapely.geometry import Point as _Point
+    from zone_ride_magnet import build_ride_magnet_overpass_query, select_ride_magnet
+
+    geoms = _load_pickup_zone_geometries()
+    zone_ids = sorted(int(z) for z in geoms.keys())
+    slice_ids = zone_ids[start:start + count]
+    now_unix = int(_t.time())
+    results = []
+    ok_count = 0
+    with httpx.Client() as client:
+        for i, zid in enumerate(slice_ids):
+            zd = geoms.get(zid) or {}
+            geom = zd.get("geometry")
+            if geom is None:
+                results.append({"zone_id": zid, "status": "no_geometry"})
+                continue
+            try:
+                rp = geom.representative_point()
+                clat, clng = float(rp.y), float(rp.x)
+            except Exception:
+                results.append({"zone_id": zid, "status": "no_point"})
+                continue
+            if i > 0:
+                _t.sleep(1.1)  # Overpass politeness (1 req/sec)
+            try:
+                q = build_ride_magnet_overpass_query(clat, clng, radius_m)
+                r = client.post(
+                    "https://overpass-api.de/api/interpreter",
+                    data={"data": q},
+                    headers={"User-Agent": "team-joseo-zone-anchor/1.0 (ride magnet build)"},
+                    timeout=30.0,
+                )
+                elements = r.json().get("elements", [])
+            except Exception as e:
+                results.append({"zone_id": zid, "status": "overpass_error", "error": str(e)[:120]})
+                continue
+            magnet = select_ride_magnet(
+                elements, center_lat=clat, center_lng=clng, zone_geom=geom
+            )
+            if not magnet:
+                results.append({
+                    "zone_id": zid, "zone_name": zd.get("zone_name"),
+                    "status": "no_magnet", "elements": len(elements),
+                })
+                continue
+            _db_exec(
+                """
+                INSERT INTO zone_ride_magnet
+                    (zone_id, label, lat, lng, kind, descriptor, score, source, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(zone_id) DO UPDATE SET
+                    label=EXCLUDED.label, lat=EXCLUDED.lat, lng=EXCLUDED.lng,
+                    kind=EXCLUDED.kind, descriptor=EXCLUDED.descriptor,
+                    score=EXCLUDED.score, source=EXCLUDED.source, updated_at=EXCLUDED.updated_at
+                """,
+                (
+                    int(zid), str(magnet["label"]), float(magnet["lat"]), float(magnet["lng"]),
+                    str(magnet["kind"]), str(magnet["descriptor"]), float(magnet["score"]),
+                    "osm_overpass", now_unix,
+                ),
+            )
+            ok_count += 1
+            results.append({
+                "zone_id": zid, "zone_name": zd.get("zone_name"), "status": "ok",
+                "label": magnet["label"], "kind": magnet["kind"],
+                "score": magnet["score"], "inside_zone": magnet.get("inside_zone"),
+            })
+    next_start = start + count
+    return {
+        "ok": True,
+        "start": start,
+        "count": count,
+        "radius_m": radius_m,
+        "total_zones": len(zone_ids),
+        "returned": len(results),
+        "upserted": ok_count,
+        "next_start": next_start if next_start < len(zone_ids) else None,
+        "results": results,
     }
 
 
