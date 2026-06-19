@@ -393,7 +393,7 @@ _CATEGORY_PRIORITY: List[str] = [
 BEST_HOURS_BY_CATEGORY: Dict[str, str] = {
     "airport":         "24/7 — peaks 5–8am, 4–9pm",
     "hospital":        "24/7 — discharges peak 10am–4pm",
-    "hotel_luxury":    "Checkout 7am–noon — airport runs (check-in isn't a pickup)",
+    "hotel_luxury":    "Checkout surge 8am–noon (peaks near the 11am–noon checkout); early-flight wave ~5–8am",
     "transit_hub":     "Weekday rush 7–9am, 5–7pm",
     "corporate":       "Weekday end-of-day 4–8pm (esp. Thu/Fri); closed holidays",
     "private_school":  "Weekday pickup 2:30–4pm; closed weekends, holidays & summer",
@@ -769,7 +769,7 @@ def _best_hours_for(category: str) -> str:
 CATEGORY_DIM_SCHEDULE: Dict[str, Dict[str, Any]] = {
     "airport":         {"peak": [[5, 9], [16, 22]],  "off": [],          "weekday_only": False, "prime": [[6, 9], [16, 21]]},
     "hospital":        {"peak": [[10, 17]],          "off": [],          "weekday_only": False, "prime": [[13, 17]]},
-    "hotel_luxury":    {"peak": [[6, 12]],           "off": [[23, 6]],   "weekday_only": False, "prime": [[7, 11]]},
+    "hotel_luxury":    {"peak": [[5, 12]],           "off": [[23, 5]],   "weekday_only": False, "prime": [[8, 12]]},
     "transit_hub":     {"peak": [[7, 10], [16, 20]], "off": [[23, 5]],   "weekday_only": False, "prime": [[7, 9], [17, 20]]},
     "corporate":       {"peak": [[16, 20]],          "off": [[20, 7]],   "weekday_only": True,  "prime": [[16, 19]]},
     "private_school":  {"peak": [[7, 9], [14, 16]],  "off": [[19, 6]],   "weekday_only": True,  "prime": [[14, 16]]},
