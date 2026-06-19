@@ -8243,6 +8243,7 @@ def _build_guidance_zone_context(
             "next_rating": round(float(current_next_rating), 2),
             "market_saturation_penalty": _safe_float_value(current_now.get("market_saturation_penalty"), 0.0),
             "continuation_raw": _safe_float_value(current_now.get("continuation_raw"), 0.0),
+            "short_trip_penalty": _safe_float_value(current_now.get("short_trip_penalty"), 0.0),
         },
         "nearby_candidates": nearby_candidates[:8],
     }
@@ -8464,6 +8465,13 @@ def assistant_guidance(
         "current_zone_continuation_raw": current_zone_debug.get("continuation_raw"),
         "current_zone": guidance.get("current_zone"),
         "target_zone": guidance.get("target_zone"),
+        "nearby_candidates": guidance.get("nearby_candidates") or [],
+        "safety_elevated_risk": guidance.get("safety_elevated_risk"),
+        "safety_advice": guidance.get("safety_advice"),
+        "safety_min_rider_rating": guidance.get("safety_min_rider_rating"),
+        "trap_zone": guidance.get("trap_zone"),
+        "offline_until_arrival": guidance.get("offline_until_arrival"),
+        "trap_advice": guidance.get("trap_advice"),
     }
 
 
