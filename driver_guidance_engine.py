@@ -171,6 +171,91 @@ def load_zone_centroid_lookup(zones_geojson_path: Path) -> Dict[int, Dict[str, A
     }
 
 
+# --- Strategic-spot ("best location + best hours") integration ----------------
+# Map the long-trip-hotspot clusters to their TLC zone so the guidance can point
+# the driver to the exact spot inside a zone and tell them when it peaks.
+_zone_hotspot_index_lock = threading.Lock()
+_zone_hotspot_index_cache: Dict[str, Any] = {}
+
+
+def build_zone_hotspot_index(
+    hotspots: List[Dict[str, Any]],
+    zones_geojson_path: Path,
+    cache_key: str,
+) -> Dict[int, List[Dict[str, Any]]]:
+    """zone_id -> [clusters], cached by cache_key (rebuilds only when the POI
+    set changes, so it auto-adapts to future zone/POI edits)."""
+    with _zone_hotspot_index_lock:
+        if _zone_hotspot_index_cache.get("key") == cache_key:
+            return _zone_hotspot_index_cache.get("index") or {}
+    zones = _load_zone_geometries(Path(zones_geojson_path))
+    index: Dict[int, List[Dict[str, Any]]] = {}
+    for h in hotspots or []:
+        try:
+            pt = Point(float(h["lng"]), float(h["lat"]))
+        except Exception:
+            continue
+        zid: Optional[int] = None
+        for zone in zones.values():
+            geom = zone.get("geometry")
+            if geom is not None and geom.covers(pt):
+                zid = int(zone.get("zone_id"))
+                break
+        if zid is None:
+            continue
+        prime = ((h.get("dim_schedule") or {}).get("prime")) or []
+        index.setdefault(zid, []).append({
+            "label": h.get("label"),
+            "lat": _safe_float(h.get("lat")),
+            "lng": _safe_float(h.get("lng")),
+            "best_hours": h.get("best_hours"),
+            "prime_ranges": [list(r) for r in prime if isinstance(r, (list, tuple)) and len(r) == 2],
+            "total_weight": _safe_float(h.get("total_weight"), 0.0),
+        })
+    for zid in index:
+        index[zid].sort(key=lambda c: -c["total_weight"])
+    with _zone_hotspot_index_lock:
+        _zone_hotspot_index_cache.clear()
+        _zone_hotspot_index_cache["key"] = cache_key
+        _zone_hotspot_index_cache["index"] = index
+    return index
+
+
+def _hour_in_ranges(hour: int, ranges: List[List[int]]) -> bool:
+    for r in ranges:
+        if len(r) != 2:
+            continue
+        a, b = int(r[0]), int(r[1])
+        if a <= b:
+            if a <= hour < b:
+                return True
+        elif hour >= a or hour < b:  # wraps midnight
+            return True
+    return False
+
+
+def zone_hotspot_hint(
+    zone_id: Optional[int],
+    arrival_hour: int,
+    index: Dict[int, List[Dict[str, Any]]],
+) -> Optional[Dict[str, Any]]:
+    """Best strategic spot in the zone, flagged prime if arrival_hour is inside
+    its window."""
+    if zone_id is None:
+        return None
+    clusters = index.get(int(zone_id)) or []
+    if not clusters:
+        return None
+    prime = [c for c in clusters if _hour_in_ranges(int(arrival_hour), c["prime_ranges"])]
+    pick = (prime or clusters)[0]
+    return {
+        "label": pick["label"],
+        "position": [pick["lat"], pick["lng"]],
+        "best_hours": pick["best_hours"],
+        "prime_now": bool(prime),
+    }
+
+
 def load_driver_activity_snapshot(
     *,
     user_id: int,
