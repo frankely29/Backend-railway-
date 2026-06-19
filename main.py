@@ -63,6 +63,8 @@ from driver_guidance_engine import (
     load_zone_centroid_lookup,
     load_driver_activity_snapshot,
     resolve_current_zone_from_position,
+    build_zone_hotspot_index,
+    zone_hotspot_hint,
 )
 from hotspot_models import MicroHotspotScoreResult
 from hotspot_scoring import score_zones
@@ -8443,13 +8445,60 @@ def assistant_guidance(
         now_ts=now_ts,
         guidance=guidance,
     )
+    # Phase 2: strategic-spot ("best location + best hours") hint for the
+    # recommended zone — points the driver to the exact spot inside the zone
+    # and whether it's peaking at their arrival time.
+    hotspot_hint = None
+    guidance_message = guidance.get("message") or ""
+    try:
+        from long_trip_hotspot_builder import hotspot_runtime_meta as _hrm
+        hs_rows_raw = _db_query_all(
+            "SELECT lat, lng, label, dominant_category, total_weight, members_json, "
+            "generated_at_unix FROM long_trip_hotspots ORDER BY total_weight DESC"
+        ) or []
+        hs_rows = []
+        hs_max_gen = 0
+        for _r in hs_rows_raw:
+            try:
+                _members = json.loads(_r["members_json"] or "[]")
+            except Exception:
+                _members = []
+            if not isinstance(_members, list):
+                _members = []
+            _meta = _hrm(_r["dominant_category"], _members)
+            hs_max_gen = max(hs_max_gen, int(_r["generated_at_unix"] or 0))
+            hs_rows.append({
+                "lat": float(_r["lat"]), "lng": float(_r["lng"]), "label": _r["label"],
+                "best_hours": _meta["best_hours"], "dim_schedule": _meta["dim_schedule"],
+                "total_weight": float(_r["total_weight"] or 0),
+            })
+        hs_index = build_zone_hotspot_index(
+            hs_rows, DATA_DIR / "taxi_zones.geojson", f"gen={hs_max_gen}:n={len(hs_rows)}"
+        )
+        _tz = guidance.get("target_zone") or {}
+        _rec_zone = _tz.get("zone_id") if _tz.get("zone_id") is not None else current_zone_id
+        _eta = _safe_float_value(_tz.get("eta_minutes"), 0.0)
+        try:
+            _base_hour = int(str(frame_key)[11:13])
+        except Exception:
+            _base_hour = 12
+        _arrival_hour = int((_base_hour + int(round(_eta / 60.0))) % 24)
+        hotspot_hint = zone_hotspot_hint(_rec_zone, _arrival_hour, hs_index)
+        if hotspot_hint:
+            if hotspot_hint.get("prime_now"):
+                guidance_message = (guidance_message + f" Aim for {hotspot_hint['label']} — {hotspot_hint['best_hours']}.").strip()
+            else:
+                guidance_message = (guidance_message + f" Anchor near {hotspot_hint['label']}.").strip()
+    except Exception:
+        hotspot_hint = None
+
     current_zone_debug = guidance.get("current_zone") or {}
     return {
         "ok": True,
         "frame_time": frame_key,
         "action": guidance.get("action"),
         "confidence": guidance.get("confidence"),
-        "message": guidance.get("message"),
+        "message": guidance_message,
         "reason_codes": guidance.get("reason_codes") or [],
         "tripless_minutes": guidance.get("tripless_minutes"),
         "stationary_minutes": guidance.get("stationary_minutes"),
@@ -8472,6 +8521,7 @@ def assistant_guidance(
         "trap_zone": guidance.get("trap_zone"),
         "offline_until_arrival": guidance.get("offline_until_arrival"),
         "trap_advice": guidance.get("trap_advice"),
+        "hotspot_hint": hotspot_hint,
     }
 
 
