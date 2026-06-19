@@ -209,6 +209,7 @@ def build_zone_hotspot_index(
             "lat": _safe_float(h.get("lat")),
             "lng": _safe_float(h.get("lng")),
             "best_hours": h.get("best_hours"),
+            "address": h.get("address"),
             "prime_ranges": [list(r) for r in prime if isinstance(r, (list, tuple)) and len(r) == 2],
             "total_weight": _safe_float(h.get("total_weight"), 0.0),
         })
@@ -252,6 +253,7 @@ def zone_hotspot_hint(
         "label": pick["label"],
         "position": [pick["lat"], pick["lng"]],
         "best_hours": pick["best_hours"],
+        "address": pick.get("address"),
         "prime_now": bool(prime),
     }
 
