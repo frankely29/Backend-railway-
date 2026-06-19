@@ -8472,6 +8472,7 @@ def assistant_guidance(
                 "lat": float(_r["lat"]), "lng": float(_r["lng"]), "label": _r["label"],
                 "best_hours": _meta["best_hours"], "dim_schedule": _meta["dim_schedule"],
                 "total_weight": float(_r["total_weight"] or 0),
+                "address": (_members[0].get("address") if _members else None),
             })
         hs_index = build_zone_hotspot_index(
             hs_rows, DATA_DIR / "taxi_zones.geojson", f"gen={hs_max_gen}:n={len(hs_rows)}"
@@ -8485,11 +8486,30 @@ def assistant_guidance(
             _base_hour = 12
         _arrival_hour = int((_base_hour + int(round(_eta / 60.0))) % 24)
         hotspot_hint = zone_hotspot_hint(_rec_zone, _arrival_hour, hs_index)
+        # Build a SPECIFIC, directive recommendation — name the exact place to
+        # go (and its address), not a general "this area is good these hours".
+        # Keep the safety + trap tips.
+        _tz = guidance.get("target_zone") or {}
+        _cz = guidance.get("current_zone") or {}
+        _moving = guidance.get("action") in ("move_nearby", "micro_reposition")
+        _where = None
         if hotspot_hint:
-            if hotspot_hint.get("prime_now"):
-                guidance_message = (guidance_message + f" Aim for {hotspot_hint['label']} — {hotspot_hint['best_hours']}.").strip()
-            else:
-                guidance_message = (guidance_message + f" Anchor near {hotspot_hint['label']}.").strip()
+            _where = hotspot_hint["label"]
+            if hotspot_hint.get("address"):
+                _where = f"{_where} ({hotspot_hint['address']})"
+        if _moving and _tz.get("zone_name"):
+            _eta = _safe_float_value(_tz.get("eta_minutes"), 0.0)
+            _eta_txt = f" (~{int(round(_eta))} min)" if _eta else ""
+            _directive = (f"Go to {_where} in {_tz['zone_name']}{_eta_txt}."
+                          if _where else f"Go to {_tz['zone_name']}{_eta_txt}.")
+        elif _where:
+            _directive = f"Set up at {_where}" + (
+                "; busy right now." if hotspot_hint.get("prime_now") else " — best anchor here."
+            )
+        else:
+            _directive = f"Stay in {_cz.get('zone_name') or 'this zone'} — it's working."
+        _tips = [t for t in (guidance.get("trap_advice"), guidance.get("safety_advice")) if t]
+        guidance_message = " ".join([_directive] + _tips)
     except Exception:
         hotspot_hint = None
 
