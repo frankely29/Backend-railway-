@@ -16,23 +16,35 @@ import math
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 # Significance of each magnet class as a rideshare origin in a residential zone.
-# Transit hubs win: that's where riders without cars start trips.
+# Real rail/subway hubs win: that's where riders without cars start trips. Bare
+# public_transport=station nodes (often a bus stop or a university shuttle desk
+# mislabeled in OSM) are a weak signal, so they sit below malls/hospitals and
+# only win when nothing better is in the zone.
 _KIND_BASE_SCORE = {
-    "transit": 1.00,
+    "rail": 1.00,
     "mall": 0.86,
     "hospital": 0.80,
     "university": 0.74,
-    "attraction": 0.60,
+    "transit_minor": 0.62,
+    "attraction": 0.50,
 }
 
 # Honest descriptor per class -- never implies pickup data we don't have.
 _KIND_DESCRIPTOR = {
-    "transit": "the local transit hub",
+    "rail": "the local transit hub",
     "mall": "a steady ride magnet",
     "hospital": "a steady ride source",
     "university": "a campus ride magnet",
+    "transit_minor": "the local transit stop",
     "attraction": "a visitor draw",
 }
+
+# Names that are not real ride magnets even when OSM tags them as a station:
+# university shuttle desks, parking, depots, lone "office" nodes, etc.
+_NAME_DENYLIST = (
+    "ram van", "shuttle", "parking", "depot", "bus depot", "bus stop",
+    "park and ride", "park & ride", "layover",
+)
 
 _RADIUS_DEFAULT_M = 750
 
@@ -67,18 +79,17 @@ def _haversine_mi(la1: float, lo1: float, la2: float, lo2: float) -> float:
 
 
 def _classify(tags: Mapping[str, Any]) -> Optional[str]:
-    if (
-        tags.get("railway") in ("station", "halt")
-        or tags.get("station") == "subway"
-        or tags.get("public_transport") == "station"
-    ):
-        return "transit"
+    # Real rail/subway is the strong signal; bare public_transport=station is weak.
+    if tags.get("railway") in ("station", "halt") or tags.get("station") == "subway":
+        return "rail"
     if tags.get("shop") in ("mall", "department_store"):
         return "mall"
     if tags.get("amenity") == "hospital":
         return "hospital"
     if tags.get("amenity") == "university":
         return "university"
+    if tags.get("public_transport") == "station":
+        return "transit_minor"
     if tags.get("tourism") == "attraction":
         return "attraction"
     return None
@@ -126,6 +137,9 @@ def select_ride_magnet(
         tags = el.get("tags") or {}
         name = str(tags.get("name") or "").strip()
         if not name:
+            continue
+        low = name.lower()
+        if any(bad in low for bad in _NAME_DENYLIST):
             continue
         kind = _classify(tags)
         if kind is None:
