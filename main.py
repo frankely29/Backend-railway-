@@ -8218,6 +8218,7 @@ def _build_guidance_zone_context(
     current_next_rating = _safe_float_value(current_track_next.get("rating"), current_rating)
 
     nearby_candidates: List[Dict[str, Any]] = []
+    far_candidates: List[Dict[str, Any]] = []
     for zone_id_raw, zone_payload in (frame_bucket or {}).items():
         points = (zone_payload or {}).get("points") or []
         if not points:
@@ -8231,7 +8232,10 @@ def _build_guidance_zone_context(
         if current_zone_id is not None and str(zone_id_raw) == str(current_zone_id):
             continue
         distance = _safe_haversine_miles(current_lat, current_lng, center_lat, center_lng)
-        if distance > 3.0:
+        # Nearby band (<=3mi) drives the normal stay/move call; a wider band
+        # (3-10mi) is kept so that when the whole local area is dead we can
+        # still point the driver to where the demand actually is.
+        if distance > 10.0:
             continue
         # Arrival-time scoring: a candidate is only worth what it will be by
         # the time the driver gets there, not what it is right now. ETA =
@@ -8243,19 +8247,22 @@ def _build_guidance_zone_context(
         arrival_bin = min(len(points) - 1, max(0, int(round(eta_minutes / 20.0))))
         rating_now = _extract_zone_rating_from_point(points[0], mode_flags)
         arrival_rating = _extract_zone_rating_from_point(points[arrival_bin], mode_flags)
-        nearby_candidates.append(
-            {
-                "zone_id": zone_id,
-                "zone_name": zone_payload.get("zone_name"),
-                "borough": zone_payload.get("borough"),
-                "distance_miles": round(float(distance), 3),
-                "eta_minutes": round(float(eta_minutes), 1),
-                "rating": round(float(arrival_rating), 2),
-                "rating_now": round(float(rating_now), 2),
-                "arrival_bin": int(arrival_bin),
-            }
-        )
+        cand = {
+            "zone_id": zone_id,
+            "zone_name": zone_payload.get("zone_name"),
+            "borough": zone_payload.get("borough"),
+            "distance_miles": round(float(distance), 3),
+            "eta_minutes": round(float(eta_minutes), 1),
+            "rating": round(float(arrival_rating), 2),
+            "rating_now": round(float(rating_now), 2),
+            "arrival_bin": int(arrival_bin),
+        }
+        if distance <= 3.0:
+            nearby_candidates.append(cand)
+        else:
+            far_candidates.append(cand)
     nearby_candidates.sort(key=lambda z: (-(z.get("rating") or 0.0), z.get("distance_miles") or 999.0))
+    far_candidates.sort(key=lambda z: (-(z.get("rating") or 0.0), z.get("distance_miles") or 999.0))
 
     return {
         "current_zone": {
@@ -8269,6 +8276,7 @@ def _build_guidance_zone_context(
             "short_trip_penalty": _safe_float_value(current_now.get("short_trip_penalty"), 0.0),
         },
         "nearby_candidates": nearby_candidates[:8],
+        "far_candidates": far_candidates[:5],
     }
 
 
@@ -8645,6 +8653,7 @@ def assistant_guidance(
             spot=_spot,
             below_blue=bool(guidance.get("below_blue")),
             current_will_improve=bool(guidance.get("current_will_improve")),
+            far_reposition=bool(guidance.get("far_reposition")),
         )
         _tips = [t for t in (guidance.get("improvement_note"), guidance.get("trap_advice"), guidance.get("safety_advice")) if t]
         guidance_message = " ".join([_directive] + _tips)
@@ -8686,6 +8695,7 @@ def assistant_guidance(
         "below_blue": guidance.get("below_blue"),
         "current_will_improve": guidance.get("current_will_improve"),
         "improvement_note": guidance.get("improvement_note"),
+        "far_reposition": guidance.get("far_reposition"),
         "ride_magnet": ride_magnet,
     }
 

@@ -97,12 +97,19 @@ def compose_guidance_directive(
     spot: Optional[Mapping[str, Any]] = None,
     below_blue: bool = False,
     current_will_improve: bool = False,
+    far_reposition: bool = False,
 ) -> str:
     czone = current_zone_name or "this area"
     sp = spot_phrase(spot)
 
     # --- GO: move to a different zone --------------------------------------
     if moving and target_zone_name:
+        spot_txt = f" Set up at {sp}." if sp else ""
+        eta_txt = f" ~{int(round(float(target_eta)))} min away." if target_eta else ""
+        # Far-field: the local area is dead, so send them where the demand is.
+        if far_reposition:
+            word = demand_word(target_rating)
+            return f"It's slow all around here — head to {target_zone_name}, it's {word}.{spot_txt}{eta_txt}".strip()
         gap = _rank(target_rating) - _rank(current_rating)
         if gap >= 2:
             lead = "much busier than here"
@@ -112,8 +119,6 @@ def compose_guidance_directive(
             lead = f"{demand_word(target_rating)} there"
         if _trend(target_rating_now, target_rating) == "climbing":
             lead += " and still climbing"
-        spot_txt = f" Set up at {sp}." if sp else ""
-        eta_txt = f" ~{int(round(float(target_eta)))} min away." if target_eta else ""
         return f"Go to {target_zone_name} — {lead}.{spot_txt}{eta_txt}".strip()
 
     # --- Reposition within the same zone -----------------------------------

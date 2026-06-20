@@ -15,6 +15,12 @@ MOVE_NEARBY_MIN_IMPROVEMENT = 10.0
 MOVE_NEARBY_STRONG_IMPROVEMENT = 13.0
 RECENT_WINDOW_SECONDS = 2 * 3600
 
+# Far-field reposition: when the whole local area is dead, only send the driver
+# on a longer deadhead if the far zone is genuinely worth it — busy (blue+),
+# clearly better than here, and reachable in a reasonable time.
+FAR_FIELD_MIN_IMPROVEMENT = 15.0
+FAR_FIELD_MAX_ETA_MIN = 35.0
+
 # Earnings-rating -> demand bucket. "blue" (>=60) is the floor for a zone that's
 # worth sitting in; sky blue (50-59) and below is a move zone. Thresholds match
 # the frontend's colorFromRating so the words line up with the map colors.
@@ -668,6 +674,38 @@ def build_driver_guidance(
     else:
         reason_codes.append("default_hold_bias")
 
+    # --- Far-field reposition: when we'd otherwise just sit in a dead area and
+    # nothing within a few miles is any better, point the driver at where the
+    # demand actually is — the best strong zone within a longer, worthwhile
+    # drive. This is the "smarter than the driver" move: it sees the whole city.
+    far_reposition = False
+    if (
+        below_blue
+        and not current_will_improve
+        and action in {"hold", "wait_dispatch"}
+        and not nearby_blue_on_arrival
+        and not in_move_cooldown
+        and recent_move_attempts < 3
+    ):
+        far_list = zone_context.get("far_candidates") or []
+        best_far = far_list[0] if far_list else None
+        if best_far is not None:
+            far_rating = _safe_float(best_far.get("rating"), 0.0)
+            far_eta = _safe_float(best_far.get("eta_minutes"), 0.0)
+            if (
+                far_rating >= BLUE_RATING
+                and far_rating >= current_rating + FAR_FIELD_MIN_IMPROVEMENT
+                and 0.0 < far_eta <= FAR_FIELD_MAX_ETA_MIN
+            ):
+                action = "move_nearby"
+                confidence = 0.66
+                target_zone = dict(best_far)
+                hold_until_unix = None
+                far_reposition = True
+                improvement_note = None
+                reason_codes.append("far_field_reposition")
+                message = f"Slow all around here — head for {best_far.get('zone_name')}."
+
     # --- Safety overlay: elevated-risk zone -> raise the rider-rating filter.
     safety_elevated_risk = current_zone_id in SAFETY_ELEVATED_RISK_ZONE_IDS
     safety_advice: Optional[str] = None
@@ -713,6 +751,7 @@ def build_driver_guidance(
         "below_blue": bool(below_blue),
         "current_will_improve": bool(current_will_improve),
         "improvement_note": improvement_note,
+        "far_reposition": bool(far_reposition),
         "nearby_candidates": nearby_candidates[:5],
         "current_zone": {
             "zone_id": current_zone_id,
