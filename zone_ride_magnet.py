@@ -46,6 +46,14 @@ _NAME_DENYLIST = (
     "park and ride", "park & ride", "layover",
 )
 
+# Major intermodal hubs that OSM sometimes tags as attraction/building rather
+# than a station -- force them to rail (the strongest ride magnet).
+_MAJOR_HUB_NAME_HINTS = (
+    "penn station", "pennsylvania station", "moynihan", "grand central",
+    "port authority bus", "atlantic terminal", "world trade center",
+    "oculus", "hoboken terminal", "jamaica station", "jamaica center",
+)
+
 _RADIUS_DEFAULT_M = 750
 
 
@@ -142,6 +150,11 @@ def select_ride_magnet(
         if any(bad in low for bad in _NAME_DENYLIST):
             continue
         kind = _classify(tags)
+        # Major intermodal hubs are sometimes tagged tourism=attraction or
+        # building in OSM (Moynihan/Penn, Grand Central, Port Authority). They
+        # are the strongest ride magnets there is -- treat them as rail.
+        if any(h in low for h in _MAJOR_HUB_NAME_HINTS):
+            kind = "rail"
         if kind is None:
             continue
         ll = _element_lat_lng(el)
