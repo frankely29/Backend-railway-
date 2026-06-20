@@ -67,6 +67,7 @@ from driver_guidance_engine import (
     zone_hotspot_hint,
 )
 from zone_live_anchor import select_zone_live_anchor, format_anchor_label
+from guidance_phrasing import compose_guidance_directive
 from hotspot_models import MicroHotspotScoreResult
 from hotspot_scoring import score_zones
 from artifact_freshness import evaluate_artifact_freshness
@@ -8617,31 +8618,34 @@ def assistant_guidance(
             except Exception:
                 _magnet = None
         ride_magnet = _magnet
-        if _moving and _tz.get("zone_name"):
-            _eta = _safe_float_value(_tz.get("eta_minutes"), 0.0)
-            _eta_txt = f" (~{int(round(_eta))} min)" if _eta else ""
-            if _where:
-                _directive = f"Go to {_where} in {_tz['zone_name']}{_eta_txt}."
-            elif _anchor_label:
-                _directive = (f"Go to {_tz['zone_name']}{_eta_txt} — aim for "
-                              f"{_anchor_label}, the busiest pickup spot there.")
-            elif _magnet:
-                _directive = (f"Go to {_tz['zone_name']}{_eta_txt} — aim for "
-                              f"{_magnet['label']}, {_magnet['descriptor']}.")
-            else:
-                _directive = f"Go to {_tz['zone_name']}{_eta_txt}."
-        elif _where:
-            _directive = f"Set up at {_where}" + (
-                "; busy right now." if hotspot_hint.get("prime_now") else " — best anchor here."
-            )
+        # Build the spot the directive should name (target zone when moving,
+        # current zone when holding) from whichever tier resolved it.
+        _spot = None
+        if hotspot_hint:
+            _spot = {
+                "label": hotspot_hint.get("label"),
+                "address": hotspot_hint.get("address"),
+                "prime_now": hotspot_hint.get("prime_now"),
+                "source": "curated",
+            }
         elif _anchor_label:
-            _directive = (f"Stay in {_cz.get('zone_name') or 'this zone'} — work "
-                          f"{_anchor_label}, the busiest pickup spot right now.")
+            _spot = {"label": _anchor_label, "source": "pickup"}
         elif _magnet:
-            _directive = (f"Stay in {_cz.get('zone_name') or 'this zone'} — set up by "
-                          f"{_magnet['label']}, {_magnet['descriptor']}.")
-        else:
-            _directive = f"Stay in {_cz.get('zone_name') or 'this zone'} — it's working."
+            _spot = {"label": _magnet.get("label"), "kind": _magnet.get("kind"), "source": "magnet"}
+        _directive = compose_guidance_directive(
+            action=str(guidance.get("action") or "hold"),
+            moving=_moving,
+            current_zone_name=_cz.get("zone_name"),
+            current_rating=_safe_float_value(_cz.get("rating"), 0.0),
+            current_next_rating=_safe_float_value(_cz.get("next_rating"), _safe_float_value(_cz.get("rating"), 0.0)),
+            target_zone_name=_tz.get("zone_name"),
+            target_rating=_safe_float_value(_tz.get("rating"), 0.0),
+            target_rating_now=_safe_float_value(_tz.get("rating_now"), 0.0),
+            target_eta=_safe_float_value(_tz.get("eta_minutes"), 0.0),
+            spot=_spot,
+            below_blue=bool(guidance.get("below_blue")),
+            current_will_improve=bool(guidance.get("current_will_improve")),
+        )
         _tips = [t for t in (guidance.get("improvement_note"), guidance.get("trap_advice"), guidance.get("safety_advice")) if t]
         guidance_message = " ".join([_directive] + _tips)
     except Exception:
