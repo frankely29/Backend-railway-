@@ -249,3 +249,48 @@ def test_guidance_outcome_settle_case_f_hold_trip_without_move_gets_hold_credit(
     row = cur.execute("SELECT moved_before_trip, settlement_reason FROM assistant_guidance_outcomes WHERE user_id=8").fetchone()
     assert row[0] == 0
     assert row[1] == "trip_while_holding_zone"
+
+
+def test_guidance_far_field_points_to_demand_when_local_is_dead():
+    # Quiet everywhere within a few miles -> point the driver at the best strong
+    # zone within a longer but worthwhile drive instead of just holding.
+    guidance = build_driver_guidance(
+        **_base_guidance_inputs(),
+        activity_snapshot={
+            "tripless_minutes": 20,
+            "stationary_minutes": 10,
+            "movement_minutes": 4,
+            "dispatch_uncertainty": 0.3,
+            "recent_move_attempts_without_trip": 0,
+            "recent_saved_trip_count_60m": 0,
+            "moved_since_last_saved_trip": False,
+            "guidance_state": {},
+        },
+        zone_context={
+            "current_zone": {"rating": 25, "next_rating": 25, "continuation_raw": 0.2},
+            "nearby_candidates": [{"zone_id": 2, "zone_name": "Next Door", "rating": 28, "distance_miles": 1.5}],
+            "far_candidates": [{"zone_id": 9, "zone_name": "Times Sq", "rating": 70, "rating_now": 70, "distance_miles": 5.0, "eta_minutes": 25}],
+        },
+    )
+    assert guidance["action"] == "move_nearby"
+    assert guidance["far_reposition"] is True
+    assert (guidance["target_zone"] or {}).get("zone_name") == "Times Sq"
+
+
+def test_guidance_far_field_not_triggered_for_a_weak_far_zone():
+    # A far zone that isn't clearly better shouldn't earn a long deadhead.
+    guidance = build_driver_guidance(
+        **_base_guidance_inputs(),
+        activity_snapshot={
+            "tripless_minutes": 20, "stationary_minutes": 10, "movement_minutes": 4,
+            "dispatch_uncertainty": 0.3, "recent_move_attempts_without_trip": 0,
+            "recent_saved_trip_count_60m": 0, "moved_since_last_saved_trip": False,
+            "guidance_state": {},
+        },
+        zone_context={
+            "current_zone": {"rating": 47, "next_rating": 47, "continuation_raw": 0.2},
+            "nearby_candidates": [{"zone_id": 2, "zone_name": "Next Door", "rating": 49, "distance_miles": 1.5}],
+            "far_candidates": [{"zone_id": 9, "zone_name": "Sorta Better", "rating": 55, "rating_now": 55, "distance_miles": 6.0, "eta_minutes": 30}],
+        },
+    )
+    assert guidance["far_reposition"] is False

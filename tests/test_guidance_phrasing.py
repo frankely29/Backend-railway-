@@ -69,3 +69,14 @@ def test_below_blue_improving_says_about_to_pick_up():
     )
     assert line.startswith("Stay in Garment District")
     assert "about to pick up" in line
+
+
+def test_far_reposition_says_its_slow_and_points_to_demand():
+    line = compose_guidance_directive(
+        action="move_nearby", moving=True,
+        current_zone_name="Great Kills", current_rating=22, current_next_rating=22,
+        target_zone_name="Times Sq", target_rating=72, target_rating_now=72, target_eta=28,
+        spot=_rail("Times Square–42nd Street"), below_blue=True, far_reposition=True,
+    )
+    assert line.startswith("It's slow all around here")
+    assert "Times Sq" in line and "28 min away" in line
