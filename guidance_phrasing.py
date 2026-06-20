@@ -131,7 +131,7 @@ def compose_guidance_directive(
             return f"Sit tight in {czone} — work {sp} while it builds."
         return f"Sit tight in {czone} — it's about to build."
 
-    # --- Below blue, not improving (nothing better / let dispatch work) ---
+    # --- Below blue, not improving (nothing reachable is stronger yet) ----
     if sp:
-        return f"Hold in {czone} a few minutes — work {sp} while dispatch catches up."
-    return f"Hold in {czone} — give dispatch a few minutes."
+        return f"Hold in {czone} for now — work {sp}; nothing nearby beats it yet."
+    return f"Hold in {czone} for now — nothing nearby is stronger yet."
