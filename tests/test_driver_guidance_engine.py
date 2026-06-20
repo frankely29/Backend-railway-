@@ -63,7 +63,10 @@ def test_guidance_case_b_move_nearby_for_material_edge():
     assert guidance["action"] == "move_nearby"
 
 
-def test_guidance_case_c_micro_reposition_when_stationary_without_clear_upgrade():
+def test_guidance_case_c_micro_reposition_when_blue_zone_stationary_without_upgrade():
+    # Micro-reposition still applies for a BLUE+ zone (>=60) that's gone quiet
+    # with no clearly stronger neighbour — the blue-floor move rule only takes
+    # over for sub-blue zones.
     guidance = build_driver_guidance(
         **_base_guidance_inputs(),
         activity_snapshot={
@@ -77,11 +80,60 @@ def test_guidance_case_c_micro_reposition_when_stationary_without_clear_upgrade(
             "guidance_state": {},
         },
         zone_context={
-            "current_zone": {"rating": 54, "next_rating": 53, "continuation_raw": 0.42},
-            "nearby_candidates": [{"zone_id": 3, "rating": 61, "distance_miles": 1.6}],
+            "current_zone": {"rating": 62, "next_rating": 61, "continuation_raw": 0.42},
+            "nearby_candidates": [{"zone_id": 3, "rating": 64, "distance_miles": 1.6}],
         },
     )
     assert guidance["action"] == "micro_reposition"
+
+
+def test_guidance_blue_floor_moves_below_blue_zone_to_blue_neighbor():
+    # Sky blue (50-59) is not a sit zone: with a neighbour that will be blue+ on
+    # arrival, the driver should be moved there even if the edge is modest.
+    guidance = build_driver_guidance(
+        **_base_guidance_inputs(),
+        activity_snapshot={
+            "tripless_minutes": 12,
+            "stationary_minutes": 6,
+            "movement_minutes": 4,
+            "dispatch_uncertainty": 0.3,
+            "recent_move_attempts_without_trip": 0,
+            "recent_saved_trip_count_60m": 0,
+            "moved_since_last_saved_trip": False,
+            "guidance_state": {},
+        },
+        zone_context={
+            "current_zone": {"rating": 54, "next_rating": 53, "continuation_raw": 0.42},
+            "nearby_candidates": [{"zone_id": 3, "zone_name": "Blue Zone", "rating": 61, "distance_miles": 1.6}],
+        },
+    )
+    assert guidance["action"] == "move_nearby"
+    assert guidance["below_blue"] is True
+
+
+def test_guidance_blue_floor_holds_when_zone_about_to_reach_blue():
+    # Below blue but climbing to blue+ in the next bin with nothing stronger
+    # reachable -> hold and tell the driver it's about to pick up.
+    guidance = build_driver_guidance(
+        **_base_guidance_inputs(),
+        activity_snapshot={
+            "tripless_minutes": 10,
+            "stationary_minutes": 5,
+            "movement_minutes": 3,
+            "dispatch_uncertainty": 0.3,
+            "recent_move_attempts_without_trip": 0,
+            "recent_saved_trip_count_60m": 0,
+            "moved_since_last_saved_trip": False,
+            "guidance_state": {},
+        },
+        zone_context={
+            "current_zone": {"rating": 54, "next_rating": 63, "continuation_raw": 0.42},
+            "nearby_candidates": [{"zone_id": 3, "zone_name": "Weak Zone", "rating": 55, "distance_miles": 1.4}],
+        },
+    )
+    assert guidance["action"] == "wait_dispatch"
+    assert guidance["current_will_improve"] is True
+    assert guidance["improvement_note"]
 
 
 def test_guidance_case_d_wait_dispatch_after_recent_move_without_trip():

@@ -15,6 +15,31 @@ MOVE_NEARBY_MIN_IMPROVEMENT = 10.0
 MOVE_NEARBY_STRONG_IMPROVEMENT = 13.0
 RECENT_WINDOW_SECONDS = 2 * 3600
 
+# Earnings-rating -> demand bucket. "blue" (>=60) is the floor for a zone that's
+# worth sitting in; sky blue (50-59) and below is a move zone. Thresholds match
+# the frontend's colorFromRating so the words line up with the map colors.
+BLUE_RATING = 60.0
+
+
+def _bucket_name(rating: float) -> str:
+    r = float(rating)
+    if r >= 83:
+        return "green"
+    if r >= 75:
+        return "purple"
+    if r >= 68:
+        return "indigo"
+    if r >= 60:
+        return "blue"
+    if r >= 50:
+        return "sky blue"
+    if r >= 40:
+        return "yellow"
+    if r >= 30:
+        return "orange"
+    return "red"
+
+
 # Elevated-risk TLC zones — the highest violent-crime areas per NYPD CompStat
 # (South/Central Bronx, East Harlem, Brownsville / East New York). Used only
 # to surface a DRIVER-SAFETY tip (raise the minimum rider rating); it never
@@ -507,7 +532,81 @@ def build_driver_guidance(
     in_move_cooldown = move_cooldown_until_unix is not None and now_ts < int(move_cooldown_until_unix)
     hold_until_unix: Optional[int] = None
 
-    if current_rating >= 64 and current_next_rating >= (current_rating - 4) and current_continuation_raw >= 0.45 and settling_window:
+    # === Blue-floor rule ===========================================
+    # Sky blue (50-59) and below is NOT a sit zone: the driver belongs in a
+    # blue+ (>=60) zone. Below blue, move to a zone that will be blue+ when the
+    # driver ARRIVES; only hold if THIS zone is itself about to rise to blue+
+    # and nothing reachable is already stronger. Whenever the current zone is
+    # improving, say so, so the choice is informed. Anti-churn still applies:
+    # we won't push a move during cooldown or after repeated failed moves.
+    below_blue = current_rating < BLUE_RATING
+    current_will_improve = below_blue and current_next_rating >= BLUE_RATING
+    best_nearby_arrival = _safe_float(best_nearby.get("rating"), 0.0) if best_nearby else 0.0
+    best_nearby_dist = _safe_float(best_nearby.get("distance_miles"), 999.0) if best_nearby else 999.0
+    best_nearby_name = (best_nearby or {}).get("zone_name") or "the nearby zone"
+    nearby_blue_on_arrival = (
+        best_nearby is not None and best_nearby_arrival >= BLUE_RATING and best_nearby_dist <= 3.0
+    )
+    can_move = (not in_move_cooldown) and recent_move_attempts < 2
+    improvement_note: Optional[str] = None
+    blue_rule_applied = False
+
+    if below_blue:
+        # Current climbing ABOVE the best reachable zone -> it becomes the better
+        # spot, so hold for it instead of chasing a now-weaker move.
+        climbs_above_nearby = (
+            current_will_improve and current_next_rating > best_nearby_arrival + 2.0
+        )
+        if nearby_blue_on_arrival and can_move and not climbs_above_nearby:
+            action = "move_nearby"
+            confidence = 0.74
+            target_zone = dict(best_nearby)
+            hold_until_unix = None
+            reason_codes = ["below_blue", "target_blue_on_arrival", "blue_floor_move"]
+            message = f"Below blue here — move to {best_nearby_name}; it'll be {_bucket_name(best_nearby_arrival)} when you arrive."
+            if current_will_improve:
+                improvement_note = (
+                    f"This zone is picking up too (→ ~{_bucket_name(current_next_rating)}), "
+                    f"but {best_nearby_name} is already stronger when you arrive."
+                )
+            blue_rule_applied = True
+        elif current_will_improve:
+            action = "wait_dispatch"
+            confidence = 0.70
+            target_zone = None
+            hold_until_unix = now_ts + 6 * 60
+            reason_codes = ["below_blue_but_improving", "hold_for_rise"]
+            message = "Hold a few minutes — this zone is about to pick up."
+            if nearby_blue_on_arrival:
+                # Holding because this zone out-climbs the best reachable move.
+                improvement_note = (
+                    f"This zone is about to climb to ~{_bucket_name(current_next_rating)} in the "
+                    f"next few minutes — stronger than moving to {best_nearby_name}, so hold."
+                )
+            else:
+                improvement_note = (
+                    f"This zone is about to climb to ~{_bucket_name(current_next_rating)} "
+                    f"in the next few minutes; nothing nearby is stronger yet."
+                )
+            blue_rule_applied = True
+        elif (
+            can_move
+            and best_nearby is not None
+            and best_nearby_dist <= 2.5
+            and best_nearby_arrival >= current_rating + MOVE_NEARBY_MIN_IMPROVEMENT
+        ):
+            action = "move_nearby"
+            confidence = 0.64
+            target_zone = dict(best_nearby)
+            hold_until_unix = None
+            reason_codes = ["below_blue_no_blue_anywhere", "move_to_better"]
+            message = f"Weak here and nothing's blue nearby — {best_nearby_name} is the better option."
+            blue_rule_applied = True
+        # else: cooldown / churn / nothing better -> fall through to base logic.
+
+    if blue_rule_applied:
+        pass
+    elif current_rating >= 64 and current_next_rating >= (current_rating - 4) and current_continuation_raw >= 0.45 and settling_window:
         action = "hold"
         confidence = 0.75
         reason_codes.extend(["zone_still_strong", "continuation_supportive", "settling_window"])
@@ -600,7 +699,7 @@ def build_driver_guidance(
         reason_codes.append("low_trip_trap")
 
     # Fold the trap + safety tips into the headline message.
-    message = " ".join([part for part in (message, trap_advice, safety_advice) if part])
+    message = " ".join([part for part in (message, improvement_note, trap_advice, safety_advice) if part])
 
     return {
         "action": action,
@@ -613,6 +712,9 @@ def build_driver_guidance(
         "trap_zone": bool(trap_zone),
         "offline_until_arrival": bool(offline_until_arrival),
         "trap_advice": trap_advice,
+        "below_blue": bool(below_blue),
+        "current_will_improve": bool(current_will_improve),
+        "improvement_note": improvement_note,
         "nearby_candidates": nearby_candidates[:5],
         "current_zone": {
             "zone_id": current_zone_id,
