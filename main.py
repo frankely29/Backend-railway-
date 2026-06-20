@@ -8642,7 +8642,7 @@ def assistant_guidance(
                           f"{_magnet['label']}, {_magnet['descriptor']}.")
         else:
             _directive = f"Stay in {_cz.get('zone_name') or 'this zone'} — it's working."
-        _tips = [t for t in (guidance.get("trap_advice"), guidance.get("safety_advice")) if t]
+        _tips = [t for t in (guidance.get("improvement_note"), guidance.get("trap_advice"), guidance.get("safety_advice")) if t]
         guidance_message = " ".join([_directive] + _tips)
     except Exception:
         hotspot_hint = None
@@ -8679,6 +8679,9 @@ def assistant_guidance(
         "trap_advice": guidance.get("trap_advice"),
         "hotspot_hint": hotspot_hint,
         "pickup_anchor": pickup_anchor,
+        "below_blue": guidance.get("below_blue"),
+        "current_will_improve": guidance.get("current_will_improve"),
+        "improvement_note": guidance.get("improvement_note"),
         "ride_magnet": ride_magnet,
     }
 
