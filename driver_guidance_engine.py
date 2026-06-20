@@ -563,11 +563,11 @@ def build_driver_guidance(
             target_zone = dict(best_nearby)
             hold_until_unix = None
             reason_codes = ["below_blue", "target_blue_on_arrival", "blue_floor_move"]
-            message = f"Below blue here — move to {best_nearby_name}; it'll be {_bucket_name(best_nearby_arrival)} when you arrive."
+            message = f"Move to {best_nearby_name} — it'll be busier when you arrive."
             if current_will_improve:
                 improvement_note = (
-                    f"This zone is picking up too (→ ~{_bucket_name(current_next_rating)}), "
-                    f"but {best_nearby_name} is already stronger when you arrive."
+                    f"This area's picking up too, but {best_nearby_name} "
+                    f"will be better when you get there."
                 )
             blue_rule_applied = True
         elif current_will_improve:
@@ -576,17 +576,16 @@ def build_driver_guidance(
             target_zone = None
             hold_until_unix = now_ts + 6 * 60
             reason_codes = ["below_blue_but_improving", "hold_for_rise"]
-            message = "Hold a few minutes — this zone is about to pick up."
+            message = "Stay put — this area is about to pick up."
             if nearby_blue_on_arrival:
                 # Holding because this zone out-climbs the best reachable move.
                 improvement_note = (
-                    f"This zone is about to climb to ~{_bucket_name(current_next_rating)} in the "
-                    f"next few minutes — stronger than moving to {best_nearby_name}, so hold."
+                    "This area's about to get busier in a few minutes — "
+                    "better than moving, so stay."
                 )
             else:
                 improvement_note = (
-                    f"This zone is about to climb to ~{_bucket_name(current_next_rating)} "
-                    f"in the next few minutes; nothing nearby is stronger yet."
+                    "This area's about to get busier in a few minutes — sit tight."
                 )
             blue_rule_applied = True
         elif (
@@ -674,8 +673,7 @@ def build_driver_guidance(
     safety_advice: Optional[str] = None
     if safety_elevated_risk:
         safety_advice = (
-            f"Elevated-risk area — set your minimum rider rating to "
-            f"{SAFETY_MIN_RIDER_RATING:g}+ to screen for higher-rated riders."
+            f"Higher-risk area — only take {SAFETY_MIN_RIDER_RATING:g}+ riders here."
         )
         reason_codes.append("elevated_risk_zone")
 
@@ -691,8 +689,8 @@ def build_driver_guidance(
     trap_advice: Optional[str] = None
     if offline_until_arrival:
         trap_advice = (
-            f"This zone keeps pinging short, low-value trips — go offline until you reach "
-            f"{target_zone.get('zone_name')} so you reposition clean."
+            f"This area keeps sending short, cheap trips — go offline until you reach "
+            f"{target_zone.get('zone_name')}."
         )
         reason_codes.append("low_trip_trap_escape")
     elif trap_zone:

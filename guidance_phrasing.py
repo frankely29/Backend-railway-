@@ -1,35 +1,46 @@
 """Driver-facing phrasing for the guidance directive.
 
-The decision (move / hold / where) is made in the engine; this turns it into a
-line that reads like a sharp dispatcher instead of a template: lead with the
-call, state the demand level and which way it's trending (in the map's own
-colour words), name the spot the way a driver would say it ("the Broadway
-stop", not "Broadway, the local transit hub"), and contrast against the
-current zone on a move. Pure/string-only so it can be unit-tested offline.
+The engine decides move/hold/where; this turns it into one plain, confident
+line a driver can read at a glance: lead with STAY or GO, say how busy it is
+and which way it's heading in plain words, name the spot the way a driver
+would say it, and on a move give the payoff and the ETA. No jargon, no
+homework, nothing left out. Pure/string-only so it can be unit-tested.
 """
 
 import re
 from typing import Any, Mapping, Optional
 
-# Rating -> demand colour, matching the frontend's colorFromRating buckets so
-# the words line up with what the driver sees on the map.
-def bucket_word(rating: float) -> str:
+
+def _rank(rating: float) -> int:
+    """Coarse busy-ness rank, for comparing two zones."""
     r = float(rating or 0)
-    if r >= 83:
-        return "green"
     if r >= 75:
-        return "purple"
+        return 5
     if r >= 68:
-        return "indigo"
+        return 4
     if r >= 60:
-        return "blue"
+        return 3
     if r >= 50:
-        return "sky blue"
+        return 2
     if r >= 40:
-        return "yellow"
-    if r >= 30:
-        return "orange"
-    return "red"
+        return 1
+    return 0
+
+
+def demand_word(rating: float) -> str:
+    """Plain busy-ness word (no colour/jargon)."""
+    r = float(rating or 0)
+    if r >= 75:
+        return "red-hot"
+    if r >= 68:
+        return "very busy"
+    if r >= 60:
+        return "busy"
+    if r >= 50:
+        return "lukewarm"
+    if r >= 40:
+        return "slow"
+    return "quiet"
 
 
 def _trend(rating: float, next_rating: Optional[float]) -> str:
@@ -60,21 +71,16 @@ def spot_phrase(spot: Optional[Mapping[str, Any]]) -> Optional[str]:
         return None
     source = spot.get("source")
     if source == "pickup":
-        return f"the pickup cluster around {label}"
+        return f"the pickup cluster at {label}"
     if source == "curated":
         address = str(spot.get("address") or "").strip()
         return f"{label} ({address})" if address else label
-    # OSM structural magnet
     if spot.get("kind") == "rail":
         low = label.lower()
-        if low.endswith(("station", "terminal", "stop")):
+        if low.endswith(("station", "terminal", "stop", "hall", "concourse")):
             return label
         return f"the {label} stop"
     return label  # hospital / mall / university / attraction / transit_minor
-
-
-def _busy_tag(spot: Optional[Mapping[str, Any]]) -> str:
-    return " Busy right now." if spot and spot.get("prime_now") else ""
 
 
 def compose_guidance_directive(
@@ -92,46 +98,51 @@ def compose_guidance_directive(
     below_blue: bool = False,
     current_will_improve: bool = False,
 ) -> str:
-    czone = current_zone_name or "this zone"
-    cur_word = bucket_word(current_rating)
+    czone = current_zone_name or "this area"
     sp = spot_phrase(spot)
 
-    # --- Move to a different zone -----------------------------------------
+    # --- GO: move to a different zone --------------------------------------
     if moving and target_zone_name:
-        tgt_word = bucket_word(target_rating)
-        eta_txt = f" ~{int(round(float(target_eta)))} min." if target_eta else ""
-        climb_txt = " and still climbing" if _trend(target_rating_now, target_rating) == "climbing" else ""
-        spot_txt = f" {_cap(sp)} is the spot there." if sp else ""
-        if tgt_word != cur_word:
-            head = f"Head to {target_zone_name} — {tgt_word} there{climb_txt} vs {cur_word} here."
+        gap = _rank(target_rating) - _rank(current_rating)
+        if gap >= 2:
+            lead = "much busier than here"
+        elif gap == 1:
+            lead = "busier than here"
         else:
-            head = f"Head to {target_zone_name} — {tgt_word}{climb_txt} and stronger than here."
-        return (head + spot_txt + eta_txt).strip()
+            lead = f"{demand_word(target_rating)} there"
+        if _trend(target_rating_now, target_rating) == "climbing":
+            lead += " and still climbing"
+        spot_txt = f" Set up at {sp}." if sp else ""
+        eta_txt = f" ~{int(round(float(target_eta)))} min away." if target_eta else ""
+        return f"Go to {target_zone_name} — {lead}.{spot_txt}{eta_txt}".strip()
 
-    # --- Reposition within the same zone ----------------------------------
+    # --- Reposition within the same zone -----------------------------------
     if action == "micro_reposition":
         if sp:
-            return f"Shift spots in {czone} — it's gone quiet. Try {sp}."
-        return f"Shift to a busier corner of {czone} — your spot's gone quiet."
+            return f"Move to a busier corner of {czone} — try {sp}."
+        return f"Move to a busier corner of {czone}."
 
-    # --- Hold a blue+ zone -------------------------------------------------
+    # --- STAY: busy zone (blue+) -------------------------------------------
     if not below_blue:
+        word = demand_word(current_rating)
         trend = _trend(current_rating, current_next_rating)
-        anchor = f" Work {sp}." if sp else ""
+        busy_now = " It's busy right now." if (spot and spot.get("prime_now")) else ""
         if trend == "climbing":
-            return (f"Stay put in {czone} — {cur_word} and still building.{anchor}{_busy_tag(spot)}").rstrip()
+            tail = f" Work {sp}." if sp else ""
+            return f"Stay in {czone} — {word} and getting busier.{tail}{busy_now}".rstrip()
         if trend == "cooling":
-            tail = f" {_cap(sp)} while it lasts." if sp else ""
-            return (f"Hold in {czone} — {cur_word} but easing.{tail}").rstrip()
-        return (f"Stay in {czone} — {cur_word} and steady.{anchor}{_busy_tag(spot)}").rstrip()
+            tail = f" Work {sp}." if sp else ""
+            return f"Stay in {czone} — {word} but slowing down.{tail}".rstrip()
+        tail = f" Work {sp}." if sp else ""
+        return f"Stay in {czone} — {word} and steady.{tail}{busy_now}".rstrip()
 
-    # --- Below blue but about to climb (held for the rise) ----------------
+    # --- STAY: below blue but about to pick up -----------------------------
     if current_will_improve:
         if sp:
-            return f"Sit tight in {czone} — work {sp} while it builds."
-        return f"Sit tight in {czone} — it's about to build."
+            return f"Stay in {czone} — it's about to pick up. Work {sp}."
+        return f"Stay in {czone} — it's about to pick up."
 
-    # --- Below blue, not improving (nothing reachable is stronger yet) ----
+    # --- STAY: below blue, nothing reachable is better yet -----------------
     if sp:
-        return f"Hold in {czone} for now — work {sp}; nothing nearby beats it yet."
-    return f"Hold in {czone} for now — nothing nearby is stronger yet."
+        return f"Stay in {czone} for now — nothing nearby is better. Work {sp}."
+    return f"Stay in {czone} for now — nothing nearby is better."
