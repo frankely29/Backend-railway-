@@ -753,24 +753,25 @@ def build_driver_guidance(
     elif trap_zone:
         reason_codes.append("low_trip_trap")
 
-    # --- Airport overlay: FIFO queue mechanics the rating can't convey.
+    # --- Airport overlay: FIFO queue mechanics the rating can't convey. At an
+    # airport this advice IS the play (you're in a queue, not working a corner),
+    # so the endpoint leads the message with it instead of "work the X stop".
     airport_advice: Optional[str] = None
-    _airport = AIRPORT_ZONE_NAMES.get(current_zone_id)
-    if _airport:
+    is_airport = current_zone_id in AIRPORT_ZONE_NAMES
+    if is_airport:
+        _airport = AIRPORT_ZONE_NAMES[current_zone_id]
         reason_codes.append("airport_zone")
         if _airport == "LaGuardia" and (1 <= _frame_hour < 6):
-            airport_advice = "LaGuardia's rideshare lot is closed now (open 6am–1am)."
+            airport_advice = "LaGuardia's rideshare lot is closed now (open 6am–1am) — work the city."
         else:
             peak = (9 <= _frame_hour < 11) or (17 <= _frame_hour < 20)
-            lead = (
-                "Peak arrival hours — the queue should move."
-                if peak
-                else "Off-peak for arrivals — only queue if the lot's short, else work the city."
-            )
-            tail = "Hold your FIFO spot: don't go offline or decline 2+ in a row, or you lose your place."
+            if peak:
+                core = f"{_airport} — peak arrivals, hold your FIFO spot (don't go offline or decline)."
+            else:
+                core = f"{_airport} — arrivals are light; the city may beat the lot wait. Hold your spot if you stay."
             if _airport == "Newark":
-                tail = "Take NYC-bound trips only (NJ rule). " + tail
-            airport_advice = f"{lead} {tail}"
+                core += " NYC-bound trips only."
+            airport_advice = core
 
     # Fold the overlay tips into the headline message.
     message = " ".join(
@@ -790,6 +791,7 @@ def build_driver_guidance(
         "offline_until_arrival": bool(offline_until_arrival),
         "trap_advice": trap_advice,
         "airport_advice": airport_advice,
+        "is_airport": bool(is_airport),
         "below_blue": bool(below_blue),
         "current_will_improve": bool(current_will_improve),
         "improvement_note": improvement_note,

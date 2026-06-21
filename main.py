@@ -8772,7 +8772,13 @@ def assistant_guidance(
                     f"{demand_word(upcoming_surge['peak_rating'])} by "
                     f"{upcoming_surge['peak_clock']} — start drifting that way."
                 )
-        _tips = [t for t in (guidance.get("improvement_note"), _surge_tip, guidance.get("trap_advice"), guidance.get("airport_advice"), guidance.get("safety_advice")) if t]
+        # At an airport while holding, the queue advice IS the play — lead with
+        # it instead of "work the X stop", and don't also repeat it as a tip.
+        _airport_tip = guidance.get("airport_advice")
+        if guidance.get("is_airport") and not _moving and _airport_tip:
+            _directive = _airport_tip
+            _airport_tip = None
+        _tips = [t for t in (guidance.get("improvement_note"), _surge_tip, guidance.get("trap_advice"), _airport_tip, guidance.get("safety_advice")) if t]
         guidance_message = " ".join([_directive] + _tips)
     except Exception:
         hotspot_hint = None
