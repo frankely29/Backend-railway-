@@ -8772,7 +8772,7 @@ def assistant_guidance(
                     f"{demand_word(upcoming_surge['peak_rating'])} by "
                     f"{upcoming_surge['peak_clock']} — start drifting that way."
                 )
-        _tips = [t for t in (guidance.get("improvement_note"), _surge_tip, guidance.get("trap_advice"), guidance.get("safety_advice")) if t]
+        _tips = [t for t in (guidance.get("improvement_note"), _surge_tip, guidance.get("trap_advice"), guidance.get("airport_advice"), guidance.get("safety_advice")) if t]
         guidance_message = " ".join([_directive] + _tips)
     except Exception:
         hotspot_hint = None
@@ -8807,6 +8807,7 @@ def assistant_guidance(
         "trap_zone": guidance.get("trap_zone"),
         "offline_until_arrival": guidance.get("offline_until_arrival"),
         "trap_advice": guidance.get("trap_advice"),
+        "airport_advice": guidance.get("airport_advice"),
         "hotspot_hint": hotspot_hint,
         "pickup_anchor": pickup_anchor,
         "below_blue": guidance.get("below_blue"),
