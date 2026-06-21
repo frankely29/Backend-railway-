@@ -8741,11 +8741,18 @@ def assistant_guidance(
             current_will_improve=bool(guidance.get("current_will_improve")),
             far_reposition=bool(guidance.get("far_reposition")),
         )
-        # Anticipation: when the driver is holding, look ahead in the forecast
-        # for a reachable zone about to surge and tell them to pre-position.
+        # Anticipation: only when the driver is genuinely IDLE (holding in a
+        # quiet, sub-blue zone that isn't itself about to pick up) do we look
+        # ahead for a reachable surge to pre-position toward. We never pull a
+        # driver off a busy spot to chase a future surge — staying busy (high
+        # utilization) beats chasing, per the earnings research.
         _surge_tip = None
         upcoming_surge = None
-        if guidance.get("action") in ("hold", "wait_dispatch", "micro_reposition"):
+        if (
+            guidance.get("action") in ("hold", "wait_dispatch", "micro_reposition")
+            and guidance.get("below_blue")
+            and not guidance.get("current_will_improve")
+        ):
             try:
                 upcoming_surge = _find_upcoming_surge(
                     frame_bucket=frame_bucket,

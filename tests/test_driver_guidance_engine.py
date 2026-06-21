@@ -294,3 +294,43 @@ def test_guidance_far_field_not_triggered_for_a_weak_far_zone():
         },
     )
     assert guidance["far_reposition"] is False
+
+
+def _elevated_inputs(frame_time):
+    base = _base_guidance_inputs()
+    base["frame_time"] = frame_time
+    base["current_zone_id"] = 126  # Hunts Point — in SAFETY_ELEVATED_RISK_ZONE_IDS
+    base["current_borough"] = "Bronx"
+    return base
+
+
+def _quiet_snapshot():
+    return {
+        "tripless_minutes": 15, "stationary_minutes": 8, "movement_minutes": 4,
+        "dispatch_uncertainty": 0.3, "recent_move_attempts_without_trip": 0,
+        "recent_saved_trip_count_60m": 0, "moved_since_last_saved_trip": False,
+        "guidance_state": {},
+    }
+
+
+def test_safety_overnight_adds_phone_snatch_warning():
+    g = build_driver_guidance(
+        **_elevated_inputs("2026-04-07T02:00:00Z"),
+        activity_snapshot=_quiet_snapshot(),
+        zone_context={"current_zone": {"rating": 55, "next_rating": 55}, "nearby_candidates": []},
+    )
+    assert g["safety_elevated_risk"] is True
+    assert g["safety_overnight"] is True
+    assert "phone" in (g["safety_advice"] or "").lower()
+
+
+def test_safety_daytime_has_no_phone_warning():
+    g = build_driver_guidance(
+        **_elevated_inputs("2026-04-07T14:00:00Z"),
+        activity_snapshot=_quiet_snapshot(),
+        zone_context={"current_zone": {"rating": 55, "next_rating": 55}, "nearby_candidates": []},
+    )
+    assert g["safety_elevated_risk"] is True
+    assert g["safety_overnight"] is False
+    assert "phone" not in (g["safety_advice"] or "").lower()
+    assert "4.7" in (g["safety_advice"] or "")
