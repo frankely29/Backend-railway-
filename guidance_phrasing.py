@@ -149,5 +149,5 @@ def compose_guidance_directive(
 
     # --- STAY: below blue, nothing reachable is better yet -----------------
     if sp:
-        return f"Stay in {czone} for now — nothing nearby is better. Work {sp}."
+        return f"Stay in {czone} for now — work {sp}; nothing nearby beats it."
     return f"Stay in {czone} for now — nothing nearby is better."
