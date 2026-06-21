@@ -334,3 +334,50 @@ def test_safety_daytime_has_no_phone_warning():
     assert g["safety_overnight"] is False
     assert "phone" not in (g["safety_advice"] or "").lower()
     assert "4.7" in (g["safety_advice"] or "")
+
+
+def test_airport_overlay_jfk_peak_holds_fifo_advice():
+    base = _base_guidance_inputs()
+    base["frame_time"] = "2026-04-07T10:00:00Z"  # 10am peak
+    base["current_zone_id"] = 132  # JFK
+    base["current_zone_name"] = "JFK Airport"
+    g = build_driver_guidance(
+        **base, activity_snapshot=_quiet_snapshot(),
+        zone_context={"current_zone": {"rating": 64, "next_rating": 64}, "nearby_candidates": []},
+    )
+    assert "FIFO" in (g["airport_advice"] or "")
+    assert "Peak" in (g["airport_advice"] or "")
+
+
+def test_airport_overlay_newark_is_nyc_bound_only():
+    base = _base_guidance_inputs()
+    base["frame_time"] = "2026-04-07T13:00:00Z"
+    base["current_zone_id"] = 1  # Newark
+    base["current_zone_name"] = "Newark Airport"
+    g = build_driver_guidance(
+        **base, activity_snapshot=_quiet_snapshot(),
+        zone_context={"current_zone": {"rating": 55, "next_rating": 55}, "nearby_candidates": []},
+    )
+    assert "NYC-bound" in (g["airport_advice"] or "")
+
+
+def test_airport_overlay_lga_lot_closed_overnight():
+    base = _base_guidance_inputs()
+    base["frame_time"] = "2026-04-07T03:00:00Z"  # 3am
+    base["current_zone_id"] = 138  # LaGuardia
+    base["current_zone_name"] = "LaGuardia Airport"
+    g = build_driver_guidance(
+        **base, activity_snapshot=_quiet_snapshot(),
+        zone_context={"current_zone": {"rating": 40, "next_rating": 40}, "nearby_candidates": []},
+    )
+    assert "closed" in (g["airport_advice"] or "").lower()
+
+
+def test_non_airport_zone_has_no_airport_advice():
+    base = _base_guidance_inputs()
+    base["current_zone_id"] = 100  # not an airport zone
+    g = build_driver_guidance(
+        **base, activity_snapshot=_quiet_snapshot(),
+        zone_context={"current_zone": {"rating": 62, "next_rating": 62}, "nearby_candidates": []},
+    )
+    assert g["airport_advice"] is None

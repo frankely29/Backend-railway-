@@ -65,6 +65,12 @@ SAFETY_MIN_RIDER_RATING = 4.7
 TRAP_SHORT_TRIP_PENALTY_MIN = 0.5
 TRAP_SATURATION_PENALTY_MIN = 0.35
 
+# TLC airport zones. Airports run a FIFO queue with mechanics the rating can't
+# convey (hold your spot, EWR is NYC-bound only, LGA lot hours), so they get a
+# dedicated overlay. Peak arrival windows worth queueing per research: weekday
+# 9-11am and 5-8pm.
+AIRPORT_ZONE_NAMES = {132: "JFK", 138: "LaGuardia", 1: "Newark"}
+
 _zone_geometry_cache_lock = threading.Lock()
 _zone_geometry_cache_mtime: Optional[float] = None
 _zone_geometry_cache_path: Optional[str] = None
@@ -747,8 +753,29 @@ def build_driver_guidance(
     elif trap_zone:
         reason_codes.append("low_trip_trap")
 
-    # Fold the trap + safety tips into the headline message.
-    message = " ".join([part for part in (message, improvement_note, trap_advice, safety_advice) if part])
+    # --- Airport overlay: FIFO queue mechanics the rating can't convey.
+    airport_advice: Optional[str] = None
+    _airport = AIRPORT_ZONE_NAMES.get(current_zone_id)
+    if _airport:
+        reason_codes.append("airport_zone")
+        if _airport == "LaGuardia" and (1 <= _frame_hour < 6):
+            airport_advice = "LaGuardia's rideshare lot is closed now (open 6am–1am)."
+        else:
+            peak = (9 <= _frame_hour < 11) or (17 <= _frame_hour < 20)
+            lead = (
+                "Peak arrival hours — the queue should move."
+                if peak
+                else "Off-peak for arrivals — only queue if the lot's short, else work the city."
+            )
+            tail = "Hold your FIFO spot: don't go offline or decline 2+ in a row, or you lose your place."
+            if _airport == "Newark":
+                tail = "Take NYC-bound trips only (NJ rule). " + tail
+            airport_advice = f"{lead} {tail}"
+
+    # Fold the overlay tips into the headline message.
+    message = " ".join(
+        [part for part in (message, improvement_note, trap_advice, airport_advice, safety_advice) if part]
+    )
 
     return {
         "action": action,
@@ -762,6 +789,7 @@ def build_driver_guidance(
         "trap_zone": bool(trap_zone),
         "offline_until_arrival": bool(offline_until_arrival),
         "trap_advice": trap_advice,
+        "airport_advice": airport_advice,
         "below_blue": bool(below_blue),
         "current_will_improve": bool(current_will_improve),
         "improvement_note": improvement_note,
