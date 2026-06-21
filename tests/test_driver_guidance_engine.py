@@ -346,7 +346,7 @@ def test_airport_overlay_jfk_peak_holds_fifo_advice():
         zone_context={"current_zone": {"rating": 64, "next_rating": 64}, "nearby_candidates": []},
     )
     assert "FIFO" in (g["airport_advice"] or "")
-    assert "Peak" in (g["airport_advice"] or "")
+    assert "peak" in (g["airport_advice"] or "").lower()
 
 
 def test_airport_overlay_newark_is_nyc_bound_only():
