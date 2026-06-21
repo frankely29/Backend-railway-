@@ -122,3 +122,33 @@ def test_airport_peak_vs_offpeak_queue_discipline():
     )
     assert "FIFO" in (peak["airport_advice"] or "")
     assert "city" in (off["airport_advice"] or "").lower()
+
+
+def test_leaves_a_fading_zone_before_it_dies():
+    # Busy now but the forecast drops it a full bucket, and a clearly stronger
+    # zone is in reach -> a veteran leaves early instead of riding it down.
+    zc = {
+        "current_zone": {"rating": 66, "next_rating": 52},
+        "nearby_candidates": [{"zone_id": 9, "zone_name": "Holding Strong", "rating": 70,
+                               "rating_now": 70, "distance_miles": 1.5}],
+    }
+    g = build_driver_guidance(
+        **_inputs(100, "Fading Zone", "2025-06-27T19:00:00"),
+        activity_snapshot=_snap(), zone_context=zc,
+    )
+    assert g["action"] == "move_nearby"
+    assert (g["target_zone"] or {}).get("zone_name") == "Holding Strong"
+
+
+def test_cooling_zone_with_nothing_better_still_holds():
+    # Cooling but nowhere clearly better -> don't churn; hold.
+    zc = {
+        "current_zone": {"rating": 66, "next_rating": 56},
+        "nearby_candidates": [{"zone_id": 9, "zone_name": "Meh", "rating": 58,
+                               "rating_now": 58, "distance_miles": 1.5}],
+    }
+    g = build_driver_guidance(
+        **_inputs(100, "Cooling Zone", "2025-06-27T19:00:00"),
+        activity_snapshot=_snap(), zone_context=zc,
+    )
+    assert g["action"] in {"hold", "wait_dispatch", "micro_reposition"}

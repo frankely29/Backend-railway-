@@ -641,6 +641,23 @@ def build_driver_guidance(
         hold_until_unix = now_ts + 6 * 60
         message = "Hold here a bit longer — this zone still has enough continuation."
     elif (
+        current_rating >= BLUE_RATING
+        and current_next_rating <= current_rating - 8.0
+        and best_nearby is not None
+        and _safe_float(best_nearby.get("rating"), 0.0) >= current_next_rating + MOVE_NEARBY_MIN_IMPROVEMENT
+        and _safe_float(best_nearby.get("distance_miles"), 999.0) <= 2.5
+        and not in_move_cooldown
+        and recent_move_attempts < 3
+    ):
+        # This zone is busy now but the forecast has it dropping a full bucket,
+        # and a clearly stronger zone is in reach — a veteran leaves BEFORE it
+        # dies rather than riding it down.
+        action = "move_nearby"
+        confidence = 0.7
+        target_zone = dict(best_nearby)
+        reason_codes.extend(["current_zone_fading", "leave_before_it_dies"])
+        message = f"Move to {best_nearby.get('zone_name')} — this zone is about to cool off."
+    elif (
         current_rating >= 50
         and moved_since_last_saved_trip
         and recent_move_attempts >= 1
