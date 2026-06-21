@@ -8195,6 +8195,10 @@ def _extract_zone_track_entry_from_point(point: Dict[str, Any], mode_flags: Dict
 # Assumed average NYC rideshare speed for converting a candidate zone's
 # distance into an ETA, so we can score it at the driver's arrival time.
 GUIDANCE_TRAVEL_MPH = 12.0
+# How much a candidate zone's post-arrival trend tilts its score: a zone still
+# climbing ~40 min after you'd arrive is worth more than one already fading.
+# Gentle (0.25) so it refines the arrival-time score, not overrides it.
+GUIDANCE_TRAJECTORY_WEIGHT = 0.25
 
 
 def _build_guidance_zone_context(
@@ -8247,13 +8251,22 @@ def _build_guidance_zone_context(
         arrival_bin = min(len(points) - 1, max(0, int(round(eta_minutes / 20.0))))
         rating_now = _extract_zone_rating_from_point(points[0], mode_flags)
         arrival_rating = _extract_zone_rating_from_point(points[arrival_bin], mode_flags)
+        # Trajectory tilt: a zone that keeps RISING after you arrive (the
+        # nightlife ramp toward bar-close) is worth more than one with a brief
+        # spike that's already fading; blend the arrival score with where it's
+        # headed ~40 min later so the brain commits to rising zones like a
+        # veteran does, instead of optimizing only the single arrival minute.
+        later_bin = min(len(points) - 1, arrival_bin + 2)
+        later_rating = _extract_zone_rating_from_point(points[later_bin], mode_flags)
+        traj_value = arrival_rating + GUIDANCE_TRAJECTORY_WEIGHT * (later_rating - arrival_rating)
         cand = {
             "zone_id": zone_id,
             "zone_name": zone_payload.get("zone_name"),
             "borough": zone_payload.get("borough"),
             "distance_miles": round(float(distance), 3),
             "eta_minutes": round(float(eta_minutes), 1),
-            "rating": round(float(arrival_rating), 2),
+            "rating": round(float(traj_value), 2),          # trajectory-adjusted comparison value
+            "arrival_rating": round(float(arrival_rating), 2),
             "rating_now": round(float(rating_now), 2),
             "arrival_bin": int(arrival_bin),
         }
