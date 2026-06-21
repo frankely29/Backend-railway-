@@ -488,7 +488,15 @@ def build_driver_guidance(
     zone_context: dict[str, Any],
     now_ts: int,
 ) -> dict[str, Any]:
-    _ = user_id, frame_time, current_lat, current_lng, mode_flags, assistant_outlook_bucket
+    _ = user_id, current_lat, current_lng, mode_flags, assistant_outlook_bucket
+    # Overnight (9pm-5am) carries ~20-25x the violent-crime rate of rush hour
+    # (NYPD/Vital City), and the documented driver-specific threat is the
+    # "tap-and-snatch" phone/payment-app robbery by fake riders.
+    try:
+        _frame_hour = int(str(frame_time)[11:13])
+    except Exception:
+        _frame_hour = 12
+    overnight = _frame_hour >= 21 or _frame_hour < 5
     tripless_minutes = _safe_float(activity_snapshot.get("tripless_minutes"))
     stationary_minutes = _safe_float(activity_snapshot.get("stationary_minutes"))
     zone_dwell_minutes = _safe_float(activity_snapshot.get("zone_dwell_minutes"))
@@ -706,14 +714,19 @@ def build_driver_guidance(
                 reason_codes.append("far_field_reposition")
                 message = f"Slow all around here — head for {best_far.get('zone_name')}."
 
-    # --- Safety overlay: elevated-risk zone -> raise the rider-rating filter.
+    # --- Safety overlay: elevated-risk zone -> raise the rider-rating filter,
+    # and overnight add the phone-snatch defense (the documented driver threat).
     safety_elevated_risk = current_zone_id in SAFETY_ELEVATED_RISK_ZONE_IDS
     safety_advice: Optional[str] = None
     if safety_elevated_risk:
         safety_advice = (
             f"Higher-risk area — only take {SAFETY_MIN_RIDER_RATING:g}+ riders here."
         )
+        if overnight:
+            safety_advice += " Late-night: keep your phone mounted, never hand it to a rider."
         reason_codes.append("elevated_risk_zone")
+        if overnight:
+            reason_codes.append("overnight_high_risk")
 
     # --- Trap escape: stuck in a short-trip trap while being told to move.
     current_short_trip_penalty = _safe_float(current_zone.get("short_trip_penalty"), 0.0)
@@ -743,6 +756,7 @@ def build_driver_guidance(
         "message": message,
         "reason_codes": reason_codes,
         "safety_elevated_risk": bool(safety_elevated_risk),
+        "safety_overnight": bool(overnight),
         "safety_advice": safety_advice,
         "safety_min_rider_rating": SAFETY_MIN_RIDER_RATING if safety_elevated_risk else None,
         "trap_zone": bool(trap_zone),
