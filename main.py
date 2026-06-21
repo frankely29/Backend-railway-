@@ -67,7 +67,7 @@ from driver_guidance_engine import (
     zone_hotspot_hint,
 )
 from zone_live_anchor import select_zone_live_anchor, format_anchor_label
-from guidance_phrasing import compose_guidance_directive
+from guidance_phrasing import compose_guidance_directive, demand_word
 from hotspot_models import MicroHotspotScoreResult
 from hotspot_scoring import score_zones
 from artifact_freshness import evaluate_artifact_freshness
@@ -8417,6 +8417,91 @@ def _reverse_geocode_anchor_label(lat: float, lng: float) -> Optional[str]:
     return label
 
 
+# How far ahead (forecast bins, 20 min each) to look for an upcoming surge, and
+# the bar a zone must clear to be worth a pre-position heads-up. Research is
+# clear that surge is forecastable, not chaseable (it lags and collapses), so we
+# read the model's forward forecast rather than any live multiplier.
+_SURGE_LOOKAHEAD_BINS = 5            # up to ~100 min out
+_SURGE_MIN_PEAK_RATING = 66.0       # indigo-ish: a genuinely strong zone
+_SURGE_MIN_RISE = 12.0              # must climb meaningfully from its own now
+_SURGE_MAX_MILES = 6.0             # reachable to pre-position
+_SURGE_HORIZON_MIN = 90            # only flag surges within a useful planning window
+
+
+def _find_upcoming_surge(
+    *,
+    frame_bucket: Dict[str, Any],
+    current_lat: float,
+    current_lng: float,
+    centroid_lookup: Dict[int, Dict[str, Any]],
+    frame_key: str,
+    mode_flags: Dict[str, bool],
+    current_zone_id: Optional[int],
+    current_rating: float,
+) -> Optional[Dict[str, Any]]:
+    """Best reachable zone about to surge in the forecast, or None.
+
+    This is the "thinks faster than the driver" signal: it pre-positions on the
+    forward forecast (venues surge 30-90 min before letout, bar-close builds
+    ~2h ahead) instead of chasing a live multiplier.
+    """
+    try:
+        base_hour = int(str(frame_key)[11:13])
+        base_min = int(str(frame_key)[14:16])
+    except Exception:
+        return None
+    base_total = base_hour * 60 + base_min
+    best: Optional[Dict[str, Any]] = None
+    for zid_raw, payload in (frame_bucket or {}).items():
+        points = (payload or {}).get("points") or []
+        if len(points) < 2:
+            continue
+        try:
+            zid = int(payload.get("location_id") or zid_raw)
+        except Exception:
+            continue
+        if current_zone_id is not None and str(zid_raw) == str(current_zone_id):
+            continue
+        centroid = centroid_lookup.get(zid) or {}
+        clat, clng = centroid.get("centroid_lat"), centroid.get("centroid_lng")
+        if clat is None or clng is None:
+            continue
+        distance = _safe_haversine_miles(current_lat, current_lng, clat, clng)
+        if distance > _SURGE_MAX_MILES:
+            continue
+        now_rating = _extract_zone_rating_from_point(points[0], mode_flags)
+        peak_rating, peak_bin = now_rating, 0
+        for b in range(1, min(_SURGE_LOOKAHEAD_BINS + 1, len(points))):
+            r = _extract_zone_rating_from_point(points[b], mode_flags)
+            if r > peak_rating:
+                peak_rating, peak_bin = r, b
+        if peak_bin == 0:
+            continue
+        minutes_ahead = peak_bin * 20
+        eta_minutes = (distance / GUIDANCE_TRAVEL_MPH) * 60.0
+        if (
+            minutes_ahead <= _SURGE_HORIZON_MIN
+            and peak_rating >= _SURGE_MIN_PEAK_RATING
+            and peak_rating >= now_rating + _SURGE_MIN_RISE
+            and peak_rating >= current_rating + 8.0
+            and eta_minutes <= minutes_ahead + 20.0  # can be there around the peak
+        ):
+            if best is None or peak_rating > best["peak_rating"]:
+                peak_total = (base_total + minutes_ahead) % (24 * 60)
+                hh, mm = divmod(peak_total, 60)
+                suffix = "AM" if hh < 12 else "PM"
+                h12 = hh % 12 or 12
+                best = {
+                    "zone_id": zid,
+                    "zone_name": payload.get("zone_name"),
+                    "peak_rating": round(float(peak_rating), 2),
+                    "minutes_ahead": int(minutes_ahead),
+                    "peak_clock": f"{h12}:{mm:02d} {suffix}",
+                    "eta_minutes": round(float(eta_minutes), 1),
+                }
+    return best
+
+
 @app.get("/assistant/guidance")
 def assistant_guidance(
     frame_time: str,
@@ -8526,6 +8611,7 @@ def assistant_guidance(
     hotspot_hint = None
     pickup_anchor = None
     ride_magnet = None
+    upcoming_surge = None
     guidance_message = guidance.get("message") or ""
     try:
         from long_trip_hotspot_builder import hotspot_runtime_meta as _hrm
@@ -8655,7 +8741,31 @@ def assistant_guidance(
             current_will_improve=bool(guidance.get("current_will_improve")),
             far_reposition=bool(guidance.get("far_reposition")),
         )
-        _tips = [t for t in (guidance.get("improvement_note"), guidance.get("trap_advice"), guidance.get("safety_advice")) if t]
+        # Anticipation: when the driver is holding, look ahead in the forecast
+        # for a reachable zone about to surge and tell them to pre-position.
+        _surge_tip = None
+        upcoming_surge = None
+        if guidance.get("action") in ("hold", "wait_dispatch", "micro_reposition"):
+            try:
+                upcoming_surge = _find_upcoming_surge(
+                    frame_bucket=frame_bucket,
+                    current_lat=float(current_lat),
+                    current_lng=float(current_lng),
+                    centroid_lookup=centroid_lookup,
+                    frame_key=frame_key,
+                    mode_flags=mode_flags,
+                    current_zone_id=current_zone_id,
+                    current_rating=_safe_float_value(_cz.get("rating"), 0.0),
+                )
+            except Exception:
+                upcoming_surge = None
+            if upcoming_surge:
+                _surge_tip = (
+                    f"Heads up: {upcoming_surge['zone_name']} should get "
+                    f"{demand_word(upcoming_surge['peak_rating'])} by "
+                    f"{upcoming_surge['peak_clock']} — start drifting that way."
+                )
+        _tips = [t for t in (guidance.get("improvement_note"), _surge_tip, guidance.get("trap_advice"), guidance.get("safety_advice")) if t]
         guidance_message = " ".join([_directive] + _tips)
     except Exception:
         hotspot_hint = None
@@ -8696,6 +8806,7 @@ def assistant_guidance(
         "current_will_improve": guidance.get("current_will_improve"),
         "improvement_note": guidance.get("improvement_note"),
         "far_reposition": guidance.get("far_reposition"),
+        "upcoming_surge": upcoming_surge,
         "ride_magnet": ride_magnet,
     }
 
