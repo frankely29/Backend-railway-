@@ -503,6 +503,15 @@ def build_driver_guidance(
     except Exception:
         _frame_hour = 12
     overnight = _frame_hour >= 21 or _frame_hour < 5
+    # Long (45+ min) trips are catchable in rush-hour traffic and scarce when
+    # roads are clear, so the "fish for long trips" strategy only pays in the
+    # weekday rush windows. weekday: 0=Mon .. 6=Sun.
+    try:
+        import datetime as _dt
+        _weekday = _dt.date.fromisoformat(str(frame_time)[:10]).weekday()
+    except Exception:
+        _weekday = 0
+    long_trip_window = _weekday < 5 and (7 <= _frame_hour < 10 or 16 <= _frame_hour < 20)
     tripless_minutes = _safe_float(activity_snapshot.get("tripless_minutes"))
     stationary_minutes = _safe_float(activity_snapshot.get("stationary_minutes"))
     zone_dwell_minutes = _safe_float(activity_snapshot.get("zone_dwell_minutes"))
@@ -785,6 +794,7 @@ def build_driver_guidance(
         "reason_codes": reason_codes,
         "safety_elevated_risk": bool(safety_elevated_risk),
         "safety_overnight": bool(overnight),
+        "long_trip_window": bool(long_trip_window),
         "safety_advice": safety_advice,
         "safety_min_rider_rating": SAFETY_MIN_RIDER_RATING if safety_elevated_risk else None,
         "trap_zone": bool(trap_zone),

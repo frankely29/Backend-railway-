@@ -8793,7 +8793,19 @@ def assistant_guidance(
         if guidance.get("is_airport") and not _moving and _airport_tip:
             _directive = _airport_tip
             _airport_tip = None
-        _tips = [t for t in (guidance.get("improvement_note"), _surge_tip, guidance.get("trap_advice"), _airport_tip, guidance.get("safety_advice")) if t]
+        # Long (45+ min) trips are catchable in rush-hour traffic and originate
+        # in the Manhattan core — a brief strategy note for drivers fishing for
+        # them. Lowest priority: only on an otherwise-clean Manhattan rush msg.
+        _longtrip_tip = None
+        if (
+            guidance.get("long_trip_window")
+            and not _surge_tip
+            and not guidance.get("safety_advice")
+            and not guidance.get("trap_advice")
+            and str((guidance.get("current_zone") or {}).get("borough") or "").strip().lower() == "manhattan"
+        ):
+            _longtrip_tip = "Rush traffic — prime window to fish for 45+ min trips."
+        _tips = [t for t in (guidance.get("improvement_note"), _surge_tip, _longtrip_tip, guidance.get("trap_advice"), _airport_tip, guidance.get("safety_advice")) if t]
         guidance_message = " ".join([_directive] + _tips)
     except Exception:
         hotspot_hint = None
@@ -8836,6 +8848,7 @@ def assistant_guidance(
         "improvement_note": guidance.get("improvement_note"),
         "far_reposition": guidance.get("far_reposition"),
         "upcoming_surge": upcoming_surge,
+        "long_trip_window": guidance.get("long_trip_window"),
         "ride_magnet": ride_magnet,
     }
 

@@ -381,3 +381,17 @@ def test_non_airport_zone_has_no_airport_advice():
         zone_context={"current_zone": {"rating": 62, "next_rating": 62}, "nearby_candidates": []},
     )
     assert g["airport_advice"] is None
+
+
+def test_long_trip_window_is_weekday_rush_only():
+    # Long (45+ min) trips ride on rush-hour traffic; off-peak/weekends scarce.
+    def win(ft):
+        b = _base_guidance_inputs(); b["frame_time"] = ft
+        g = build_driver_guidance(**b, activity_snapshot=_quiet_snapshot(),
+            zone_context={"current_zone": {"rating": 62, "next_rating": 62}, "nearby_candidates": []})
+        return g["long_trip_window"]
+    assert win("2025-06-27T18:00:00") is True   # Friday 6pm rush
+    assert win("2025-06-27T08:00:00") is True   # Friday 8am rush
+    assert win("2025-06-27T14:00:00") is False  # Friday 2pm (no rush)
+    assert win("2025-06-28T18:00:00") is False  # Saturday 6pm (weekend)
+    assert win("2025-06-27T03:00:00") is False  # overnight
