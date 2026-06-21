@@ -8766,7 +8766,9 @@ def assistant_guidance(
                 )
             except Exception:
                 upcoming_surge = None
-            if upcoming_surge:
+            # Foresight is the lowest-priority tip: don't stack it on top of a
+            # safety or trap warning (keep those messages focused and short).
+            if upcoming_surge and not guidance.get("safety_advice") and not guidance.get("trap_advice"):
                 _surge_tip = (
                     f"Heads up: {upcoming_surge['zone_name']} should get "
                     f"{demand_word(upcoming_surge['peak_rating'])} by "
