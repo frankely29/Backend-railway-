@@ -8817,6 +8817,7 @@ def assistant_guidance(
             below_blue=bool(guidance.get("below_blue")),
             current_will_improve=bool(guidance.get("current_will_improve")),
             far_reposition=bool(guidance.get("far_reposition")),
+            held_for_antichurn=bool(guidance.get("held_for_antichurn")),
         )
         # Anticipation: only when the driver is genuinely IDLE (holding in a
         # quiet, sub-blue zone that isn't itself about to pick up) do we look

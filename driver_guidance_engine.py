@@ -576,7 +576,14 @@ def build_driver_guidance(
     nearby_blue_on_arrival = (
         best_nearby is not None and best_nearby_arrival >= BLUE_RATING and best_nearby_dist <= 3.0
     )
-    can_move = (not in_move_cooldown) and recent_move_attempts < 2
+    # A clearly-bad zone with a close, blue+ zone in reach is an ESCAPE, not
+    # churn — let the driver take it even after a couple of moves (the cooldown
+    # still blocks rapid re-bouncing). This stops the brain trapping a driver in
+    # a red trap zone when a strong zone is ~7 min away.
+    clear_close_upgrade = (
+        nearby_blue_on_arrival and current_rating < 50.0 and best_nearby_dist <= 2.0
+    )
+    can_move = (not in_move_cooldown) and (recent_move_attempts < 2 or clear_close_upgrade)
     improvement_note: Optional[str] = None
     blue_rule_applied = False
 
@@ -823,6 +830,12 @@ def build_driver_guidance(
         "current_will_improve": bool(current_will_improve),
         "improvement_note": improvement_note,
         "far_reposition": bool(far_reposition),
+        # Holding a sub-blue zone even though a blue+ zone is in reach -> we're
+        # waiting out anti-churn/cooldown, NOT because nothing's better. Lets the
+        # message stay honest instead of claiming "nothing nearby beats it".
+        "held_for_antichurn": bool(
+            action in {"hold", "wait_dispatch"} and below_blue and nearby_blue_on_arrival
+        ),
         "nearby_candidates": nearby_candidates[:5],
         "current_zone": {
             "zone_id": current_zone_id,

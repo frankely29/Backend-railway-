@@ -98,6 +98,7 @@ def compose_guidance_directive(
     below_blue: bool = False,
     current_will_improve: bool = False,
     far_reposition: bool = False,
+    held_for_antichurn: bool = False,
 ) -> str:
     czone = current_zone_name or "this area"
     sp = spot_phrase(spot)
@@ -146,6 +147,12 @@ def compose_guidance_directive(
         if sp:
             return f"Stay in {czone} — it's about to pick up. Work {sp}."
         return f"Stay in {czone} — it's about to pick up."
+
+    # --- STAY: below blue, holding out the anti-churn timer (a better zone IS
+    # nearby, we've just moved too much to chase it again right now) ----------
+    if held_for_antichurn:
+        tail = f" Work {sp} meanwhile." if sp else ""
+        return f"Sit tight in {czone} a few minutes — you've moved a lot without a trip, so let dispatch work.{tail}"
 
     # --- STAY: below blue, nothing reachable is better yet -----------------
     if sp:
