@@ -8204,6 +8204,17 @@ def _extract_zone_track_entry_from_point(point: Dict[str, Any], mode_flags: Dict
 # Assumed average NYC rideshare speed for converting a candidate zone's
 # distance into an ETA, so we can score it at the driver's arrival time.
 GUIDANCE_TRAVEL_MPH = 12.0
+# Time-of-day speed as a traffic proxy until a live-traffic feed is wired in:
+# NYC street speed averages ~11.5 mph midday, craters in the rush windows, and
+# opens up overnight (per iquantny / TLC speed data). Used for ETA so a cross-
+# town haul in rush traffic is judged on a realistic clock, not a flat speed.
+def _guidance_speed_for_hour(hour: int) -> float:
+    h = int(hour) % 24
+    if 0 <= h < 6:
+        return 16.0  # empty overnight roads
+    if (7 <= h < 10) or (16 <= h < 20):
+        return 9.0   # rush-hour congestion
+    return 12.0      # normal NYC daytime
 # The dock polls guidance as the driver's GPS jitters; only record a NEW
 # recommendation (and move the anti-churn counters) once per window, so rapid
 # identical polls can't inflate the move-attempt count and oscillate move/stay.
@@ -8222,7 +8233,12 @@ def _build_guidance_zone_context(
     current_lng: float,
     mode_flags: Dict[str, bool],
     centroid_lookup: Dict[int, Dict[str, Any]],
+    travel_mph: float = GUIDANCE_TRAVEL_MPH,
 ) -> Dict[str, Any]:
+    from shapely.geometry import Point as _ShpPoint
+    from shapely.ops import nearest_points as _nearest_points
+    _zone_geoms = _load_pickup_zone_geometries()
+    _driver_pt = _ShpPoint(float(current_lng), float(current_lat))
     current_zone_payload = None
     if current_zone_id is not None:
         current_zone_payload = frame_bucket.get(str(int(current_zone_id)))
@@ -8248,19 +8264,39 @@ def _build_guidance_zone_context(
             continue
         if current_zone_id is not None and str(zone_id_raw) == str(current_zone_id):
             continue
-        distance = _safe_haversine_miles(current_lat, current_lng, center_lat, center_lng)
+        # Cheap centroid pre-filter to bound the polygon work, generous enough
+        # not to drop a zone whose near EDGE is close even if its center is far.
+        center_distance = _safe_haversine_miles(current_lat, current_lng, center_lat, center_lng)
+        if center_distance > 13.0:
+            continue
+        # Distance to where the driver ENTERS the zone (nearest point of the
+        # polygon), not its center — a closer zone shouldn't look far just
+        # because its centroid sits deep inside it. TLC zones don't overlap, so
+        # only the current zone covers the driver; everything else gets the true
+        # edge distance.
+        geom = (_zone_geoms.get(zone_id) or {}).get("geometry") if center_distance <= 8.0 else None
+        if geom is not None:
+            try:
+                if geom.covers(_driver_pt):
+                    distance = 0.0
+                else:
+                    _np = _nearest_points(geom, _driver_pt)[0]
+                    distance = _safe_haversine_miles(current_lat, current_lng, _np.y, _np.x)
+            except Exception:
+                distance = center_distance
+        else:
+            distance = center_distance
         # Nearby band (<=3mi) drives the normal stay/move call; a wider band
         # (3-10mi) is kept so that when the whole local area is dead we can
         # still point the driver to where the demand actually is.
         if distance > 10.0:
             continue
         # Arrival-time scoring: a candidate is only worth what it will be by
-        # the time the driver gets there, not what it is right now. ETA =
-        # distance / assumed NYC speed; score the outlook bin nearest arrival
-        # (bins are 20 min apart) instead of points[0]. `rating` carries the
-        # arrival-time score so the existing move logic compares the right
-        # number; `rating_now` is kept for transparency.
-        eta_minutes = (distance / GUIDANCE_TRAVEL_MPH) * 60.0
+        # the time the driver gets there, not what it is right now. ETA = edge
+        # distance / a time-of-day speed (traffic proxy); score the outlook bin
+        # nearest arrival (bins are 20 min apart). `rating` carries the
+        # arrival-time score; `rating_now` is kept for transparency.
+        eta_minutes = (distance / float(travel_mph or GUIDANCE_TRAVEL_MPH)) * 60.0
         arrival_bin = min(len(points) - 1, max(0, int(round(eta_minutes / 20.0))))
         rating_now = _extract_zone_rating_from_point(points[0], mode_flags)
         arrival_rating = _extract_zone_rating_from_point(points[arrival_bin], mode_flags)
@@ -8613,6 +8649,10 @@ def assistant_guidance(
         db_query_all=_db_query_all,
         current_zone_id=current_zone_id,
     )
+    try:
+        _frame_hour_for_speed = int(str(frame_key)[11:13])
+    except Exception:
+        _frame_hour_for_speed = 12
     zone_context = _build_guidance_zone_context(
         frame_bucket=frame_bucket,
         current_zone_id=current_zone_id,
@@ -8620,6 +8660,7 @@ def assistant_guidance(
         current_lng=float(current_lng),
         mode_flags=mode_flags,
         centroid_lookup=centroid_lookup,
+        travel_mph=_guidance_speed_for_hour(_frame_hour_for_speed),
     )
     guidance = build_driver_guidance(
         user_id=int(user["id"]),
