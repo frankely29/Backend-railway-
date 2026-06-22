@@ -186,3 +186,21 @@ def test_held_message_is_honest_when_a_better_zone_is_nearby():
     )
     assert g["action"] in {"hold", "wait_dispatch"}
     assert g["held_for_antichurn"] is True
+
+
+def test_escape_fires_when_a_close_blue_exists_even_if_best_is_farther():
+    # Top-rated nearby (Boerum 76) is 2.7mi, but a close blue+ (Red Hook 69) is
+    # 1.4mi. Churned driver in a red zone should still escape (move).
+    zc = {
+        "current_zone": {"rating": 34, "next_rating": 34},
+        "nearby_candidates": [
+            {"zone_id": 8, "zone_name": "Boerum Hill", "rating": 76, "rating_now": 76, "distance_miles": 2.7},
+            {"zone_id": 9, "zone_name": "Red Hook", "rating": 69, "rating_now": 69, "distance_miles": 1.4},
+        ],
+    }
+    g = build_driver_guidance(
+        **_inputs(200, "Sunset Park East", "2025-06-22T15:00:00", borough="Brooklyn"),
+        activity_snapshot=_snap({"recent_move_attempts_without_trip": 2}),
+        zone_context=zc,
+    )
+    assert g["action"] == "move_nearby"

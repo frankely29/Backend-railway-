@@ -576,12 +576,18 @@ def build_driver_guidance(
     nearby_blue_on_arrival = (
         best_nearby is not None and best_nearby_arrival >= BLUE_RATING and best_nearby_dist <= 3.0
     )
-    # A clearly-bad zone with a close, blue+ zone in reach is an ESCAPE, not
+    # A clearly-bad zone with ANY close, blue+ zone in reach is an ESCAPE, not
     # churn — let the driver take it even after a couple of moves (the cooldown
-    # still blocks rapid re-bouncing). This stops the brain trapping a driver in
-    # a red trap zone when a strong zone is ~7 min away.
+    # still blocks rapid re-bouncing). Check the whole nearby list, not just the
+    # top-rated one, since the strongest zone may be a bit farther than a close
+    # blue+ option. Stops the brain trapping a driver in a red trap zone.
+    close_blue_exists = any(
+        _safe_float(c.get("rating"), 0.0) >= BLUE_RATING
+        and _safe_float(c.get("distance_miles"), 999.0) <= 2.0
+        for c in nearby_candidates
+    )
     clear_close_upgrade = (
-        nearby_blue_on_arrival and current_rating < 50.0 and best_nearby_dist <= 2.0
+        nearby_blue_on_arrival and current_rating < 50.0 and close_blue_exists
     )
     can_move = (not in_move_cooldown) and (recent_move_attempts < 2 or clear_close_upgrade)
     improvement_note: Optional[str] = None
