@@ -8519,6 +8519,7 @@ def _find_upcoming_surge(
     except Exception:
         return None
     base_total = base_hour * 60 + base_min
+    _speed = _guidance_speed_for_hour(base_hour)
     best: Optional[Dict[str, Any]] = None
     for zid_raw, payload in (frame_bucket or {}).items():
         points = (payload or {}).get("points") or []
@@ -8546,7 +8547,7 @@ def _find_upcoming_surge(
         if peak_bin == 0:
             continue
         minutes_ahead = peak_bin * 20
-        eta_minutes = (distance / GUIDANCE_TRAVEL_MPH) * 60.0
+        eta_minutes = (distance / float(_speed or GUIDANCE_TRAVEL_MPH)) * 60.0
         if (
             minutes_ahead <= _SURGE_HORIZON_MIN
             and peak_rating >= _SURGE_MIN_PEAK_RATING
@@ -8559,6 +8560,11 @@ def _find_upcoming_surge(
                 hh, mm = divmod(peak_total, 60)
                 suffix = "AM" if hh < 12 else "PM"
                 h12 = hh % 12 or 12
+                # When to actually LEAVE: surge time minus the drive. Keep the
+                # driver earning locally until then instead of deadheading early.
+                leave_in = max(0, int(minutes_ahead) - int(round(eta_minutes)))
+                _lt = (base_total + leave_in) % (24 * 60)
+                _lh, _lm = divmod(_lt, 60)
                 best = {
                     "zone_id": zid,
                     "zone_name": payload.get("zone_name"),
@@ -8566,6 +8572,8 @@ def _find_upcoming_surge(
                     "minutes_ahead": int(minutes_ahead),
                     "peak_clock": f"{h12}:{mm:02d} {suffix}",
                     "eta_minutes": round(float(eta_minutes), 1),
+                    "leave_in_minutes": int(leave_in),
+                    "leave_clock": f"{_lh % 12 or 12}:{_lm:02d} {'AM' if _lh < 12 else 'PM'}",
                 }
     return best
 
@@ -8846,12 +8854,29 @@ def assistant_guidance(
                 upcoming_surge = None
             # Foresight is the lowest-priority tip: don't stack it on top of a
             # safety or trap warning (keep those messages focused and short).
-            if upcoming_surge and not guidance.get("safety_advice") and not guidance.get("trap_advice"):
-                _surge_tip = (
-                    f"Heads up: {upcoming_surge['zone_name']} should get "
-                    f"{demand_word(upcoming_surge['peak_rating'])} by "
-                    f"{upcoming_surge['peak_clock']} — start drifting that way."
-                )
+            # And only surface it when it's nearly time to LEAVE (surge time
+            # minus the drive) — telling a driver to deadhead an hour early just
+            # burns empty miles. Until then, keep earning where they are.
+            _leave_in = int((upcoming_surge or {}).get("leave_in_minutes", 999))
+            if (
+                upcoming_surge
+                and _leave_in <= 30
+                and not guidance.get("safety_advice")
+                and not guidance.get("trap_advice")
+            ):
+                _z = upcoming_surge["zone_name"]
+                _w = demand_word(upcoming_surge["peak_rating"])
+                _eta_i = int(round(_safe_float_value(upcoming_surge.get("eta_minutes"), 0.0)))
+                if _leave_in <= 8:
+                    _surge_tip = (
+                        f"{_z} gets {_w} around {upcoming_surge['peak_clock']} — "
+                        f"head that way now (~{_eta_i} min)."
+                    )
+                else:
+                    _surge_tip = (
+                        f"{_z} gets {_w} around {upcoming_surge['peak_clock']} — keep earning "
+                        f"here, then head over around {upcoming_surge['leave_clock']} (~{_eta_i} min)."
+                    )
         # At an airport while holding, the queue advice IS the play — lead with
         # it instead of "work the X stop", and don't also repeat it as a tip.
         _airport_tip = guidance.get("airport_advice")
