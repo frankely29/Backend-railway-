@@ -8155,6 +8155,13 @@ def _safe_haversine_miles(lat1: Any, lng1: Any, lat2: Any, lng2: Any) -> float:
 
 
 def _assistant_track_priority_from_mode_flags(mode_flags: Dict[str, bool]) -> List[str]:
+    # Mirror the map's getVisibleScoreSourceForFeature precedence EXACTLY so the
+    # brain reads the same score the driver sees painted on the map: 45+ trips
+    # (citywide) > borough modes (zone-scoped via fall-through) > Manhattan mode
+    # > citywide_v3 default. Borough/Manhattan tracks are null for out-of-borough
+    # zones, so they fall through to citywide_v3 just like the map does.
+    if mode_flags.get("trips_45plus_mode"):
+        return ["trips_45plus_v3_shadow", "citywide_v3_shadow", "citywide_shadow"]
     if mode_flags.get("staten_island_mode"):
         return ["staten_island_v3_shadow", "staten_island_shadow", "citywide_v3_shadow", "citywide_shadow"]
     if mode_flags.get("bronx_wash_heights_mode"):
@@ -8163,7 +8170,9 @@ def _assistant_track_priority_from_mode_flags(mode_flags: Dict[str, bool]) -> Li
         return ["queens_v3_shadow", "queens_shadow", "citywide_v3_shadow", "citywide_shadow"]
     if mode_flags.get("brooklyn_mode"):
         return ["brooklyn_v3_shadow", "brooklyn_shadow", "citywide_v3_shadow", "citywide_shadow"]
-    return ["manhattan_v3_shadow", "manhattan_shadow", "citywide_v3_shadow", "citywide_shadow"]
+    if mode_flags.get("manhattan_mode"):
+        return ["manhattan_v3_shadow", "manhattan_shadow", "citywide_v3_shadow", "citywide_shadow"]
+    return ["citywide_v3_shadow", "citywide_shadow"]
 
 
 def _extract_zone_rating_from_point(point: Dict[str, Any], mode_flags: Dict[str, bool]) -> float:
@@ -8534,6 +8543,8 @@ def assistant_guidance(
     bronx_wash_heights_mode: int = 0,
     queens_mode: int = 0,
     brooklyn_mode: int = 0,
+    manhattan_mode: int = 0,
+    trips_45plus_mode: int = 0,
     user: sqlite3.Row = Depends(require_user),
 ):
     now_ts = int(time.time())
@@ -8542,6 +8553,8 @@ def assistant_guidance(
         "bronx_wash_heights_mode": bool(int(bronx_wash_heights_mode or 0)),
         "queens_mode": bool(int(queens_mode or 0)),
         "brooklyn_mode": bool(int(brooklyn_mode or 0)),
+        "manhattan_mode": bool(int(manhattan_mode or 0)),
+        "trips_45plus_mode": bool(int(trips_45plus_mode or 0)),
     }
     presence_row = _db_query_one("SELECT lat, lng FROM presence WHERE user_id=? LIMIT 1", (int(user["id"]),))
     current_lat = float(lat if lat is not None else (presence_row or {}).get("lat")) if (lat is not None or presence_row) else None
