@@ -8195,6 +8195,10 @@ def _extract_zone_track_entry_from_point(point: Dict[str, Any], mode_flags: Dict
 # Assumed average NYC rideshare speed for converting a candidate zone's
 # distance into an ETA, so we can score it at the driver's arrival time.
 GUIDANCE_TRAVEL_MPH = 12.0
+# The dock polls guidance as the driver's GPS jitters; only record a NEW
+# recommendation (and move the anti-churn counters) once per window, so rapid
+# identical polls can't inflate the move-attempt count and oscillate move/stay.
+GUIDANCE_RECORD_DEBOUNCE_SECONDS = 75
 # How much a candidate zone's post-arrival trend tilts its score: a zone still
 # climbing ~40 min after you'd arrive is worth more than one already fading.
 # Gentle (0.25) so it refines the arrival-time score, not overrides it.
@@ -8306,6 +8310,12 @@ def _persist_driver_guidance_state_and_outcome(
     current_rating = (guidance.get("current_zone") or {}).get("rating")
     target_rating = (guidance.get("target_zone") or {}).get("rating") if guidance.get("target_zone") else None
     prev = _db_query_one("SELECT * FROM driver_guidance_state WHERE user_id=? LIMIT 1", (int(user_id),))
+    last_generated = int((prev or {}).get("last_guidance_generated_at") or 0)
+    if last_generated and (int(now_ts) - last_generated) < GUIDANCE_RECORD_DEBOUNCE_SECONDS:
+        # A recommendation was just recorded — this is a rapid re-poll, not a new
+        # decision. Skip so we don't inflate the anti-churn counter (the cause of
+        # the move<->stay flip-flop seen on a stationary driver).
+        return
     prev_move_attempts = int((prev or {}).get("recent_move_attempts_without_trip") or 0)
     prev_wait_count = int((prev or {}).get("recent_wait_dispatch_count") or 0)
 
