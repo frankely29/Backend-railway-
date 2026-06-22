@@ -25,10 +25,14 @@ TRACK_KEYS = (
     "brooklyn_shadow",
     "staten_island_v3_shadow",
     "staten_island_shadow",
+    # "45+ trips" mode (citywide scope) — the map paints this when the toggle is
+    # on, so guidance must be able to read it too or the two contradict.
+    "trips_45plus_v3_shadow",
 )
 TRACK_SOURCES = {
     "citywide_v3_shadow": ("citywide_v3",),
     "citywide_shadow": ("citywide_v2", "citywide"),
+    "trips_45plus_v3_shadow": ("trips_45plus_v3",),
     "manhattan_v3_shadow": ("manhattan_v3",),
     "manhattan_shadow": ("manhattan_v2", "manhattan"),
     "bronx_wash_heights_v3_shadow": ("bronx_wash_heights_v3",),
