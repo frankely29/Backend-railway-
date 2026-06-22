@@ -152,3 +152,37 @@ def test_cooling_zone_with_nothing_better_still_holds():
         activity_snapshot=_snap(), zone_context=zc,
     )
     assert g["action"] in {"hold", "wait_dispatch", "micro_reposition"}
+
+
+def test_escapes_a_bad_zone_to_a_close_strong_one_despite_recent_moves():
+    # Red trap zone (34) with a blue+ zone ~1.5mi away. Even after 2 recent moves
+    # a veteran takes the short hop to the strong zone — that's escape, not churn.
+    zc = {
+        "current_zone": {"rating": 34, "next_rating": 34},
+        "nearby_candidates": [{"zone_id": 9, "zone_name": "Park Slope", "rating": 69,
+                               "rating_now": 69, "distance_miles": 1.5}],
+    }
+    g = build_driver_guidance(
+        **_inputs(200, "Sunset Park East", "2025-06-22T15:00:00", borough="Brooklyn"),
+        activity_snapshot=_snap({"recent_move_attempts_without_trip": 2}),
+        zone_context=zc,
+    )
+    assert g["action"] == "move_nearby"
+    assert (g["target_zone"] or {}).get("zone_name") == "Park Slope"
+
+
+def test_held_message_is_honest_when_a_better_zone_is_nearby():
+    # Sky zone (55) held due to anti-churn while a blue+ zone is nearby -> the
+    # message must NOT claim "nothing nearby beats it".
+    zc = {
+        "current_zone": {"rating": 55, "next_rating": 55},
+        "nearby_candidates": [{"zone_id": 9, "zone_name": "Better Zone", "rating": 65,
+                               "rating_now": 65, "distance_miles": 1.5}],
+    }
+    g = build_driver_guidance(
+        **_inputs(200, "Sky Zone", "2025-06-22T15:00:00", borough="Brooklyn"),
+        activity_snapshot=_snap({"recent_move_attempts_without_trip": 2}),
+        zone_context=zc,
+    )
+    assert g["action"] in {"hold", "wait_dispatch"}
+    assert g["held_for_antichurn"] is True
