@@ -197,6 +197,34 @@ def test_churned_sky_driver_takes_the_close_blue_hop_not_a_hold():
     assert (g["target_zone"] or {}).get("zone_name") == "Sunset Park West"
 
 
+def test_close_blue_escape_stays_consistent_through_cooldown():
+    # After issuing a move to a close blue zone, a later poll WHILE the move
+    # cooldown is still active must keep pointing at that same zone — not flip
+    # to "sit tight" (the GO->STAY contradiction a driver flagged as
+    # inconsistent). A close blue+ is a stable destination, so the advice stays
+    # consistent until the driver actually arrives.
+    zc = {
+        "current_zone": {"rating": 54, "next_rating": 54},
+        "nearby_candidates": [
+            {"zone_id": 228, "zone_name": "Sunset Park West", "rating": 64,
+             "rating_now": 64, "distance_miles": 0.85},
+        ],
+    }
+    g = build_driver_guidance(
+        **_inputs(14, "Bay Ridge", "2025-06-23T17:05:00", borough="Brooklyn"),
+        activity_snapshot=_snap({
+            "recent_move_attempts_without_trip": 3,
+            "guidance_state": {
+                "last_guidance_action": "move_nearby",
+                "last_move_guidance_at": 1_800_000_000 - 60,  # 1 min ago -> still in cooldown
+            },
+        }),
+        zone_context=zc,
+    )
+    assert g["action"] == "move_nearby"
+    assert (g["target_zone"] or {}).get("zone_name") == "Sunset Park West"
+
+
 def test_held_message_is_honest_when_a_better_zone_is_nearby():
     # Sky zone (55), churned, with a blue+ zone in view but a bit too far to
     # chase right now (2.3mi -> beyond the close-escape range) -> we hold, and
