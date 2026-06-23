@@ -173,6 +173,47 @@ def test_escapes_a_bad_zone_to_a_close_strong_one_despite_recent_moves():
     assert (g["target_zone"] or {}).get("zone_name") == "Park Slope"
 
 
+def test_picks_the_close_good_zone_over_a_farther_marginally_better_one():
+    # Be efficient ($40/hr): a blue zone right here (62 @0.8mi) beats driving
+    # 3mi past it for a marginally-hotter one (70). Unpaid miles cost more than
+    # a couple of rating points.
+    zc = {
+        "current_zone": {"rating": 54, "next_rating": 54},
+        "nearby_candidates": [
+            {"zone_id": 70, "zone_name": "Far Better", "rating": 70,
+             "rating_now": 70, "distance_miles": 3.0},
+            {"zone_id": 62, "zone_name": "Close Good", "rating": 62,
+             "rating_now": 62, "distance_miles": 0.8},
+        ],
+    }
+    g = build_driver_guidance(
+        **_inputs(14, "Bay Ridge", "2025-06-23T17:00:00", borough="Brooklyn"),
+        activity_snapshot=_snap(), zone_context=zc,
+    )
+    assert g["action"] == "move_nearby"
+    assert (g["target_zone"] or {}).get("zone_name") == "Close Good"
+
+
+def test_a_much_better_zone_is_still_worth_the_drive():
+    # But don't be penny-wise: a green zone (84) a bit farther (2.4mi) clears the
+    # deadhead cost over a close blue (62 @0.8mi) — take the clearly-better one.
+    zc = {
+        "current_zone": {"rating": 54, "next_rating": 54},
+        "nearby_candidates": [
+            {"zone_id": 84, "zone_name": "Green Hot", "rating": 84,
+             "rating_now": 84, "distance_miles": 2.4},
+            {"zone_id": 62, "zone_name": "Close Good", "rating": 62,
+             "rating_now": 62, "distance_miles": 0.8},
+        ],
+    }
+    g = build_driver_guidance(
+        **_inputs(14, "Bay Ridge", "2025-06-23T17:00:00", borough="Brooklyn"),
+        activity_snapshot=_snap(), zone_context=zc,
+    )
+    assert g["action"] == "move_nearby"
+    assert (g["target_zone"] or {}).get("zone_name") == "Green Hot"
+
+
 def test_churned_sky_driver_takes_the_close_blue_hop_not_a_hold():
     # IMG_4138 live board: Bay Ridge (sky 54), churned (2 moves), with Sunset
     # Park West (blue 64) less than a mile away. Sky is a move zone — crossing

@@ -28,6 +28,12 @@ BLUE_RATING = 60.0
 # A nearby zone this many points better (~2 demand buckets) is an obvious
 # upgrade a human always takes — it overrides anti-churn (not the cooldown).
 LARGE_UPGRADE_GAP = 15.0
+# Per-mile "deadhead" penalty for ranking move targets. Driving to a zone is
+# unpaid time, so among zones that already clear the busy floor we prefer the
+# CLOSEST good-enough one over a marginally-hotter one farther away — the goal
+# is $40/hr, and saved empty miles beat a couple of rating points. ~5 pts/mile
+# means a zone has to be ~half a bucket better to be worth each extra mile.
+DISTANCE_PENALTY_PER_MILE = 5.0
 
 
 def _bucket_name(rating: float) -> str:
@@ -607,6 +613,21 @@ def build_driver_guidance(
         (below_blue and nearby_blue_on_arrival and close_blue_exists)
         or obvious_upgrade is not None
     )
+    # Closest-BEST target: among blue+ zones in reach, pick the one that nets the
+    # most after the unpaid drive (rating minus a per-mile deadhead penalty), so
+    # we send the driver to the nearest good-enough zone instead of driving them
+    # past it to a marginally-hotter one. This is the "$40/hr, be efficient" rule.
+    def _net_after_drive(c: Dict[str, Any]) -> float:
+        return (
+            _safe_float(c.get("rating"), 0.0)
+            - DISTANCE_PENALTY_PER_MILE * _safe_float(c.get("distance_miles"), 999.0)
+        )
+    blue_in_reach = [
+        c for c in nearby_candidates
+        if _safe_float(c.get("rating"), 0.0) >= BLUE_RATING
+        and _safe_float(c.get("distance_miles"), 999.0) <= 3.0
+    ]
+    efficient_blue_target = max(blue_in_reach, key=_net_after_drive) if blue_in_reach else None
     # A clear blue-floor escape (close blue+ while below blue, or a +15 obvious
     # upgrade) overrides BOTH the move-attempt gate AND the cooldown. A close
     # blue zone is a stable DESTINATION: we keep pointing the driver at it every
@@ -625,15 +646,17 @@ def build_driver_guidance(
             current_will_improve and current_next_rating > best_nearby_arrival + 2.0
         )
         if nearby_blue_on_arrival and can_move and not climbs_above_nearby:
+            _blue_target = efficient_blue_target or best_nearby
+            _blue_target_name = (_blue_target or {}).get("zone_name") or best_nearby_name
             action = "move_nearby"
             confidence = 0.74
-            target_zone = dict(best_nearby)
+            target_zone = dict(_blue_target)
             hold_until_unix = None
             reason_codes = ["below_blue", "target_blue_on_arrival", "blue_floor_move"]
-            message = f"Move to {best_nearby_name} — it'll be busier when you arrive."
+            message = f"Move to {_blue_target_name} — it'll be busier when you arrive."
             if current_will_improve:
                 improvement_note = (
-                    f"This area's picking up too, but {best_nearby_name} "
+                    f"This area's picking up too, but {_blue_target_name} "
                     f"will be better when you get there."
                 )
             blue_rule_applied = True
