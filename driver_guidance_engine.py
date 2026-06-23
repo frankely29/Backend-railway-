@@ -607,7 +607,14 @@ def build_driver_guidance(
         (below_blue and nearby_blue_on_arrival and close_blue_exists)
         or obvious_upgrade is not None
     )
-    can_move = (not in_move_cooldown) and (recent_move_attempts < 2 or clear_close_upgrade)
+    # A clear blue-floor escape (close blue+ while below blue, or a +15 obvious
+    # upgrade) overrides BOTH the move-attempt gate AND the cooldown. A close
+    # blue zone is a stable DESTINATION: we keep pointing the driver at it every
+    # poll until they arrive, instead of issuing a move and then flipping to
+    # "sit tight" mid-cooldown (the GO->STAY contradiction). It's not churn —
+    # it's the same target reaffirmed. The cooldown still blocks moves whenever
+    # there's no clear escape, so ordinary anti-spam is untouched.
+    can_move = clear_close_upgrade or ((not in_move_cooldown) and recent_move_attempts < 2)
     improvement_note: Optional[str] = None
     blue_rule_applied = False
 
@@ -671,10 +678,11 @@ def build_driver_guidance(
         reason_codes.extend(["zone_still_strong", "continuation_supportive", "settling_window"])
         hold_until_unix = now_ts + 6 * 60
         message = "Hold here a bit longer — this zone still has enough continuation."
-    elif obvious_upgrade is not None and not in_move_cooldown:
+    elif obvious_upgrade is not None:
         # A clearly much-better zone (~2 buckets up) is right here — a human
-        # always takes it. Don't let "you've moved a lot" pin a driver in an OK
-        # zone when a great one is a couple minutes away.
+        # always takes it. Don't let "you've moved a lot" OR a lingering move
+        # cooldown pin a driver in an OK zone when a great one is a couple
+        # minutes away; it's a stable target, so reaffirm it until they arrive.
         action = "move_nearby"
         confidence = 0.74
         target_zone = dict(obvious_upgrade)
