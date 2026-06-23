@@ -8215,6 +8215,52 @@ def _guidance_speed_for_hour(hour: int) -> float:
     if (7 <= h < 10) or (16 <= h < 20):
         return 9.0   # rush-hour congestion
     return 12.0      # normal NYC daytime
+
+
+def _borough_key(value: Any) -> str:
+    s = str(value or "").strip().lower()
+    if "staten" in s:
+        return "staten island"
+    if "ewr" in s or "newark" in s:
+        return "ewr"
+    if "manhattan" in s:
+        return "manhattan"
+    if "bronx" in s:
+        return "bronx"
+    if "brooklyn" in s:
+        return "brooklyn"
+    if "queens" in s:
+        return "queens"
+    return s
+
+
+# Which boroughs you can actually DRIVE between (bridges/tunnels). A straight
+# line across the harbor (Manhattan<->Staten Island) or to EWR/NJ is NOT a
+# drivable path, so those zones must never be a reposition target even when the
+# edge distance looks short. Staten Island connects to the rest of the city by
+# road only via Brooklyn (Verrazzano).
+_BOROUGH_ROAD_ADJ = {
+    "manhattan": {"manhattan", "bronx", "brooklyn", "queens"},
+    "bronx": {"bronx", "manhattan", "queens"},
+    "brooklyn": {"brooklyn", "queens", "manhattan", "staten island"},
+    "queens": {"queens", "brooklyn", "manhattan", "bronx"},
+    "staten island": {"staten island", "brooklyn"},
+    "ewr": {"ewr"},
+}
+
+
+def _borough_road_reachable(from_borough: Any, to_borough: Any) -> bool:
+    """True unless reaching the candidate borough needs a water crossing with no
+    short road path (so we never route a driver across the harbor or to NJ)."""
+    fb, tb = _borough_key(from_borough), _borough_key(to_borough)
+    if not fb or not tb:
+        return True  # unknown -> don't exclude
+    if tb == "ewr":
+        return False  # NJ/Newark is out of the NYC reposition area
+    allowed = _BOROUGH_ROAD_ADJ.get(fb)
+    if allowed is None:
+        return True
+    return tb in allowed
 # The dock polls guidance as the driver's GPS jitters; only record a NEW
 # recommendation (and move the anti-churn counters) once per window, so rapid
 # identical polls can't inflate the move-attempt count and oscillate move/stay.
@@ -8234,6 +8280,7 @@ def _build_guidance_zone_context(
     mode_flags: Dict[str, bool],
     centroid_lookup: Dict[int, Dict[str, Any]],
     travel_mph: float = GUIDANCE_TRAVEL_MPH,
+    current_borough: Optional[str] = None,
 ) -> Dict[str, Any]:
     from shapely.geometry import Point as _ShpPoint
     from shapely.ops import nearest_points as _nearest_points
@@ -8263,6 +8310,10 @@ def _build_guidance_zone_context(
         if center_lat is None or center_lng is None:
             continue
         if current_zone_id is not None and str(zone_id_raw) == str(current_zone_id):
+            continue
+        # Never route across water where there's no road (harbor to Staten
+        # Island, or to EWR/NJ) — the straight-line edge distance would lie.
+        if not _borough_road_reachable(current_borough, zone_payload.get("borough")):
             continue
         # Cheap centroid pre-filter to bound the polygon work, generous enough
         # not to drop a zone whose near EDGE is close even if its center is far.
@@ -8506,6 +8557,7 @@ def _find_upcoming_surge(
     mode_flags: Dict[str, bool],
     current_zone_id: Optional[int],
     current_rating: float,
+    current_borough: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Best reachable zone about to surge in the forecast, or None.
 
@@ -8530,6 +8582,8 @@ def _find_upcoming_surge(
         except Exception:
             continue
         if current_zone_id is not None and str(zid_raw) == str(current_zone_id):
+            continue
+        if not _borough_road_reachable(current_borough, payload.get("borough")):
             continue
         centroid = centroid_lookup.get(zid) or {}
         clat, clng = centroid.get("centroid_lat"), centroid.get("centroid_lng")
@@ -8669,6 +8723,7 @@ def assistant_guidance(
         mode_flags=mode_flags,
         centroid_lookup=centroid_lookup,
         travel_mph=_guidance_speed_for_hour(_frame_hour_for_speed),
+        current_borough=current_borough,
     )
     guidance = build_driver_guidance(
         user_id=int(user["id"]),
@@ -8849,6 +8904,7 @@ def assistant_guidance(
                     mode_flags=mode_flags,
                     current_zone_id=current_zone_id,
                     current_rating=_safe_float_value(_cz.get("rating"), 0.0),
+                    current_borough=current_borough,
                 )
             except Exception:
                 upcoming_surge = None
