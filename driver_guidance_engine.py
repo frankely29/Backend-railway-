@@ -579,11 +579,13 @@ def build_driver_guidance(
     nearby_blue_on_arrival = (
         best_nearby is not None and best_nearby_arrival >= BLUE_RATING and best_nearby_dist <= 3.0
     )
-    # A clearly-bad zone with ANY close, blue+ zone in reach is an ESCAPE, not
-    # churn — let the driver take it even after a couple of moves (the cooldown
-    # still blocks rapid re-bouncing). Check the whole nearby list, not just the
-    # top-rated one, since the strongest zone may be a bit farther than a close
-    # blue+ option. Stops the brain trapping a driver in a red trap zone.
+    # Crossing the blue floor is an ESCAPE, not churn. ANY below-blue zone (red
+    # OR sky) with a close blue+ zone in reach should hand the driver that short
+    # hop even after a couple of moves — sky is a move zone by the blue-floor
+    # rule, so sitting in it while a blue zone is ~a mile away is the exact
+    # "not smarter than a human" complaint. The 11-min cooldown still blocks
+    # rapid re-bouncing. Check the whole nearby list, not just the top-rated
+    # one, since the strongest zone may be a bit farther than a close blue+.
     close_blue_exists = any(
         _safe_float(c.get("rating"), 0.0) >= BLUE_RATING
         and _safe_float(c.get("distance_miles"), 999.0) <= 2.0
@@ -592,7 +594,8 @@ def build_driver_guidance(
     # An OBVIOUS upgrade: a clearly stronger zone (>= +15, ~2 buckets) within
     # easy reach. A human ALWAYS takes this — it must never be blocked by
     # "you've moved a lot" (only the rapid-rebounce cooldown can). Pick the
-    # closest such zone so we don't send them farther than needed.
+    # closest such zone so we don't send them farther than needed. This is the
+    # path for an already-blue+ driver to jump to a much-hotter zone.
     obvious_upgrade: Optional[Dict[str, Any]] = None
     for c in nearby_candidates:
         cr = _safe_float(c.get("rating"), 0.0)
@@ -601,7 +604,7 @@ def build_driver_guidance(
             if obvious_upgrade is None or cd < _safe_float(obvious_upgrade.get("distance_miles"), 999.0):
                 obvious_upgrade = c
     clear_close_upgrade = (
-        (nearby_blue_on_arrival and current_rating < 50.0 and close_blue_exists)
+        (below_blue and nearby_blue_on_arrival and close_blue_exists)
         or obvious_upgrade is not None
     )
     can_move = (not in_move_cooldown) and (recent_move_attempts < 2 or clear_close_upgrade)

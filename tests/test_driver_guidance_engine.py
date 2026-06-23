@@ -137,6 +137,10 @@ def test_guidance_blue_floor_holds_when_zone_about_to_reach_blue():
 
 
 def test_guidance_case_d_wait_dispatch_after_recent_move_without_trip():
+    # Anti-churn: after two fruitless moves, a slightly-better blue zone that is
+    # a bit too far to be a cheap hop (2.5mi -> beyond the close-escape range)
+    # is not worth chasing -> let dispatch work. (A blue zone within the close
+    # range would instead be a blue-floor escape; this is the farther case.)
     guidance = build_driver_guidance(
         **_base_guidance_inputs(),
         activity_snapshot={
@@ -151,7 +155,7 @@ def test_guidance_case_d_wait_dispatch_after_recent_move_without_trip():
         },
         zone_context={
             "current_zone": {"rating": 56, "next_rating": 54, "continuation_raw": 0.47},
-            "nearby_candidates": [{"zone_id": 4, "rating": 62, "distance_miles": 1.0}],
+            "nearby_candidates": [{"zone_id": 4, "rating": 62, "distance_miles": 2.5}],
         },
     )
     assert guidance["action"] in {"wait_dispatch", "hold"}
