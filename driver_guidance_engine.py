@@ -33,7 +33,14 @@ LARGE_UPGRADE_GAP = 15.0
 # CLOSEST good-enough one over a marginally-hotter one farther away — the goal
 # is $40/hr, and saved empty miles beat a couple of rating points. ~5 pts/mile
 # means a zone has to be ~half a bucket better to be worth each extra mile.
+# (Fallback only — used when the builder didn't supply a forecast-based
+# move_value; otherwise the next-hour expected value already folds in distance.)
 DISTANCE_PENALTY_PER_MILE = 5.0
+# How much better STAYING must be, over the next hour, before we keep a driver
+# in a below-blue zone instead of sending them to a reachable blue+ one. Only
+# blocks a discretionary move (a clearly-climbing current zone); a real escape
+# or a much-better zone has a far bigger gap and sails past it.
+HOUR_STAY_PREFERENCE = 4.0
 
 
 def _bucket_name(rating: float) -> str:
@@ -613,11 +620,17 @@ def build_driver_guidance(
         (below_blue and nearby_blue_on_arrival and close_blue_exists)
         or obvious_upgrade is not None
     )
-    # Closest-BEST target: among blue+ zones in reach, pick the one that nets the
-    # most after the unpaid drive (rating minus a per-mile deadhead penalty), so
-    # we send the driver to the nearest good-enough zone instead of driving them
-    # past it to a marginally-hotter one. This is the "$40/hr, be efficient" rule.
+    # Worth-the-move value: what a candidate earns over the next hour AFTER you
+    # arrive, minus the deadhead cost of driving there. The builder computes this
+    # from the forecast curve (move_value); when it's absent (unit tests/degraded
+    # data) fall back to the single-point rating minus a per-mile travel penalty.
+    # Picking the highest move_value sends the driver to the nearest good-enough
+    # zone instead of driving them past it to a marginally-hotter one, and lets a
+    # genuinely much-better zone still win the extra miles — the "$40/hr" rule.
     def _net_after_drive(c: Dict[str, Any]) -> float:
+        mv = c.get("move_value")
+        if mv is not None:
+            return _safe_float(mv, 0.0)
         return (
             _safe_float(c.get("rating"), 0.0)
             - DISTANCE_PENALTY_PER_MILE * _safe_float(c.get("distance_miles"), 999.0)
@@ -628,6 +641,21 @@ def build_driver_guidance(
         and _safe_float(c.get("distance_miles"), 999.0) <= 3.0
     ]
     efficient_blue_target = max(blue_in_reach, key=_net_after_drive) if blue_in_reach else None
+    # How the CURRENT zone earns over the next hour if we STAY — the bar a move
+    # must clear. From the forecast curve when present (stay_hour_value); else
+    # blend now with the +20 trend so a rise/fade still shows without full bins.
+    _stay_hv_raw = current_zone.get("stay_hour_value")
+    if _stay_hv_raw is not None:
+        stay_hour_value = _safe_float(_stay_hv_raw, current_rating)
+    else:
+        stay_hour_value = 0.6 * current_rating + 0.4 * current_next_rating
+    # Best worth-the-move value among reachable zones, and whether STAYING is
+    # clearly the better play over the next hour. We only let this BLOCK a move —
+    # so when the current zone is climbing (high stay value) we don't bail for a
+    # flat nearby zone; it never forces a move (escapes/fades keep their own
+    # logic) and a big value gap (a real escape) sails past it untouched.
+    best_move_value = max((_net_after_drive(c) for c in nearby_candidates), default=float("-inf"))
+    stay_beats_moving = stay_hour_value >= best_move_value + HOUR_STAY_PREFERENCE
     # A clear blue-floor escape (close blue+ while below blue, or a +15 obvious
     # upgrade) overrides BOTH the move-attempt gate AND the cooldown. A close
     # blue zone is a stable DESTINATION: we keep pointing the driver at it every
@@ -641,11 +669,14 @@ def build_driver_guidance(
 
     if below_blue:
         # Current climbing ABOVE the best reachable zone -> it becomes the better
-        # spot, so hold for it instead of chasing a now-weaker move.
+        # spot, so hold for it instead of chasing a now-weaker move. The single-
+        # point check (climbs_above_nearby) is kept; stay_beats_moving generalizes
+        # it to the full next hour so we don't bail on a zone that's about to get
+        # hotter than the nearby blue zone over the hour.
         climbs_above_nearby = (
             current_will_improve and current_next_rating > best_nearby_arrival + 2.0
         )
-        if nearby_blue_on_arrival and can_move and not climbs_above_nearby:
+        if nearby_blue_on_arrival and can_move and not climbs_above_nearby and not stay_beats_moving:
             _blue_target = efficient_blue_target or best_nearby
             _blue_target_name = (_blue_target or {}).get("zone_name") or best_nearby_name
             action = "move_nearby"
@@ -910,6 +941,9 @@ def build_driver_guidance(
             "bucket": current_bucket,
             "color": current_color,
             "next_rating": current_next_rating,
+            "rating_40": _safe_float(current_zone.get("rating_40"), current_next_rating),
+            "rating_60": _safe_float(current_zone.get("rating_60"), current_next_rating),
+            "stay_hour_value": round(stay_hour_value, 2),
             "market_saturation_penalty": current_saturation_penalty,
             "continuation_raw": current_continuation_raw,
         },

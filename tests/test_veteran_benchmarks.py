@@ -83,6 +83,61 @@ def test_busy_nightlife_zone_is_a_hold_not_a_chase():
     assert g["below_blue"] is False
 
 
+def test_holds_a_climbing_zone_over_a_flat_nearby_blue():
+    # Next-hour intelligence: the current zone is sky now (56) but its forecast
+    # climbs through the hour (stay_hour_value 66), while a nearby blue zone is
+    # flat — worth only 58 after the drive. A veteran reads the curve and stays
+    # for the climb instead of bailing for the flat zone.
+    zc = {
+        "current_zone": {"rating": 56, "next_rating": 58, "stay_hour_value": 66},
+        "nearby_candidates": [{"zone_id": 9, "zone_name": "Flat Blue", "rating": 62,
+                               "rating_now": 62, "move_value": 58, "distance_miles": 1.0}],
+    }
+    g = build_driver_guidance(
+        **_inputs(120, "Climbing Zone", "2025-06-27T20:00:00", borough="Brooklyn"),
+        activity_snapshot=_snap(), zone_context=zc,
+    )
+    assert g["action"] in {"hold", "wait_dispatch", "micro_reposition"}
+
+
+def test_leaves_a_flat_zone_for_a_better_next_hour_elsewhere():
+    # Same board shape, but now the current zone is NOT climbing (stay_hour_value
+    # 53) and the nearby blue holds up over the hour (move_value 61). Staying no
+    # longer beats moving, so the veteran takes the blue zone.
+    zc = {
+        "current_zone": {"rating": 56, "next_rating": 55, "stay_hour_value": 53},
+        "nearby_candidates": [{"zone_id": 9, "zone_name": "Steady Blue", "rating": 64,
+                               "rating_now": 64, "move_value": 61, "distance_miles": 1.0}],
+    }
+    g = build_driver_guidance(
+        **_inputs(120, "Flat Zone", "2025-06-27T20:00:00", borough="Brooklyn"),
+        activity_snapshot=_snap(), zone_context=zc,
+    )
+    assert g["action"] == "move_nearby"
+    assert (g["target_zone"] or {}).get("zone_name") == "Steady Blue"
+
+
+def test_move_value_picks_the_better_next_hour_target_not_the_hotter_now():
+    # Two reachable blue zones: A is hotter right now but its hour fades and it's
+    # farther (move_value 56); B is a touch cooler now but holds over the hour and
+    # is close (move_value 62). The worth-the-move value picks B.
+    zc = {
+        "current_zone": {"rating": 52, "next_rating": 52, "stay_hour_value": 52},
+        "nearby_candidates": [
+            {"zone_id": 8, "zone_name": "Hot Now Fades", "rating": 70, "rating_now": 74,
+             "move_value": 56, "distance_miles": 2.6},
+            {"zone_id": 9, "zone_name": "Holds The Hour", "rating": 64, "rating_now": 63,
+             "move_value": 62, "distance_miles": 0.9},
+        ],
+    }
+    g = build_driver_guidance(
+        **_inputs(120, "Sky Start", "2025-06-27T20:00:00", borough="Brooklyn"),
+        activity_snapshot=_snap(), zone_context=zc,
+    )
+    assert g["action"] == "move_nearby"
+    assert (g["target_zone"] or {}).get("zone_name") == "Holds The Hour"
+
+
 def test_dead_area_routes_to_demand_not_idle():
     # Quiet everywhere nearby but a strong zone within a worthwhile drive -> a
     # veteran deadheads toward the demand rather than sitting.
