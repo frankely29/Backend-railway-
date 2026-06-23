@@ -173,13 +173,39 @@ def test_escapes_a_bad_zone_to_a_close_strong_one_despite_recent_moves():
     assert (g["target_zone"] or {}).get("zone_name") == "Park Slope"
 
 
+def test_churned_sky_driver_takes_the_close_blue_hop_not_a_hold():
+    # IMG_4138 live board: Bay Ridge (sky 54), churned (2 moves), with Sunset
+    # Park West (blue 64) less than a mile away. Sky is a move zone — crossing
+    # the blue floor to a close blue+ is an escape, not churn — so a veteran
+    # takes the ~5-min hop instead of sitting in the saturated sky zone. This is
+    # the exact case a driver flagged as "not smarter than a human."
+    zc = {
+        "current_zone": {"rating": 54, "next_rating": 54},
+        "nearby_candidates": [
+            {"zone_id": 228, "zone_name": "Sunset Park West", "rating": 64,
+             "rating_now": 64, "distance_miles": 0.85},
+            {"zone_id": 89, "zone_name": "Flatbush", "rating": 61,
+             "rating_now": 61, "distance_miles": 2.78},
+        ],
+    }
+    g = build_driver_guidance(
+        **_inputs(14, "Bay Ridge", "2025-06-23T17:00:00", borough="Brooklyn"),
+        activity_snapshot=_snap({"recent_move_attempts_without_trip": 2}),
+        zone_context=zc,
+    )
+    assert g["action"] == "move_nearby"
+    assert (g["target_zone"] or {}).get("zone_name") == "Sunset Park West"
+
+
 def test_held_message_is_honest_when_a_better_zone_is_nearby():
-    # Sky zone (55) held due to anti-churn while a blue+ zone is nearby -> the
-    # message must NOT claim "nothing nearby beats it".
+    # Sky zone (55), churned, with a blue+ zone in view but a bit too far to
+    # chase right now (2.3mi -> beyond the close-escape range) -> we hold, and
+    # the message must NOT claim "nothing nearby beats it". (A blue+ zone within
+    # ~the close range would instead trigger a move; this is the farther case.)
     zc = {
         "current_zone": {"rating": 55, "next_rating": 55},
         "nearby_candidates": [{"zone_id": 9, "zone_name": "Better Zone", "rating": 65,
-                               "rating_now": 65, "distance_miles": 1.5}],
+                               "rating_now": 65, "distance_miles": 2.3}],
     }
     g = build_driver_guidance(
         **_inputs(200, "Sky Zone", "2025-06-22T15:00:00", borough="Brooklyn"),
