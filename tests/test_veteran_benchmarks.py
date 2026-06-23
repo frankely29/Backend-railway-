@@ -52,13 +52,15 @@ def test_letout_sends_fresh_driver_to_the_rising_nightlife():
 
 
 def test_after_two_fruitless_moves_it_holds_instead_of_bouncing():
-    # Same board, but the driver already chased two moves without a trip — a
-    # veteran stops churning and lets dispatch work. Anti-churn must hold.
+    # Same board but the nearby zone is only MARGINALLY better (+8), and the
+    # driver already chased two moves without a trip -> a veteran stops churning
+    # for small gains and lets dispatch work. (A clearly much-better zone would
+    # still override anti-churn; this is the marginal case.)
     zc = {
-        "current_zone": {"rating": 58, "next_rating": 69},
+        "current_zone": {"rating": 58, "next_rating": 58},
         "nearby_candidates": [
-            {"zone_id": 9, "zone_name": "Greenwich Village South", "rating": 74,
-             "rating_now": 70, "distance_miles": 2.1}
+            {"zone_id": 9, "zone_name": "Slightly Better", "rating": 66,
+             "rating_now": 66, "distance_miles": 2.1}
         ],
     }
     g = build_driver_guidance(

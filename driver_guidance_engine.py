@@ -25,6 +25,9 @@ FAR_FIELD_MAX_ETA_MIN = 35.0
 # worth sitting in; sky blue (50-59) and below is a move zone. Thresholds match
 # the frontend's colorFromRating so the words line up with the map colors.
 BLUE_RATING = 60.0
+# A nearby zone this many points better (~2 demand buckets) is an obvious
+# upgrade a human always takes — it overrides anti-churn (not the cooldown).
+LARGE_UPGRADE_GAP = 15.0
 
 
 def _bucket_name(rating: float) -> str:
@@ -586,8 +589,20 @@ def build_driver_guidance(
         and _safe_float(c.get("distance_miles"), 999.0) <= 2.0
         for c in nearby_candidates
     )
+    # An OBVIOUS upgrade: a clearly stronger zone (>= +15, ~2 buckets) within
+    # easy reach. A human ALWAYS takes this — it must never be blocked by
+    # "you've moved a lot" (only the rapid-rebounce cooldown can). Pick the
+    # closest such zone so we don't send them farther than needed.
+    obvious_upgrade: Optional[Dict[str, Any]] = None
+    for c in nearby_candidates:
+        cr = _safe_float(c.get("rating"), 0.0)
+        cd = _safe_float(c.get("distance_miles"), 999.0)
+        if cr >= current_rating + LARGE_UPGRADE_GAP and cr >= BLUE_RATING and cd <= 2.5:
+            if obvious_upgrade is None or cd < _safe_float(obvious_upgrade.get("distance_miles"), 999.0):
+                obvious_upgrade = c
     clear_close_upgrade = (
-        nearby_blue_on_arrival and current_rating < 50.0 and close_blue_exists
+        (nearby_blue_on_arrival and current_rating < 50.0 and close_blue_exists)
+        or obvious_upgrade is not None
     )
     can_move = (not in_move_cooldown) and (recent_move_attempts < 2 or clear_close_upgrade)
     improvement_note: Optional[str] = None
@@ -653,6 +668,16 @@ def build_driver_guidance(
         reason_codes.extend(["zone_still_strong", "continuation_supportive", "settling_window"])
         hold_until_unix = now_ts + 6 * 60
         message = "Hold here a bit longer — this zone still has enough continuation."
+    elif obvious_upgrade is not None and not in_move_cooldown:
+        # A clearly much-better zone (~2 buckets up) is right here — a human
+        # always takes it. Don't let "you've moved a lot" pin a driver in an OK
+        # zone when a great one is a couple minutes away.
+        action = "move_nearby"
+        confidence = 0.74
+        target_zone = dict(obvious_upgrade)
+        hold_until_unix = None
+        reason_codes.extend(["obvious_upgrade_nearby", "much_better_zone"])
+        message = f"Move to {obvious_upgrade.get('zone_name')} — much busier and close."
     elif (
         current_rating >= BLUE_RATING
         and current_next_rating <= current_rating - 8.0
