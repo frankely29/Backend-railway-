@@ -71,6 +71,36 @@ def test_below_blue_improving_says_about_to_pick_up():
     assert "about to pick up" in line
 
 
+def test_spot_phrase_tags_the_zone_when_asked():
+    # A bare street is useless to a driver who navigates by zones — tag it.
+    assert spot_phrase({"label": "72nd Street", "source": "pickup"}, zone_name="Bay Ridge") == \
+        "the pickup cluster at 72nd Street in Bay Ridge"
+    assert spot_phrase(_rail("Broadway"), zone_name="Astoria") == "the Broadway stop in Astoria"
+    # No double-tag when the label already names the zone.
+    assert spot_phrase({"label": "Bay Ridge Pier", "source": "pickup"}, zone_name="Bay Ridge") == \
+        "the pickup cluster at Bay Ridge Pier"
+
+
+def test_below_blue_hold_names_the_spots_zone_but_move_does_not():
+    # Below-blue STAY can get a surge sentence appended (a 2nd zone), so the
+    # current-zone spot must say its zone to stay unambiguous.
+    hold = compose_guidance_directive(
+        action="wait_dispatch", moving=False, current_zone_name="Bay Ridge",
+        current_rating=54, current_next_rating=54,
+        spot={"label": "72nd Street", "source": "pickup"}, below_blue=True,
+    )
+    assert "72nd Street in Bay Ridge" in hold
+    # A move names the target zone right before the spot and carries no 2nd zone,
+    # so it doesn't repeat the zone on the spot.
+    move = compose_guidance_directive(
+        action="move_nearby", moving=True, current_zone_name="Bay Ridge",
+        target_zone_name="Sunset Park West", current_rating=54, current_next_rating=54,
+        target_rating=64, target_rating_now=64, target_eta=6,
+        spot={"label": "Industry City", "source": "pickup"}, below_blue=True,
+    )
+    assert "in Sunset Park West" not in move and "Industry City" in move
+
+
 def test_far_reposition_says_its_slow_and_points_to_demand():
     line = compose_guidance_directive(
         action="move_nearby", moving=True,

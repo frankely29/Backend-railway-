@@ -62,25 +62,35 @@ def _cap(text: str) -> str:
     return (text[:1].upper() + text[1:]) if text else text
 
 
-def spot_phrase(spot: Optional[Mapping[str, Any]]) -> Optional[str]:
-    """How a driver would refer to the spot, by source/kind."""
+def spot_phrase(spot: Optional[Mapping[str, Any]], zone_name: Optional[str] = None) -> Optional[str]:
+    """How a driver would refer to the spot, by source/kind.
+
+    When zone_name is given, the spot is tagged with the zone it sits in
+    ("...in Bay Ridge") so a street name is never orphaned. Drivers navigate by
+    the colored zones on the map, not by the thousands of street names — a bare
+    "72nd Street" is useless unless we say which zone it's in. The tag is skipped
+    when the label already names that zone (no "X in Bay Ridge in Bay Ridge").
+    """
     if not spot:
         return None
     label = _clean_label(spot.get("label"))
     if not label:
         return None
+    z = str(zone_name or "").strip()
+    tag = f" in {z}" if z and z.lower() not in label.lower() else ""
     source = spot.get("source")
     if source == "pickup":
-        return f"the pickup cluster at {label}"
+        return f"the pickup cluster at {label}{tag}"
     if source == "curated":
         address = str(spot.get("address") or "").strip()
-        return f"{label} ({address})" if address else label
+        base = f"{label} ({address})" if address else label
+        return f"{base}{tag}"
     if spot.get("kind") == "rail":
         low = label.lower()
         if low.endswith(("station", "terminal", "stop", "hall", "concourse")):
-            return label
-        return f"the {label} stop"
-    return label  # hospital / mall / university / attraction / transit_minor
+            return f"{label}{tag}"
+        return f"the {label} stop{tag}"
+    return f"{label}{tag}"  # hospital / mall / university / attraction / transit_minor
 
 
 def compose_guidance_directive(
@@ -102,6 +112,12 @@ def compose_guidance_directive(
 ) -> str:
     czone = current_zone_name or "this area"
     sp = spot_phrase(spot)
+    # Zone-tagged spot for the below-blue STAY lines: those can have an upcoming-
+    # surge sentence appended (a SECOND zone), so the current-zone spot must name
+    # its zone or "72nd Street" is ambiguous against the surge zone. Move/blue
+    # lines name the zone right before the spot and carry no second zone, so they
+    # use the plain form to avoid repeating the zone twice in one breath.
+    sp_here = spot_phrase(spot, zone_name=current_zone_name)
 
     # --- GO: move to a different zone --------------------------------------
     if moving and target_zone_name:
@@ -144,17 +160,17 @@ def compose_guidance_directive(
 
     # --- STAY: below blue but about to pick up -----------------------------
     if current_will_improve:
-        if sp:
-            return f"Stay in {czone} — it's about to pick up. Work {sp}."
+        if sp_here:
+            return f"Stay in {czone} — it's about to pick up. Work {sp_here}."
         return f"Stay in {czone} — it's about to pick up."
 
     # --- STAY: below blue, holding out the anti-churn timer (a better zone IS
     # nearby, we've just moved too much to chase it again right now) ----------
     if held_for_antichurn:
-        tail = f" Work {sp} meanwhile." if sp else ""
+        tail = f" Work {sp_here} meanwhile." if sp_here else ""
         return f"Sit tight in {czone} a few minutes — you've moved a lot without a trip, so let dispatch work.{tail}"
 
     # --- STAY: below blue, nothing reachable is better yet -----------------
-    if sp:
-        return f"Stay in {czone} for now — work {sp}; nothing nearby beats it."
+    if sp_here:
+        return f"Stay in {czone} for now — work {sp_here}; nothing nearby beats it."
     return f"Stay in {czone} for now — nothing nearby is better."
