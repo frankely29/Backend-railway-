@@ -8269,6 +8269,41 @@ GUIDANCE_RECORD_DEBOUNCE_SECONDS = 75
 # climbing ~40 min after you'd arrive is worth more than one already fading.
 # Gentle (0.25) so it refines the arrival-time score, not overrides it.
 GUIDANCE_TRAJECTORY_WEIGHT = 0.25
+# Next-hour expected-value scoring. A veteran doesn't compare zones at a single
+# minute — they think "where do I earn most over the next hour, and is the drive
+# worth it?". We score the current zone (if you STAY) and each candidate (if you
+# MOVE) as a weighted mean of its forecast over the next ~hour (now/+20/+40/+60),
+# nearer bins weighted more (sooner = more certain). For a MOVE we also subtract
+# the deadhead cost of the drive: ~1 rating-point per minute of unpaid travel,
+# so a far zone has to be clearly better over the hour to be worth leaving for.
+GUIDANCE_HOUR_BIN_WEIGHTS = (1.0, 0.85, 0.7, 0.55)
+GUIDANCE_DEADHEAD_COST_PER_HOUR = 60.0
+
+
+def _guidance_hour_value(
+    points: List[Dict[str, Any]],
+    mode_flags: Dict[str, bool],
+    start_bin: int = 0,
+) -> float:
+    """Weighted mean of a zone's forecast over the ~next hour from start_bin.
+
+    Bins are 20 min apart, so start_bin..start_bin+3 spans ~60 min. Nearer bins
+    weigh more (sooner = more certain). Captures how a zone BEHAVES over the
+    hour — a sky zone climbing to busy scores well; a hot zone about to fade
+    scores down — instead of judging it on a single arrival minute.
+    """
+    if not points:
+        return 0.0
+    acc = 0.0
+    total_w = 0.0
+    for i, w in enumerate(GUIDANCE_HOUR_BIN_WEIGHTS):
+        b = int(start_bin) + i
+        if b >= len(points):
+            break
+        acc += w * _extract_zone_rating_from_point(points[b], mode_flags)
+        total_w += w
+    return (acc / total_w) if total_w else 0.0
+
 
 
 def _build_guidance_zone_context(
@@ -8296,6 +8331,18 @@ def _build_guidance_zone_context(
     current_track_next = _extract_zone_track_entry_from_point(current_next, mode_flags)
     current_rating = _safe_float_value(current_track_now.get("rating"), 0.0)
     current_next_rating = _safe_float_value(current_track_next.get("rating"), current_rating)
+    # How the CURRENT zone behaves over the next hour if the driver stays put —
+    # the value to beat before a move is worth it. Plus the +40/+60 min points so
+    # the brain (and the driver) can see a rise/fade coming, not just +20.
+    current_stay_hour_value = _guidance_hour_value(current_points, mode_flags, 0)
+    current_rating_40 = (
+        _extract_zone_rating_from_point(current_points[2], mode_flags)
+        if len(current_points) > 2 else current_next_rating
+    )
+    current_rating_60 = (
+        _extract_zone_rating_from_point(current_points[3], mode_flags)
+        if len(current_points) > 3 else current_rating_40
+    )
 
     nearby_candidates: List[Dict[str, Any]] = []
     far_candidates: List[Dict[str, Any]] = []
@@ -8359,6 +8406,15 @@ def _build_guidance_zone_context(
         later_bin = min(len(points) - 1, arrival_bin + 2)
         later_rating = _extract_zone_rating_from_point(points[later_bin], mode_flags)
         traj_value = arrival_rating + GUIDANCE_TRAJECTORY_WEIGHT * (later_rating - arrival_rating)
+        # Worth-the-move value: what this zone is worth over the hour AFTER you'd
+        # arrive, MINUS the deadhead cost of getting there (unpaid drive time).
+        # This is the number to compare against staying — it folds in both the
+        # destination's full-hour trajectory and the distance/ETA in one figure.
+        dest_hour_value = _guidance_hour_value(points, mode_flags, arrival_bin)
+        deadhead_cost = (float(eta_minutes) / 60.0) * GUIDANCE_DEADHEAD_COST_PER_HOUR
+        move_value = dest_hour_value - deadhead_cost
+        arr40_bin = min(len(points) - 1, arrival_bin + 2)
+        arr60_bin = min(len(points) - 1, arrival_bin + 3)
         cand = {
             "zone_id": zone_id,
             "zone_name": zone_payload.get("zone_name"),
@@ -8369,6 +8425,11 @@ def _build_guidance_zone_context(
             "arrival_rating": round(float(arrival_rating), 2),
             "rating_now": round(float(rating_now), 2),
             "arrival_bin": int(arrival_bin),
+            # Next-hour-from-arrival forecast + the worth-the-move figure.
+            "hour_value": round(float(dest_hour_value), 2),
+            "move_value": round(float(move_value), 2),
+            "arrival_rating_40": round(float(_extract_zone_rating_from_point(points[arr40_bin], mode_flags)), 2),
+            "arrival_rating_60": round(float(_extract_zone_rating_from_point(points[arr60_bin], mode_flags)), 2),
         }
         if distance <= 3.0:
             nearby_candidates.append(cand)
@@ -8384,6 +8445,9 @@ def _build_guidance_zone_context(
             "bucket": current_track_now.get("bucket"),
             "color": current_track_now.get("color"),
             "next_rating": round(float(current_next_rating), 2),
+            "rating_40": round(float(current_rating_40), 2),
+            "rating_60": round(float(current_rating_60), 2),
+            "stay_hour_value": round(float(current_stay_hour_value), 2),
             "market_saturation_penalty": _safe_float_value(current_now.get("market_saturation_penalty"), 0.0),
             "continuation_raw": _safe_float_value(current_now.get("continuation_raw"), 0.0),
             "short_trip_penalty": _safe_float_value(current_now.get("short_trip_penalty"), 0.0),
