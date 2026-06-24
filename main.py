@@ -8261,6 +8261,32 @@ def _borough_road_reachable(from_borough: Any, to_borough: Any) -> bool:
     if allowed is None:
         return True
     return tb in allowed
+
+
+# Extra "bridge detour" miles for a move that crosses water. Zones sit face-to-
+# face across the East River, so the straight-line EDGE distance between them is
+# tiny (a Manhattan zone can read 0.8mi from a Brooklyn-waterfront driver) — but
+# the DRIVE has to detour to a bridge or tunnel and back, several miles and many
+# minutes. Without this, a far cross-river zone looks deceptively close and we'd
+# send the driver across the harbor when closer same-side zones are just as good,
+# burning gas and time. Keyed by the unordered borough pair.
+_BOROUGH_CROSSING_PENALTY_MILES = {
+    frozenset({"brooklyn", "manhattan"}): 2.5,
+    frozenset({"queens", "manhattan"}): 2.5,
+    frozenset({"brooklyn", "staten island"}): 3.0,
+    frozenset({"queens", "bronx"}): 2.5,
+    frozenset({"manhattan", "bronx"}): 1.0,  # Harlem River — short bridges
+}
+
+
+def _borough_crossing_penalty_miles(from_borough: Any, to_borough: Any) -> float:
+    """Detour miles to add for a water crossing; 0 for same borough or a land
+    border (Brooklyn<->Queens). Folds the bridge/tunnel detour into the distance
+    so ETA and the worth-the-move value reflect the real drive, not the river."""
+    fb, tb = _borough_key(from_borough), _borough_key(to_borough)
+    if not fb or not tb or fb == tb:
+        return 0.0
+    return _BOROUGH_CROSSING_PENALTY_MILES.get(frozenset({fb, tb}), 0.0)
 # The dock polls guidance as the driver's GPS jitters; only record a NEW
 # recommendation (and move the anti-churn counters) once per window, so rapid
 # identical polls can't inflate the move-attempt count and oscillate move/stay.
@@ -8384,6 +8410,10 @@ def _build_guidance_zone_context(
                 distance = center_distance
         else:
             distance = center_distance
+        # Fold in the bridge/tunnel detour for a water crossing so a zone sitting
+        # right across the river isn't treated as next door — the straight-line
+        # edge distance lies when the only road there is a bridge miles away.
+        distance += _borough_crossing_penalty_miles(current_borough, zone_payload.get("borough"))
         # Nearby band (<=3mi) drives the normal stay/move call; a wider band
         # (3-10mi) is kept so that when the whole local area is dead we can
         # still point the driver to where the demand actually is.
