@@ -41,6 +41,11 @@ DISTANCE_PENALTY_PER_MILE = 5.0
 # blocks a discretionary move (a clearly-climbing current zone); a real escape
 # or a much-better zone has a far bigger gap and sails past it.
 HOUR_STAY_PREFERENCE = 4.0
+# Margin a move must beat staying by, over the next hour, to override the
+# strong-hold (which otherwise pins a driver in a "decent and rising" zone for a
+# settling window after arrival). A full bucket of net edge after the drive and
+# the hour are priced in — clearly worth leaving the conversion timer for.
+STRONG_HOLD_OVERRIDE_MARGIN = 8.0
 
 
 def _bucket_name(rating: float) -> str:
@@ -760,12 +765,16 @@ def build_driver_guidance(
         and settling_window
         and obvious_upgrade is None
         and not current_is_trap
+        and not (best_move_value >= stay_hour_value + STRONG_HOLD_OVERRIDE_MARGIN)
     ):
         # Strong hold: rating fine, continuation OK, just arrived — give the zone
         # a chance to convert. But NOT when (a) an obviously-much-better zone is
-        # one block away (the obvious_upgrade branch should win), and NOT when
-        # we're inside a known short-trip trap (cheap-trip churn beats setup —
-        # the lower branches need a chance to take the escape).
+        # one block away (the obvious_upgrade branch should win), NOT when we're
+        # inside a known short-trip trap (cheap-trip churn beats setup), and NOT
+        # when the next-hour math clearly favors moving by a full bucket of edge
+        # (a +13 close zone whose move_value beats staying by +16 — that's worth
+        # leaving the "settling window" for, even before the LARGE_UPGRADE_GAP
+        # raw-rating threshold trips).
         action = "hold"
         confidence = 0.75
         reason_codes.extend(["zone_still_strong", "continuation_supportive", "settling_window"])
@@ -782,6 +791,25 @@ def build_driver_guidance(
         hold_until_unix = None
         reason_codes.extend(["obvious_upgrade_nearby", "much_better_zone"])
         message = f"Move to {obvious_upgrade.get('zone_name')} — much busier and close."
+    elif (
+        current_rating >= BLUE_RATING
+        and best_move_target is not None
+        and best_move_value >= stay_hour_value + STRONG_HOLD_OVERRIDE_MARGIN
+        and _safe_float(best_move_target.get("distance_miles"), 999.0) <= 2.5
+        and not in_move_cooldown
+        and recent_move_attempts < 3
+    ):
+        # Above-blue zone but a clearly better next-hour move sits in reach —
+        # this catches the case the strong-hold ladder misses: a +13 close zone
+        # whose move_value beats stay_hour_value by a full bucket isn't picked
+        # up by obvious_upgrade (raw gap < 15) or fade (not dropping 8+), yet
+        # it's plainly worth the short hop. Keeps using the closest-best target.
+        action = "move_nearby"
+        confidence = 0.72
+        target_zone = dict(best_move_target)
+        hold_until_unix = None
+        reason_codes.extend(["above_blue_better_move", "hour_value_edge"])
+        message = f"Move to {best_move_target.get('zone_name')} — clearly busier next hour."
     elif (
         current_rating >= BLUE_RATING
         and current_next_rating <= current_rating - 8.0

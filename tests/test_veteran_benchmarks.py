@@ -138,6 +138,34 @@ def test_move_value_picks_the_better_next_hour_target_not_the_hotter_now():
     assert (g["target_zone"] or {}).get("zone_name") == "Holds The Hour"
 
 
+def test_above_blue_takes_a_clearly_better_next_hour_move_even_without_obvious_upgrade():
+    # Live bug (TriBeCa Saturday): zone reads strong (rating 68, fading slowly
+    # to 64) so strong-hold WAS firing. A close zone is +13.5 (Financial District
+    # North 81.5 @0.355mi) — below the +15 obvious_upgrade threshold — but its
+    # move_value clears stay_hour_value by +15 (a full bucket of net edge over
+    # the hour). The settling window isn't worth losing $15/hr to a close move.
+    zc = {
+        "current_zone": {
+            "rating": 68, "next_rating": 64, "stay_hour_value": 64.29,
+            "continuation_raw": 8.4, "market_saturation_penalty": 1.0,
+        },
+        "nearby_candidates": [
+            {"zone_id": 5, "zone_name": "Financial District North", "rating": 81.5,
+             "rating_now": 82, "arrival_rating": 82, "move_value": 79.78,
+             "distance_miles": 0.355},
+            {"zone_id": 6, "zone_name": "East Chelsea", "rating": 81.0,
+             "rating_now": 81, "arrival_rating": 81, "move_value": 70.4,
+             "distance_miles": 1.67},
+        ],
+    }
+    g = build_driver_guidance(
+        **_inputs(200, "TriBeCa", "2025-06-21T15:00:00"),
+        activity_snapshot=_snap(), zone_context=zc,
+    )
+    assert g["action"] == "move_nearby"
+    assert (g["target_zone"] or {}).get("zone_name") == "Financial District North"
+
+
 def test_strong_hold_yields_to_an_obvious_upgrade_in_a_trap_zone():
     # Live bug (SoHo Saturday): zone is "strong" by rating (64) and rising, so
     # the strong-hold branch fires. But the zone is a short-trip TRAP, and
