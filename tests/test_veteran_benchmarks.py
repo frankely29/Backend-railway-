@@ -197,6 +197,28 @@ def test_leaves_a_fading_zone_before_it_dies():
     assert (g["target_zone"] or {}).get("zone_name") == "Holding Strong"
 
 
+def test_fading_zone_goes_to_the_closer_zone_not_the_farther_higher_rated():
+    # The IMG live bug (SoHo): a fading blue+ zone with two strong options — one
+    # a hair higher-rated but farther (East Chelsea 80 @1.14mi) and one a touch
+    # lower but much closer (Greenwich Village South 79 @0.31mi). The closer one
+    # nets more after the drive, so we must send there, not drive past it.
+    zc = {
+        "current_zone": {"rating": 67, "next_rating": 58, "stay_hour_value": 60},
+        "nearby_candidates": [
+            {"zone_id": 8, "zone_name": "East Chelsea", "rating": 80, "rating_now": 80,
+             "move_value": 71.76, "distance_miles": 1.137},
+            {"zone_id": 9, "zone_name": "Greenwich Village South", "rating": 79, "rating_now": 79,
+             "move_value": 75.19, "distance_miles": 0.306},
+        ],
+    }
+    g = build_driver_guidance(
+        **_inputs(100, "SoHo", "2025-06-23T19:00:00"),
+        activity_snapshot=_snap(), zone_context=zc,
+    )
+    assert g["action"] == "move_nearby"
+    assert (g["target_zone"] or {}).get("zone_name") == "Greenwich Village South"
+
+
 def test_cooling_zone_with_nothing_better_still_holds():
     # Cooling but nowhere clearly better -> don't churn; hold.
     zc = {

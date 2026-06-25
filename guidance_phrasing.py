@@ -124,19 +124,24 @@ def compose_guidance_directive(
         spot_txt = f" Set up at {sp}." if sp else ""
         eta_txt = f" ~{int(round(float(target_eta)))} min away." if target_eta else ""
         # Far-field: the local area is dead, so send them where the demand is.
+        # Lead with how busy the destination is (e.g. "Very busy"), then the zone.
         if far_reposition:
             word = demand_word(target_rating)
-            return f"It's slow all around here — head to {target_zone_name}, it's {word}.{spot_txt}{eta_txt}".strip()
+            head = _cap(word)
+            return f"{head} over in {target_zone_name} — slow all around here.{spot_txt}{eta_txt}".strip()
+        # Lead with the busy-ness descriptor (the most important info — HOW HOT
+        # the destination is), then the zone name. So the driver sees "Very busy"
+        # / "Much busier" / "Red-hot" first, then "go to Brooklyn Heights".
         gap = _rank(target_rating) - _rank(current_rating)
         if gap >= 2:
-            lead = "much busier than here"
+            head = "Much busier"
         elif gap == 1:
-            lead = "busier than here"
+            head = "Busier"
         else:
-            lead = f"{demand_word(target_rating)} there"
+            head = _cap(demand_word(target_rating))
         if _trend(target_rating_now, target_rating) == "climbing":
-            lead += " and still climbing"
-        return f"Go to {target_zone_name} — {lead}.{spot_txt}{eta_txt}".strip()
+            head += " and climbing"
+        return f"{head} — go to {target_zone_name}.{spot_txt}{eta_txt}".strip()
 
     # --- Reposition within the same zone -----------------------------------
     if action == "micro_reposition":
