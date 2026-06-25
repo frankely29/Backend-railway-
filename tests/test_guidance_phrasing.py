@@ -24,16 +24,32 @@ def test_spot_phrase_is_natural_by_source_and_kind():
     assert spot_phrase({"label": "Kings County Hospital", "kind": "hospital", "source": "magnet"}) == "Kings County Hospital"
 
 
-def test_move_is_a_plain_go_with_payoff_and_eta():
+def test_move_leads_with_busy_descriptor_then_the_zone_name():
+    # The most important info — HOW BUSY the destination is — must be the FIRST
+    # word, with the zone name right after. Driver glances at the card and
+    # immediately sees "Much busier — go to Clinton East" instead of having to
+    # parse "Go to Clinton East — much busier than here" backwards.
     line = compose_guidance_directive(
         action="move_nearby", moving=True,
         current_zone_name="East Chelsea", current_rating=57, current_next_rating=56,
         target_zone_name="Clinton East", target_rating=69, target_rating_now=66, target_eta=7,
         spot=_rail("50th Street"), below_blue=True,
     )
-    assert line.startswith("Go to Clinton East")
-    assert "busier than here" in line
+    assert line.startswith("Much busier") or line.startswith("Busier")
+    assert "go to Clinton East" in line
     assert "50th Street stop" in line and "7 min" in line
+
+
+def test_move_to_very_busy_leads_with_the_demand_word():
+    # Same-bucket move with the destination already busy on arrival — lead with
+    # the actual demand word (Very busy / Red-hot) before the zone name.
+    line = compose_guidance_directive(
+        action="move_nearby", moving=True,
+        current_zone_name="Williamsburg", current_rating=70, current_next_rating=70,
+        target_zone_name="Greenpoint", target_rating=72, target_rating_now=72, target_eta=5,
+        spot=_rail("Greenpoint Avenue"), below_blue=False,
+    )
+    assert line.startswith("Very busy — go to Greenpoint")
 
 
 def test_stay_is_plain_and_drops_old_jargon():
@@ -101,12 +117,15 @@ def test_below_blue_hold_names_the_spots_zone_but_move_does_not():
     assert "in Sunset Park West" not in move and "Industry City" in move
 
 
-def test_far_reposition_says_its_slow_and_points_to_demand():
+def test_far_reposition_leads_with_destination_demand_then_zone():
+    # Far-field still leads with the busy-ness (so the driver sees the payoff
+    # first), then names the zone, and explains the local area is slow.
     line = compose_guidance_directive(
         action="move_nearby", moving=True,
         current_zone_name="Great Kills", current_rating=22, current_next_rating=22,
         target_zone_name="Times Sq", target_rating=72, target_rating_now=72, target_eta=28,
         spot=_rail("Times Square–42nd Street"), below_blue=True, far_reposition=True,
     )
-    assert line.startswith("It's slow all around here")
-    assert "Times Sq" in line and "28 min away" in line
+    assert line.startswith("Very busy over in Times Sq")
+    assert "slow all around here" in line
+    assert "28 min away" in line
