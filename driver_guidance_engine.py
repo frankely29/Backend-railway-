@@ -656,6 +656,13 @@ def build_driver_guidance(
     # logic) and a big value gap (a real escape) sails past it untouched.
     best_move_value = max((_net_after_drive(c) for c in nearby_candidates), default=float("-inf"))
     stay_beats_moving = stay_hour_value >= best_move_value + HOUR_STAY_PREFERENCE
+    # The zone we'd actually send the driver to on ANY nearby move: the highest
+    # worth-the-move value (which folds in distance/ETA), NOT merely the highest-
+    # rated best_nearby. This is the fix for "sends me far when a closer, just-as-
+    # good zone is right here" — every move branch below targets this so we never
+    # drive a driver PAST a closer equal-or-better zone to reach a farther one.
+    best_move_target = max(nearby_candidates, key=_net_after_drive) if nearby_candidates else None
+    best_move_target_name = (best_move_target or {}).get("zone_name") or best_nearby_name
     # A clear blue-floor escape (close blue+ while below blue, or a +15 obvious
     # upgrade) overrides BOTH the move-attempt gate AND the cooldown. A close
     # blue zone is a stable DESTINATION: we keep pointing the driver at it every
@@ -715,12 +722,15 @@ def build_driver_guidance(
             and best_nearby_dist <= 2.5
             and best_nearby_arrival >= current_rating + MOVE_NEARBY_MIN_IMPROVEMENT
         ):
+            # Nothing's blue nearby, but a materially-better sub-blue zone is in
+            # reach — go to the closest-best one (highest worth-the-move value).
+            _t = best_move_target or best_nearby
             action = "move_nearby"
             confidence = 0.64
-            target_zone = dict(best_nearby)
+            target_zone = dict(_t)
             hold_until_unix = None
             reason_codes = ["below_blue_no_blue_anywhere", "move_to_better"]
-            message = f"Weak here and nothing's blue nearby — {best_nearby_name} is the better option."
+            message = f"Weak here and nothing's blue nearby — {_t.get('zone_name')} is the better option."
             blue_rule_applied = True
         # else: cooldown / churn / nothing better -> fall through to base logic.
 
@@ -754,12 +764,14 @@ def build_driver_guidance(
     ):
         # This zone is busy now but the forecast has it dropping a full bucket,
         # and a clearly stronger zone is in reach — a veteran leaves BEFORE it
-        # dies rather than riding it down.
+        # dies rather than riding it down. Go to the closest-best zone, not the
+        # merely highest-rated one a mile farther.
+        _t = best_move_target or best_nearby
         action = "move_nearby"
         confidence = 0.7
-        target_zone = dict(best_nearby)
+        target_zone = dict(_t)
         reason_codes.extend(["current_zone_fading", "leave_before_it_dies"])
-        message = f"Move to {best_nearby.get('zone_name')} — this zone is about to cool off."
+        message = f"Move to {_t.get('zone_name')} — this zone is about to cool off."
     elif (
         current_rating >= 50
         and moved_since_last_saved_trip
@@ -792,11 +804,12 @@ def build_driver_guidance(
         and recent_move_attempts < 3
         and _safe_float(best_nearby.get("distance_miles"), 999.0) <= 2.5
     ):
+        _t = best_move_target or best_nearby
         action = "move_nearby"
         confidence = 0.72
-        target_zone = dict(best_nearby)
+        target_zone = dict(_t)
         reason_codes.extend(["current_zone_weak", "nearby_materially_better", "cooldown_clear"])
-        message = "Move to the nearby stronger zone with a material outlook edge."
+        message = f"Move to {_t.get('zone_name')} — stronger nearby with a material outlook edge."
     elif (
         recent_move_attempts >= 2
         and recent_saved_60 <= 0
@@ -831,23 +844,26 @@ def build_driver_guidance(
         and recent_move_attempts < 3
     ):
         far_list = zone_context.get("far_candidates") or []
-        best_far = far_list[0] if far_list else None
+        # Only strong, reachable far zones qualify; among those pick the highest
+        # worth-the-move value (closest-best), not merely the highest-rated one,
+        # so a dead-area escape still goes to the nearest strong demand, not the
+        # farthest hot zone on the map.
+        far_eligible = [
+            c for c in far_list
+            if _safe_float(c.get("rating"), 0.0) >= BLUE_RATING
+            and _safe_float(c.get("rating"), 0.0) >= current_rating + FAR_FIELD_MIN_IMPROVEMENT
+            and 0.0 < _safe_float(c.get("eta_minutes"), 0.0) <= FAR_FIELD_MAX_ETA_MIN
+        ]
+        best_far = max(far_eligible, key=_net_after_drive) if far_eligible else None
         if best_far is not None:
-            far_rating = _safe_float(best_far.get("rating"), 0.0)
-            far_eta = _safe_float(best_far.get("eta_minutes"), 0.0)
-            if (
-                far_rating >= BLUE_RATING
-                and far_rating >= current_rating + FAR_FIELD_MIN_IMPROVEMENT
-                and 0.0 < far_eta <= FAR_FIELD_MAX_ETA_MIN
-            ):
-                action = "move_nearby"
-                confidence = 0.66
-                target_zone = dict(best_far)
-                hold_until_unix = None
-                far_reposition = True
-                improvement_note = None
-                reason_codes.append("far_field_reposition")
-                message = f"Slow all around here — head for {best_far.get('zone_name')}."
+            action = "move_nearby"
+            confidence = 0.66
+            target_zone = dict(best_far)
+            hold_until_unix = None
+            far_reposition = True
+            improvement_note = None
+            reason_codes.append("far_field_reposition")
+            message = f"Slow all around here — head for {best_far.get('zone_name')}."
 
     # --- Safety overlay: elevated-risk zone -> raise the rider-rating filter,
     # and overnight add the phone-snatch defense (the documented driver threat).
