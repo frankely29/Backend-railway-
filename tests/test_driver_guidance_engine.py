@@ -7,12 +7,15 @@ from pickup_recording_feature import _settle_latest_assistant_guidance_outcome_t
 
 
 def _base_guidance_inputs():
+    # NOTE: use a plain non-airport, non-safety zone id. Zone 1 is EWR/Newark in
+    # AIRPORT_ZONE_NAMES, which would (correctly) trigger the airport overlay and
+    # force a peak-hold — not what these general decision tests are exercising.
     return {
         "user_id": 9,
         "frame_time": "2026-04-07T10:00:00Z",
         "current_lat": 40.75,
         "current_lng": -73.99,
-        "current_zone_id": 1,
+        "current_zone_id": 100,
         "current_zone_name": "Zone One",
         "current_borough": "Manhattan",
         "mode_flags": {},

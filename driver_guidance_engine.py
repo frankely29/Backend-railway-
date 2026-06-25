@@ -663,6 +663,12 @@ def build_driver_guidance(
     # drive a driver PAST a closer equal-or-better zone to reach a farther one.
     best_move_target = max(nearby_candidates, key=_net_after_drive) if nearby_candidates else None
     best_move_target_name = (best_move_target or {}).get("zone_name") or best_nearby_name
+    # A discretionary move must actually beat STAYING over the next hour. A zone
+    # can read +10 on arrival rating yet net LESS once the drive and the hour are
+    # priced in (a quiet zone hopping to another quiet zone) — moving there just
+    # burns gas. Escapes (a close blue while below blue, a +15 obvious upgrade)
+    # have their own gates and a big enough gap to clear this anyway.
+    move_beats_staying = best_move_value > stay_hour_value
     # A clear blue-floor escape (close blue+ while below blue, or a +15 obvious
     # upgrade) overrides BOTH the move-attempt gate AND the cooldown. A close
     # blue zone is a stable DESTINATION: we keep pointing the driver at it every
@@ -721,9 +727,11 @@ def build_driver_guidance(
             and best_nearby is not None
             and best_nearby_dist <= 2.5
             and best_nearby_arrival >= current_rating + MOVE_NEARBY_MIN_IMPROVEMENT
+            and move_beats_staying
         ):
             # Nothing's blue nearby, but a materially-better sub-blue zone is in
-            # reach — go to the closest-best one (highest worth-the-move value).
+            # reach AND it beats staying over the hour — go to the closest-best
+            # one (highest worth-the-move value), not a wash a mile away.
             _t = best_move_target or best_nearby
             action = "move_nearby"
             confidence = 0.64
@@ -761,6 +769,7 @@ def build_driver_guidance(
         and _safe_float(best_nearby.get("distance_miles"), 999.0) <= 2.5
         and not in_move_cooldown
         and recent_move_attempts < 3
+        and move_beats_staying
     ):
         # This zone is busy now but the forecast has it dropping a full bucket,
         # and a clearly stronger zone is in reach — a veteran leaves BEFORE it
@@ -803,6 +812,7 @@ def build_driver_guidance(
         and not in_move_cooldown
         and recent_move_attempts < 3
         and _safe_float(best_nearby.get("distance_miles"), 999.0) <= 2.5
+        and move_beats_staying
     ):
         _t = best_move_target or best_nearby
         action = "move_nearby"
@@ -912,6 +922,19 @@ def build_driver_guidance(
             peak = (9 <= _frame_hour < 11) or (17 <= _frame_hour < 20)
             if peak:
                 core = f"{_airport} — peak arrivals, hold your FIFO spot (don't go offline or decline)."
+                # At peak the QUEUE is the play. The move logic only ever sees the
+                # airport's EXCLUDED 0 rating, so left alone it would tell a driver
+                # to leave a busy queue — and the appended "hold your FIFO spot"
+                # would then contradict a "go to X" headline. Force the hold so the
+                # advice and the action agree, and clear the stale move message/note
+                # (the airport advice below becomes the whole line).
+                action = "wait_dispatch"
+                target_zone = None
+                far_reposition = False
+                hold_until_unix = now_ts + 8 * 60
+                message = ""
+                improvement_note = None
+                reason_codes.append("airport_peak_hold")
             else:
                 core = f"{_airport} — arrivals are light; the city may beat the lot wait. Hold your spot if you stay."
             if _airport == "Newark":
