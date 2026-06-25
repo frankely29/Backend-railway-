@@ -138,6 +138,25 @@ def test_move_value_picks_the_better_next_hour_target_not_the_hotter_now():
     assert (g["target_zone"] or {}).get("zone_name") == "Holds The Hour"
 
 
+def test_does_not_move_to_a_zone_that_nets_less_than_staying():
+    # Live bug (Saint George, SI): a quiet zone (22) with a nearby zone that
+    # reads +11 on ARRIVAL rating (33) but, once the drive and the hour are
+    # priced in, is worth LESS than just staying (move_value 23 < stay_hour_value
+    # 25). Moving there only burns gas — hold.
+    zc = {
+        "current_zone": {"rating": 22, "next_rating": 22, "stay_hour_value": 25.29},
+        "nearby_candidates": [
+            {"zone_id": 9, "zone_name": "Stapleton", "rating": 33, "rating_now": 33,
+             "arrival_rating": 33, "move_value": 23.0, "distance_miles": 0.414},
+        ],
+    }
+    g = build_driver_guidance(
+        **_inputs(200, "Saint George", "2025-06-23T19:00:00", borough="Staten Island"),
+        activity_snapshot=_snap(), zone_context=zc,
+    )
+    assert g["action"] in {"hold", "wait_dispatch", "micro_reposition"}
+
+
 def test_dead_area_routes_to_demand_not_idle():
     # Quiet everywhere nearby but a strong zone within a worthwhile drive -> a
     # veteran deadheads toward the demand rather than sitting.
@@ -167,10 +186,16 @@ def test_overnight_elevated_zone_gets_safety_and_phone_defense():
 
 
 def test_airport_peak_vs_offpeak_queue_discipline():
+    # Airport zones are EXCLUDED from the score (rating reads 0), so the move
+    # logic would otherwise try to send the driver away even at peak arrivals.
+    # A tempting close zone is present to prove the peak overlay FORCES the hold
+    # (you stay in the FIFO queue) instead of telling them to leave it.
+    tempting = [{"zone_id": 9, "zone_name": "Jackson Heights", "rating": 70,
+                 "rating_now": 70, "arrival_rating": 70, "move_value": 65, "distance_miles": 0.4}]
     peak = build_driver_guidance(
         **_inputs(132, "JFK Airport", "2026-04-07T10:00:00Z", borough="Queens"),
         activity_snapshot=_snap(),
-        zone_context={"current_zone": {"rating": 64, "next_rating": 64}, "nearby_candidates": []},
+        zone_context={"current_zone": {"rating": 0, "next_rating": 0}, "nearby_candidates": tempting},
     )
     off = build_driver_guidance(
         **_inputs(132, "JFK Airport", "2026-04-07T03:00:00Z", borough="Queens"),
@@ -178,6 +203,7 @@ def test_airport_peak_vs_offpeak_queue_discipline():
         zone_context={"current_zone": {"rating": 35, "next_rating": 35}, "nearby_candidates": []},
     )
     assert "FIFO" in (peak["airport_advice"] or "")
+    assert peak["action"] in {"hold", "wait_dispatch"}  # never "go to X" at peak
     assert "city" in (off["airport_advice"] or "").lower()
 
 
