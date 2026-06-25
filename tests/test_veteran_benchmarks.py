@@ -138,6 +138,36 @@ def test_move_value_picks_the_better_next_hour_target_not_the_hotter_now():
     assert (g["target_zone"] or {}).get("zone_name") == "Holds The Hour"
 
 
+def test_strong_hold_yields_to_an_obvious_upgrade_in_a_trap_zone():
+    # Live bug (SoHo Saturday): zone is "strong" by rating (64) and rising, so
+    # the strong-hold branch fires. But the zone is a short-trip TRAP, and
+    # Financial District North is a +17 upgrade < 1mi away — an obvious escape.
+    # The strong-hold must NOT pin the driver in a trap when a real upgrade
+    # sits one block away; the obvious-upgrade branch should win.
+    zc = {
+        "current_zone": {
+            "rating": 64, "next_rating": 70, "stay_hour_value": 65.27,
+            "continuation_raw": 0.5,
+            "market_saturation_penalty": 0.7,
+            "short_trip_penalty": 0.6,
+        },
+        "nearby_candidates": [
+            {"zone_id": 5, "zone_name": "Financial District North", "rating": 81.5,
+             "rating_now": 82, "arrival_rating": 82, "move_value": 76.98,
+             "distance_miles": 0.915},
+            {"zone_id": 6, "zone_name": "Lower East Side", "rating": 76.25,
+             "rating_now": 77, "arrival_rating": 77, "move_value": 73.11,
+             "distance_miles": 0.52},
+        ],
+    }
+    g = build_driver_guidance(
+        **_inputs(200, "SoHo", "2025-06-21T15:00:00"),
+        activity_snapshot=_snap(), zone_context=zc,
+    )
+    assert g["action"] == "move_nearby"
+    assert (g["target_zone"] or {}).get("zone_name") == "Financial District North"
+
+
 def test_does_not_move_to_a_zone_that_nets_less_than_staying():
     # Live bug (Saint George, SI): a quiet zone (22) with a nearby zone that
     # reads +11 on ARRIVAL rating (33) but, once the drive and the hour are
