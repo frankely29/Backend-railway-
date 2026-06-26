@@ -41,6 +41,12 @@ DISTANCE_PENALTY_PER_MILE = 5.0
 # blocks a discretionary move (a clearly-climbing current zone); a real escape
 # or a much-better zone has a far bigger gap and sails past it.
 HOUR_STAY_PREFERENCE = 4.0
+# When the blue-floor escape is firing ONLY by overriding anti-churn (the driver
+# is mid-cooldown or has already bounced without a fare), the escape must clear
+# THIS much next-hour edge over staying to be worth spending the override on. A
+# fresh driver can take a small upgrade; a churning one shouldn't bounce again
+# for +2. A genuine escape (a real blue zone while sitting red) clears this easily.
+BLUE_ESCAPE_OVERRIDE_MARGIN = 5.0
 # Margin a move must beat staying by, over the next hour, to override the
 # strong-hold (which otherwise pins a driver in a "decent and rising" zone for a
 # settling window after arrival). A full bucket of net edge after the drive and
@@ -698,6 +704,12 @@ def build_driver_guidance(
     # it's the same target reaffirmed. The cooldown still blocks moves whenever
     # there's no clear escape, so ordinary anti-spam is untouched.
     can_move = clear_close_upgrade or ((not in_move_cooldown) and recent_move_attempts < 2)
+    # We're overriding anti-churn if the ONLY reason we can move is the clear-
+    # escape override (mid-cooldown, or already bounced >=2x without a fare). In
+    # that case the escape has to be genuinely worth re-bouncing for — a real
+    # next-hour edge, not a marginal +2 blue zone. A fresh driver isn't gated.
+    overriding_antichurn = in_move_cooldown or recent_move_attempts >= 2
+    clear_escape_margin = best_move_value >= stay_hour_value + BLUE_ESCAPE_OVERRIDE_MARGIN
     improvement_note: Optional[str] = None
     blue_rule_applied = False
 
@@ -710,7 +722,13 @@ def build_driver_guidance(
         climbs_above_nearby = (
             current_will_improve and current_next_rating > best_nearby_arrival + 2.0
         )
-        if nearby_blue_on_arrival and can_move and not climbs_above_nearby and not stay_beats_moving:
+        if (
+            nearby_blue_on_arrival
+            and can_move
+            and not climbs_above_nearby
+            and not stay_beats_moving
+            and (not overriding_antichurn or clear_escape_margin)
+        ):
             # The escape is justified (a blue zone is reachable, so sitting here
             # below blue is leaving money on the table). Send the driver to the
             # CLOSEST-BEST zone by next-hour move_value — NOT necessarily the
@@ -801,12 +819,18 @@ def build_driver_guidance(
         # always takes it. Don't let "you've moved a lot" OR a lingering move
         # cooldown pin a driver in an OK zone when a great one is a couple
         # minutes away; it's a stable target, so reaffirm it until they arrive.
+        # Send them to the CLOSEST-BEST zone by move_value, not necessarily the
+        # one that tripped the +15 raw gate: a closer zone with a HIGHER move_value
+        # (Lower East Side 83 @0.5mi, mv 80) beats the +15 zone a touch farther
+        # (FiDi North 84 @0.9mi, mv 79). best_move_target is the global max
+        # move_value, so it's >= the obvious upgrade; fall back if it's absent.
+        _t = best_move_target or obvious_upgrade
         action = "move_nearby"
         confidence = 0.74
-        target_zone = dict(obvious_upgrade)
+        target_zone = dict(_t)
         hold_until_unix = None
         reason_codes.extend(["obvious_upgrade_nearby", "much_better_zone"])
-        message = f"Move to {obvious_upgrade.get('zone_name')} — much busier and close."
+        message = f"Move to {_t.get('zone_name')} — much busier and close."
     elif (
         current_rating >= BLUE_RATING
         and best_move_target is not None
