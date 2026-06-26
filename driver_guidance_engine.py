@@ -677,6 +677,13 @@ def build_driver_guidance(
     # drive a driver PAST a closer equal-or-better zone to reach a farther one.
     best_move_target = max(nearby_candidates, key=_net_after_drive) if nearby_candidates else None
     best_move_target_name = (best_move_target or {}).get("zone_name") or best_nearby_name
+    # Distance/arrival of the zone we'd ACTUALLY move to (the closest-best by
+    # move_value). The move gates below test THESE, not best_nearby's: best_nearby
+    # is merely the highest-RATED candidate, which can sit far away — gating the
+    # whole move on its distance wrongly blocks a move to a closer, better-value
+    # zone. Demand-vs-distance must judge the zone we're sending the driver to.
+    best_move_target_dist = _safe_float((best_move_target or {}).get("distance_miles"), 999.0)
+    best_move_target_arrival = _safe_float((best_move_target or {}).get("rating"), 0.0)
     # A discretionary move must actually beat STAYING over the next hour. A zone
     # can read +10 on arrival rating yet net LESS once the drive and the hour are
     # priced in (a quiet zone hopping to another quiet zone) — moving there just
@@ -704,7 +711,15 @@ def build_driver_guidance(
             current_will_improve and current_next_rating > best_nearby_arrival + 2.0
         )
         if nearby_blue_on_arrival and can_move and not climbs_above_nearby and not stay_beats_moving:
-            _blue_target = efficient_blue_target or best_nearby
+            # The escape is justified (a blue zone is reachable, so sitting here
+            # below blue is leaving money on the table). Send the driver to the
+            # CLOSEST-BEST zone by next-hour move_value — NOT necessarily the
+            # absolute-blue one a mile farther. A closer zone with a higher
+            # move_value (Sunset Park West 57 @0.9mi, mv 53) beats a farther blue
+            # zone (Flatbush 61 @2.8mi, mv 50): same demand, far less deadhead.
+            # best_move_target is the global max move_value (deadhead folded in),
+            # so it's always >= the blue target; fall back only if it's absent.
+            _blue_target = best_move_target or efficient_blue_target or best_nearby
             _blue_target_name = (_blue_target or {}).get("zone_name") or best_nearby_name
             action = "move_nearby"
             confidence = 0.74
@@ -738,14 +753,15 @@ def build_driver_guidance(
             blue_rule_applied = True
         elif (
             can_move
-            and best_nearby is not None
-            and best_nearby_dist <= 2.5
-            and best_nearby_arrival >= current_rating + MOVE_NEARBY_MIN_IMPROVEMENT
+            and best_move_target is not None
+            and best_move_target_dist <= 2.5
+            and best_move_target_arrival >= current_rating + MOVE_NEARBY_MIN_IMPROVEMENT
             and move_beats_staying
         ):
             # Nothing's blue nearby, but a materially-better sub-blue zone is in
             # reach AND it beats staying over the hour — go to the closest-best
-            # one (highest worth-the-move value), not a wash a mile away.
+            # one (highest worth-the-move value), not a wash a mile away. Gate on
+            # the closest-best target itself so a far top-rated zone can't block it.
             _t = best_move_target or best_nearby
             action = "move_nearby"
             confidence = 0.64
@@ -813,9 +829,9 @@ def build_driver_guidance(
     elif (
         current_rating >= BLUE_RATING
         and current_next_rating <= current_rating - 8.0
-        and best_nearby is not None
-        and _safe_float(best_nearby.get("rating"), 0.0) >= current_next_rating + MOVE_NEARBY_MIN_IMPROVEMENT
-        and _safe_float(best_nearby.get("distance_miles"), 999.0) <= 2.5
+        and best_move_target is not None
+        and best_move_target_arrival >= current_next_rating + MOVE_NEARBY_MIN_IMPROVEMENT
+        and best_move_target_dist <= 2.5
         and not in_move_cooldown
         and recent_move_attempts < 3
         and move_beats_staying
@@ -846,7 +862,7 @@ def build_driver_guidance(
         current_rating >= 50
         and tripless_minutes >= 20
         and stationary_minutes >= 14
-        and (best_nearby is None or _safe_float(best_nearby.get("rating"), 0.0) < current_rating + MOVE_NEARBY_MIN_IMPROVEMENT)
+        and (best_move_target is None or best_move_target_arrival < current_rating + MOVE_NEARBY_MIN_IMPROVEMENT)
     ):
         action = "micro_reposition"
         confidence = 0.62
@@ -854,13 +870,13 @@ def build_driver_guidance(
         hold_until_unix = now_ts + 5 * 60
         message = "Micro-reposition inside this zone; avoid a full jump right now."
     elif (
-        best_nearby is not None
+        best_move_target is not None
         and current_rating < 55
         and current_next_rating < 58
-        and _safe_float(best_nearby.get("rating"), 0.0) >= current_rating + move_improvement_required
+        and best_move_target_arrival >= current_rating + move_improvement_required
         and not in_move_cooldown
         and recent_move_attempts < 3
-        and _safe_float(best_nearby.get("distance_miles"), 999.0) <= 2.5
+        and best_move_target_dist <= 2.5
         and move_beats_staying
     ):
         _t = best_move_target or best_nearby

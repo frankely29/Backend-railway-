@@ -138,6 +138,53 @@ def test_move_value_picks_the_better_next_hour_target_not_the_hotter_now():
     assert (g["target_zone"] or {}).get("zone_name") == "Holds The Hour"
 
 
+def test_blue_floor_escape_takes_the_closer_higher_value_zone_not_the_farther_blue():
+    # IMG_4173 (Bay Ridge, 11pm): the only ABSOLUTE-blue zone is far (Flatbush 61
+    # @2.8mi, move_value 50) while a CLOSER sub-blue zone has a HIGHER move_value
+    # (Sunset Park West 57 @0.9mi, move_value 53). The below-blue escape must send
+    # the driver to the closest-best by move_value, not deadhead 2.8mi to the
+    # absolute-blue zone past a closer, busier-enough one.
+    zc = {
+        "current_zone": {"rating": 39, "next_rating": 57, "stay_hour_value": 47.26},
+        "nearby_candidates": [
+            {"zone_id": 1, "zone_name": "Flatbush/Ditmas Park", "rating": 61.5, "rating_now": 61.5,
+             "arrival_rating": 61, "move_value": 50.05, "distance_miles": 2.79},
+            {"zone_id": 2, "zone_name": "Sunset Park West", "rating": 57.5, "rating_now": 57.5,
+             "arrival_rating": 56, "move_value": 53.4, "distance_miles": 0.882},
+        ],
+    }
+    g = build_driver_guidance(
+        **_inputs(200, "Bay Ridge", "2025-06-25T23:00:00", borough="Brooklyn"),
+        activity_snapshot=_snap(), zone_context=zc,
+    )
+    assert g["action"] == "move_nearby"
+    assert (g["target_zone"] or {}).get("zone_name") == "Sunset Park West"
+
+
+def test_a_far_top_rated_zone_does_not_block_a_close_better_move():
+    # The move GATES must judge the zone we'd actually go to (closest-best by
+    # move_value), not the highest-RATED candidate. Here the top-rated zone is far
+    # (Far Top 58 @2.9mi, move_value 45 — beyond the 2.5mi gate) while a close zone
+    # is the real best move (Close Better 54 @1.0mi, move_value 51). Gating on the
+    # far zone's distance used to block the move entirely ("nothing nearby beats
+    # it"); now the close better move fires.
+    zc = {
+        "current_zone": {"rating": 40, "next_rating": 40, "stay_hour_value": 40},
+        "nearby_candidates": [
+            {"zone_id": 1, "zone_name": "Far Top", "rating": 58, "rating_now": 58,
+             "arrival_rating": 58, "move_value": 45.0, "distance_miles": 2.9},
+            {"zone_id": 2, "zone_name": "Close Better", "rating": 54, "rating_now": 54,
+             "arrival_rating": 54, "move_value": 51.0, "distance_miles": 1.0},
+        ],
+    }
+    g = build_driver_guidance(
+        **_inputs(200, "Quiet Start", "2025-06-23T19:00:00", borough="Brooklyn"),
+        activity_snapshot=_snap(), zone_context=zc,
+    )
+    assert g["action"] == "move_nearby"
+    assert (g["target_zone"] or {}).get("zone_name") == "Close Better"
+
+
 def test_above_blue_takes_a_clearly_better_next_hour_move_even_without_obvious_upgrade():
     # Live bug (TriBeCa Saturday): zone reads strong (rating 68, fading slowly
     # to 64) so strong-hold WAS firing. A close zone is +13.5 (Financial District
