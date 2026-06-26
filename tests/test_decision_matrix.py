@@ -148,6 +148,24 @@ def test_obvious_upgrade_still_goes_to_the_closest_best_not_the_plus15_zone():
     assert (g["target_zone"] or {}).get("zone_name") == "Lower East Side"
 
 
+def test_clearly_better_zone_stays_the_call_as_current_rating_ticks_up():
+    # Stability: a clearly-better, close zone (Lower East Side, move_value ~80)
+    # must stay the recommendation across consecutive frames even as the CURRENT
+    # zone's rating ticks up (64 -> 71). At 64 LES is a +15 obvious upgrade; at 71
+    # it's no longer +15 raw but still +10 move_value — the call must NOT flip from
+    # move to hold (the SoHo 7-8pm oscillation a churn-free driver should never see).
+    les = {"zone_id": 9, "zone_name": "Lower East Side", "rating": 83, "rating_now": 83,
+           "arrival_rating": 83, "move_value": 80.0, "distance_miles": 0.469}
+    for cur, nxt, shv in [(64, 71, 67.9), (71, 68, 69.6)]:
+        zc = {"current_zone": {"rating": cur, "next_rating": nxt, "stay_hour_value": shv,
+                               "short_trip_penalty": 0.0, "market_saturation_penalty": 0.0},
+              "nearby_candidates": [dict(les)]}
+        g = build_driver_guidance(**_inputs(200, "SoHo", "2025-06-21T19:40:00"),
+                                  activity_snapshot=_snap(), zone_context=zc)
+        assert g["action"] == "move_nearby", f"flipped to {g['action']} at cur={cur}"
+        assert (g["target_zone"] or {}).get("zone_name") == "Lower East Side"
+
+
 def test_dead_area_everywhere_routes_to_the_far_demand():
     # Quiet here and quiet in the whole nearby band, but a strong zone sits within
     # a worthwhile longer drive. A veteran deadheads toward the demand, not sits.
