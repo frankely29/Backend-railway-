@@ -170,10 +170,13 @@ def compose_guidance_directive(
         return f"Stay in {czone} — it's about to pick up."
 
     # --- STAY: below blue, holding out the anti-churn timer (a better zone IS
-    # nearby, we've just moved too much to chase it again right now) ----------
+    # nearby, we've just hopped zones too much to chase it again right now).
+    # Acknowledge the busier zones the driver can see so "sit tight" doesn't read
+    # as ignoring them, then give the reason: chasing again hasn't been landing a
+    # fare, so let a dispatch come instead of burning another hop. ------------
     if held_for_antichurn:
         tail = f" Work {sp_here} meanwhile." if sp_here else ""
-        return f"Sit tight in {czone} a few minutes — you've moved a lot without a trip, so let dispatch work.{tail}"
+        return f"Sit tight in {czone} a few minutes — hopping toward the busier zones hasn't landed a fare, so let a dispatch come before chasing again.{tail}"
 
     # --- STAY: below blue, nothing reachable is better yet -----------------
     if sp_here:

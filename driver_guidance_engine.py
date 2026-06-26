@@ -994,6 +994,17 @@ def build_driver_guidance(
         [part for part in (message, improvement_note, trap_advice, airport_advice, safety_advice) if part]
     )
 
+    # Anti-churn hold: sub-blue, a blue+ zone IS reachable, yet we're holding —
+    # specifically because the driver has bounced between zones without landing a
+    # fare and the anti-churn gate is now blocking another hop. We require an
+    # ACTUAL churn signal (repeated move attempts without a trip, or a cooldown
+    # left by a move that hasn't converted) so the "you've moved a lot without a
+    # trip" line is truthful — never a fresh, hasn't-moved hold.
+    churn_blocked_move = (
+        recent_move_attempts >= 2
+        or (in_move_cooldown and moved_since_last_saved_trip)
+    )
+
     return {
         "action": action,
         "confidence": max(0.0, min(1.0, round(float(confidence), 3))),
@@ -1014,10 +1025,16 @@ def build_driver_guidance(
         "improvement_note": improvement_note,
         "far_reposition": bool(far_reposition),
         # Holding a sub-blue zone even though a blue+ zone is in reach -> we're
-        # waiting out anti-churn/cooldown, NOT because nothing's better. Lets the
-        # message stay honest instead of claiming "nothing nearby beats it".
+        # waiting out anti-churn/cooldown after real churn, NOT because nothing's
+        # better and NOT because staying simply out-values the move. Lets the
+        # message stay honest instead of claiming "you've moved a lot" on a hold
+        # the hour math (or a default bias) would make regardless.
         "held_for_antichurn": bool(
-            action in {"hold", "wait_dispatch"} and below_blue and nearby_blue_on_arrival
+            action in {"hold", "wait_dispatch"}
+            and below_blue
+            and nearby_blue_on_arrival
+            and not stay_beats_moving
+            and churn_blocked_move
         ),
         "nearby_candidates": nearby_candidates[:5],
         "current_zone": {
