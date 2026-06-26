@@ -8487,6 +8487,40 @@ def _build_guidance_zone_context(
     }
 
 
+def _next_move_attempts_without_trip(
+    prev_attempts: int,
+    action: str,
+    target_zone_id: Any,
+    prev_target_zone_id: Any,
+    prev_action: Any,
+) -> int:
+    """How the anti-churn move counter should step on this recommendation.
+
+    The counter means "times the driver was redirected without a fare," and the
+    anti-churn ladder leans on it (>=2 starts holding). It must count a GENUINELY
+    NEW redirection — not the same plan re-shown across polls. Reaffirming the
+    same target zone while the driver is en route ("go to X" every refresh) is
+    ONE move; counting each poll would inflate the counter and then flip the card
+    to "sit tight — you've moved a lot" while we're still pointing at X (the
+    move->move->"stop moving" contradiction). A hold steps it back down.
+    """
+    if action in {"move_nearby", "micro_reposition"}:
+        if action == "move_nearby":
+            # New only if we're now pointing at a DIFFERENT zone than last poll.
+            is_new_redirection = not (
+                target_zone_id is not None
+                and str(target_zone_id) == str(prev_target_zone_id)
+            )
+        else:
+            # micro_reposition has no target zone; it's a fresh attempt only when
+            # we weren't already micro-repositioning last poll.
+            is_new_redirection = str(prev_action or "") != "micro_reposition"
+        return prev_attempts + 1 if is_new_redirection else prev_attempts
+    if action in {"hold", "wait_dispatch"}:
+        return max(0, prev_attempts - 1)
+    return prev_attempts
+
+
 def _persist_driver_guidance_state_and_outcome(
     *,
     user_id: int,
@@ -8509,11 +8543,16 @@ def _persist_driver_guidance_state_and_outcome(
     prev_move_attempts = int((prev or {}).get("recent_move_attempts_without_trip") or 0)
     prev_wait_count = int((prev or {}).get("recent_wait_dispatch_count") or 0)
 
-    next_move_attempts = prev_move_attempts
-    if action in {"move_nearby", "micro_reposition"}:
-        next_move_attempts = prev_move_attempts + 1
-    elif action in {"hold", "wait_dispatch"}:
-        next_move_attempts = max(0, prev_move_attempts - 1)
+    # Only a NEW redirection (a different target than last poll) counts as a churn
+    # attempt — reaffirming the same move across polls while en route must NOT
+    # inflate the counter into a spurious "you've moved a lot" hold.
+    next_move_attempts = _next_move_attempts_without_trip(
+        prev_move_attempts,
+        action,
+        target_zone_id,
+        (prev or {}).get("last_target_zone_id"),
+        (prev or {}).get("last_guidance_action"),
+    )
 
     next_wait_count = prev_wait_count + 1 if action == "wait_dispatch" else 0
     _db_exec(
