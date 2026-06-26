@@ -87,6 +87,21 @@ def test_below_blue_improving_says_about_to_pick_up():
     assert "about to pick up" in line
 
 
+def test_antichurn_hold_acknowledges_the_busier_zones_and_explains():
+    # IMG_4170: a churned driver in Bay Ridge sees busier zones nearby yet the
+    # card said "sit tight ... you've moved a lot without a trip, so let dispatch
+    # work" — reading as if it ignored the busier zones. The reworded line names
+    # the tactic (chasing hasn't landed a fare) and doesn't lecture about moving.
+    line = compose_guidance_directive(
+        action="wait_dispatch", moving=False, current_zone_name="Bay Ridge",
+        current_rating=46, current_next_rating=46, spot=None,
+        below_blue=True, held_for_antichurn=True,
+    )
+    assert line.startswith("Sit tight in Bay Ridge")
+    assert "busier zones" in line and "let a dispatch come" in line
+    assert "you've moved a lot" not in line
+
+
 def test_spot_phrase_tags_the_zone_when_asked():
     # A bare street is useless to a driver who navigates by zones — tag it.
     assert spot_phrase({"label": "72nd Street", "source": "pickup"}, zone_name="Bay Ridge") == \

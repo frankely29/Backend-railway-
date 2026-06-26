@@ -446,6 +446,47 @@ def test_held_message_is_honest_when_a_better_zone_is_nearby():
     assert g["held_for_antichurn"] is True
 
 
+def test_fresh_hold_with_a_blue_nearby_is_not_labeled_antichurn():
+    # IMG_4170 false positive: below-blue zone with a blue+ zone reachable, but
+    # staying out-values the move over the hour (move_value 50 vs stay 58) so we
+    # hold — and the driver has NOT churned (no moves, no cooldown). The hold must
+    # NOT be flagged held_for_antichurn; otherwise the card reads "you've moved a
+    # lot without a trip" on a fresh stay whose real reason was the hour math.
+    zc = {
+        "current_zone": {"rating": 58, "next_rating": 58, "stay_hour_value": 58.0},
+        "nearby_candidates": [
+            {"zone_id": 9, "zone_name": "Blue Nearby", "rating": 62, "rating_now": 62,
+             "arrival_rating": 62, "move_value": 50.0, "distance_miles": 1.0},
+        ],
+    }
+    g = build_driver_guidance(
+        **_inputs(200, "Calm Zone", "2025-06-25T20:20:00", borough="Brooklyn"),
+        activity_snapshot=_snap(), zone_context=zc,
+    )
+    assert g["action"] in {"hold", "wait_dispatch", "micro_reposition"}
+    assert g["held_for_antichurn"] is False
+
+
+def test_antichurn_label_yields_when_staying_clearly_beats_the_move():
+    # Even churned (repeated moves + cooldown), if staying clearly out-values the
+    # reachable blue zone over the hour we hold because the HOUR favors it, not
+    # because of churn — so don't slap the "you moved a lot" line on it.
+    zc = {
+        "current_zone": {"rating": 58, "next_rating": 58, "stay_hour_value": 58.0},
+        "nearby_candidates": [
+            {"zone_id": 9, "zone_name": "Blue Nearby", "rating": 62, "rating_now": 62,
+             "arrival_rating": 62, "move_value": 50.0, "distance_miles": 1.0},
+        ],
+    }
+    g = build_driver_guidance(
+        **_inputs(200, "Calm Zone", "2025-06-25T20:20:00", borough="Brooklyn"),
+        activity_snapshot=_snap({"recent_move_attempts_without_trip": 3,
+                                 "moved_since_last_saved_trip": True}),
+        zone_context=zc,
+    )
+    assert g["held_for_antichurn"] is False
+
+
 def test_escape_fires_when_a_close_blue_exists_even_if_best_is_farther():
     # Top-rated nearby (Boerum 76) is 2.7mi, but a close blue+ (Red Hook 69) is
     # 1.4mi. Churned driver in a red zone should still escape (move).
