@@ -212,6 +212,29 @@ def test_held_in_a_short_trip_trap_warns_the_driver():
     assert "low_trip_trap" in g.get("reason_codes", [])
 
 
+def test_warns_when_sent_into_a_higher_risk_zone():
+    # The engine routes a driver from a non-risk zone INTO a higher-risk one
+    # (zone 75). The current-zone safety check never sees the destination, so the
+    # driver used to get no warning. Now the card warns about where they're headed
+    # and surfaces the rider-rating floor.
+    zc = {
+        "current_zone": {"rating": 45, "next_rating": 45, "stay_hour_value": 45.0},
+        "nearby_candidates": [
+            {"zone_id": 75, "zone_name": "East Harlem North", "rating": 66, "rating_now": 66,
+             "arrival_rating": 66, "move_value": 62.0, "distance_miles": 1.0},
+        ],
+    }
+    g = build_driver_guidance(**_inputs(200, "Start Zone", "2025-06-23T14:00:00"),
+                              activity_snapshot=_snap(), zone_context=zc)
+    assert g["action"] == "move_nearby"
+    assert (g["target_zone"] or {}).get("zone_name") == "East Harlem North"
+    assert g["target_elevated_risk"] is True
+    assert g["safety_elevated_risk"] is False
+    assert g["safety_min_rider_rating"] == 4.7
+    assert "higher-risk" in (g["safety_advice"] or "")
+    assert "East Harlem North" in (g["safety_advice"] or "")
+
+
 def test_dead_area_everywhere_routes_to_the_far_demand():
     # Quiet here and quiet in the whole nearby band, but a strong zone sits within
     # a worthwhile longer drive. A veteran deadheads toward the demand, not sits.
