@@ -605,7 +605,18 @@ def build_driver_guidance(
     # improving, say so, so the choice is informed. Anti-churn still applies:
     # we won't push a move during cooldown or after repeated failed moves.
     below_blue = current_rating < BLUE_RATING
-    current_will_improve = below_blue and current_next_rating >= BLUE_RATING
+    # "About to pick up" must be a SUSTAINED rise, not a single +20 blip that
+    # craters by the time the driver would benefit. Require the +20 to reach blue
+    # AND the rest of the hour (+40/+60) to hold near blue — otherwise we'd pin a
+    # driver waiting on a surge that's already gone. (Bins default to the +20
+    # value when the builder didn't supply them, so this is a no-op there.)
+    _improve_r40 = _safe_float(current_zone.get("rating_40"), current_next_rating)
+    _improve_r60 = _safe_float(current_zone.get("rating_60"), _improve_r40)
+    current_will_improve = (
+        below_blue
+        and current_next_rating >= BLUE_RATING
+        and min(_improve_r40, _improve_r60) >= BLUE_RATING - 4.0
+    )
     best_nearby_arrival = _safe_float(best_nearby.get("rating"), 0.0) if best_nearby else 0.0
     best_nearby_dist = _safe_float(best_nearby.get("distance_miles"), 999.0) if best_nearby else 999.0
     best_nearby_name = (best_nearby or {}).get("zone_name") or "the nearby zone"
