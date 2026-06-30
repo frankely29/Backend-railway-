@@ -9023,6 +9023,18 @@ def assistant_guidance(
                 if _arr >= _best_arr:
                     _best_arr = _arr
                     _busier_zone_name = _c.get("zone_name")
+        # The rest-of-the-hour level (avg of +40/+60 mins) so the STAY trend
+        # ("steady"/"easing") reflects the whole hour, not just the +20 bin; falls
+        # back to +20 (or None) when those bins aren't present.
+        _r40_raw, _r60_raw = _cz.get("rating_40"), _cz.get("rating_60")
+        if _r40_raw is not None and _r60_raw is not None:
+            _current_hour_trend_rating = (_safe_float_value(_r40_raw) + _safe_float_value(_r60_raw)) / 2.0
+        elif _r60_raw is not None:
+            _current_hour_trend_rating = _safe_float_value(_r60_raw)
+        elif _cz.get("next_rating") is not None:
+            _current_hour_trend_rating = _safe_float_value(_cz.get("next_rating"))
+        else:
+            _current_hour_trend_rating = None
         _directive = compose_guidance_directive(
             action=str(guidance.get("action") or "hold"),
             moving=_moving,
@@ -9039,6 +9051,7 @@ def assistant_guidance(
             far_reposition=bool(guidance.get("far_reposition")),
             held_for_antichurn=bool(guidance.get("held_for_antichurn")),
             busier_zone_name=_busier_zone_name,
+            current_hour_trend_rating=_current_hour_trend_rating,
         )
         # Anticipation: only when the driver is genuinely IDLE (holding in a
         # quiet, sub-blue zone that isn't itself about to pick up) do we look

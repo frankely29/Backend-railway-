@@ -87,6 +87,25 @@ def test_below_blue_improving_says_about_to_pick_up():
     assert "about to pick up" in line
 
 
+def test_stay_trend_reflects_the_rest_of_the_hour_not_just_plus20():
+    # Red-hot now (80), still 80 at +20 (so the +20 trend reads "steady"), but it
+    # eases over the rest of the hour (avg of +40/+60 ~= 72). The line must say
+    # "slowing down", not "steady" — the driver sees the hour, not one bin.
+    line = compose_guidance_directive(
+        action="hold", moving=False, current_zone_name="Times Sq",
+        current_rating=80, current_next_rating=80, spot=None,
+        below_blue=False, current_hour_trend_rating=72.0,
+    )
+    assert "slowing down" in line
+    # Control: when the hour holds (still ~80), it stays "steady".
+    steady = compose_guidance_directive(
+        action="hold", moving=False, current_zone_name="Times Sq",
+        current_rating=80, current_next_rating=80, spot=None,
+        below_blue=False, current_hour_trend_rating=80.0,
+    )
+    assert "steady" in steady
+
+
 def test_antichurn_hold_acknowledges_the_busier_zones_and_explains():
     # IMG_4170: a churned driver in Bay Ridge sees busier zones nearby yet the
     # card said "sit tight ... you've moved a lot without a trip, so let dispatch
