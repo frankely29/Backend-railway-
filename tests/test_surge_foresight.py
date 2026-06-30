@@ -44,6 +44,27 @@ def test_surge_across_the_river_is_priced_with_the_bridge_detour():
     assert best["zone_name"] == "Manhattan Surge"
 
 
+def test_surge_picks_the_closer_one_when_a_hotter_surge_is_much_farther():
+    # A close surge (peak 78, ~1mi) vs a hotter one a long deadhead away (peak 82,
+    # ~5mi). Net of the unpaid drive the close one is the better pre-position — the
+    # foresight must rank by peak MINUS deadhead, like the router, not raw peak.
+    def z(zid, name, peak):
+        return {"location_id": zid, "zone_name": name, "borough": "Manhattan",
+                "points": [_pt(60), _pt(70), _pt(peak)]}
+    frame_bucket = {"301": z(301, "Close Surge", 78), "302": z(302, "Far Hot Surge", 82)}
+    centroid_lookup = {
+        301: {"centroid_lat": 40.75 + 0.0145, "centroid_lng": -73.99},  # ~1mi
+        302: {"centroid_lat": 40.75 + 0.0725, "centroid_lng": -73.99},  # ~5mi
+    }
+    best = _find_upcoming_surge(
+        frame_bucket=frame_bucket, current_lat=40.75, current_lng=-73.99,
+        centroid_lookup=centroid_lookup, frame_key="2025-06-21T22:00:00",
+        mode_flags={}, current_zone_id=None, current_rating=50.0, current_borough="Manhattan",
+    )
+    assert best is not None
+    assert best["zone_name"] == "Close Surge"
+
+
 def test_same_borough_surge_is_still_found():
     # Control: a single reachable same-borough surge is returned with a sane ETA.
     frame_bucket = {"201": _surge_zone(201, "Manhattan Surge", "Manhattan")}
