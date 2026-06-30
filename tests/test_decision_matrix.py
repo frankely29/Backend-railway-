@@ -194,6 +194,24 @@ def test_about_to_pick_up_fires_on_a_sustained_rise():
     assert g["action"] in {"hold", "wait_dispatch"}
 
 
+def test_held_in_a_short_trip_trap_warns_the_driver():
+    # Holding inside a known short-trip trap (high short-trip + saturation penalty)
+    # with nothing better reachable. The card must include a factual heads-up, not
+    # a bare "stay" — and must NOT claim the offline-until-arrival escape (no move).
+    zc = {
+        "current_zone": {"rating": 48, "next_rating": 48, "stay_hour_value": 48.0,
+                         "short_trip_penalty": 0.6, "market_saturation_penalty": 0.5},
+        "nearby_candidates": [],
+    }
+    g = build_driver_guidance(**_inputs(200, "Trap Zone", "2025-06-23T15:00:00", borough="Brooklyn"),
+                              activity_snapshot=_snap(), zone_context=zc)
+    assert not _is_move(g)
+    assert g.get("trap_zone") is True
+    assert g.get("offline_until_arrival") is False
+    assert "short, cheap trips" in (g.get("trap_advice") or "")
+    assert "low_trip_trap" in g.get("reason_codes", [])
+
+
 def test_dead_area_everywhere_routes_to_the_far_demand():
     # Quiet here and quiet in the whole nearby band, but a strong zone sits within
     # a worthwhile longer drive. A veteran deadheads toward the demand, not sits.

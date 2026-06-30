@@ -1005,6 +1005,11 @@ def build_driver_guidance(
         )
         reason_codes.append("low_trip_trap_escape")
     elif trap_zone:
+        # Holding INSIDE a short-trip trap (no better escape right now, or a
+        # cooldown). The escape line above only fires on a move, so without this
+        # the driver sits in a known cheap-trip trap with a plain "stay" and no
+        # heads-up. State it factually — don't tell them to decline trips.
+        trap_advice = "Heads up — this area's sending mostly short, cheap trips right now."
         reason_codes.append("low_trip_trap")
 
     # --- Airport overlay: FIFO queue mechanics the rating can't convey. At an
