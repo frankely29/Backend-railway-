@@ -109,6 +109,7 @@ def compose_guidance_directive(
     current_will_improve: bool = False,
     far_reposition: bool = False,
     held_for_antichurn: bool = False,
+    busier_zone_name: Optional[str] = None,
 ) -> str:
     czone = current_zone_name or "this area"
     sp = spot_phrase(spot)
@@ -177,6 +178,17 @@ def compose_guidance_directive(
     if held_for_antichurn:
         tail = f" Work {sp_here} meanwhile." if sp_here else ""
         return f"Sit tight in {czone} a few minutes — hopping toward the busier zones hasn't landed a fare, so let a dispatch come before chasing again.{tail}"
+
+    # --- STAY: below blue, holding while a zone IS busier now but the move
+    # isn't worth it yet (the deadhead eats the gain, or we're cooling a hop).
+    # Be honest — a driver can SEE the busier zone on the map, so never claim
+    # "nothing nearby beats it"; name it and say why we're not chasing. --------
+    if busier_zone_name:
+        tail = f" Work {sp_here} meanwhile." if sp_here else ""
+        return (
+            f"Stay in {czone} for now — {busier_zone_name}'s busier, but not worth "
+            f"the drive yet.{tail}"
+        )
 
     # --- STAY: below blue, nothing reachable is better yet -----------------
     if sp_here:

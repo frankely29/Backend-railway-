@@ -8999,6 +8999,19 @@ def assistant_guidance(
             _spot = {"label": _anchor_label, "source": "pickup"}
         elif _magnet:
             _spot = {"label": _magnet.get("label"), "kind": _magnet.get("kind"), "source": "magnet"}
+        # When we're holding sub-blue, find a zone the driver can plainly SEE is
+        # busier on the map (clearly higher on arrival) so the directive can name
+        # it honestly instead of claiming "nothing nearby beats it." Only used by
+        # the below-blue hold fallback; a real move would have named it already.
+        _busier_zone_name = None
+        if not _moving and bool(guidance.get("below_blue")):
+            _cur_r = _safe_float_value(_cz.get("rating"), 0.0)
+            _best_arr = _cur_r + 8.0
+            for _c in (guidance.get("nearby_candidates") or []):
+                _arr = _safe_float_value(_c.get("arrival_rating"), _safe_float_value(_c.get("rating"), 0.0))
+                if _arr >= _best_arr:
+                    _best_arr = _arr
+                    _busier_zone_name = _c.get("zone_name")
         _directive = compose_guidance_directive(
             action=str(guidance.get("action") or "hold"),
             moving=_moving,
@@ -9014,6 +9027,7 @@ def assistant_guidance(
             current_will_improve=bool(guidance.get("current_will_improve")),
             far_reposition=bool(guidance.get("far_reposition")),
             held_for_antichurn=bool(guidance.get("held_for_antichurn")),
+            busier_zone_name=_busier_zone_name,
         )
         # Anticipation: only when the driver is genuinely IDLE (holding in a
         # quiet, sub-blue zone that isn't itself about to pick up) do we look
