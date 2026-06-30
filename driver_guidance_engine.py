@@ -978,6 +978,12 @@ def build_driver_guidance(
     # --- Safety overlay: elevated-risk zone -> raise the rider-rating filter,
     # and overnight add the phone-snatch defense (the documented driver threat).
     safety_elevated_risk = current_zone_id in SAFETY_ELEVATED_RISK_ZONE_IDS
+    _target_zone_id = (target_zone or {}).get("zone_id")
+    target_elevated_risk = (
+        action in {"move_nearby", "micro_reposition"}
+        and _target_zone_id is not None
+        and _target_zone_id in SAFETY_ELEVATED_RISK_ZONE_IDS
+    )
     safety_advice: Optional[str] = None
     if safety_elevated_risk:
         safety_advice = (
@@ -986,6 +992,20 @@ def build_driver_guidance(
         if overnight:
             safety_advice += " Late-night: keep your phone mounted, never hand it to a rider."
         reason_codes.append("elevated_risk_zone")
+        if overnight:
+            reason_codes.append("overnight_high_risk")
+    elif target_elevated_risk:
+        # We're sending the driver INTO a higher-risk zone — warn about the
+        # DESTINATION (the current-zone check above never sees it). Same rider
+        # filter + overnight phone defense, phrased for where they're headed.
+        _tname = (target_zone or {}).get("zone_name") or "that area"
+        safety_advice = (
+            f"Heads up — {_tname} is a higher-risk area; only take "
+            f"{SAFETY_MIN_RIDER_RATING:g}+ riders there."
+        )
+        if overnight:
+            safety_advice += " Late-night: keep your phone mounted, never hand it to a rider."
+        reason_codes.append("target_elevated_risk_zone")
         if overnight:
             reason_codes.append("overnight_high_risk")
 
@@ -1067,10 +1087,11 @@ def build_driver_guidance(
         "message": message,
         "reason_codes": reason_codes,
         "safety_elevated_risk": bool(safety_elevated_risk),
+        "target_elevated_risk": bool(target_elevated_risk),
         "safety_overnight": bool(overnight),
         "long_trip_window": bool(long_trip_window),
         "safety_advice": safety_advice,
-        "safety_min_rider_rating": SAFETY_MIN_RIDER_RATING if safety_elevated_risk else None,
+        "safety_min_rider_rating": SAFETY_MIN_RIDER_RATING if (safety_elevated_risk or target_elevated_risk) else None,
         "trap_zone": bool(trap_zone),
         "offline_until_arrival": bool(offline_until_arrival),
         "trap_advice": trap_advice,
