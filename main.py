@@ -8747,7 +8747,12 @@ def _find_upcoming_surge(
             and peak_rating >= current_rating + 8.0
             and eta_minutes <= minutes_ahead + 20.0  # can be there around the peak
         ):
-            if best is None or peak_rating > best["peak_rating"]:
+            # Closest-best, like the router: rank surges by peak rating MINUS the
+            # deadhead to reach them, not raw peak. A closer surge of similar heat
+            # beats a marginally-hotter one a longer empty drive away — fewer
+            # unpaid miles for the same payoff.
+            surge_net = peak_rating - (eta_minutes / 60.0) * GUIDANCE_DEADHEAD_COST_PER_HOUR
+            if best is None or surge_net > best["surge_net"]:
                 peak_total = (base_total + minutes_ahead) % (24 * 60)
                 hh, mm = divmod(peak_total, 60)
                 suffix = "AM" if hh < 12 else "PM"
@@ -8761,6 +8766,7 @@ def _find_upcoming_surge(
                     "zone_id": zid,
                     "zone_name": payload.get("zone_name"),
                     "peak_rating": round(float(peak_rating), 2),
+                    "surge_net": round(float(surge_net), 2),
                     "minutes_ahead": int(minutes_ahead),
                     "peak_clock": f"{h12}:{mm:02d} {suffix}",
                     "eta_minutes": round(float(eta_minutes), 1),
