@@ -235,6 +235,41 @@ def test_warns_when_sent_into_a_higher_risk_zone():
     assert "East Harlem North" in (g["safety_advice"] or "")
 
 
+def test_takes_a_busier_zone_one_block_over_on_a_smaller_edge():
+    # Live Park Slope 11pm: already blue (77) and 'strong-hold' eligible, but
+    # Boerum Hill is busier next door (move_value 80.6 @0.6mi) — a +6 net edge over
+    # staying (74.3). The flat +8 bucket missed it; a few-minute hop to a clearly
+    # busier zone is worth a smaller edge, so we move.
+    zc = {
+        "current_zone": {"rating": 77, "next_rating": 76, "rating_40": 75, "rating_60": 74,
+                         "stay_hour_value": 74.3, "continuation_raw": 0.6},
+        "nearby_candidates": [
+            {"zone_id": 9, "zone_name": "Boerum Hill", "rating": 81, "rating_now": 81,
+             "arrival_rating": 81, "move_value": 80.56, "distance_miles": 0.6},
+        ],
+    }
+    g = build_driver_guidance(**_inputs(200, "Park Slope", "2025-06-21T23:00:00", borough="Brooklyn"),
+                              activity_snapshot=_snap(), zone_context=zc)
+    assert g["action"] == "move_nearby"
+    assert (g["target_zone"] or {}).get("zone_name") == "Boerum Hill"
+
+
+def test_does_not_hop_for_a_small_edge_when_the_better_zone_is_far():
+    # Same +6 edge but the better zone is 2.2mi away (not a quick hop) — the full
+    # bucket still applies, so we hold the strong zone rather than deadhead for +6.
+    zc = {
+        "current_zone": {"rating": 77, "next_rating": 76, "rating_40": 75, "rating_60": 74,
+                         "stay_hour_value": 74.3, "continuation_raw": 0.6},
+        "nearby_candidates": [
+            {"zone_id": 9, "zone_name": "Far Better", "rating": 81, "rating_now": 81,
+             "arrival_rating": 81, "move_value": 80.56, "distance_miles": 2.2},
+        ],
+    }
+    g = build_driver_guidance(**_inputs(200, "Park Slope", "2025-06-21T23:00:00", borough="Brooklyn"),
+                              activity_snapshot=_snap(), zone_context=zc)
+    assert not _is_move(g)
+
+
 def test_dead_area_everywhere_routes_to_the_far_demand():
     # Quiet here and quiet in the whole nearby band, but a strong zone sits within
     # a worthwhile longer drive. A veteran deadheads toward the demand, not sits.

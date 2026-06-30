@@ -52,6 +52,13 @@ BLUE_ESCAPE_OVERRIDE_MARGIN = 5.0
 # settling window after arrival). A full bucket of net edge after the drive and
 # the hour are priced in — clearly worth leaving the conversion timer for.
 STRONG_HOLD_OVERRIDE_MARGIN = 8.0
+# A zone right next door (<= this many miles, a few minutes) is low-risk to hop
+# to and easy to come back from, so a SMALLER net edge over staying earns the
+# move; a farther zone still needs the full bucket above. Lets a veteran take the
+# busier zone one block over (Park Slope 77 -> Boerum Hill mv 80 @0.6mi) instead
+# of sitting on a flat "strong hold".
+CLOSE_HOP_MAX_MILES = 1.0
+CLOSE_HOP_OVERRIDE_MARGIN = 5.0
 
 
 def _bucket_name(rating: float) -> str:
@@ -701,6 +708,16 @@ def build_driver_guidance(
     # zone. Demand-vs-distance must judge the zone we're sending the driver to.
     best_move_target_dist = _safe_float((best_move_target or {}).get("distance_miles"), 999.0)
     best_move_target_arrival = _safe_float((best_move_target or {}).get("rating"), 0.0)
+    # How much a discretionary move from an ALREADY-blue zone must beat staying by
+    # over the next hour. Distance-scaled: a zone right next door (a few-minute
+    # hop, easy to come back from) earns the move on a smaller edge; a farther one
+    # still needs the full bucket. Used by both the strong-hold yield and the
+    # above-blue better-move branch so they agree on what "clearly better" means.
+    strong_hold_override_margin = (
+        CLOSE_HOP_OVERRIDE_MARGIN
+        if best_move_target_dist <= CLOSE_HOP_MAX_MILES
+        else STRONG_HOLD_OVERRIDE_MARGIN
+    )
     # A discretionary move must actually beat STAYING over the next hour. A zone
     # can read +10 on arrival rating yet net LESS once the drive and the hour are
     # priced in (a quiet zone hopping to another quiet zone) — moving there just
@@ -810,7 +827,7 @@ def build_driver_guidance(
         and settling_window
         and obvious_upgrade is None
         and not current_is_trap
-        and not (best_move_value >= stay_hour_value + STRONG_HOLD_OVERRIDE_MARGIN)
+        and not (best_move_value >= stay_hour_value + strong_hold_override_margin)
     ):
         # Strong hold: rating fine, continuation OK, just arrived — give the zone
         # a chance to convert. But NOT when (a) an obviously-much-better zone is
@@ -845,7 +862,7 @@ def build_driver_guidance(
     elif (
         current_rating >= BLUE_RATING
         and best_move_target is not None
-        and best_move_value >= stay_hour_value + STRONG_HOLD_OVERRIDE_MARGIN
+        and best_move_value >= stay_hour_value + strong_hold_override_margin
         and _safe_float(best_move_target.get("distance_miles"), 999.0) <= 2.5
         and not in_move_cooldown
         and recent_move_attempts < 3
