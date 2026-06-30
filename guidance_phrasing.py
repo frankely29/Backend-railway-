@@ -110,6 +110,7 @@ def compose_guidance_directive(
     far_reposition: bool = False,
     held_for_antichurn: bool = False,
     busier_zone_name: Optional[str] = None,
+    current_hour_trend_rating: Optional[float] = None,
 ) -> str:
     czone = current_zone_name or "this area"
     sp = spot_phrase(spot)
@@ -153,7 +154,11 @@ def compose_guidance_directive(
     # --- STAY: busy zone (blue+) -------------------------------------------
     if not below_blue:
         word = demand_word(current_rating)
-        trend = _trend(current_rating, current_next_rating)
+        # Trend over the REST OF THE HOUR, not just the +20 bin: a red-hot zone
+        # that eases by +40/+60 should read "slowing down", not "steady". Falls
+        # back to the +20 value when the hour signal isn't supplied (unit tests).
+        _trend_to = current_hour_trend_rating if current_hour_trend_rating is not None else current_next_rating
+        trend = _trend(current_rating, _trend_to)
         busy_now = " It's busy right now." if (spot and spot.get("prime_now")) else ""
         if trend == "climbing":
             tail = f" Work {sp}." if sp else ""
