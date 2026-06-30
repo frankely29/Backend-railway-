@@ -8723,6 +8723,11 @@ def _find_upcoming_surge(
         if clat is None or clng is None:
             continue
         distance = _safe_haversine_miles(current_lat, current_lng, clat, clng)
+        # Fold the bridge/tunnel detour for a water crossing into the distance —
+        # same model the main router uses. Without it, a surge across the East
+        # River reads closer than it drives, so the ETA (and the "leave around
+        # X:XX" time) would send the driver off too late to actually make the peak.
+        distance += _borough_crossing_penalty_miles(current_borough, payload.get("borough"))
         if distance > _SURGE_MAX_MILES:
             continue
         now_rating = _extract_zone_rating_from_point(points[0], mode_flags)
