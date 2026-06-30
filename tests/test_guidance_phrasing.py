@@ -102,6 +102,28 @@ def test_antichurn_hold_acknowledges_the_busier_zones_and_explains():
     assert "you've moved a lot" not in line
 
 
+def test_below_blue_hold_names_a_visibly_busier_zone_instead_of_lying():
+    # We're holding sub-blue but a zone the driver can SEE is busier sits nearby
+    # (the move just isn't worth the deadhead yet). The line must name it honestly,
+    # never claim "nothing nearby beats it" while a redder zone is on the map.
+    line = compose_guidance_directive(
+        action="wait_dispatch", moving=False, current_zone_name="Bay Ridge",
+        current_rating=48, current_next_rating=48, spot=None,
+        below_blue=True, busier_zone_name="Sunset Park West",
+    )
+    assert "Sunset Park West" in line and "not worth the drive yet" in line
+    assert "nothing nearby" not in line
+
+
+def test_below_blue_hold_keeps_plain_line_when_nothing_is_busier():
+    line = compose_guidance_directive(
+        action="hold", moving=False, current_zone_name="Quiet Outer Zone",
+        current_rating=40, current_next_rating=40, spot=None,
+        below_blue=True, busier_zone_name=None,
+    )
+    assert "nothing nearby is better" in line
+
+
 def test_spot_phrase_tags_the_zone_when_asked():
     # A bare street is useless to a driver who navigates by zones — tag it.
     assert spot_phrase({"label": "72nd Street", "source": "pickup"}, zone_name="Bay Ridge") == \
