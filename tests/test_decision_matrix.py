@@ -166,6 +166,34 @@ def test_clearly_better_zone_stays_the_call_as_current_rating_ticks_up():
         assert (g["target_zone"] or {}).get("zone_name") == "Lower East Side"
 
 
+def test_about_to_pick_up_requires_a_sustained_rise_not_a_one_bin_blip():
+    # Below blue, +20 blips to blue (61) but the rest of the hour craters (46/45).
+    # We must NOT tell the driver to wait on a surge that's already gone — a
+    # one-bin spike is not "about to pick up".
+    zc = {
+        "current_zone": {"rating": 55, "next_rating": 61, "rating_40": 46, "rating_60": 45,
+                         "stay_hour_value": 50.0},
+        "nearby_candidates": [],
+    }
+    g = build_driver_guidance(**_inputs(200, "Blip Zone", "2025-06-23T17:00:00", borough="Brooklyn"),
+                              activity_snapshot=_snap(), zone_context=zc)
+    assert g["current_will_improve"] is False
+
+
+def test_about_to_pick_up_fires_on_a_sustained_rise():
+    # Below blue, +20 reaches blue (62) AND it holds across the hour (64/65) -> a
+    # genuine ramp, so "stay, it's about to pick up" is correct.
+    zc = {
+        "current_zone": {"rating": 55, "next_rating": 62, "rating_40": 64, "rating_60": 65,
+                         "stay_hour_value": 62.0},
+        "nearby_candidates": [],
+    }
+    g = build_driver_guidance(**_inputs(200, "Ramp Zone", "2025-06-23T17:00:00", borough="Brooklyn"),
+                              activity_snapshot=_snap(), zone_context=zc)
+    assert g["current_will_improve"] is True
+    assert g["action"] in {"hold", "wait_dispatch"}
+
+
 def test_dead_area_everywhere_routes_to_the_far_demand():
     # Quiet here and quiet in the whole nearby band, but a strong zone sits within
     # a worthwhile longer drive. A veteran deadheads toward the demand, not sits.
