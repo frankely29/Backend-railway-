@@ -1577,6 +1577,22 @@ def _month_demand_breakpoints(con: Any, exact_store_path: Path) -> List[float]:
     return bps
 
 
+def month_demand_breakpoints_for_store(exact_store_path: Path) -> List[float]:
+    """Open the month store read-only and return its demand breakpoints (cached).
+    Used by the parquet serve path, which builds frames from parquet but needs the
+    WHOLE-month demand distribution to anchor colors."""
+    try:
+        if not exact_store_path.exists() or exact_store_path.stat().st_size <= 0:
+            return []
+        con = duckdb.connect(database=str(exact_store_path), read_only=True)
+        try:
+            return _month_demand_breakpoints(con, exact_store_path)
+        finally:
+            con.close()
+    except Exception:
+        return []
+
+
 def _apply_month_anchored_colors(features: List[Dict[str, Any]], breakpoints: List[float]) -> None:
     """Re-base each zone's visible citywide rating/bucket/color to its month-wide
     demand percentile (the benchmark), overriding the per-frame rank the visible
