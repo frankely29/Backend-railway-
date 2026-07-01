@@ -3324,17 +3324,38 @@ def _build_and_persist_month_tendency_benchmark(month_key: str) -> Dict[str, Any
 def _load_month_tendency_benchmark_payload(month_key: str, *, active_month_key: str) -> Tuple[Dict[str, Any], str]:
     resolved = str(month_key or "").strip()
     benchmark_path = _month_tendency_benchmark_path(resolved)
+
+    def _is_stale_version(candidate: Any) -> bool:
+        # A benchmark built by older code (e.g. the pre-demand-anchor v1) must be
+        # rebuilt so Tendency stays on the same month benchmark as the colors.
+        try:
+            from month_tendency_benchmark import MONTH_TENDENCY_BENCHMARK_VERSION
+        except Exception:
+            return False
+        version = str((candidate or {}).get("version") or "").strip()
+        return version != MONTH_TENDENCY_BENCHMARK_VERSION
+
     if benchmark_path.exists() and benchmark_path.is_file() and benchmark_path.stat().st_size > 0:
         try:
             payload = _read_json(benchmark_path)
         except Exception as exc:
             raise HTTPException(status_code=503, detail=f"month tendency benchmark file unreadable: {str(exc)}")
-        return _validate_month_tendency_benchmark_payload(payload, resolved), "month_file"
+        if not _is_stale_version(payload):
+            return _validate_month_tendency_benchmark_payload(payload, resolved), "month_file"
+        # Stale on-disk version: fall through to rebuild below (best-effort; if the
+        # rebuild fails, serve the stale payload rather than erroring the driver).
+        try:
+            rebuilt = _build_and_persist_month_tendency_benchmark(resolved)
+            if str(resolved) == str(active_month_key or "").strip():
+                save_generated_artifact("month_tendency_benchmark", rebuilt, compress=False)
+            return rebuilt, "regenerated_stale_version"
+        except Exception:
+            return _validate_month_tendency_benchmark_payload(payload, resolved), "month_file_stale"
 
     active_key = str(active_month_key or "").strip()
     artifact = load_generated_artifact("month_tendency_benchmark")
     artifact_payload = (artifact or {}).get("payload") if isinstance(artifact, dict) else None
-    if isinstance(artifact_payload, dict):
+    if isinstance(artifact_payload, dict) and not _is_stale_version(artifact_payload):
         artifact_month_key = str(artifact_payload.get("month_key") or "").strip()
         if artifact_month_key == resolved:
             return _validate_month_tendency_benchmark_payload(artifact_payload, resolved), "active_mirror"
@@ -7226,12 +7247,15 @@ def debug_month_anchor(month_key: Optional[str] = None):
             out["breakpoints_min"] = round(float(bps[0]), 4)
             out["breakpoints_max"] = round(float(bps[-1]), 4)
             out["breakpoints_median"] = round(float(bps[len(bps) // 2]), 4)
+            # The benchmark now ranks the composite citywide EARNINGS score
+            # (~0..1, saturation included), not raw pickups. Sample across that
+            # range so the mapping is legible.
             samples = {}
-            for pk in (0, 5, 20, 50, 100, 300, 800):
-                pct = score_on_breakpoints(float(pk), bps)
+            for sc in (0.0, 0.05, 0.1, 0.2, 0.3, 0.4, 0.6):
+                pct = score_on_breakpoints(float(sc), bps)
                 rating = None if pct is None else int(round(1 + 0.99 * pct))
-                samples[str(pk)] = {"pct": None if pct is None else round(pct, 1), "rating": rating}
-            out["sample_pickup_to_rating"] = samples
+                samples[str(sc)] = {"pct": None if pct is None else round(pct, 1), "rating": rating}
+            out["sample_earnings_score_to_rating"] = samples
         out["last_error"] = dict(_MONTH_DEMAND_BP_LAST_ERROR)
     except Exception as exc:
         out["error"] = f"{type(exc).__name__}: {exc}"
@@ -7356,7 +7380,7 @@ def status():
         # Diagnostics for the month-anchored-colors rollout: echoes the build-time
         # flag and a code marker so we can confirm the deploy + flag without logs.
         "month_anchored_colors_env": os.environ.get("MONTH_ANCHORED_COLORS", "unset"),
-        "month_anchor_code_marker": "serve_v3_sidecar",
+        "month_anchor_code_marker": "serve_v4_earnings_score",
         "synthetic_week_enabled": False,
         "data_dir": str(DATA_DIR),
         "data_dir_exists": DATA_DIR.exists(),
