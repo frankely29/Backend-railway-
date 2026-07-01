@@ -3366,6 +3366,71 @@ def _load_month_tendency_benchmark_payload(month_key: str, *, active_month_key: 
     return payload, "generated_on_demand"
 
 
+# Citywide "good night / bad night" day-quality read for the day-tendency meter.
+# Typicals (per weekday+bin citywide demand) are scanned once per store and cached
+# in-memory; the current frame's citywide demand is a cheap indexed lookup.
+_DAY_QUALITY_TYPICALS_CACHE: Dict[str, Dict[str, float]] = {}
+
+
+def _day_quality_typicals_for_store(store_path: Path) -> Dict[str, float]:
+    try:
+        cache_key = f"{store_path}:{store_path.stat().st_mtime_ns}"
+    except Exception:
+        cache_key = str(store_path)
+    cached = _DAY_QUALITY_TYPICALS_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    typicals: Dict[str, float] = {}
+    try:
+        if store_path.exists() and store_path.stat().st_size > 0:
+            import duckdb as _duckdb
+            from month_day_quality_benchmark import compute_day_quality_typicals
+            con = _duckdb.connect(database=str(store_path), read_only=True)
+            try:
+                typicals = compute_day_quality_typicals(con)
+            finally:
+                con.close()
+    except Exception:
+        typicals = {}
+    _DAY_QUALITY_TYPICALS_CACHE[cache_key] = typicals
+    return typicals
+
+
+def _month_day_quality_for_frame(month_key: str, frame_time: Optional[str]) -> Dict[str, Any]:
+    if not frame_time:
+        return {"status": "unavailable"}
+    try:
+        store_path = _month_store_path(str(month_key).strip())
+        if not (store_path.exists() and store_path.stat().st_size > 0):
+            return {"status": "unavailable"}
+        typicals = _day_quality_typicals_for_store(store_path)
+        if not typicals:
+            return {"status": "unavailable"}
+        frame_dt = _parse_frame_time_to_nyc(frame_time)
+        frame_iso = _frame_time_iso_local(frame_dt)
+        bin_minutes = int(DEFAULT_BIN_MINUTES)
+        bin_index = _current_bin_index_from_dt(frame_dt, bin_minutes=bin_minutes)
+        weekday_iso = frame_dt.isoweekday()  # Monday=1 .. Sunday=7, matches ISODOW
+        typical = typicals.get(f"{weekday_iso}-{bin_index}")
+        import duckdb as _duckdb
+        from month_day_quality_benchmark import current_citywide_pickups, day_quality_read
+        con = _duckdb.connect(database=str(store_path), read_only=True)
+        try:
+            current = current_citywide_pickups(con, frame_iso)
+        finally:
+            con.close()
+        read = day_quality_read(
+            current,
+            typical,
+            weekday_name=_weekday_name_from_mon0(frame_dt.weekday()),
+            time_label=_bin_label(bin_index, bin_minutes=bin_minutes),
+        )
+        read["frame_time"] = frame_iso
+        return read
+    except Exception:
+        return {"status": "unavailable"}
+
+
 def _day_tendency_scope_kind(scope: Optional[str]) -> str:
     resolved = str(scope or "").strip()
     if not resolved:
@@ -8124,6 +8189,9 @@ def day_tendency_month_benchmark(
         payload["active_month_key"] = active_month_key
     payload["source"] = source
     payload["requested_month_key"] = resolved_month_key
+    # Citywide "good night / bad night" read for the day-tendency meter: this
+    # frame's citywide demand vs the typical for the SAME weekday+time this month.
+    payload["day_quality"] = _month_day_quality_for_frame(resolved_month_key, frame_time)
     return payload
 
 
