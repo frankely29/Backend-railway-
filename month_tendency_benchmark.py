@@ -16,8 +16,9 @@ MANHATTAN_CORE_MAX_LATITUDE = 40.795
 # Bump whenever the benchmark's computation changes so serve time can detect a
 # stale on-disk benchmark (built by older code) and rebuild it automatically.
 # v2 = raw-pickups month benchmark (dropped saturation); v3 = composite earnings
-# score benchmark (saturation + all formulas restored).
-MONTH_TENDENCY_BENCHMARK_VERSION = "month_tendency_benchmark_v3"
+# score percentile (dropped confidence + display curve); v4 = full original blend
+# + relaxed display curve on the month-anchored rank (matches the map colors).
+MONTH_TENDENCY_BENCHMARK_VERSION = "month_tendency_benchmark_v4"
 
 
 FAMILY_SPECS: List[Dict[str, str]] = [
@@ -232,24 +233,44 @@ def build_month_tendency_benchmark(
                 ],
             )
 
-        # The month benchmark: each non-airport zone-frame's ABSOLUTE percentile of
-        # the composite citywide EARNINGS score (saturation + every formula baked
-        # in) over the WHOLE month, on the SAME footing as the map colors.
-        # score_on_breakpoints (serve time, colors) is the 101-point compression of
-        # this exact PERCENT_RANK; both rank LN(1 + earnings score) over the same
-        # airport-excluded, score-eligible population, so Tendency and the colors
-        # read one ruler AND both respect saturation. (v1 ranked raw pickups, which
-        # discarded saturation -- that regression is fixed here.)
+        # The month benchmark, computed to EXACTLY match the map colors' rating so
+        # Tendency and the colors read one ruler. The colors' rating (see
+        # build_hotspot._citywide_visible_rating_from_components) is the ORIGINAL
+        # blend -- 0.40*rank + 0.46*earnings_score + 0.14*confidence, reshaped by the
+        # relaxed display curve 0.62*x + 0.38*sqrt(x) -- with ONLY the rank term made
+        # day-consistent: the per-frame rank is replaced by the zone's month-wide
+        # percentile of the earnings score (PERCENT_RANK over LN(1+score)). We
+        # reproduce that whole formula here so the baseline respects saturation,
+        # confidence, and the curve -- nothing dropped. (v1 ranked raw pickups; v2/v3
+        # dropped confidence + curve; v4 is the faithful match.)
         anchored_cte = """
-            WITH anchored AS (
+            WITH ranked AS (
                 SELECT
                     e.*,
-                    (1.0 + 99.0 * PERCENT_RANK() OVER (
+                    PERCENT_RANK() OVER (
                         ORDER BY LN(1 + COALESCE(e.earnings_shadow_score_citywide_v3_anchor_shadow, 0))
-                    )) AS anchored_citywide_rating
+                    ) AS month_rank_norm
                 FROM exact_shadow_rows e
                 WHERE e.PULocationID NOT IN (1, 132, 138)
                   AND e.earnings_shadow_score_citywide_v3_anchor_shadow IS NOT NULL
+            ),
+            based AS (
+                SELECT
+                    r.*,
+                    LEAST(GREATEST(
+                        0.40 * r.month_rank_norm
+                        + 0.46 * LEAST(GREATEST(r.earnings_shadow_score_citywide_v3_anchor_shadow, 0), 1)
+                        + 0.14 * LEAST(GREATEST(COALESCE(r.earnings_shadow_confidence_citywide_v3, 0), 0), 1)
+                    , 0), 1) AS base_norm
+                FROM ranked r
+            ),
+            anchored AS (
+                SELECT
+                    b.*,
+                    (1.0 + 99.0 * LEAST(GREATEST(
+                        0.62 * b.base_norm + 0.38 * SQRT(b.base_norm)
+                    , 0), 1)) AS anchored_citywide_rating
+                FROM based b
             )
         """
         union_queries: List[str] = []

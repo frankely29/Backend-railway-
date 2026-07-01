@@ -391,6 +391,34 @@ def _relaxed_display_curve(x: float) -> float:
     return _clamp01(0.62 * x + 0.38 * (x ** 0.5))
 
 
+# The citywide visible rating is a blend of three [0,1] inputs -- a rank term, the
+# earnings-score anchor, and confidence -- then reshaped by the relaxed display
+# curve. These weights and this helper are the SINGLE definition shared by the
+# per-frame recalibration and the month-anchored override, so the two paths
+# produce the identical rating and only ever differ in the RANK input (per-frame
+# rank vs month-anchored percentile). Keeping them here prevents the month
+# benchmark from silently dropping the confidence term or the display curve.
+CITYWIDE_VISIBLE_RANK_WEIGHT = 0.40
+CITYWIDE_VISIBLE_ANCHOR_WEIGHT = 0.46
+CITYWIDE_VISIBLE_CONF_WEIGHT = 0.14
+
+
+def _citywide_visible_base_norm(rank_norm: float, anchor_input: float, conf: float) -> float:
+    return _clamp01(
+        CITYWIDE_VISIBLE_RANK_WEIGHT * _clamp01(rank_norm) +
+        CITYWIDE_VISIBLE_ANCHOR_WEIGHT * _clamp01(anchor_input) +
+        CITYWIDE_VISIBLE_CONF_WEIGHT * _clamp01(conf)
+    )
+
+
+def _citywide_visible_rating_from_components(rank_norm: float, anchor_input: float, conf: float) -> Tuple[int, float, float]:
+    """Return (visible_rating, base_norm, display_norm) for the citywide rating.
+    rank_norm is the ONLY term the month benchmark changes (per-frame -> month)."""
+    base_norm = _citywide_visible_base_norm(rank_norm, anchor_input, conf)
+    display_norm = _relaxed_display_curve(base_norm)
+    return int(round(1 + 99 * display_norm)), base_norm, display_norm
+
+
 def _eligible_for_profile(profile_name: str, props: Dict[str, Any], geometry: Any) -> bool:
     location_id = int(props.get("LocationID", 0))
     borough = _normalized_borough_name(props.get("borough"))
@@ -490,13 +518,9 @@ def _recalibrate_visible_v3_fields(features: List[Dict[str, Any]]) -> None:
         citywide_anchor_discount_factor = 1.0
         citywide_anchor_input = _clamp01(float(props.get(citywide_rank_field) or 0.0))
         citywide_conf = _clamp01(float(props.get(citywide_conf_field) or 0.0))
-        citywide_base_norm = _clamp01(
-            0.40 * citywide_local_rank +
-            0.46 * citywide_anchor_input +
-            0.14 * citywide_conf
+        visible_rating, citywide_base_norm, citywide_display_norm = _citywide_visible_rating_from_components(
+            citywide_local_rank, citywide_anchor_input, citywide_conf
         )
-        citywide_display_norm = _relaxed_display_curve(citywide_base_norm)
-        visible_rating = int(round(1 + 99 * citywide_display_norm))
         visible_bucket, visible_color = bucket_and_color_from_rating(visible_rating)
         props["earnings_shadow_visible_rank_citywide_v3"] = float(citywide_local_rank)
         props["earnings_shadow_visible_base_score_citywide_v3"] = float(citywide_base_norm)
@@ -1563,6 +1587,9 @@ MONTH_DEMAND_BREAKPOINTS_SIDECAR = "month_demand_breakpoints.json"
 # sides. v2 == earnings-score basis (v1 was the flawed raw-pickups basis).
 MONTH_BENCHMARK_SCORE_COLUMN = "earnings_shadow_score_citywide_v3_anchor_shadow"
 MONTH_BENCHMARK_FEATURE_FIELD = "earnings_shadow_score_citywide_v3_anchor_shadow"
+# Confidence term the original rating blends in (14%); the month override must
+# keep reading it so the anchored rating matches the original formula exactly.
+MONTH_BENCHMARK_CONF_FIELD = "earnings_shadow_confidence_citywide_v3"
 MONTH_DEMAND_BREAKPOINTS_VERSION = "month_benchmark_earnings_score_v2"
 
 
@@ -1731,14 +1758,40 @@ def month_demand_breakpoints_for_store(exact_store_path: Path) -> List[float]:
         return []
 
 
+def _month_anchored_ceiling_rating(pct: float, anchor_input: float, conf: float) -> int:
+    """The BEST rating this zone's absolute month level can justify -- the benchmark
+    ceiling. Built from the same blend/curve as the visible rating, but the rank
+    term is the zone's month-wide earnings percentile (not a per-frame rank), so on
+    a quiet day (low percentile) the ceiling is low and on a busy day it is high."""
+    month_rank = _clamp01(float(pct) / 100.0)
+    rating, _base_norm, _display_norm = _citywide_visible_rating_from_components(
+        month_rank, _clamp01(anchor_input), _clamp01(conf)
+    )
+    return rating
+
+
 def _apply_month_anchored_colors(features: List[Dict[str, Any]], breakpoints: List[float]) -> None:
-    """Re-base each zone's visible citywide rating/bucket/color to its month-wide
-    EARNINGS-score percentile (the benchmark), overriding the per-frame rank the
-    visible recalibration produced. Because the benchmark ranks the composite
-    earnings score (saturation + every formula included), the color/rating means
-    the same earnings quality every day -- day-consistent WITHOUT dropping any of
-    the model's features. Zones missing a citywide score keep their existing
-    rating (same eligibility the recalibration already enforces)."""
+    """Apply the monthly benchmark as a CEILING on the existing per-frame rating --
+    never a replacement.
+
+    The per-frame recalibration (_recalibrate_visible_v3_fields) already ranks zones
+    best-to-worst with all the earnings formulas; we keep that untouched. The only
+    flaw is that its ranking re-normalizes inside each 20-min frame, so the best zone
+    is ~green even on a dead-quiet night. The monthly benchmark fixes ONLY that, by
+    capping the rating at what the zone's absolute month level earns:
+
+        final_rating = min(per_frame_rating, month_ceiling)
+
+    where month_ceiling is built from the zone's month-wide earnings percentile.
+    Consequences:
+      * On a busy frame the ceiling is high, so min() keeps the normal per-frame
+        colors -- the map looks like it always did. NO extra greens can appear
+        (min never raises a rating).
+      * On a quiet frame the ceiling is low, so unearned greens/purples are pulled
+        down -- exactly "if the best only got 75, it doesn't qualify for green."
+    Saturation, confidence and every formula still drive BOTH the per-frame rating
+    and the ceiling, so nothing is dropped. Zones with no score/rating are left as-is.
+    """
     if not breakpoints or len(breakpoints) < 2:
         return
     from month_color_benchmark import score_on_breakpoints
@@ -1747,14 +1800,17 @@ def _apply_month_anchored_colors(features: List[Dict[str, Any]], breakpoints: Li
         if props.get("airport_excluded"):
             continue
         score = props.get(MONTH_BENCHMARK_FEATURE_FIELD)
-        if score is None:
+        existing = props.get("earnings_shadow_rating_citywide_v3")
+        if score is None or existing is None:
             continue
         pct = score_on_breakpoints(float(score), breakpoints)
         if pct is None:
             continue
-        rating = int(round(1 + 0.99 * pct))
-        bucket, color = bucket_and_color_from_rating(rating)
-        props["earnings_shadow_rating_citywide_v3"] = rating
+        conf = float(props.get(MONTH_BENCHMARK_CONF_FIELD) or 0.0)
+        ceiling = _month_anchored_ceiling_rating(pct, float(score), conf)
+        final_rating = min(int(round(float(existing))), int(ceiling))
+        bucket, color = bucket_and_color_from_rating(final_rating)
+        props["earnings_shadow_rating_citywide_v3"] = final_rating
         props["earnings_shadow_bucket_citywide_v3"] = bucket
         props["earnings_shadow_color_citywide_v3"] = color
 
