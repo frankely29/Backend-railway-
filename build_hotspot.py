@@ -1544,10 +1544,96 @@ def _same_weekday_blended_scores(
 
 
 _MONTH_DEMAND_BP_CACHE: Dict[str, Any] = {}
+# Last runtime error from breakpoint resolution, surfaced by /debug_month_anchor
+# so we can diagnose a silent empty-breakpoints result without server logs.
+_MONTH_DEMAND_BP_LAST_ERROR: Dict[str, Any] = {}
+# Sidecar filename that carries the month demand breakpoints alongside the store,
+# written at build time (Option A) so serve time never has to reopen the DuckDB
+# store (avoids any lock / version reopen fragility).
+MONTH_DEMAND_BREAKPOINTS_SIDECAR = "month_demand_breakpoints.json"
 
 
 def _month_anchored_colors_enabled() -> bool:
     return str(os.environ.get("MONTH_ANCHORED_COLORS", "0")).strip() == "1"
+
+
+def _demand_breakpoints_sidecar_path(exact_store_path: Path) -> Path:
+    return Path(exact_store_path).parent / MONTH_DEMAND_BREAKPOINTS_SIDECAR
+
+
+def _read_demand_breakpoints_sidecar(exact_store_path: Path) -> List[float]:
+    """Read the build-time breakpoints sidecar next to the store, if present."""
+    sidecar = _demand_breakpoints_sidecar_path(exact_store_path)
+    try:
+        if not sidecar.exists() or sidecar.stat().st_size <= 0:
+            return []
+        payload = json.loads(sidecar.read_text(encoding="utf-8"))
+        raw = payload.get("breakpoints") if isinstance(payload, dict) else payload
+        if not isinstance(raw, list) or len(raw) < 2:
+            return []
+        return sorted(float(x) for x in raw)
+    except Exception as exc:
+        _MONTH_DEMAND_BP_LAST_ERROR["read_sidecar"] = f"{type(exc).__name__}: {exc}"
+        return []
+
+
+def _write_demand_breakpoints_sidecar(exact_store_path: Path, breakpoints: List[float]) -> bool:
+    """Persist breakpoints atomically next to the store. Best-effort."""
+    if not breakpoints or len(breakpoints) < 2:
+        return False
+    sidecar = _demand_breakpoints_sidecar_path(exact_store_path)
+    tmp = sidecar.with_suffix(sidecar.suffix + ".tmp")
+    try:
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": "month_demand_breakpoints_v1",
+            "signal": "ln1p_pickups_now",
+            "airport_excluded_zone_ids": [1, 132, 138],
+            "breakpoints": [float(x) for x in breakpoints],
+        }
+        with tmp.open("w", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, separators=(",", ":")))
+            handle.flush()
+            try:
+                os.fsync(handle.fileno())
+            except Exception:
+                pass
+        os.replace(tmp, sidecar)
+        return True
+    except Exception as exc:
+        _MONTH_DEMAND_BP_LAST_ERROR["write_sidecar"] = f"{type(exc).__name__}: {exc}"
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+        return False
+
+
+def _compute_demand_breakpoints_from_store(con: Any) -> List[float]:
+    """Run the 101-quantile month benchmark query against an OPEN store connection."""
+    qlist = "[" + ", ".join(f"{i/100.0:.4f}" for i in range(101)) + "]"
+    row = con.execute(
+        f"SELECT QUANTILE_CONT(LN(1 + COALESCE(pickups_now, 0)), {qlist}) "
+        f"FROM exact_shadow_rows WHERE PULocationID NOT IN (1, 132, 138)"
+    ).fetchone()
+    if row and row[0]:
+        return sorted(float(x) for x in row[0])
+    return []
+
+
+def compute_and_persist_demand_breakpoints(con: Any, exact_store_path: Path) -> List[float]:
+    """Compute the month demand breakpoints from an already-open (writable or
+    read-only) store connection and persist the sidecar. Call this at BUILD time
+    right after publish, while the store connection is already open."""
+    try:
+        bps = _compute_demand_breakpoints_from_store(con)
+    except Exception as exc:
+        _MONTH_DEMAND_BP_LAST_ERROR["compute"] = f"{type(exc).__name__}: {exc}"
+        return []
+    if bps:
+        _write_demand_breakpoints_sidecar(exact_store_path, bps)
+    return bps
 
 
 def _month_demand_breakpoints(con: Any, exact_store_path: Path) -> List[float]:
@@ -1562,34 +1648,59 @@ def _month_demand_breakpoints(con: Any, exact_store_path: Path) -> List[float]:
     cached = _MONTH_DEMAND_BP_CACHE.get(key)
     if cached is not None:
         return cached
-    qlist = "[" + ", ".join(f"{i/100.0:.4f}" for i in range(101)) + "]"
     bps: List[float] = []
     try:
-        row = con.execute(
-            f"SELECT QUANTILE_CONT(LN(1 + COALESCE(pickups_now, 0)), {qlist}) "
-            f"FROM exact_shadow_rows WHERE PULocationID NOT IN (1, 132, 138)"
-        ).fetchone()
-        if row and row[0]:
-            bps = sorted(float(x) for x in row[0])
-    except Exception:
+        bps = _compute_demand_breakpoints_from_store(con)
+    except Exception as exc:
+        _MONTH_DEMAND_BP_LAST_ERROR["compute"] = f"{type(exc).__name__}: {exc}"
         bps = []
     _MONTH_DEMAND_BP_CACHE[key] = bps
     return bps
 
 
 def month_demand_breakpoints_for_store(exact_store_path: Path) -> List[float]:
-    """Open the month store read-only and return its demand breakpoints (cached).
+    """Return the month demand breakpoints for a store, cheaply and robustly.
+
+    Resolution order:
+      1) In-memory cache (keyed by path+mtime).
+      2) Build-time sidecar JSON next to the store (no DuckDB open -- lock/version safe).
+      3) Fallback: open the store read-only, compute, and self-heal by writing the
+         sidecar so subsequent serves take path (2). This covers months built before
+         the sidecar existed.
     Used by the parquet serve path, which builds frames from parquet but needs the
     WHOLE-month demand distribution to anchor colors."""
+    exact_store_path = Path(exact_store_path)
+    try:
+        cache_key = f"{exact_store_path}:{exact_store_path.stat().st_mtime_ns}"
+    except Exception:
+        cache_key = str(exact_store_path)
+    cached = _MONTH_DEMAND_BP_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    # (2) Prefer the build-time sidecar -- no DuckDB open required.
+    sidecar_bps = _read_demand_breakpoints_sidecar(exact_store_path)
+    if sidecar_bps:
+        _MONTH_DEMAND_BP_CACHE[cache_key] = sidecar_bps
+        return sidecar_bps
+
+    # (3) Fallback: compute from the store read-only and persist the sidecar.
     try:
         if not exact_store_path.exists() or exact_store_path.stat().st_size <= 0:
+            _MONTH_DEMAND_BP_LAST_ERROR["open"] = "store_missing_or_empty"
+            _MONTH_DEMAND_BP_CACHE[cache_key] = []
             return []
         con = duckdb.connect(database=str(exact_store_path), read_only=True)
         try:
-            return _month_demand_breakpoints(con, exact_store_path)
+            bps = _compute_demand_breakpoints_from_store(con)
         finally:
             con.close()
-    except Exception:
+        if bps:
+            _write_demand_breakpoints_sidecar(exact_store_path, bps)
+        _MONTH_DEMAND_BP_CACHE[cache_key] = bps
+        return bps
+    except Exception as exc:
+        _MONTH_DEMAND_BP_LAST_ERROR["open"] = f"{type(exc).__name__}: {exc}"
         return []
 
 
@@ -2779,6 +2890,28 @@ def build_hotspots_frames(
                 except Exception:
                     pass
         save_generated_artifact("month_tendency_benchmark", month_benchmark_payload, compress=False)
+        # Month-anchored colors (Option A): compute the whole-month demand
+        # breakpoints from the freshly published store and persist them as a
+        # sidecar JSON next to the store. Serve time then reads this cheap file
+        # instead of reopening the DuckDB store. Best-effort: a failure here must
+        # not fail the build (serve time can self-heal by recomputing).
+        try:
+            _bp_con = duckdb.connect(database=str(published_store_path), read_only=True)
+            try:
+                _month_bps = compute_and_persist_demand_breakpoints(_bp_con, published_store_path)
+            finally:
+                _bp_con.close()
+            logger.info(
+                "month_demand_breakpoints_sidecar_written month_key=%s count=%d",
+                month_key,
+                len(_month_bps or []),
+            )
+        except Exception as _bp_exc:
+            logger.warning(
+                "month_demand_breakpoints_sidecar_failed month_key=%s error=%s",
+                month_key,
+                str(_bp_exc),
+            )
         logger.info("monthly_partition_publish_done month_key=%s", month_key)
 
         build_result = {
