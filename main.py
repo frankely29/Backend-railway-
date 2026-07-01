@@ -7189,6 +7189,55 @@ def root():
     }
 
 
+@app.get("/debug_month_anchor")
+def debug_month_anchor(month_key: Optional[str] = None):
+    """Diagnostics for the month-anchored-colors feature. Reports whether the
+    breakpoints resolve at runtime (sidecar or store), the last captured error,
+    and a couple of sample pickup->rating mappings so we can confirm end-to-end
+    without server logs."""
+    out: Dict[str, Any] = {"flag": os.environ.get("MONTH_ANCHORED_COLORS", "unset")}
+    try:
+        available_month_keys = list(_load_month_manifest().get("available_month_keys") or [])
+    except Exception:
+        available_month_keys = []
+    resolved_month_key = (
+        str(month_key).strip()
+        if month_key
+        else (resolve_active_month_key(datetime.now(timezone.utc).astimezone(NYC_TZ), available_month_keys) or "")
+    )
+    out["month_key"] = resolved_month_key
+    try:
+        store_path = _month_store_path(resolved_month_key) if resolved_month_key else None
+        out["store_path"] = str(store_path) if store_path else None
+        out["store_exists"] = bool(store_path and store_path.exists() and store_path.stat().st_size > 0)
+        out["store_bytes"] = int(store_path.stat().st_size) if store_path and store_path.exists() else 0
+        from build_hotspot import (
+            month_demand_breakpoints_for_store,
+            _demand_breakpoints_sidecar_path,
+            _MONTH_DEMAND_BP_LAST_ERROR,
+        )
+        from month_color_benchmark import score_on_breakpoints
+        sidecar = _demand_breakpoints_sidecar_path(store_path) if store_path else None
+        out["sidecar_path"] = str(sidecar) if sidecar else None
+        out["sidecar_exists"] = bool(sidecar and sidecar.exists() and sidecar.stat().st_size > 0)
+        bps = month_demand_breakpoints_for_store(store_path) if store_path else []
+        out["breakpoints_count"] = len(bps)
+        if bps:
+            out["breakpoints_min"] = round(float(bps[0]), 4)
+            out["breakpoints_max"] = round(float(bps[-1]), 4)
+            out["breakpoints_median"] = round(float(bps[len(bps) // 2]), 4)
+            samples = {}
+            for pk in (0, 5, 20, 50, 100, 300, 800):
+                pct = score_on_breakpoints(float(pk), bps)
+                rating = None if pct is None else int(round(1 + 0.99 * pct))
+                samples[str(pk)] = {"pct": None if pct is None else round(pct, 1), "rating": rating}
+            out["sample_pickup_to_rating"] = samples
+        out["last_error"] = dict(_MONTH_DEMAND_BP_LAST_ERROR)
+    except Exception as exc:
+        out["error"] = f"{type(exc).__name__}: {exc}"
+    return out
+
+
 @app.get("/status")
 def status():
     parquets = [p.name for p in _list_parquets()]
@@ -7307,7 +7356,7 @@ def status():
         # Diagnostics for the month-anchored-colors rollout: echoes the build-time
         # flag and a code marker so we can confirm the deploy + flag without logs.
         "month_anchored_colors_env": os.environ.get("MONTH_ANCHORED_COLORS", "unset"),
-        "month_anchor_code_marker": "serve_v2",
+        "month_anchor_code_marker": "serve_v3_sidecar",
         "synthetic_week_enabled": False,
         "data_dir": str(DATA_DIR),
         "data_dir_exists": DATA_DIR.exists(),
