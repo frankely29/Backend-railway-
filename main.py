@@ -7247,12 +7247,15 @@ def debug_month_anchor(month_key: Optional[str] = None):
             out["breakpoints_min"] = round(float(bps[0]), 4)
             out["breakpoints_max"] = round(float(bps[-1]), 4)
             out["breakpoints_median"] = round(float(bps[len(bps) // 2]), 4)
+            # The benchmark now ranks the composite citywide EARNINGS score
+            # (~0..1, saturation included), not raw pickups. Sample across that
+            # range so the mapping is legible.
             samples = {}
-            for pk in (0, 5, 20, 50, 100, 300, 800):
-                pct = score_on_breakpoints(float(pk), bps)
+            for sc in (0.0, 0.05, 0.1, 0.2, 0.3, 0.4, 0.6):
+                pct = score_on_breakpoints(float(sc), bps)
                 rating = None if pct is None else int(round(1 + 0.99 * pct))
-                samples[str(pk)] = {"pct": None if pct is None else round(pct, 1), "rating": rating}
-            out["sample_pickup_to_rating"] = samples
+                samples[str(sc)] = {"pct": None if pct is None else round(pct, 1), "rating": rating}
+            out["sample_earnings_score_to_rating"] = samples
         out["last_error"] = dict(_MONTH_DEMAND_BP_LAST_ERROR)
     except Exception as exc:
         out["error"] = f"{type(exc).__name__}: {exc}"
@@ -7377,7 +7380,7 @@ def status():
         # Diagnostics for the month-anchored-colors rollout: echoes the build-time
         # flag and a code marker so we can confirm the deploy + flag without logs.
         "month_anchored_colors_env": os.environ.get("MONTH_ANCHORED_COLORS", "unset"),
-        "month_anchor_code_marker": "serve_v3_sidecar",
+        "month_anchor_code_marker": "serve_v4_earnings_score",
         "synthetic_week_enabled": False,
         "data_dir": str(DATA_DIR),
         "data_dir_exists": DATA_DIR.exists(),

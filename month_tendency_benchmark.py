@@ -15,7 +15,9 @@ MANHATTAN_CORE_MAX_LATITUDE = 40.795
 
 # Bump whenever the benchmark's computation changes so serve time can detect a
 # stale on-disk benchmark (built by older code) and rebuild it automatically.
-MONTH_TENDENCY_BENCHMARK_VERSION = "month_tendency_benchmark_v2"
+# v2 = raw-pickups month benchmark (dropped saturation); v3 = composite earnings
+# score benchmark (saturation + all formulas restored).
+MONTH_TENDENCY_BENCHMARK_VERSION = "month_tendency_benchmark_v3"
 
 
 FAMILY_SPECS: List[Dict[str, str]] = [
@@ -230,20 +232,24 @@ def build_month_tendency_benchmark(
                 ],
             )
 
-        # The month benchmark: each non-airport zone-frame's ABSOLUTE demand
-        # percentile over the WHOLE month, on the SAME footing as the map colors.
+        # The month benchmark: each non-airport zone-frame's ABSOLUTE percentile of
+        # the composite citywide EARNINGS score (saturation + every formula baked
+        # in) over the WHOLE month, on the SAME footing as the map colors.
         # score_on_breakpoints (serve time, colors) is the 101-point compression of
-        # this exact PERCENT_RANK; both rank LN(1+pickups_now) over the same
-        # airport-excluded population, so Tendency and the colors read one ruler.
+        # this exact PERCENT_RANK; both rank LN(1 + earnings score) over the same
+        # airport-excluded, score-eligible population, so Tendency and the colors
+        # read one ruler AND both respect saturation. (v1 ranked raw pickups, which
+        # discarded saturation -- that regression is fixed here.)
         anchored_cte = """
             WITH anchored AS (
                 SELECT
                     e.*,
                     (1.0 + 99.0 * PERCENT_RANK() OVER (
-                        ORDER BY LN(1 + COALESCE(e.pickups_now, 0))
+                        ORDER BY LN(1 + COALESCE(e.earnings_shadow_score_citywide_v3_anchor_shadow, 0))
                     )) AS anchored_citywide_rating
                 FROM exact_shadow_rows e
                 WHERE e.PULocationID NOT IN (1, 132, 138)
+                  AND e.earnings_shadow_score_citywide_v3_anchor_shadow IS NOT NULL
             )
         """
         union_queries: List[str] = []

@@ -19,13 +19,18 @@ import build_hotspot as bh
 def _make_store(tmp_path: Path) -> Path:
     store = tmp_path / "exact_shadow.duckdb"
     con = duckdb.connect(str(store))
-    con.execute("CREATE TABLE exact_shadow_rows(PULocationID INTEGER, pickups_now INTEGER)")
+    # The benchmark ranks the composite earnings score, so that column must exist.
+    con.execute(
+        "CREATE TABLE exact_shadow_rows("
+        "PULocationID INTEGER, "
+        "earnings_shadow_score_citywide_v3_anchor_shadow DOUBLE)"
+    )
     rows = []
     for zone_id in range(2, 60):
-        for pickups in range(0, zone_id):
-            rows.append((zone_id, pickups))
-    # Airports carry huge demand but must be excluded from the benchmark.
-    rows += [(1, 999), (132, 999), (138, 999)]
+        for step in range(0, zone_id):
+            rows.append((zone_id, step / 100.0))  # earnings score ~0..0.6
+    # Airports carry a high score but must be excluded from the benchmark.
+    rows += [(1, 0.99), (132, 0.99), (138, 0.99)]
     con.executemany("INSERT INTO exact_shadow_rows VALUES (?, ?)", rows)
     con.close()
     return store

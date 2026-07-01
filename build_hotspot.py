@@ -1547,10 +1547,23 @@ _MONTH_DEMAND_BP_CACHE: Dict[str, Any] = {}
 # Last runtime error from breakpoint resolution, surfaced by /debug_month_anchor
 # so we can diagnose a silent empty-breakpoints result without server logs.
 _MONTH_DEMAND_BP_LAST_ERROR: Dict[str, Any] = {}
-# Sidecar filename that carries the month demand breakpoints alongside the store,
-# written at build time (Option A) so serve time never has to reopen the DuckDB
-# store (avoids any lock / version reopen fragility).
+# Sidecar filename that carries the month benchmark breakpoints alongside the
+# store, written at build time (Option A) so serve time never has to reopen the
+# DuckDB store (avoids any lock / version reopen fragility).
 MONTH_DEMAND_BREAKPOINTS_SIDECAR = "month_demand_breakpoints.json"
+
+# The quantity the month benchmark ranks. This is the SAME composite earnings
+# score the original visible rating was built on -- it already folds in the
+# saturation penalty and every earnings component (long-run/live/continuation/
+# network). Anchoring the month benchmark on THIS (not raw pickups) keeps the
+# colors day-consistent WITHOUT discarding saturation or any other formula: a
+# color/rating means the same earnings quality every day. A monotonic transform
+# (LN(1+x)) is applied on both the breakpoint build and the serve-time score, so
+# the percentile is exact regardless; the transform only needs to match on both
+# sides. v2 == earnings-score basis (v1 was the flawed raw-pickups basis).
+MONTH_BENCHMARK_SCORE_COLUMN = "earnings_shadow_score_citywide_v3_anchor_shadow"
+MONTH_BENCHMARK_FEATURE_FIELD = "earnings_shadow_score_citywide_v3_anchor_shadow"
+MONTH_DEMAND_BREAKPOINTS_VERSION = "month_benchmark_earnings_score_v2"
 
 
 def _month_anchored_colors_enabled() -> bool:
@@ -1568,6 +1581,12 @@ def _read_demand_breakpoints_sidecar(exact_store_path: Path) -> List[float]:
         if not sidecar.exists() or sidecar.stat().st_size <= 0:
             return []
         payload = json.loads(sidecar.read_text(encoding="utf-8"))
+        # Reject a sidecar written by older code (e.g. the raw-pickups v1) so the
+        # caller recomputes it on the current earnings-score basis. Missing version
+        # (very old) is treated as stale too.
+        if isinstance(payload, dict) and str(payload.get("version") or "") != MONTH_DEMAND_BREAKPOINTS_VERSION:
+            _MONTH_DEMAND_BP_LAST_ERROR["read_sidecar"] = "stale_version"
+            return []
         raw = payload.get("breakpoints") if isinstance(payload, dict) else payload
         if not isinstance(raw, list) or len(raw) < 2:
             return []
@@ -1586,8 +1605,8 @@ def _write_demand_breakpoints_sidecar(exact_store_path: Path, breakpoints: List[
     try:
         sidecar.parent.mkdir(parents=True, exist_ok=True)
         payload = {
-            "version": "month_demand_breakpoints_v1",
-            "signal": "ln1p_pickups_now",
+            "version": MONTH_DEMAND_BREAKPOINTS_VERSION,
+            "signal": f"ln1p_{MONTH_BENCHMARK_SCORE_COLUMN}",
             "airport_excluded_zone_ids": [1, 132, 138],
             "breakpoints": [float(x) for x in breakpoints],
         }
@@ -1611,11 +1630,19 @@ def _write_demand_breakpoints_sidecar(exact_store_path: Path, breakpoints: List[
 
 
 def _compute_demand_breakpoints_from_store(con: Any) -> List[float]:
-    """Run the 101-quantile month benchmark query against an OPEN store connection."""
+    """Run the 101-quantile month benchmark query against an OPEN store connection.
+
+    Ranks the composite citywide EARNINGS score (saturation + all formulas baked
+    in), NOT raw pickups -- so the anchored color/rating preserves every feature
+    the earnings model computes. Rows without a citywide score are excluded (the
+    same eligibility the visible rating already requires); airports excluded so
+    they don't skew the distribution."""
     qlist = "[" + ", ".join(f"{i/100.0:.4f}" for i in range(101)) + "]"
     row = con.execute(
-        f"SELECT QUANTILE_CONT(LN(1 + COALESCE(pickups_now, 0)), {qlist}) "
-        f"FROM exact_shadow_rows WHERE PULocationID NOT IN (1, 132, 138)"
+        f"SELECT QUANTILE_CONT(LN(1 + COALESCE({MONTH_BENCHMARK_SCORE_COLUMN}, 0)), {qlist}) "
+        f"FROM exact_shadow_rows "
+        f"WHERE PULocationID NOT IN (1, 132, 138) "
+        f"AND {MONTH_BENCHMARK_SCORE_COLUMN} IS NOT NULL"
     ).fetchone()
     if row and row[0]:
         return sorted(float(x) for x in row[0])
@@ -1706,8 +1733,12 @@ def month_demand_breakpoints_for_store(exact_store_path: Path) -> List[float]:
 
 def _apply_month_anchored_colors(features: List[Dict[str, Any]], breakpoints: List[float]) -> None:
     """Re-base each zone's visible citywide rating/bucket/color to its month-wide
-    demand percentile (the benchmark), overriding the per-frame rank the visible
-    recalibration produced. A color then means the same busy-ness every day."""
+    EARNINGS-score percentile (the benchmark), overriding the per-frame rank the
+    visible recalibration produced. Because the benchmark ranks the composite
+    earnings score (saturation + every formula included), the color/rating means
+    the same earnings quality every day -- day-consistent WITHOUT dropping any of
+    the model's features. Zones missing a citywide score keep their existing
+    rating (same eligibility the recalibration already enforces)."""
     if not breakpoints or len(breakpoints) < 2:
         return
     from month_color_benchmark import score_on_breakpoints
@@ -1715,10 +1746,10 @@ def _apply_month_anchored_colors(features: List[Dict[str, Any]], breakpoints: Li
         props = feature.get("properties") or {}
         if props.get("airport_excluded"):
             continue
-        pk = props.get("pickups_now_shadow")
-        if pk is None:
+        score = props.get(MONTH_BENCHMARK_FEATURE_FIELD)
+        if score is None:
             continue
-        pct = score_on_breakpoints(float(pk), breakpoints)
+        pct = score_on_breakpoints(float(score), breakpoints)
         if pct is None:
             continue
         rating = int(round(1 + 0.99 * pct))

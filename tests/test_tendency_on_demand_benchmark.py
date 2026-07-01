@@ -31,17 +31,20 @@ _RATING_COLS = [
 def _make_store_and_zones(tmp_path: Path):
     store = tmp_path / "exact_shadow.duckdb"
     con = duckdb.connect(str(store))
-    cols = "PULocationID INTEGER, exact_bin_local_ts VARCHAR, pickups_now INTEGER, " + ", ".join(
-        f"{c} DOUBLE" for c in _RATING_COLS
+    cols = (
+        "PULocationID INTEGER, exact_bin_local_ts VARCHAR, "
+        "earnings_shadow_score_citywide_v3_anchor_shadow DOUBLE, "
+        + ", ".join(f"{c} DOUBLE" for c in _RATING_COLS)
     )
     con.execute(f"CREATE TABLE exact_shadow_rows({cols})")
-    # Two Manhattan zones with very different demand but IDENTICAL stored per-frame
-    # rank (90) -- the old flaw. The demand benchmark must separate them.
+    # Two Manhattan zones with very different EARNINGS score but IDENTICAL stored
+    # per-frame rank (90) -- the old flaw. The month benchmark must separate them
+    # on the earnings score (which carries saturation + all formulas).
     rows = []
     const_ratings = [90.0] * len(_RATING_COLS)
     for ts in range(60):
-        rows.append((100, f"t{ts}", 120, *const_ratings))  # busy
-        rows.append((200, f"t{ts}", 1, *const_ratings))    # quiet
+        rows.append((100, f"t{ts}", 0.85, *const_ratings))  # high earnings quality
+        rows.append((200, f"t{ts}", 0.05, *const_ratings))  # low earnings quality
     placeholders = ",".join(["?"] * (3 + len(_RATING_COLS)))
     con.executemany(f"INSERT INTO exact_shadow_rows VALUES ({placeholders})", rows)
     con.close()
@@ -61,7 +64,7 @@ def test_citywide_family_uses_demand_benchmark_not_perframe_rank(tmp_path: Path)
     out = build_month_tendency_benchmark(
         exact_store_path=store, zones_geojson_path=zones, month_key="2025-07"
     )
-    assert out["version"] == "month_tendency_benchmark_v2"
+    assert out["version"] == "month_tendency_benchmark_v3"
     fam = out["families"]["citywide_all"]
     # If it still averaged the per-frame rank it would be ~90. Demand-anchored, a
     # busy+quiet mix averages far below that.
