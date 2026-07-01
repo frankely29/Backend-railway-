@@ -7286,6 +7286,10 @@ def status():
         "status": "ok",
         "timeline_mode": "monthly_exact_historical",
         "frame_time_model": "exact_local_20min",
+        # Diagnostics for the month-anchored-colors rollout: echoes the build-time
+        # flag and a code marker so we can confirm the deploy + flag without logs.
+        "month_anchored_colors_env": os.environ.get("MONTH_ANCHORED_COLORS", "unset"),
+        "month_anchor_code_marker": "post_pass_v1",
         "synthetic_week_enabled": False,
         "data_dir": str(DATA_DIR),
         "data_dir_exists": DATA_DIR.exists(),
