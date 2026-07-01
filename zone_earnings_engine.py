@@ -106,6 +106,25 @@ def build_zone_earnings_shadow_sql(
     qw3 = queens_v3_profile or qw
     bkw3 = brooklyn_v3_profile or bkw
     sw3 = staten_island_v3_profile or sw
+
+    # --- Month-anchored colors (Option A, flag-gated) -------------------------
+    # Default OFF => byte-identical to the current per-frame rating. When
+    # MONTH_ANCHORED_COLORS=1 at build time, the citywide v3 rating becomes the
+    # WHOLE-MONTH percentile of raw demand (LN(1+pickups)) instead of the
+    # per-frame composite, so a color means the same busy-ness every day (a quiet
+    # day never reaches green) rather than being re-normalized inside each 20-min
+    # frame. PERCENT_RANK() has NO PARTITION, so it ranks across every zone-frame
+    # in the month; it's monotonic in demand, so best-to-worst order within a
+    # frame is preserved. Borough-mode tracks stay on the composite until citywide
+    # is verified live. Colors AND the guidance engine read this same rating, so
+    # they stay consistent.
+    import os as _os
+    _month_anchored_colors = str(_os.getenv("MONTH_ANCHORED_COLORS", "0")).strip() == "1"
+    citywide_v3_rating_expr = (
+        "CAST(ROUND(1 + 99 * PERCENT_RANK() OVER (ORDER BY LN(1 + COALESCE(pickups_now, 0)))) AS INTEGER)"
+        if _month_anchored_colors
+        else "CAST(ROUND(1 + 99 * earnings_shadow_score_citywide_v3) AS INTEGER)"
+    )
     # 45+ trips mode: long-trip-biased citywide profile. Falls back to
     # citywide_v3 if no dedicated profile is passed.
     tw3 = trips_45plus_v3_profile or c3w
@@ -1552,7 +1571,7 @@ AND PULocationID NOT IN ({BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS_SQL})
       earnings_shadow_confidence_queens_v3 AS queens_v3_confidence_profile_shadow,
       earnings_shadow_confidence_brooklyn_v3 AS brooklyn_v3_confidence_profile_shadow,
       earnings_shadow_confidence_staten_island_v3 AS staten_island_v3_confidence_profile_shadow,
-      CAST(ROUND(1 + 99 * earnings_shadow_score_citywide_v3) AS INTEGER) AS earnings_shadow_rating_citywide_v3,
+      {citywide_v3_rating_expr} AS earnings_shadow_rating_citywide_v3,
       CASE
         WHEN earnings_shadow_rating_citywide_v3 >= 83 THEN 'green'
         WHEN earnings_shadow_rating_citywide_v3 >= 75 THEN 'purple'
