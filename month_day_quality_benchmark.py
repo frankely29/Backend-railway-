@@ -134,4 +134,9 @@ def day_quality_read(
         "typical_citywide_pickups": int(round(float(typical_pickups))),
         "pct_vs_typical": pct_vs_typical,
         "explain": explain,
+        # Reference identity so the client can recompute the read against the SAME
+        # citywide level it renders on the map (keeps meter and map consistent).
+        "weekday_name": weekday_name,
+        "time_label": time_label,
+        "full_swing_fraction": _FULL_SWING_FRACTION,
     }
