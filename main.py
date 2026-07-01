@@ -3324,17 +3324,38 @@ def _build_and_persist_month_tendency_benchmark(month_key: str) -> Dict[str, Any
 def _load_month_tendency_benchmark_payload(month_key: str, *, active_month_key: str) -> Tuple[Dict[str, Any], str]:
     resolved = str(month_key or "").strip()
     benchmark_path = _month_tendency_benchmark_path(resolved)
+
+    def _is_stale_version(candidate: Any) -> bool:
+        # A benchmark built by older code (e.g. the pre-demand-anchor v1) must be
+        # rebuilt so Tendency stays on the same month benchmark as the colors.
+        try:
+            from month_tendency_benchmark import MONTH_TENDENCY_BENCHMARK_VERSION
+        except Exception:
+            return False
+        version = str((candidate or {}).get("version") or "").strip()
+        return version != MONTH_TENDENCY_BENCHMARK_VERSION
+
     if benchmark_path.exists() and benchmark_path.is_file() and benchmark_path.stat().st_size > 0:
         try:
             payload = _read_json(benchmark_path)
         except Exception as exc:
             raise HTTPException(status_code=503, detail=f"month tendency benchmark file unreadable: {str(exc)}")
-        return _validate_month_tendency_benchmark_payload(payload, resolved), "month_file"
+        if not _is_stale_version(payload):
+            return _validate_month_tendency_benchmark_payload(payload, resolved), "month_file"
+        # Stale on-disk version: fall through to rebuild below (best-effort; if the
+        # rebuild fails, serve the stale payload rather than erroring the driver).
+        try:
+            rebuilt = _build_and_persist_month_tendency_benchmark(resolved)
+            if str(resolved) == str(active_month_key or "").strip():
+                save_generated_artifact("month_tendency_benchmark", rebuilt, compress=False)
+            return rebuilt, "regenerated_stale_version"
+        except Exception:
+            return _validate_month_tendency_benchmark_payload(payload, resolved), "month_file_stale"
 
     active_key = str(active_month_key or "").strip()
     artifact = load_generated_artifact("month_tendency_benchmark")
     artifact_payload = (artifact or {}).get("payload") if isinstance(artifact, dict) else None
-    if isinstance(artifact_payload, dict):
+    if isinstance(artifact_payload, dict) and not _is_stale_version(artifact_payload):
         artifact_month_key = str(artifact_payload.get("month_key") or "").strip()
         if artifact_month_key == resolved:
             return _validate_month_tendency_benchmark_payload(artifact_payload, resolved), "active_mirror"

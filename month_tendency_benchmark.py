@@ -13,6 +13,10 @@ BRONX_WASH_HEIGHTS_CORRIDOR_ZONE_IDS = {
 AIRPORT_ZONE_IDS = {1, 132, 138}
 MANHATTAN_CORE_MAX_LATITUDE = 40.795
 
+# Bump whenever the benchmark's computation changes so serve time can detect a
+# stale on-disk benchmark (built by older code) and rebuild it automatically.
+MONTH_TENDENCY_BENCHMARK_VERSION = "month_tendency_benchmark_v2"
+
 
 FAMILY_SPECS: List[Dict[str, str]] = [
     {
@@ -226,8 +230,34 @@ def build_month_tendency_benchmark(
                 ],
             )
 
+        # The month benchmark: each non-airport zone-frame's ABSOLUTE demand
+        # percentile over the WHOLE month, on the SAME footing as the map colors.
+        # score_on_breakpoints (serve time, colors) is the 101-point compression of
+        # this exact PERCENT_RANK; both rank LN(1+pickups_now) over the same
+        # airport-excluded population, so Tendency and the colors read one ruler.
+        anchored_cte = """
+            WITH anchored AS (
+                SELECT
+                    e.*,
+                    (1.0 + 99.0 * PERCENT_RANK() OVER (
+                        ORDER BY LN(1 + COALESCE(e.pickups_now, 0))
+                    )) AS anchored_citywide_rating
+                FROM exact_shadow_rows e
+                WHERE e.PULocationID NOT IN (1, 132, 138)
+            )
+        """
         union_queries: List[str] = []
         for spec in FAMILY_SPECS:
+            # Citywide families (the per-borough Tendency the driver sees) now read
+            # the month demand benchmark instead of the old per-frame rank average.
+            # Mode families keep their visible mode rating until those maps are
+            # demand-anchored too (separate follow-up), so each stays paired with
+            # the rating its own map shows.
+            rating_expr = (
+                "e.anchored_citywide_rating"
+                if spec["rating_field_family"] == "citywide_visible"
+                else spec["rating_expr"]
+            )
             union_queries.append(
                 f"""
                 SELECT
@@ -235,15 +265,15 @@ def build_month_tendency_benchmark(
                     AVG(rating_value) AS average_rating,
                     COUNT(*) AS sample_zone_frames
                 FROM (
-                    SELECT {spec['rating_expr']} AS rating_value
-                    FROM exact_shadow_rows e
+                    SELECT {rating_expr} AS rating_value
+                    FROM anchored e
                     INNER JOIN zone_month_tendency_meta zm ON zm.PULocationID = e.PULocationID
                     WHERE {spec['predicate']}
                 ) filtered
                 WHERE rating_value IS NOT NULL
                 """
             )
-        aggregate_sql = "\nUNION ALL\n".join(union_queries)
+        aggregate_sql = anchored_cte + "\nUNION ALL\n".join(union_queries)
         rows = con.execute(aggregate_sql).fetchall()
     finally:
         con.close()
@@ -269,8 +299,8 @@ def build_month_tendency_benchmark(
         }
 
     return {
-        "version": "month_tendency_benchmark_v1",
-        "basis": "current_visible_zone_score_vs_active_month_average",
+        "version": MONTH_TENDENCY_BENCHMARK_VERSION,
+        "basis": "citywide_families_on_month_demand_benchmark_vs_active_month_average",
         "generated_at_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
         "month_key": str(month_key).strip(),
         "bin_minutes": int(bin_minutes),
