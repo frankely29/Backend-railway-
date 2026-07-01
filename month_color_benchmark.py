@@ -91,6 +91,65 @@ def bucket_for_score(score: Optional[float]) -> str:
 
 TENDENCY_SATURATION_POINTS = 16.0
 
+# Airport zones (EWR/JFK/LGA) are handled specially by the engine and excluded
+# from ordinary scoring; keep them OUT of the month re-base so their pickups
+# don't skew the distribution and their color isn't overwritten.
+_AIRPORT_ZONE_IDS = (1, 132, 138)
+
+_BUCKET_CASE = """CASE
+            WHEN {r} >= 83 THEN 'green'
+            WHEN {r} >= 75 THEN 'purple'
+            WHEN {r} >= 68 THEN 'indigo'
+            WHEN {r} >= 60 THEN 'blue'
+            WHEN {r} >= 50 THEN 'sky'
+            WHEN {r} >= 40 THEN 'yellow'
+            WHEN {r} >= 30 THEN 'orange'
+            ELSE 'red' END"""
+
+_COLOR_CASE = """CASE
+            WHEN {r} >= 83 THEN '#00b050'
+            WHEN {r} >= 75 THEN '#8000ff'
+            WHEN {r} >= 68 THEN '#4b3cff'
+            WHEN {r} >= 60 THEN '#0066ff'
+            WHEN {r} >= 50 THEN '#66ccff'
+            WHEN {r} >= 40 THEN '#ffd400'
+            WHEN {r} >= 30 THEN '#ff8c00'
+            ELSE '#e60000' END"""
+
+
+def month_anchor_citywide_update_sql(table: str = "exact_shadow_rows") -> str:
+    """DuckDB UPDATE that re-bases the citywide v3 rating to the WHOLE-MONTH demand
+    percentile — run ONCE after the full month's rows are materialized.
+
+    The sliced build can't do this (each 6-hour slice only sees its own rows), so
+    the month benchmark has to be a post-build pass over the complete table, which
+    is exactly "build the benchmark from the month's data, then rank by it." The
+    percentile is over every non-airport zone-frame in the month, so a color means
+    the same busy-ness on any day (a quiet day never reaches green). PERCENT_RANK
+    is monotonic in demand, so best-to-worst order within a frame is preserved.
+    Colors AND the guidance engine read this same rating, so they stay consistent.
+    Airports are left untouched.
+    """
+    airports = ", ".join(str(z) for z in _AIRPORT_ZONE_IDS)
+    month_rating = (
+        "CAST(ROUND(1 + 99 * PERCENT_RANK() OVER "
+        "(ORDER BY LN(1 + COALESCE(pickups_now, 0)))) AS INTEGER)"
+    )
+    return f"""
+    UPDATE {table} AS t
+    SET earnings_shadow_rating_citywide_v3 = m.month_rating,
+        earnings_shadow_bucket_citywide_v3 = {_BUCKET_CASE.format(r='m.month_rating')},
+        earnings_shadow_color_citywide_v3 = {_COLOR_CASE.format(r='m.month_rating')}
+    FROM (
+        SELECT PULocationID, exact_bin_local_ts,
+               {month_rating} AS month_rating
+        FROM {table}
+        WHERE PULocationID NOT IN ({airports})
+    ) m
+    WHERE t.PULocationID = m.PULocationID
+      AND t.exact_bin_local_ts = m.exact_bin_local_ts
+    """
+
 
 def zone_month_average_score(
     zone_raw_pickups: Iterable[float], sorted_scale: Sequence[float]

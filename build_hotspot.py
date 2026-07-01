@@ -1911,6 +1911,21 @@ def build_hotspots_frames(
             """
         )
         logger.info("exact_shadow_rows_materialized month_key=%s row_count=%d", month_key, rows_total_in_shadow)
+
+        # --- Month-anchored colors (Option A, flag-gated) --------------------
+        # The sliced build ranks demand within each 6-hour slice, so the top zone
+        # is "green" even at 4am. Now that the WHOLE month is materialized, re-base
+        # the citywide v3 rating to the month-wide demand percentile in one pass:
+        # a color then means the same busy-ness every day (a quiet day never
+        # reaches green), best-to-worst order within a frame is preserved, and
+        # colors + the guidance engine stay consistent (same rating). Default OFF.
+        if str(os.environ.get("MONTH_ANCHORED_COLORS", "0")).strip() == "1":
+            from month_color_benchmark import month_anchor_citywide_update_sql
+            logger.info("month_anchored_colors_rebase_start month_key=%s", month_key)
+            con.execute(month_anchor_citywide_update_sql("exact_shadow_rows"))
+            con.execute("CHECKPOINT")
+            logger.info("month_anchored_colors_rebase_done month_key=%s", month_key)
+
         total_rows = rows_total_in_shadow
         if bool(build_review_artifacts):
             logger.info("monthly_partition_review_pass_start month_key=%s", month_key)
