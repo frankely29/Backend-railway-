@@ -1543,6 +1543,64 @@ def _same_weekday_blended_scores(
     )
 
 
+_MONTH_DEMAND_BP_CACHE: Dict[str, Any] = {}
+
+
+def _month_anchored_colors_enabled() -> bool:
+    return str(os.environ.get("MONTH_ANCHORED_COLORS", "0")).strip() == "1"
+
+
+def _month_demand_breakpoints(con: Any, exact_store_path: Path) -> List[float]:
+    """101 month-wide quantile breakpoints of the demand signal LN(1+pickups),
+    computed once per store (cached by path+mtime). This is the month benchmark:
+    a zone's pickups map onto this curve to get an ABSOLUTE, day-consistent color.
+    Airports excluded so they don't skew the distribution."""
+    try:
+        key = f"{exact_store_path}:{exact_store_path.stat().st_mtime_ns}"
+    except Exception:
+        key = str(exact_store_path)
+    cached = _MONTH_DEMAND_BP_CACHE.get(key)
+    if cached is not None:
+        return cached
+    qlist = "[" + ", ".join(f"{i/100.0:.4f}" for i in range(101)) + "]"
+    bps: List[float] = []
+    try:
+        row = con.execute(
+            f"SELECT QUANTILE_CONT(LN(1 + COALESCE(pickups_now, 0)), {qlist}) "
+            f"FROM exact_shadow_rows WHERE PULocationID NOT IN (1, 132, 138)"
+        ).fetchone()
+        if row and row[0]:
+            bps = sorted(float(x) for x in row[0])
+    except Exception:
+        bps = []
+    _MONTH_DEMAND_BP_CACHE[key] = bps
+    return bps
+
+
+def _apply_month_anchored_colors(features: List[Dict[str, Any]], breakpoints: List[float]) -> None:
+    """Re-base each zone's visible citywide rating/bucket/color to its month-wide
+    demand percentile (the benchmark), overriding the per-frame rank the visible
+    recalibration produced. A color then means the same busy-ness every day."""
+    if not breakpoints or len(breakpoints) < 2:
+        return
+    from month_color_benchmark import score_on_breakpoints
+    for feature in features:
+        props = feature.get("properties") or {}
+        if props.get("airport_excluded"):
+            continue
+        pk = props.get("pickups_now_shadow")
+        if pk is None:
+            continue
+        pct = score_on_breakpoints(float(pk), breakpoints)
+        if pct is None:
+            continue
+        rating = int(round(1 + 0.99 * pct))
+        bucket, color = bucket_and_color_from_rating(rating)
+        props["earnings_shadow_rating_citywide_v3"] = rating
+        props["earnings_shadow_bucket_citywide_v3"] = bucket
+        props["earnings_shadow_color_citywide_v3"] = color
+
+
 def build_single_frame_from_exact_store(
     *,
     exact_store_path: Path,
@@ -1587,6 +1645,12 @@ def build_single_frame_from_exact_store(
         blended_by_zone = _same_weekday_blended_scores(
             con, requested_frame_time, SAME_WEEKDAY_BLEND_COLUMNS
         )
+        # Month benchmark (flag-gated): computed from the whole store while the
+        # connection is open, then applied to the visible colors below.
+        month_demand_breakpoints = (
+            _month_demand_breakpoints(con, exact_store_path)
+            if _month_anchored_colors_enabled() else []
+        )
     finally:
         con.close()
 
@@ -1614,6 +1678,10 @@ def build_single_frame_from_exact_store(
             }
         )
     _recalibrate_visible_v3_fields(features)
+    # Override the per-frame-ranked visible colors with month-anchored ones so a
+    # color means the same busy-ness every day (a quiet 4am never reads green).
+    if month_demand_breakpoints:
+        _apply_month_anchored_colors(features, month_demand_breakpoints)
     return {
         "time": requested_frame_time,
         "bin_minutes": int(bin_minutes),
@@ -1911,21 +1979,6 @@ def build_hotspots_frames(
             """
         )
         logger.info("exact_shadow_rows_materialized month_key=%s row_count=%d", month_key, rows_total_in_shadow)
-
-        # --- Month-anchored colors (Option A, flag-gated) --------------------
-        # The sliced build ranks demand within each 6-hour slice, so the top zone
-        # is "green" even at 4am. Now that the WHOLE month is materialized, re-base
-        # the citywide v3 rating to the month-wide demand percentile in one pass:
-        # a color then means the same busy-ness every day (a quiet day never
-        # reaches green), best-to-worst order within a frame is preserved, and
-        # colors + the guidance engine stay consistent (same rating). Default OFF.
-        if str(os.environ.get("MONTH_ANCHORED_COLORS", "0")).strip() == "1":
-            from month_color_benchmark import month_anchor_citywide_update_sql
-            logger.info("month_anchored_colors_rebase_start month_key=%s", month_key)
-            con.execute(month_anchor_citywide_update_sql("exact_shadow_rows"))
-            con.execute("CHECKPOINT")
-            logger.info("month_anchored_colors_rebase_done month_key=%s", month_key)
-
         total_rows = rows_total_in_shadow
         if bool(build_review_artifacts):
             logger.info("monthly_partition_review_pass_start month_key=%s", month_key)
