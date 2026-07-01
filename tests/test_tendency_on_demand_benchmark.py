@@ -34,6 +34,7 @@ def _make_store_and_zones(tmp_path: Path):
     cols = (
         "PULocationID INTEGER, exact_bin_local_ts VARCHAR, "
         "earnings_shadow_score_citywide_v3_anchor_shadow DOUBLE, "
+        "earnings_shadow_confidence_citywide_v3 DOUBLE, "
         + ", ".join(f"{c} DOUBLE" for c in _RATING_COLS)
     )
     con.execute(f"CREATE TABLE exact_shadow_rows({cols})")
@@ -43,9 +44,9 @@ def _make_store_and_zones(tmp_path: Path):
     rows = []
     const_ratings = [90.0] * len(_RATING_COLS)
     for ts in range(60):
-        rows.append((100, f"t{ts}", 0.85, *const_ratings))  # high earnings quality
-        rows.append((200, f"t{ts}", 0.05, *const_ratings))  # low earnings quality
-    placeholders = ",".join(["?"] * (3 + len(_RATING_COLS)))
+        rows.append((100, f"t{ts}", 0.85, 0.9, *const_ratings))  # high earnings quality
+        rows.append((200, f"t{ts}", 0.05, 0.9, *const_ratings))  # low earnings quality
+    placeholders = ",".join(["?"] * (4 + len(_RATING_COLS)))
     con.executemany(f"INSERT INTO exact_shadow_rows VALUES ({placeholders})", rows)
     con.close()
 
@@ -64,7 +65,7 @@ def test_citywide_family_uses_demand_benchmark_not_perframe_rank(tmp_path: Path)
     out = build_month_tendency_benchmark(
         exact_store_path=store, zones_geojson_path=zones, month_key="2025-07"
     )
-    assert out["version"] == "month_tendency_benchmark_v3"
+    assert out["version"] == "month_tendency_benchmark_v4"
     fam = out["families"]["citywide_all"]
     # If it still averaged the per-frame rank it would be ~90. Demand-anchored, a
     # busy+quiet mix averages far below that.
