@@ -73,6 +73,29 @@ def score_on_scale(raw_pickups: float, sorted_scale: Sequence[float]) -> Optiona
     return max(0.0, min(100.0, 100.0 * rank / n))
 
 
+def score_on_breakpoints(raw_pickups: float, breakpoints: Sequence[float]) -> Optional[float]:
+    """Absolute 0-100 score from precomputed month quantile breakpoints.
+
+    `breakpoints[i]` is the demand-signal value at percentile i/(N-1) across the
+    whole month (e.g. 101 evenly-spaced quantiles). A zone's pickups map to where
+    they fall on that month-wide curve, so the same demand -> same score every
+    day. Interpolates between breakpoints; monotonic, so order is preserved. This
+    is the compact serve-time form of `score_on_scale` (no 500k-element array)."""
+    n = len(breakpoints)
+    if n < 2:
+        return None
+    v = _demand_signal(raw_pickups)
+    if v <= breakpoints[0]:
+        return 0.0
+    if v >= breakpoints[-1]:
+        return 100.0
+    hi = bisect.bisect_right(breakpoints, v)
+    lo = hi - 1
+    span = breakpoints[hi] - breakpoints[lo]
+    frac = 0.0 if span <= 0 else (v - breakpoints[lo]) / span
+    return max(0.0, min(100.0, 100.0 * (lo + frac) / (n - 1)))
+
+
 def bucket_for_score(score: Optional[float]) -> str:
     if score is None:
         return "red"
