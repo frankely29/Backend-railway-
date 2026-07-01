@@ -2167,13 +2167,31 @@ def _build_single_frame_for_month(month_key: str, frame_time: str) -> Dict[str, 
     # apples-to-apples. Widening BOTH paths to the prior month is a future
     # enhancement that must move together to avoid spurious store retirement.
     zones_path = ensure_zones_geojson(DATA_DIR, force=False)
-    return build_single_frame_for_month(
+    payload = build_single_frame_for_month(
         parquet_files=parquets,
         zones_geojson_path=zones_path,
         frame_time=str(frame_time),
         bin_minutes=int(DEFAULT_BIN_MINUTES),
         min_trips_per_window=int(DEFAULT_MIN_TRIPS_PER_WINDOW),
     )
+    # Month-anchored colors (flag-gated): this parquet path is what actually
+    # serves the map, and its visible rating is a PER-FRAME rank. Override the
+    # citywide rating/bucket/color with each zone's month-wide demand percentile
+    # (breakpoints from the month store), so a color means the same busy-ness
+    # every day. No-op when the flag is off or the store/benchmark is unavailable.
+    if str(os.environ.get("MONTH_ANCHORED_COLORS", "0")).strip() == "1":
+        try:
+            from build_hotspot import (
+                month_demand_breakpoints_for_store,
+                _apply_month_anchored_colors,
+            )
+            _bps = month_demand_breakpoints_for_store(_month_store_path(month_key))
+            _feats = ((payload or {}).get("polygons") or {}).get("features") or []
+            if _bps and _feats:
+                _apply_month_anchored_colors(_feats, _bps)
+        except Exception:
+            pass
+    return payload
 
 
 def _frame_build_worker(month_key: str, idx: int, frame_time: str, run_token: str) -> None:
@@ -7289,7 +7307,7 @@ def status():
         # Diagnostics for the month-anchored-colors rollout: echoes the build-time
         # flag and a code marker so we can confirm the deploy + flag without logs.
         "month_anchored_colors_env": os.environ.get("MONTH_ANCHORED_COLORS", "unset"),
-        "month_anchor_code_marker": "post_pass_v1",
+        "month_anchor_code_marker": "serve_v2",
         "synthetic_week_enabled": False,
         "data_dir": str(DATA_DIR),
         "data_dir_exists": DATA_DIR.exists(),
