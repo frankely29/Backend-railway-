@@ -2183,12 +2183,15 @@ def _build_single_frame_for_month(month_key: str, frame_time: str) -> Dict[str, 
         try:
             from build_hotspot import (
                 month_demand_breakpoints_for_store,
+                month_mode_breakpoints_for_store,
                 _apply_month_anchored_colors,
             )
-            _bps = month_demand_breakpoints_for_store(_month_store_path(month_key))
+            _store = _month_store_path(month_key)
+            _bps = month_demand_breakpoints_for_store(_store)
+            _mode_bps = month_mode_breakpoints_for_store(_store)
             _feats = ((payload or {}).get("polygons") or {}).get("features") or []
             if _bps and _feats:
-                _apply_month_anchored_colors(_feats, _bps)
+                _apply_month_anchored_colors(_feats, _bps, _mode_bps)
         except Exception:
             pass
     return payload
