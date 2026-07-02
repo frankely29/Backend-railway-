@@ -419,6 +419,52 @@ def _citywide_visible_rating_from_components(rank_norm: float, anchor_input: flo
     return int(round(1 + 99 * display_norm)), base_norm, display_norm
 
 
+# Per borough-mode blend weights (citywide-anchor, rank, mode-score, confidence).
+# Single source shared by the per-frame recalibration and the month-anchored
+# ceiling, so a mode's ceiling uses the SAME blend as its rating and only ever
+# differs in the rank term (per-frame rank -> month percentile).
+_MODE_VISIBLE_BLEND_WEIGHTS: Dict[str, Tuple[float, float, float, float]] = {
+    "manhattan_v3": (0.18, 0.18, 0.50, 0.14),
+    "bronx_wash_heights_v3": (0.22, 0.20, 0.46, 0.12),
+    "queens_v3": (0.22, 0.20, 0.46, 0.12),
+    "brooklyn_v3": (0.22, 0.20, 0.46, 0.12),
+    "staten_island_v3": (0.10, 0.30, 0.44, 0.16),
+}
+_MODE_VISIBLE_BLEND_DEFAULT: Tuple[float, float, float, float] = (0.22, 0.20, 0.46, 0.12)
+
+
+def _mode_visible_base_norm(
+    profile_name: str,
+    citywide_anchor_norm: float,
+    rank_norm: float,
+    profile_raw_score: float,
+    profile_conf: float,
+) -> float:
+    w_anchor, w_rank, w_score, w_conf = _MODE_VISIBLE_BLEND_WEIGHTS.get(
+        profile_name, _MODE_VISIBLE_BLEND_DEFAULT
+    )
+    return _clamp01(
+        w_anchor * _clamp01(citywide_anchor_norm)
+        + w_rank * _clamp01(rank_norm)
+        + w_score * _clamp01(profile_raw_score)
+        + w_conf * _clamp01(profile_conf)
+    )
+
+
+def _mode_visible_rating_from_components(
+    profile_name: str,
+    citywide_anchor_norm: float,
+    rank_norm: float,
+    profile_raw_score: float,
+    profile_conf: float,
+) -> Tuple[int, float, float]:
+    base_norm = _mode_visible_base_norm(
+        profile_name, citywide_anchor_norm, rank_norm, profile_raw_score, profile_conf
+    )
+    display_norm = _relaxed_display_curve(base_norm)
+    return int(round(1 + 99 * display_norm)), base_norm, display_norm
+
+
 def _eligible_for_profile(profile_name: str, props: Dict[str, Any], geometry: Any) -> bool:
     location_id = int(props.get("LocationID", 0))
     borough = _normalized_borough_name(props.get("borough"))
@@ -568,36 +614,9 @@ def _recalibrate_visible_v3_fields(features: List[Dict[str, Any]]) -> None:
             profile_local_rank = 0.0 if n <= 1 else (idx / (n - 1))
             profile_raw_score = _clamp01(float(props.get(score_field) or 0.0))
             profile_conf = _clamp01(float(props.get(confidence_field) or 0.0))
-            if profile_name == "manhattan_v3":
-                base_visible_norm = _clamp01(
-                    0.18 * citywide_anchor_norm +
-                    0.18 * profile_local_rank +
-                    0.50 * profile_raw_score +
-                    0.14 * profile_conf
-                )
-            elif profile_name in {"bronx_wash_heights_v3", "queens_v3", "brooklyn_v3"}:
-                base_visible_norm = _clamp01(
-                    0.22 * citywide_anchor_norm +
-                    0.20 * profile_local_rank +
-                    0.46 * profile_raw_score +
-                    0.12 * profile_conf
-                )
-            elif profile_name == "staten_island_v3":
-                base_visible_norm = _clamp01(
-                    0.10 * citywide_anchor_norm +
-                    0.30 * profile_local_rank +
-                    0.44 * profile_raw_score +
-                    0.16 * profile_conf
-                )
-            else:
-                base_visible_norm = _clamp01(
-                    0.22 * citywide_anchor_norm +
-                    0.20 * profile_local_rank +
-                    0.46 * profile_raw_score +
-                    0.12 * profile_conf
-                )
-            visible_display_norm = _relaxed_display_curve(base_visible_norm)
-            visible_rating = int(round(1 + 99 * visible_display_norm))
+            visible_rating, base_visible_norm, visible_display_norm = _mode_visible_rating_from_components(
+                profile_name, citywide_anchor_norm, profile_local_rank, profile_raw_score, profile_conf
+            )
             visible_bucket, visible_color = bucket_and_color_from_rating(visible_rating)
 
             props[f"earnings_shadow_visible_rank_{profile_name}"] = float(profile_local_rank)
@@ -1656,24 +1675,28 @@ def _write_demand_breakpoints_sidecar(exact_store_path: Path, breakpoints: List[
         return False
 
 
-def _compute_demand_breakpoints_from_store(con: Any) -> List[float]:
-    """Run the 101-quantile month benchmark query against an OPEN store connection.
-
-    Ranks the composite citywide EARNINGS score (saturation + all formulas baked
-    in), NOT raw pickups -- so the anchored color/rating preserves every feature
-    the earnings model computes. Rows without a citywide score are excluded (the
-    same eligibility the visible rating already requires); airports excluded so
-    they don't skew the distribution."""
+def _compute_breakpoints_for_column(con: Any, score_column: str) -> List[float]:
+    """101 month-wide quantile breakpoints of LN(1 + score) for a given earnings
+    score column, over the whole month (airports + null-score rows excluded). The
+    monotonic LN transform preserves percentile order, so the result is the
+    absolute month distribution of that score."""
     qlist = "[" + ", ".join(f"{i/100.0:.4f}" for i in range(101)) + "]"
     row = con.execute(
-        f"SELECT QUANTILE_CONT(LN(1 + COALESCE({MONTH_BENCHMARK_SCORE_COLUMN}, 0)), {qlist}) "
+        f"SELECT QUANTILE_CONT(LN(1 + COALESCE({score_column}, 0)), {qlist}) "
         f"FROM exact_shadow_rows "
         f"WHERE PULocationID NOT IN (1, 132, 138) "
-        f"AND {MONTH_BENCHMARK_SCORE_COLUMN} IS NOT NULL"
+        f"AND {score_column} IS NOT NULL"
     ).fetchone()
     if row and row[0]:
         return sorted(float(x) for x in row[0])
     return []
+
+
+def _compute_demand_breakpoints_from_store(con: Any) -> List[float]:
+    """Citywide month benchmark: ranks the composite citywide EARNINGS score
+    (saturation + all formulas baked in), NOT raw pickups -- so the anchored
+    color/rating preserves every feature the earnings model computes."""
+    return _compute_breakpoints_for_column(con, MONTH_BENCHMARK_SCORE_COLUMN)
 
 
 def compute_and_persist_demand_breakpoints(con: Any, exact_store_path: Path) -> List[float]:
@@ -1758,6 +1781,50 @@ def month_demand_breakpoints_for_store(exact_store_path: Path) -> List[float]:
         return []
 
 
+# Per borough-mode benchmark: each mode's rating has the same per-frame flaw as
+# citywide, so we cap it by the month-wide distribution of that mode's OWN earnings
+# score. Cached per store in-memory (5 quantile scans on first serve after deploy).
+_MONTH_MODE_BP_CACHE: Dict[str, Dict[str, List[float]]] = {}
+_MODE_BENCHMARK_SCORE_COLUMNS: Dict[str, str] = {
+    name: fields["score"]
+    for name, fields in V3_PROFILE_CONFIG.items()
+    if name != "citywide_v3"
+}
+
+
+def month_mode_breakpoints_for_store(exact_store_path: Path) -> Dict[str, List[float]]:
+    """Month breakpoints for each borough mode's earnings score, keyed by profile
+    name. Empty dict on any failure so the caller no-ops (modes keep their per-frame
+    rating). Cached in-memory by path+mtime; no sidecar (secondary to citywide)."""
+    exact_store_path = Path(exact_store_path)
+    try:
+        cache_key = f"{exact_store_path}:{exact_store_path.stat().st_mtime_ns}"
+    except Exception:
+        cache_key = str(exact_store_path)
+    cached = _MONTH_MODE_BP_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    out: Dict[str, List[float]] = {}
+    try:
+        if exact_store_path.exists() and exact_store_path.stat().st_size > 0:
+            con = duckdb.connect(database=str(exact_store_path), read_only=True)
+            try:
+                for profile_name, score_column in _MODE_BENCHMARK_SCORE_COLUMNS.items():
+                    try:
+                        bps = _compute_breakpoints_for_column(con, score_column)
+                    except Exception:
+                        bps = []
+                    if bps:
+                        out[profile_name] = bps
+            finally:
+                con.close()
+    except Exception as exc:
+        _MONTH_DEMAND_BP_LAST_ERROR["mode_open"] = f"{type(exc).__name__}: {exc}"
+        out = {}
+    _MONTH_MODE_BP_CACHE[cache_key] = out
+    return out
+
+
 def _month_anchored_ceiling_rating(pct: float, anchor_input: float, conf: float) -> int:
     """The BEST rating this zone's absolute month level can justify -- the benchmark
     ceiling. Built from the same blend/curve as the visible rating, but the rank
@@ -1770,9 +1837,14 @@ def _month_anchored_ceiling_rating(pct: float, anchor_input: float, conf: float)
     return rating
 
 
-def _apply_month_anchored_colors(features: List[Dict[str, Any]], breakpoints: List[float]) -> None:
+def _apply_month_anchored_colors(
+    features: List[Dict[str, Any]],
+    breakpoints: List[float],
+    mode_breakpoints: Optional[Dict[str, List[float]]] = None,
+) -> None:
     """Apply the monthly benchmark as a CEILING on the existing per-frame rating --
-    never a replacement.
+    never a replacement. Applies to citywide AND (when mode_breakpoints is given)
+    each borough-mode color track, so day-consistency holds in every view.
 
     The per-frame recalibration (_recalibrate_visible_v3_fields) already ranks zones
     best-to-worst with all the earnings formulas; we keep that untouched. The only
@@ -1795,6 +1867,10 @@ def _apply_month_anchored_colors(features: List[Dict[str, Any]], breakpoints: Li
     if not breakpoints or len(breakpoints) < 2:
         return
     from month_color_benchmark import score_on_breakpoints
+    # Citywide pass. Also record each zone's month-anchored citywide base_norm so
+    # the borough-mode ceilings below use the MONTH-anchored citywide anchor (their
+    # blend's anchor term), keeping modes day-consistent the same way citywide is.
+    citywide_month_anchor_by_location: Dict[int, float] = {}
     for feature in features:
         props = feature.get("properties") or {}
         if props.get("airport_excluded"):
@@ -1807,12 +1883,57 @@ def _apply_month_anchored_colors(features: List[Dict[str, Any]], breakpoints: Li
         if pct is None:
             continue
         conf = float(props.get(MONTH_BENCHMARK_CONF_FIELD) or 0.0)
-        ceiling = _month_anchored_ceiling_rating(pct, float(score), conf)
+        month_rank = _clamp01(float(pct) / 100.0)
+        ceiling, base_norm, _display = _citywide_visible_rating_from_components(
+            month_rank, float(score), conf
+        )
+        try:
+            citywide_month_anchor_by_location[int(props.get("LocationID") or 0)] = float(base_norm)
+        except Exception:
+            pass
         final_rating = min(int(round(float(existing))), int(ceiling))
         bucket, color = bucket_and_color_from_rating(final_rating)
         props["earnings_shadow_rating_citywide_v3"] = final_rating
         props["earnings_shadow_bucket_citywide_v3"] = bucket
         props["earnings_shadow_color_citywide_v3"] = color
+
+    # Borough-mode passes: same CEILING idea, each mode capped by the month-wide
+    # distribution of its OWN earnings score, using that mode's blend so its ceiling
+    # matches its rating (only the rank + citywide anchor become month-anchored).
+    if not mode_breakpoints:
+        return
+    for profile_name, mode_bps in mode_breakpoints.items():
+        if not mode_bps or len(mode_bps) < 2:
+            continue
+        score_field = _MODE_BENCHMARK_SCORE_COLUMNS.get(profile_name)
+        conf_field = (V3_PROFILE_CONFIG.get(profile_name) or {}).get("confidence")
+        if not score_field:
+            continue
+        rating_field = f"earnings_shadow_rating_{profile_name}"
+        bucket_field = f"earnings_shadow_bucket_{profile_name}"
+        color_field = f"earnings_shadow_color_{profile_name}"
+        for feature in features:
+            props = feature.get("properties") or {}
+            if props.get("airport_excluded"):
+                continue
+            mscore = props.get(score_field)
+            existing = props.get(rating_field)
+            if mscore is None or existing is None:
+                continue
+            pct = score_on_breakpoints(float(mscore), mode_bps)
+            if pct is None:
+                continue
+            month_rank = _clamp01(float(pct) / 100.0)
+            anchor = citywide_month_anchor_by_location.get(int(props.get("LocationID") or 0), 0.0)
+            conf = float(props.get(conf_field) or 0.0) if conf_field else 0.0
+            ceiling, _b, _d = _mode_visible_rating_from_components(
+                profile_name, anchor, month_rank, float(mscore), conf
+            )
+            final_rating = min(int(round(float(existing))), int(ceiling))
+            bucket, color = bucket_and_color_from_rating(final_rating)
+            props[rating_field] = final_rating
+            props[bucket_field] = bucket
+            props[color_field] = color
 
 
 def build_single_frame_from_exact_store(
