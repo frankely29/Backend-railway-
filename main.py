@@ -640,6 +640,30 @@ def _month_store_path(month_key: str) -> Path:
     return _month_dir(month_key) / "exact_shadow.duckdb"
 
 
+def _benchmark_reference_month_key() -> str:
+    """The month whose distribution anchors the color / Tendency benchmark for ALL
+    months. Anchoring to a strong-normal reference month (default October) instead
+    of the active month means a slow active month reads accurately dim rather than
+    inflated. Configurable via BENCHMARK_REFERENCE_MONTH; empty disables it (falls
+    back to per-month self-anchoring)."""
+    return str(os.environ.get("BENCHMARK_REFERENCE_MONTH", "2025-10")).strip()
+
+
+def _benchmark_reference_store_path() -> Optional[Path]:
+    """The reference month's store IF it exists, else None so callers fall back to
+    the active month (no regression until the reference month is built)."""
+    mk = _benchmark_reference_month_key()
+    if not mk or not _safe_parse_month_key(mk):
+        return None
+    p = _month_store_path(mk)
+    try:
+        if p.exists() and p.is_file() and p.stat().st_size > 0:
+            return p
+    except Exception:
+        return None
+    return None
+
+
 def _auto_rebuild_state_path(month_key: str) -> Path:
     """Returns /data/exact_history/months/{mk}/.auto_rebuild_state.json."""
     return _month_dir(str(month_key).strip()) / ".auto_rebuild_state.json"
@@ -915,6 +939,16 @@ def _write_month_build_meta_atomic(month_key: str, payload: Dict[str, Any]) -> P
 
 def _retire_obsolete_exact_store(month_key: str, reason: str) -> Dict[str, Any]:
     mk = str(month_key or "").strip()
+    # Never retire the cross-month benchmark reference month's store -- the colors
+    # and Tendency anchor to it for EVERY month, so it must persist even though it
+    # isn't the active month.
+    if mk and mk == _benchmark_reference_month_key():
+        return {
+            "removed_store": False,
+            "removed_old_build_meta": False,
+            "removed_frame_cache_count": 0,
+            "reason": "protected_benchmark_reference_month",
+        }
     store_path = _month_store_path(mk)
     build_meta_path = _month_build_meta_path(mk)
     removed_store = False
@@ -2186,7 +2220,11 @@ def _build_single_frame_for_month(month_key: str, frame_time: str) -> Dict[str, 
                 month_mode_breakpoints_for_store,
                 _apply_month_anchored_colors,
             )
-            _store = _month_store_path(month_key)
+            # Cross-month benchmark: anchor colors to the strong-normal REFERENCE
+            # month (e.g. October) so a slow active month isn't graded on its own
+            # deflated bar. Falls back to the active month's own store until the
+            # reference month is built (no regression).
+            _store = _benchmark_reference_store_path() or _month_store_path(month_key)
             _bps = month_demand_breakpoints_for_store(_store)
             _mode_bps = month_mode_breakpoints_for_store(_store)
             _feats = ((payload or {}).get("polygons") or {}).get("features") or []
@@ -7334,8 +7372,15 @@ def debug_month_anchor(month_key: Optional[str] = None):
         else (resolve_active_month_key(datetime.now(timezone.utc).astimezone(NYC_TZ), available_month_keys) or "")
     )
     out["month_key"] = resolved_month_key
+    # Report the cross-month benchmark reference and which store actually anchors
+    # colors (reference if built, else the active month as a fallback).
+    ref_mk = _benchmark_reference_month_key()
+    ref_store = _benchmark_reference_store_path()
+    out["benchmark_reference_month_key"] = ref_mk
+    out["benchmark_reference_store_present"] = ref_store is not None
+    out["benchmark_store_used"] = ref_mk if ref_store is not None else resolved_month_key
     try:
-        store_path = _month_store_path(resolved_month_key) if resolved_month_key else None
+        store_path = ref_store if ref_store is not None else (_month_store_path(resolved_month_key) if resolved_month_key else None)
         out["store_path"] = str(store_path) if store_path else None
         out["store_exists"] = bool(store_path and store_path.exists() and store_path.stat().st_size > 0)
         out["store_bytes"] = int(store_path.stat().st_size) if store_path and store_path.exists() else 0
@@ -8222,8 +8267,16 @@ def day_tendency_month_benchmark(
         frame_time=frame_time,
     )
     current_active_month_key, _ = _resolve_active_month_key()
+    # Anchor the Tendency families to the same strong-normal REFERENCE month the
+    # colors use, so "vs usual" is measured on the same cross-month ruler as the
+    # map. Falls back to the resolved (active) month until the reference is built.
+    benchmark_month_key = (
+        _benchmark_reference_month_key()
+        if _benchmark_reference_store_path() is not None
+        else resolved_month_key
+    )
     payload, source = _load_month_tendency_benchmark_payload(
-        resolved_month_key,
+        benchmark_month_key,
         active_month_key=current_active_month_key,
     )
     payload = dict(payload)
@@ -8231,6 +8284,7 @@ def day_tendency_month_benchmark(
         payload["active_month_key"] = active_month_key
     payload["source"] = source
     payload["requested_month_key"] = resolved_month_key
+    payload["benchmark_reference_month_key"] = benchmark_month_key
     # Citywide "good night / bad night" read for the day-tendency meter: this
     # frame's citywide demand vs the typical for the SAME weekday+time this month.
     payload["day_quality"] = _month_day_quality_for_frame(resolved_month_key, frame_time)
