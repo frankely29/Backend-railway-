@@ -519,6 +519,10 @@ def _cors_allow_origins() -> list[str]:
         "WEB_URL",
     )
     defaults = [
+        # The app's GitHub Pages frontend origin. Serving from github.io was hitting
+        # a CORS block (preflight 400 -> browser "Failed to fetch"), because only
+        # *.railway.app was allowed. Allow the Pages origin explicitly.
+        "https://frankely29.github.io",
         "http://localhost:3000",
         "http://127.0.0.1:3000",
         "http://localhost:5173",
@@ -532,7 +536,9 @@ def _cors_allow_origins() -> list[str]:
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_allow_origins(),
-    allow_origin_regex=r"https://([a-zA-Z0-9-]+\.)*(railway\.app|up\.railway\.app)",
+    # Allow this app's Railway hosts AND its GitHub Pages origin(s). Endpoints
+    # still require a Bearer token, so the widened origin set isn't a data risk.
+    allow_origin_regex=r"https://([a-zA-Z0-9-]+\.)*(railway\.app|up\.railway\.app|github\.io)",
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
