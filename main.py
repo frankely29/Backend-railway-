@@ -7278,6 +7278,45 @@ def root():
     }
 
 
+@app.get("/debug_month_activity")
+def debug_month_activity():
+    """Per-month total trips (demand) from parquet metadata -- cheap, no scan.
+    Used to pick the strongest month as a cross-month benchmark reference so a slow
+    active month doesn't deflate the color/forecast bar."""
+    out: Dict[str, Any] = {}
+    try:
+        import duckdb as _duckdb
+        grouped = _group_parquets_by_month(_list_parquets())
+        con = _duckdb.connect(database=":memory:")
+        try:
+            per_month: Dict[str, int] = {}
+            for mk in sorted(grouped.keys()):
+                files = grouped.get(mk) or []
+                if not files:
+                    continue
+                sql_files = ", ".join("'" + str(p).replace("'", "''") + "'" for p in files)
+                try:
+                    row = con.execute(f"SELECT COUNT(*) FROM read_parquet([{sql_files}])").fetchone()
+                    per_month[mk] = int(row[0] or 0) if row else 0
+                except Exception as exc:
+                    per_month[mk] = -1
+                    out.setdefault("errors", {})[mk] = f"{type(exc).__name__}: {exc}"
+        finally:
+            con.close()
+        out["trips_per_month"] = per_month
+        ranked = sorted(((v, k) for k, v in per_month.items() if v > 0), reverse=True)
+        if ranked:
+            out["busiest_month"] = ranked[0][1]
+            out["busiest_trips"] = ranked[0][0]
+            out["slowest_month"] = ranked[-1][1]
+            out["slowest_trips"] = ranked[-1][0]
+            if ranked[-1][0] > 0:
+                out["busiest_vs_slowest_ratio"] = round(ranked[0][0] / ranked[-1][0], 3)
+    except Exception as exc:
+        out["error"] = f"{type(exc).__name__}: {exc}"
+    return out
+
+
 @app.get("/debug_month_anchor")
 def debug_month_anchor(month_key: Optional[str] = None):
     """Diagnostics for the month-anchored-colors feature. Reports whether the
