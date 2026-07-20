@@ -1710,6 +1710,75 @@ def _reclaim_orphan_month_dirs() -> Dict[str, Any]:
     return {"removed_month_dirs": removed_month_dirs, "bytes_freed_estimate": int(bytes_freed_estimate)}
 
 
+def _ensure_benchmark_reference_month_ready() -> Dict[str, Any]:
+    """Keep the cross-month benchmark reference month built and on the CURRENT
+    scoring logic. Complements the cleanup-protection guards: those stop the
+    reference store from being DELETED; this REBUILDS it if it ever goes missing
+    (new volume, an unprotected path) or goes stale after a scoring-logic change
+    (the active month regenerates on such a change, but a non-active reference
+    month would not, leaving its breakpoints on old logic). Cheap no-op when the
+    reference is already present + current. Respects the single-build lock and the
+    same persisted per-month backoff as the rollover watcher. Serve time already
+    falls back to the active month whenever the reference is absent, so this only
+    affects whether the cross-month benchmark is active -- never map availability."""
+    try:
+        ref = _benchmark_reference_month_key()
+        if not ref or not _safe_parse_month_key(ref):
+            return {"action": "disabled"}
+        source_months = set(_available_source_month_keys())
+        active = resolve_active_month_key(
+            datetime.now(timezone.utc).astimezone(NYC_TZ), sorted(source_months)
+        )
+        if ref == str(active or "").strip():
+            return {"action": "is_active_month"}  # the active-month path keeps it fresh
+        if ref not in source_months:
+            return {"action": "no_source_parquet"}  # cannot build; serve falls back to active
+        store = _month_store_path(ref)
+        present = bool(store.exists() and store.is_file() and store.stat().st_size > 0)
+        needs_build = not present
+        stale_reason = "missing" if not present else None
+        if present:
+            try:
+                ref_meta = load_month_build_meta(EXACT_HISTORY_MONTHS_DIR, ref) or {}
+                active_meta = (
+                    load_month_build_meta(EXACT_HISTORY_MONTHS_DIR, str(active)) or {}
+                ) if active else {}
+                ref_hash = str(ref_meta.get("code_dependency_hash") or "")
+                active_hash = str(active_meta.get("code_dependency_hash") or "")
+                # The active month is always rebuilt to the current logic, so a hash
+                # mismatch means the reference month is on stale scoring logic.
+                if ref_hash and active_hash and ref_hash != active_hash:
+                    needs_build = True
+                    stale_reason = "stale_rating_logic"
+            except Exception:
+                pass
+        if not needs_build:
+            return {"action": "fresh"}
+        state = _get_state()
+        if str(state.get("state") or "").strip() == "running":
+            return {"action": "skip_build_running", "stale_reason": stale_reason}
+        rebuild_state = _read_auto_rebuild_state(ref) or {}
+        last_attempt = int(rebuild_state.get("last_attempt_unix") or 0)
+        now_unix = int(time.time())
+        if last_attempt > 0 and (now_unix - last_attempt) < int(AUTO_RETIRED_REBUILD_BACKOFF_SEC):
+            return {"action": "backoff", "stale_reason": stale_reason}
+        _write_auto_rebuild_state(ref)
+        print(f"[benchmark-reference] rebuilding reference month {ref} reason={stale_reason}")
+        start_generate(
+            DEFAULT_BIN_MINUTES,
+            DEFAULT_MIN_TRIPS_PER_WINDOW,
+            force_clear_lock=False,
+            include_day_tendency=False,
+            build_review_artifacts=False,
+            month_key=ref,
+            build_all_months=False,
+        )
+        return {"action": "build_started", "month_key": ref, "reason": stale_reason}
+    except Exception:
+        traceback.print_exc()
+        return {"action": "error"}
+
+
 def _available_source_month_keys() -> List[str]:
     grouped = _group_parquets_by_month(_list_parquets())
     return sorted(grouped.keys())
@@ -3036,6 +3105,13 @@ def _start_monthly_rollover_watcher() -> None:
                 )
                 tendency_fresh = _tendency_fresh_for_month()
                 if exact_store_present and tendency_fresh:
+                    # Active month is fresh -> spend this cycle keeping the
+                    # cross-month benchmark reference month built + current (it
+                    # isn't the active month, so nothing else rebuilds it).
+                    try:
+                        _ensure_benchmark_reference_month_ready()
+                    except Exception:
+                        traceback.print_exc()
                     continue
 
                 # Persisted backoff — survives redeploys and prevents the
@@ -6957,6 +7033,15 @@ def startup():
         traceback.print_exc()
     try:
         _start_monthly_rollover_watcher()
+    except Exception:
+        traceback.print_exc()
+    # Self-heal the cross-month benchmark reference month on boot: rebuild it if it
+    # was lost (e.g. deleted by a past cleanup, fresh volume) or went stale after a
+    # scoring-logic change. Best-effort; skips if a build is already running (the
+    # hourly rollover watcher then picks it up). Serve time falls back to the active
+    # month meanwhile, so this never gates map availability.
+    try:
+        _ensure_benchmark_reference_month_ready()
     except Exception:
         traceback.print_exc()
     try:
