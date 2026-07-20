@@ -1677,6 +1677,14 @@ def _reclaim_orphan_month_dirs() -> Dict[str, Any]:
         active = resolve_active_month_key(datetime.now(timezone.utc).astimezone(NYC_TZ), sorted(manifest_months))
         if active:
             keep.add(str(active))
+        # Never reclaim the cross-month benchmark reference month: the colors and
+        # Tendency anchor to its store for EVERY month, so it must persist even
+        # though it isn't in the manifest and isn't the active month. (Without this
+        # the startup cleanup deletes it on the next deploy and the benchmark
+        # silently falls back to the active month.)
+        ref_month = _benchmark_reference_month_key()
+        if ref_month and _safe_parse_month_key(ref_month):
+            keep.add(str(ref_month))
         for child in EXACT_HISTORY_MONTHS_DIR.iterdir():
             if not child.is_dir():
                 continue

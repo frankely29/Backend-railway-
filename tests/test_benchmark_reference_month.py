@@ -42,3 +42,25 @@ def test_non_reference_month_not_protected(monkeypatch):
     # to normal retirement logic; store simply doesn't exist here so nothing removed).
     result = main._retire_obsolete_exact_store("1999-02", reason="unit_test")
     assert result["reason"] != "protected_benchmark_reference_month"
+
+
+def test_reclaim_orphan_dirs_keeps_reference_month(monkeypatch, tmp_path):
+    # Reproduces the bug: the startup orphan-reclaim deleted the reference month
+    # (not in the manifest, not active) on deploy. It must now keep it.
+    monkeypatch.setenv("BENCHMARK_REFERENCE_MONTH", "2025-10")
+    months_dir = tmp_path / "months"
+    months_dir.mkdir()
+    for mk in ("2025-07", "2025-10", "2025-03"):
+        (months_dir / mk).mkdir()
+        (months_dir / mk / "exact_shadow.duckdb").write_bytes(b"x" * 16)
+    monkeypatch.setattr(main, "EXACT_HISTORY_MONTHS_DIR", months_dir)
+    monkeypatch.setattr(main, "_load_month_manifest", lambda: {"available_month_keys": ["2025-07"]})
+    monkeypatch.setattr(main, "resolve_active_month_key", lambda *a, **k: "2025-07")
+
+    res = main._reclaim_orphan_month_dirs()
+
+    assert (months_dir / "2025-10").exists(), "reference month must be protected from reclaim"
+    assert (months_dir / "2025-07").exists(), "active/manifest month kept"
+    assert not (months_dir / "2025-03").exists(), "true orphan should be removed"
+    assert "2025-03" in res["removed_month_dirs"]
+    assert "2025-10" not in res["removed_month_dirs"]
