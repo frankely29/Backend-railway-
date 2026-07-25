@@ -292,3 +292,33 @@ def test_dead_area_everywhere_routes_to_the_far_demand():
     assert g["action"] == "move_nearby"
     assert (g["target_zone"] or {}).get("zone_name") == "Strong Far"
     assert g.get("far_reposition") is True
+
+
+def test_manhattan_core_crowding_counts_toward_the_trap():
+    # Citywide market saturation is mild, but the Manhattan-core measure says the
+    # zone is crowded. The map's assistant already consults that field for
+    # Manhattan zones; the server used to ignore it, so the two engines could
+    # disagree about whether the same zone was a trap.
+    zc = {
+        "current_zone": {"rating": 48, "next_rating": 48, "stay_hour_value": 48.0,
+                         "short_trip_penalty": 0.85,
+                         "market_saturation_penalty": 0.10,
+                         "manhattan_core_saturation_penalty": 0.66},
+        "nearby_candidates": [],
+    }
+    g = build_driver_guidance(**_inputs(200, "Core Zone", "2025-06-23T15:00:00", borough="Manhattan"),
+                              activity_snapshot=_snap(), zone_context=zc)
+    assert g.get("trap_zone") is True
+
+
+def test_mild_crowding_on_both_measures_is_not_a_trap():
+    zc = {
+        "current_zone": {"rating": 48, "next_rating": 48, "stay_hour_value": 48.0,
+                         "short_trip_penalty": 0.85,
+                         "market_saturation_penalty": 0.10,
+                         "manhattan_core_saturation_penalty": 0.12},
+        "nearby_candidates": [],
+    }
+    g = build_driver_guidance(**_inputs(200, "Calm Zone", "2025-06-23T15:00:00", borough="Manhattan"),
+                              activity_snapshot=_snap(), zone_context=zc)
+    assert g.get("trap_zone") is False

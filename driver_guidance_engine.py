@@ -603,9 +603,20 @@ def build_driver_guidance(
     # saturated (too many drivers chasing them). Hoisted here so the decision
     # branches below can refuse to STRONG-HOLD a driver inside one when a real
     # escape exists; the trap overlay below also reads it.
+    # Manhattan-core crowding is a separate signal from citywide market
+    # saturation; inside the core it is the one that actually describes how many
+    # drivers are competing. Take whichever is worse so a crowded core zone is
+    # judged on the right measure -- the map's own assistant already does this,
+    # and the server ignoring it made the two disagree.
+    current_manhattan_core_saturation = _safe_float(
+        current_zone.get("manhattan_core_saturation_penalty"), 0.0
+    )
+    current_effective_saturation = max(
+        current_saturation_penalty, current_manhattan_core_saturation
+    )
     current_is_trap = (
         current_short_trip_penalty >= TRAP_SHORT_TRIP_PENALTY_MIN
-        and current_saturation_penalty >= TRAP_SATURATION_PENALTY_MIN
+        and current_effective_saturation >= TRAP_SATURATION_PENALTY_MIN
     )
     current_bucket = current_zone.get("bucket")
     current_color = current_zone.get("color")

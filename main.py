@@ -8849,6 +8849,13 @@ def _build_guidance_zone_context(
             "rating_60": round(float(current_rating_60), 2),
             "stay_hour_value": round(float(current_stay_hour_value), 2),
             "market_saturation_penalty": _safe_float_value(current_now.get("market_saturation_penalty"), 0.0),
+            # Manhattan-core crowding is tracked separately from citywide market
+            # saturation, and the map's own assistant already consults it for
+            # Manhattan zones. The server ignored it entirely, so the two engines
+            # could disagree about whether a crowded core zone was a trap.
+            "manhattan_core_saturation_penalty": _safe_float_value(
+                current_now.get("manhattan_core_saturation_penalty"), 0.0
+            ),
             "continuation_raw": _safe_float_value(current_now.get("continuation_raw"), 0.0),
             # Normalized 0-1 continuation. Passed through explicitly (None stays
             # None) so the engine can tell "weak continuation" apart from "this
