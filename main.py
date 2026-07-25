@@ -9015,6 +9015,25 @@ _REVERSE_GEOCODE_OK_TTL = 7 * 24 * 3600
 _REVERSE_GEOCODE_MISS_TTL = 20 * 60
 
 
+def _frame_instant_unix(frame_time: str, fallback_ts: int) -> int:
+    """Unix instant for a frame's NYC-local timestamp.
+
+    The pickup-anchor matcher derives a weekday + time-of-day bin from this and
+    compares it against each logged pickup's own instant, so it has to be a real
+    instant on the same clock -- interpreting the local string as UTC would shift
+    every comparison by the NYC offset. Falls back to the caller's timestamp when
+    the frame string can't be parsed.
+    """
+    try:
+        naive = datetime.fromisoformat(str(frame_time).strip()[:19])
+    except Exception:
+        return int(fallback_ts)
+    try:
+        return int(naive.replace(tzinfo=NYC_TZ).timestamp())
+    except Exception:
+        return int(fallback_ts)
+
+
 def _reverse_geocode_anchor_label(lat: float, lng: float) -> Optional[str]:
     """Short street/landmark label for a pickup anchor, or None on failure.
 
@@ -9022,7 +9041,12 @@ def _reverse_geocode_anchor_label(lat: float, lng: float) -> Optional[str]:
     failure or empty result returns None and the caller keeps generic wording.
     """
     try:
-        key = f"{round(float(lat), 3)},{round(float(lng), 3)}"
+        # 4 decimals ~= 11m. At 3 decimals the key covered ~110m of latitude, so
+        # anchors several blocks apart collided in the cache and the second one
+        # was labelled with the first one's street -- naming a corner the driver
+        # was not being sent to. Anchors sit on a 135m grid, so 4dp keeps them
+        # distinct while still collapsing repeat lookups of the same anchor.
+        key = f"{round(float(lat), 4)},{round(float(lng), 4)}"
     except Exception:
         return None
     now = time.time()
@@ -9337,7 +9361,15 @@ def assistant_guidance(
                         zone_id=int(_rec_zone),
                         zone_geom=_zg,
                         pickup_rows=_pickup_zone_long_run_points(int(_rec_zone), limit=2400),
-                        frame_time=now_ts,
+                        # The anchor is chosen by matching each past pickup's
+                        # weekday+time-of-day against a reference instant, so that
+                        # instant must be the FRAME the driver is being advised
+                        # about -- not the server's wall clock. Passing now_ts
+                        # named the corner that is busiest at the moment the
+                        # request happened to land, which is a different corner
+                        # whenever the displayed frame isn't the current hour.
+                        # Everything else in this block already keys off frame_key.
+                        frame_time=_frame_instant_unix(frame_key, now_ts),
                     )
                 if pickup_anchor:
                     _anchor_label = _reverse_geocode_anchor_label(

@@ -26,13 +26,32 @@ def _timeslot_context_weight(frame_weekday: int, frame_bin: int, sample_ts: int,
     dt = time.gmtime(int(sample_ts))
     sample_weekday = int(dt.tm_wday)
     sample_bin = _timeslot_bin(sample_ts, bin_minutes=bin_minutes)
-    delta = abs(sample_bin - frame_bin)
+    # Time is a CLOCK, and both of its hands wrap. Comparing raw bin numbers and
+    # raw weekday numbers made 23:40 Friday and 00:00 Saturday look maximally far
+    # apart -- different weekday, 71 bins -- when they are 20 minutes apart and
+    # the same working night. An overnight recommendation therefore discarded
+    # exactly the pickups that describe it and named its corner from unrelated
+    # daytime traffic.
+    #
+    # Measure adjacency on a single weekly clock so both midnight and the
+    # Sunday->Monday seam are continuous, and keep a separate time-of-day
+    # distance for the weaker "same hour, other day" signal.
+    bins_per_day = max(1, (24 * 60) // max(1, int(bin_minutes)))
+    week_bins = bins_per_day * 7
 
-    if sample_weekday == frame_weekday and delta == 0:
+    raw_delta = abs(sample_bin - frame_bin)
+    delta = min(raw_delta, bins_per_day - raw_delta)
+
+    frame_index = (int(frame_weekday) % 7) * bins_per_day + int(frame_bin)
+    sample_index = (sample_weekday % 7) * bins_per_day + sample_bin
+    raw_week_delta = abs(sample_index - frame_index)
+    week_delta = min(raw_week_delta, week_bins - raw_week_delta)
+
+    if week_delta == 0:
         return 1.00
-    if sample_weekday == frame_weekday and delta == 1:
+    if week_delta == 1:
         return 0.80
-    if sample_weekday == frame_weekday and delta == 2:
+    if week_delta == 2:
         return 0.65
     if delta == 0:
         return 0.55
