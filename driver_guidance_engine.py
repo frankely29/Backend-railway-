@@ -70,6 +70,11 @@ STAGNANT_RISE_EPSILON = 2.0
 # has to beat staying over the hour AFTER the deadhead, so this never sends a
 # driver on a losing drive.
 STAGNANT_MOVE_MIN_IMPROVEMENT = 6.0
+# Extra margin a STAGNANT zone must win by before "staying out-earns moving"
+# blocks a move. Added on top of HOUR_STAY_PREFERENCE, which is the amount
+# STAYING has to beat the move by -- so a larger total means the flat zone has to
+# prove more, and a driver stuck in it is freed sooner.
+STAGNANT_STAY_EXTRA_MARGIN = 4.0
 
 
 # Elevated-risk TLC zones — the highest violent-crime areas per NYPD CompStat
@@ -732,11 +737,17 @@ def build_driver_guidance(
     # flat nearby zone; it never forces a move (escapes/fades keep their own
     # logic) and a big value gap (a real escape) sails past it untouched.
     best_move_value = max((_net_after_drive(c) for c in nearby_candidates), default=float("-inf"))
-    # The stay preference is a HANDICAP given to the current zone for the chance
-    # it comes up. A stagnant sub-blue zone has no such chance, so it gets no
-    # handicap -- staying then has to genuinely out-earn the move on the hour's
-    # own numbers, not on a bonus it hasn't earned.
-    _stay_preference = 0.0 if current_is_stagnant else HOUR_STAY_PREFERENCE
+    # NOTE the direction: this margin is what STAYING must win BY before it
+    # blocks a move, so a BIGGER number means staying has to prove more and moves
+    # get easier. A stagnant sub-blue zone is exactly the case where staying
+    # should have to prove more -- it is asking the driver to wait out an hour
+    # the forecast says stays flat -- so it must clear a wider margin, not the
+    # ordinary one.
+    _stay_preference = (
+        HOUR_STAY_PREFERENCE + STAGNANT_STAY_EXTRA_MARGIN
+        if current_is_stagnant
+        else HOUR_STAY_PREFERENCE
+    )
     stay_beats_moving = stay_hour_value >= best_move_value + _stay_preference
     # The zone we'd actually send the driver to on ANY nearby move: the highest
     # worth-the-move value (which folds in distance/ETA), NOT merely the highest-

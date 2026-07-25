@@ -6,10 +6,11 @@ but the forecast had this zone flat and sub-blue for the whole next hour. Holdin
 there is not a free option -- it is a decision to bank another bin of sub-blue
 earnings for a rise that is not coming.
 
-So a STAGNANT sub-blue zone (no meaningful rise in the next 20/40/60 min) loses
-the stay-preference handicap, and a clearly better reachable zone wins on a
-smaller edge. It must still out-earn staying after the deadhead, so this never
-sends a driver on a losing drive.
+So a STAGNANT sub-blue zone (no meaningful rise in the next 20/40/60 min) has to
+clear a WIDER margin before "staying out-earns moving" blocks a move, and a
+clearly better reachable zone wins on a smaller arrival edge. It must still
+out-earn staying after the deadhead, so this never sends a driver on a losing
+drive.
 """
 from __future__ import annotations
 
@@ -141,3 +142,29 @@ def test_above_blue_zone_is_never_stagnant():
     })
     g = _guide(zc)
     assert g["current_is_stagnant"] is False
+
+
+def test_stay_margin_direction_frees_the_driver_not_traps_them():
+    """Regression on the sign of the stay margin.
+
+    stay_beats_moving requires STAYING to win BY the margin, so shrinking it
+    makes holding EASIER. A first attempt at this feature lowered the margin for
+    stagnant zones, which pinned drivers harder in exactly the zones meant to be
+    escaped -- it broke the blue-floor move and the anti-churn honesty check.
+    A stagnant zone must face a WIDER bar, so a tie goes to the driver leaving.
+    """
+    from driver_guidance_engine import (
+        HOUR_STAY_PREFERENCE,
+        STAGNANT_STAY_EXTRA_MARGIN,
+    )
+    assert STAGNANT_STAY_EXTRA_MARGIN > 0, "stagnant zones must prove MORE, not less"
+
+    # A move that staying beats by only the ordinary margin must still be allowed
+    # out of a stagnant zone (it would have been blocked under the old margin).
+    zc = _coney_island_flat(target_rating=53.0, target_move_value=48.0)
+    zc["current_zone"]["stay_hour_value"] = 48.0 + HOUR_STAY_PREFERENCE + 0.5
+    g = _guide(zc)
+    assert g["current_is_stagnant"] is True
+    # Staying wins by the ordinary margin but NOT by the wider stagnant one, so
+    # the hold must not be justified by "staying out-earns moving".
+    assert g.get("held_for_antichurn") is not True
