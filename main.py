@@ -2301,6 +2301,8 @@ def _build_single_frame_for_month(month_key: str, frame_time: str) -> Dict[str, 
             from build_hotspot import (
                 month_demand_breakpoints_for_store,
                 month_mode_breakpoints_for_store,
+                month_frame_demand_breakpoints_for_store,
+                apply_frame_demand_ceiling,
                 _apply_month_anchored_colors,
             )
             # Cross-month benchmark: anchor colors to the strong-normal REFERENCE
@@ -2313,6 +2315,16 @@ def _build_single_frame_for_month(month_key: str, frame_time: str) -> Dict[str, 
             _feats = ((payload or {}).get("polygons") or {}).get("features") or []
             if _bps and _feats:
                 _apply_month_anchored_colors(_feats, _bps, _mode_bps)
+            # Frame-level demand ceiling. The per-zone ceiling above cannot cap a
+            # quiet hour (its score nets saturation out of demand, so 2am scores
+            # like noon). This caps what the frame's BEST zone may read based on
+            # how much work the whole city actually has, which is what makes a
+            # green mean the same thing at 2am as at 7pm. Applies to every colour
+            # track, so the 45+ mode is day-consistent too.
+            if _feats:
+                _frame_bps = month_frame_demand_breakpoints_for_store(_store)
+                if _frame_bps:
+                    apply_frame_demand_ceiling(_feats, _frame_bps)
         except Exception:
             pass
     return payload
@@ -8838,6 +8850,10 @@ def _build_guidance_zone_context(
             "stay_hour_value": round(float(current_stay_hour_value), 2),
             "market_saturation_penalty": _safe_float_value(current_now.get("market_saturation_penalty"), 0.0),
             "continuation_raw": _safe_float_value(current_now.get("continuation_raw"), 0.0),
+            # Normalized 0-1 continuation. Passed through explicitly (None stays
+            # None) so the engine can tell "weak continuation" apart from "this
+            # frame didn't carry the column" instead of defaulting to a pass.
+            "continuation_n": current_now.get("continuation_n"),
             "short_trip_penalty": _safe_float_value(current_now.get("short_trip_penalty"), 0.0),
         },
         "nearby_candidates": nearby_candidates[:8],

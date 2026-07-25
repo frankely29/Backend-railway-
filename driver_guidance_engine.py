@@ -96,8 +96,21 @@ SAFETY_MIN_RIDER_RATING = 4.7
 
 # A zone is a "low-trip trap" when it keeps pinging short, low-value trips
 # that strand the driver: high short-trip penalty AND market saturation.
-TRAP_SHORT_TRIP_PENALTY_MIN = 0.5
-TRAP_SATURATION_PENALTY_MIN = 0.35
+#
+# BOTH inputs are PERCENTILE RANKS within the frame (median lands at ~0.50 by
+# construction), so the old 0.5/0.35 pair meant "worse than the median zone" and
+# flagged 22-27% of the city -- including purple and indigo zones, which then got
+# a message that called them red-hot AND a cheap-trip trap in the same breath.
+# A trap is meant to be the genuinely bad tail: short-trip pressure in the worst
+# quartile AND saturation in the worst half. That lands at ~0-2% of zones with
+# essentially no high-rated zones caught, so the warning means something again.
+TRAP_SHORT_TRIP_PENALTY_MIN = 0.75
+TRAP_SATURATION_PENALTY_MIN = 0.5
+# Continuation strength (0-1 percentile) a zone needs before "hold, it still has
+# continuation" is a truthful claim. The value arrives normalized; anything
+# outside 0-1 means a stale frame served the unbounded raw column, which we
+# treat as UNKNOWN (gate fails) rather than letting it auto-pass.
+STRONG_HOLD_CONTINUATION_MIN = 0.45
 
 # TLC airport zones. Airports run a FIFO queue with mechanics the rating can't
 # convey (hold your spot, EWR is NYC-bound only, LGA lot hours), so they get a
@@ -575,6 +588,16 @@ def build_driver_guidance(
     current_next_rating = _safe_float(current_zone.get("next_rating"), current_rating)
     current_saturation_penalty = _safe_float(current_zone.get("market_saturation_penalty"), 0.0)
     current_continuation_raw = _safe_float(current_zone.get("continuation_raw"), 0.0)
+    # Normalized 0-1 continuation for the strong-hold gate. Prefer the explicit
+    # continuation_n when the builder supplied it; otherwise accept
+    # continuation_raw ONLY if it is already in range. An out-of-range value is a
+    # stale frame's unbounded column (0-12), and treating that as "supportive"
+    # is what made the gate pass ~96% of zones.
+    _continuation_n_raw = current_zone.get("continuation_n")
+    if _continuation_n_raw is None:
+        _continuation_n_raw = current_zone.get("continuation_raw")
+    _continuation_n = _safe_float(_continuation_n_raw, -1.0)
+    current_continuation_ok = 0.0 <= _continuation_n <= 1.0 and _continuation_n >= STRONG_HOLD_CONTINUATION_MIN
     current_short_trip_penalty = _safe_float(current_zone.get("short_trip_penalty"), 0.0)
     # A short-trip TRAP zone: high penalty (lots of short, cheap trips) and
     # saturated (too many drivers chasing them). Hoisted here so the decision
@@ -823,7 +846,7 @@ def build_driver_guidance(
     elif (
         current_rating >= 64
         and current_next_rating >= (current_rating - 4)
-        and current_continuation_raw >= 0.45
+        and current_continuation_ok
         and settling_window
         and obvious_upgrade is None
         and not current_is_trap

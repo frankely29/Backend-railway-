@@ -12,34 +12,51 @@ from typing import Any, Mapping, Optional
 
 
 def _rank(rating: float) -> int:
-    """Coarse busy-ness rank, for comparing two zones."""
+    """Coarse busy-ness rank, for comparing two zones.
+
+    One rank per MAP BUCKET. The old ladder merged green (>=83) with purple
+    (75-82) and merged orange (30-39) with red (<30), so a hop from a purple 79
+    to a green 90 scored gap 0 and was announced as neither "Busier" nor "Much
+    busier" -- the words could not express the map's own top colour. Ranks now
+    line up 1:1 with bucket_and_color_from_rating.
+    """
     r = float(rating or 0)
+    if r >= 83:
+        return 7  # green
     if r >= 75:
-        return 5
+        return 6  # purple
     if r >= 68:
-        return 4
+        return 5  # indigo
     if r >= 60:
-        return 3
+        return 4  # blue
     if r >= 50:
-        return 2
+        return 3  # sky
     if r >= 40:
-        return 1
-    return 0
+        return 2  # yellow
+    if r >= 30:
+        return 1  # orange
+    return 0      # red
 
 
 def demand_word(rating: float) -> str:
-    """Plain busy-ness word (no colour/jargon)."""
+    """Plain busy-ness word (no colour/jargon), one per map bucket."""
     r = float(rating or 0)
-    if r >= 75:
+    if r >= 83:
         return "red-hot"
-    if r >= 68:
+    if r >= 75:
         return "very busy"
-    if r >= 60:
+    if r >= 68:
         return "busy"
+    # NOT "steady" -- _trend() also yields "steady", and the STAY line reads
+    # "{word} and steady", which would stutter as "steady and steady".
+    if r >= 60:
+        return "fairly busy"
     if r >= 50:
         return "lukewarm"
     if r >= 40:
         return "slow"
+    if r >= 30:
+        return "very slow"
     return "quiet"
 
 

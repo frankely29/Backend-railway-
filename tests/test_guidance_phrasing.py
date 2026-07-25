@@ -8,11 +8,34 @@ def _rail(label):
 
 
 def test_demand_words_are_plain():
-    assert demand_word(85) == "red-hot"
-    assert demand_word(70) == "very busy"
-    assert demand_word(62) == "busy"
-    assert demand_word(55) == "lukewarm"
-    assert demand_word(20) == "quiet"
+    # One word per MAP BUCKET. The old ladder merged green with purple (both
+    # "red-hot") and orange with red (both "quiet"), so the words could not
+    # describe the map's own top colour.
+    assert demand_word(85) == "red-hot"      # green   >= 83
+    assert demand_word(78) == "very busy"    # purple  >= 75
+    assert demand_word(70) == "busy"         # indigo  >= 68
+    assert demand_word(62) == "fairly busy"  # blue    >= 60
+    assert demand_word(55) == "lukewarm"     # sky     >= 50
+    assert demand_word(44) == "slow"         # yellow  >= 40
+    assert demand_word(33) == "very slow"    # orange  >= 30
+    assert demand_word(20) == "quiet"        # red
+
+
+def test_green_and_purple_no_longer_share_a_word():
+    """A green zone must be describable as better than a purple one."""
+    assert demand_word(90) != demand_word(78)
+
+
+def test_purple_to_green_hop_reads_as_busier():
+    """The regression: purple 79 -> green 90 used to compute gap 0 and announce
+    itself with a bare demand word instead of "Busier"."""
+    line = compose_guidance_directive(
+        action="move_nearby", moving=True,
+        current_zone_name="Bushwick South", current_rating=79, current_next_rating=79,
+        target_zone_name="Williamsburg", target_rating=90, target_rating_now=90, target_eta=13,
+        below_blue=False,
+    )
+    assert line.startswith("Busier — go to Williamsburg"), line
 
 
 def test_spot_phrase_is_natural_by_source_and_kind():
@@ -49,7 +72,7 @@ def test_move_to_very_busy_leads_with_the_demand_word():
         target_zone_name="Greenpoint", target_rating=72, target_rating_now=72, target_eta=5,
         spot=_rail("Greenpoint Avenue"), below_blue=False,
     )
-    assert line.startswith("Very busy — go to Greenpoint")
+    assert line.startswith("Busy — go to Greenpoint")
 
 
 def test_stay_is_plain_and_drops_old_jargon():
@@ -58,7 +81,7 @@ def test_stay_is_plain_and_drops_old_jargon():
         current_zone_name="Astoria", current_rating=62, current_next_rating=61,
         spot=_rail("Broadway"), below_blue=False,
     )
-    assert line == "Stay in Astoria — busy and steady. Work the Broadway stop."
+    assert line == "Stay in Astoria — fairly busy and steady. Work the Broadway stop."
     for banned in ("the local transit hub", "a visitor draw", "it's working",
                    "best anchor here", "blue but easing", "indigo"):
         assert banned not in line
@@ -182,6 +205,6 @@ def test_far_reposition_leads_with_destination_demand_then_zone():
         target_zone_name="Times Sq", target_rating=72, target_rating_now=72, target_eta=28,
         spot=_rail("Times Square–42nd Street"), below_blue=True, far_reposition=True,
     )
-    assert line.startswith("Very busy over in Times Sq")
+    assert line.startswith("Busy over in Times Sq")
     assert "slow all around here" in line
     assert "28 min away" in line

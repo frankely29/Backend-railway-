@@ -199,8 +199,11 @@ def test_held_in_a_short_trip_trap_warns_the_driver():
     # with nothing better reachable. The card must include a factual heads-up, not
     # a bare "stay" — and must NOT claim the offline-until-arrival escape (no move).
     zc = {
+        # Both inputs are percentile ranks (median ~0.50), so a genuine trap has
+        # to sit in the bad TAIL -- 0.6/0.5 was merely "worse than the median"
+        # and used to flag ~22% of the city, including purple zones.
         "current_zone": {"rating": 48, "next_rating": 48, "stay_hour_value": 48.0,
-                         "short_trip_penalty": 0.6, "market_saturation_penalty": 0.5},
+                         "short_trip_penalty": 0.85, "market_saturation_penalty": 0.62},
         "nearby_candidates": [],
     }
     g = build_driver_guidance(**_inputs(200, "Trap Zone", "2025-06-23T15:00:00", borough="Brooklyn"),
