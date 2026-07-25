@@ -159,3 +159,82 @@ def test_same_ratio_helper_never_raises_next():
     assert props["r_next"] == 60
     _apply_same_ratio_to_next(props, "r", 50, 80)   # base raised (shouldn't happen)
     assert props["r_next"] == 60
+
+
+# --- benchmark basis ------------------------------------------------------
+# The distribution must be built on the same basis as the value scored against
+# it. The store holds EXACT per-bin counts; the frames we serve carry a
+# same-weekday BLEND. Blending removes variance, so ranking a blended value
+# against an exact distribution squeezes both ends of the scale.
+
+def _seeded_store(path):
+    import datetime
+    import random
+    import duckdb
+    random.seed(7)
+    con = duckdb.connect(str(path))
+    con.execute(
+        "CREATE TABLE exact_shadow_rows "
+        "(PULocationID INTEGER, exact_bin_local_ts TIMESTAMP, pickups_now INTEGER)"
+    )
+    rows = []
+    base = datetime.datetime(2025, 10, 1)
+    for d in range(28):
+        day_mult = random.uniform(0.75, 1.25)   # real day-to-day variance
+        for b in range(72):
+            hour = b * 20 / 60.0
+            diurnal = 0.15 + 0.85 * max(0.0, math.sin((hour - 4) / 24 * 2 * math.pi) + 0.35)
+            total = 3000 * diurnal * day_mult
+            ts = base + datetime.timedelta(days=d, minutes=20 * b)
+            for z in range(5):
+                rows.append((z + 1, ts, int(max(0, random.gauss(total / 5, total / 25)))))
+    con.executemany("INSERT INTO exact_shadow_rows VALUES (?,?,?)", rows)
+    return con
+
+
+def test_frame_breakpoints_use_the_blended_basis(tmp_path):
+    from build_hotspot import (
+        _MONTH_DEMAND_BP_LAST_ERROR,
+        _compute_frame_demand_breakpoints_from_store,
+    )
+    _MONTH_DEMAND_BP_LAST_ERROR.pop("frame_blended", None)
+    con = _seeded_store(tmp_path / "s.duckdb")
+    try:
+        bps = _compute_frame_demand_breakpoints_from_store(con)
+    finally:
+        con.close()
+    assert len(bps) == 101
+    # The blended query must actually have run, not silently fallen back.
+    assert _MONTH_DEMAND_BP_LAST_ERROR.get("frame_blended") is None
+
+
+def test_blended_basis_stops_over_capping_quiet_frames(tmp_path):
+    """The defect: on an exact-count distribution a blended trough looked far
+    more extreme than it is, so quiet frames were capped harder than warranted."""
+    from month_color_benchmark import score_on_breakpoints
+    from build_hotspot import _compute_frame_demand_breakpoints_from_store
+
+    con = _seeded_store(tmp_path / "s2.duckdb")
+    try:
+        blended_bps = _compute_frame_demand_breakpoints_from_store(con)
+        qlist = "[" + ", ".join(f"{i/100.0:.4f}" for i in range(101)) + "]"
+        exact_bps = sorted(float(x) for x in con.execute(
+            f"SELECT QUANTILE_CONT(LN(1+t),{qlist}) FROM ("
+            f"SELECT exact_bin_local_ts, SUM(pickups_now) t FROM exact_shadow_rows GROUP BY 1)"
+        ).fetchone()[0])
+        trough = min(r[0] for r in con.execute(
+            "SELECT AVG(t) FROM (SELECT exact_bin_local_ts ts, SUM(pickups_now) t "
+            "FROM exact_shadow_rows GROUP BY 1) "
+            "GROUP BY EXTRACT(DOW FROM (ts AT TIME ZONE 'UTC')), "
+            "EXTRACT(HOUR FROM (ts AT TIME ZONE 'UTC'))*60"
+            "+EXTRACT(MINUTE FROM (ts AT TIME ZONE 'UTC'))"
+        ).fetchall())
+    finally:
+        con.close()
+
+    on_blended = score_on_breakpoints(trough, blended_bps)
+    on_exact = score_on_breakpoints(trough, exact_bps)
+    assert on_blended > on_exact + 5, (
+        f"blended basis should place a blended trough meaningfully higher than the "
+        f"exact basis did (blended={on_blended:.1f}% exact={on_exact:.1f}%)"
+    )

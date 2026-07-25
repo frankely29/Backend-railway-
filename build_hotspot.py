@@ -1633,7 +1633,9 @@ MONTH_DEMAND_BREAKPOINTS_VERSION = "month_benchmark_earnings_score_v2"
 # full saturation-aware earnings blend. This only adds the time-of-day dimension
 # that the saturation-netted score cancels out.
 MONTH_FRAME_DEMAND_SIDECAR = "month_frame_demand_breakpoints.json"
-MONTH_FRAME_DEMAND_VERSION = "month_frame_demand_v1"
+# v2: blended basis. v1 ranked a blended serve value against an EXACT per-bin
+# distribution -- see _compute_frame_demand_breakpoints_from_store.
+MONTH_FRAME_DEMAND_VERSION = "month_frame_demand_v2"
 # A frame at the month's demand floor still needs a usable spread -- a night
 # driver must be able to tell the best zone from the worst. So the frame cap is
 # mapped into [FLOOR, 100] rather than all the way to zero: the quietest hour's
@@ -1727,11 +1729,47 @@ def _compute_breakpoints_for_column(con: Any, score_column: str) -> List[float]:
 def _compute_frame_demand_breakpoints_from_store(con: Any) -> List[float]:
     """101 month-wide quantile breakpoints of LN(1 + citywide pickups per FRAME).
 
-    One row per 20-min bin (summed across non-airport zones), so the resulting
-    curve is the month's distribution of "how much work does the whole city have
-    right now". Airports are excluded to match every other benchmark here.
+    The distribution MUST be built on the same basis as the value that will be
+    scored against it. The store's pickups_now is an exact per-bin COUNT(*), but
+    the frames we serve carry a SAME-WEEKDAY BLEND (an average over that
+    weekday's occurrences in the month). Blending removes variance: a blended
+    peak is lower than any single real peak, and a blended trough is higher than
+    any single real trough.
+
+    Ranking the blended value against the exact distribution therefore squeezed
+    both ends -- real peaks scored as merely above-average (over-capped) and dead
+    hours scored as ordinary (under-capped), which is precisely the error the
+    ceiling exists to remove.
+
+    So we reduce to one row per (weekday, time-of-day) and average across the
+    month's weeks, reproducing the serve-time blend before taking quantiles.
+    Falls back to the raw per-bin basis if the date parts aren't available, since
+    a slightly mis-scaled ceiling still beats no ceiling.
     """
     qlist = "[" + ", ".join(f"{i/100.0:.4f}" for i in range(101)) + "]"
+    blended_sql = f"""
+        SELECT QUANTILE_CONT(LN(1 + blended_pickups), {qlist}) FROM (
+          SELECT AVG(frame_pickups) AS blended_pickups
+          FROM (
+            SELECT exact_bin_local_ts AS ts,
+                   SUM(COALESCE(pickups_now, 0)) AS frame_pickups
+            FROM exact_shadow_rows
+            WHERE PULocationID NOT IN (1, 132, 138)
+            GROUP BY exact_bin_local_ts
+          )
+          GROUP BY
+            EXTRACT(DOW FROM (ts AT TIME ZONE 'UTC')),
+            EXTRACT(HOUR FROM (ts AT TIME ZONE 'UTC')) * 60
+              + EXTRACT(MINUTE FROM (ts AT TIME ZONE 'UTC'))
+        )
+    """
+    try:
+        row = con.execute(blended_sql).fetchone()
+        if row and row[0]:
+            return sorted(float(x) for x in row[0])
+    except Exception as exc:
+        _MONTH_DEMAND_BP_LAST_ERROR["frame_blended"] = f"{type(exc).__name__}: {exc}"
+
     row = con.execute(
         f"SELECT QUANTILE_CONT(LN(1 + frame_pickups), {qlist}) FROM ("
         f"  SELECT exact_bin_local_ts, SUM(COALESCE(pickups_now, 0)) AS frame_pickups"
