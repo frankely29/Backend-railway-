@@ -61,25 +61,6 @@ CLOSE_HOP_MAX_MILES = 1.0
 CLOSE_HOP_OVERRIDE_MARGIN = 5.0
 
 
-def _bucket_name(rating: float) -> str:
-    r = float(rating)
-    if r >= 83:
-        return "green"
-    if r >= 75:
-        return "purple"
-    if r >= 68:
-        return "indigo"
-    if r >= 60:
-        return "blue"
-    if r >= 50:
-        return "sky blue"
-    if r >= 40:
-        return "yellow"
-    if r >= 30:
-        return "orange"
-    return "red"
-
-
 # Elevated-risk TLC zones — the highest violent-crime areas per NYPD CompStat
 # (South/Central Bronx, East Harlem, Brownsville / East New York). Used only
 # to surface a DRIVER-SAFETY tip (raise the minimum rider rating); it never

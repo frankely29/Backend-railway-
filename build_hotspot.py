@@ -1894,6 +1894,12 @@ def apply_frame_demand_ceiling(
         scale = ceiling / frame_max
         bucket_field = rating_field.replace("_rating_", "_bucket_")
         color_field = rating_field.replace("_rating_", "_color_")
+        # The "_next" companion drives the map's demand-trend label ("about to
+        # heat up / cool off"). It MUST move with its base rating: scaling the
+        # now-value while leaving next untouched would invent a large fake climb
+        # on every zone in a quiet frame. Adjacent 20-min bins have near-identical
+        # citywide demand, so the same factor is the right first-order correction.
+        next_field = f"{rating_field}_next"
         for feature in features or []:
             props = feature.get("properties") or {}
             if props.get("airport_excluded"):
@@ -1908,6 +1914,9 @@ def apply_frame_demand_ceiling(
                 props[bucket_field] = bucket
             if color_field in props:
                 props[color_field] = color
+            next_value = props.get(next_field)
+            if isinstance(next_value, (int, float)):
+                props[next_field] = int(round(max(1.0, float(next_value) * scale)))
     return ceiling
 
 
@@ -2056,6 +2065,33 @@ def _month_anchored_ceiling_rating(pct: float, anchor_input: float, conf: float)
     return rating
 
 
+def _apply_same_ratio_to_next(
+    props: Dict[str, Any],
+    rating_field: str,
+    before: Any,
+    after: Any,
+) -> None:
+    """Move a rating's "_next" companion by the same factor its base moved.
+
+    The "_next" value is the same zone's rating one 20-min bin later and drives
+    the map's demand-trend label. Any adjustment applied to the now-value has to
+    reach it as well, or a capped zone reads as "about to heat up" purely because
+    its now-value was pulled down and its next-value was not.
+    """
+    next_field = f"{rating_field}_next"
+    next_value = props.get(next_field)
+    if not isinstance(next_value, (int, float)):
+        return
+    try:
+        before_f = float(before)
+        after_f = float(after)
+    except (TypeError, ValueError):
+        return
+    if before_f <= 0 or after_f >= before_f:
+        return
+    props[next_field] = int(round(max(1.0, float(next_value) * (after_f / before_f))))
+
+
 def _apply_month_anchored_colors(
     features: List[Dict[str, Any]],
     breakpoints: List[float],
@@ -2115,6 +2151,10 @@ def _apply_month_anchored_colors(
         props["earnings_shadow_rating_citywide_v3"] = final_rating
         props["earnings_shadow_bucket_citywide_v3"] = bucket
         props["earnings_shadow_color_citywide_v3"] = color
+        # Keep the "_next" companion in step. It feeds the map's demand-trend
+        # label, so capping only the now-value would manufacture a climb that
+        # isn't there ("about to heat up" on every capped zone).
+        _apply_same_ratio_to_next(props, "earnings_shadow_rating_citywide_v3", existing, final_rating)
 
     # Borough-mode passes: same CEILING idea, each mode capped by the month-wide
     # distribution of its OWN earnings score, using that mode's blend so its ceiling
@@ -2153,6 +2193,7 @@ def _apply_month_anchored_colors(
             props[rating_field] = final_rating
             props[bucket_field] = bucket
             props[color_field] = color
+            _apply_same_ratio_to_next(props, rating_field, existing, final_rating)
 
 
 def build_single_frame_from_exact_store(

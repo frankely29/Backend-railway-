@@ -126,3 +126,36 @@ def test_airport_zones_excluded_from_frame_total():
     ceiling = frame_demand_ceiling_rating(feats, _bps())
     plain = frame_demand_ceiling_rating(_frame(3000, [90, 70]), _bps())
     assert ceiling == plain, "an airport must not inflate the frame's demand"
+
+
+def test_next_rating_moves_with_its_base_rating():
+    """The "_next" companion drives the map's trend label. Scaling the now-value
+    while leaving next alone would invent an 'about to heat up' on every capped
+    zone in a quiet frame."""
+    feats = _frame(3000, [90, 70])
+    for f, nxt in zip(feats, [88, 69]):
+        f["properties"]["earnings_shadow_rating_citywide_v3_next"] = nxt
+    apply_frame_demand_ceiling(feats, _bps())
+    p = feats[0]["properties"]
+    now = p["earnings_shadow_rating_citywide_v3"]
+    nxt = p["earnings_shadow_rating_citywide_v3_next"]
+    assert nxt < 88, "next must be scaled too"
+    # Before: 90 -> 88 is a mild fade. After scaling both, it must STILL read as
+    # a mild fade, not a climb.
+    assert nxt <= now + 1, f"capping invented a fake climb: now={now} next={nxt}"
+
+
+def test_per_zone_anchor_also_keeps_next_in_step():
+    from build_hotspot import _apply_same_ratio_to_next
+    props = {"r": 90, "r_next": 88}
+    _apply_same_ratio_to_next(props, "r", 90, 72)
+    assert props["r_next"] == 70, props["r_next"]
+
+
+def test_same_ratio_helper_never_raises_next():
+    from build_hotspot import _apply_same_ratio_to_next
+    props = {"r": 50, "r_next": 60}
+    _apply_same_ratio_to_next(props, "r", 50, 50)   # unchanged base
+    assert props["r_next"] == 60
+    _apply_same_ratio_to_next(props, "r", 50, 80)   # base raised (shouldn't happen)
+    assert props["r_next"] == 60
