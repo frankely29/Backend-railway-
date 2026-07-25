@@ -9503,6 +9503,7 @@ def assistant_guidance(
             held_for_antichurn=bool(guidance.get("held_for_antichurn")),
             busier_zone_name=_busier_zone_name,
             current_hour_trend_rating=_current_hour_trend_rating,
+            current_is_stagnant=bool(guidance.get("current_is_stagnant")),
         )
         # Anticipation: only when the driver is genuinely IDLE (holding in a
         # quiet, sub-blue zone that isn't itself about to pick up) do we look
@@ -9613,6 +9614,7 @@ def assistant_guidance(
         "pickup_anchor": pickup_anchor,
         "below_blue": guidance.get("below_blue"),
         "current_will_improve": guidance.get("current_will_improve"),
+        "current_is_stagnant": guidance.get("current_is_stagnant"),
         "improvement_note": guidance.get("improvement_note"),
         "far_reposition": guidance.get("far_reposition"),
         "upcoming_surge": upcoming_surge,
