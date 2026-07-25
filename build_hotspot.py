@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime, timedelta, time as dt_time, date as dt_date, timezone
 import calendar
 import json
@@ -1611,6 +1611,40 @@ MONTH_BENCHMARK_FEATURE_FIELD = "earnings_shadow_score_citywide_v3_anchor_shadow
 MONTH_BENCHMARK_CONF_FIELD = "earnings_shadow_confidence_citywide_v3"
 MONTH_DEMAND_BREAKPOINTS_VERSION = "month_benchmark_earnings_score_v2"
 
+# --- Frame-level demand ceiling ----------------------------------------------
+# The per-zone earnings ceiling above CANNOT cap a quiet hour, because the score
+# it ranks nets saturation OUT of demand: at 2am there is little work but also
+# few drivers, so the composite lands at almost exactly the midday value. Live
+# proof from production (July 2025, citywide v3):
+#
+#     Fri 02:00   5,360 pickups   median score 0.3153   ->  8 greens
+#     Fri 12:00  11,182 pickups   median score 0.3143   ->  3 greens
+#
+# Twice the work at noon, fewer greens. A flat score means a flat ceiling, so
+# min(per_frame, ceiling) was a no-op exactly when it was needed most.
+#
+# The missing dimension is the ABSOLUTE amount of work in the frame. We rank each
+# frame's citywide pickup total against the whole month, then cap what the BEST
+# zone in that frame is allowed to read. That is the user's rule stated directly:
+# "if green had to reach 85 and on July 5 the best it got was 75, that zone would
+# not qualify for green."
+#
+# Saturation is NOT discarded: the per-zone rating being capped still carries the
+# full saturation-aware earnings blend. This only adds the time-of-day dimension
+# that the saturation-netted score cancels out.
+MONTH_FRAME_DEMAND_SIDECAR = "month_frame_demand_breakpoints.json"
+# v2: blended basis. v1 ranked a blended serve value against an EXACT per-bin
+# distribution -- see _compute_frame_demand_breakpoints_from_store.
+MONTH_FRAME_DEMAND_VERSION = "month_frame_demand_v2"
+# A frame at the month's demand floor still needs a usable spread -- a night
+# driver must be able to tell the best zone from the worst. So the frame cap is
+# mapped into [FLOOR, 100] rather than all the way to zero: the quietest hour's
+# best zone reads mid-blue, not red, and ordering is preserved by SCALING the
+# frame (not clamping it flat, which would collapse every top zone onto one
+# value and destroy the ranking a driver actually needs).
+FRAME_DEMAND_CEILING_FLOOR = 58.0
+_MONTH_FRAME_DEMAND_BP_CACHE: Dict[str, Any] = {}
+
 
 def _month_anchored_colors_enabled() -> bool:
     return str(os.environ.get("MONTH_ANCHORED_COLORS", "0")).strip() == "1"
@@ -1690,6 +1724,238 @@ def _compute_breakpoints_for_column(con: Any, score_column: str) -> List[float]:
     if row and row[0]:
         return sorted(float(x) for x in row[0])
     return []
+
+
+def _compute_frame_demand_breakpoints_from_store(con: Any) -> List[float]:
+    """101 month-wide quantile breakpoints of LN(1 + citywide pickups per FRAME).
+
+    The distribution MUST be built on the same basis as the value that will be
+    scored against it. The store's pickups_now is an exact per-bin COUNT(*), but
+    the frames we serve carry a SAME-WEEKDAY BLEND (an average over that
+    weekday's occurrences in the month). Blending removes variance: a blended
+    peak is lower than any single real peak, and a blended trough is higher than
+    any single real trough.
+
+    Ranking the blended value against the exact distribution therefore squeezed
+    both ends -- real peaks scored as merely above-average (over-capped) and dead
+    hours scored as ordinary (under-capped), which is precisely the error the
+    ceiling exists to remove.
+
+    So we reduce to one row per (weekday, time-of-day) and average across the
+    month's weeks, reproducing the serve-time blend before taking quantiles.
+    Falls back to the raw per-bin basis if the date parts aren't available, since
+    a slightly mis-scaled ceiling still beats no ceiling.
+    """
+    qlist = "[" + ", ".join(f"{i/100.0:.4f}" for i in range(101)) + "]"
+    blended_sql = f"""
+        SELECT QUANTILE_CONT(LN(1 + blended_pickups), {qlist}) FROM (
+          SELECT AVG(frame_pickups) AS blended_pickups
+          FROM (
+            SELECT exact_bin_local_ts AS ts,
+                   SUM(COALESCE(pickups_now, 0)) AS frame_pickups
+            FROM exact_shadow_rows
+            WHERE PULocationID NOT IN (1, 132, 138)
+            GROUP BY exact_bin_local_ts
+          )
+          GROUP BY
+            EXTRACT(DOW FROM (ts AT TIME ZONE 'UTC')),
+            EXTRACT(HOUR FROM (ts AT TIME ZONE 'UTC')) * 60
+              + EXTRACT(MINUTE FROM (ts AT TIME ZONE 'UTC'))
+        )
+    """
+    try:
+        row = con.execute(blended_sql).fetchone()
+        if row and row[0]:
+            return sorted(float(x) for x in row[0])
+    except Exception as exc:
+        _MONTH_DEMAND_BP_LAST_ERROR["frame_blended"] = f"{type(exc).__name__}: {exc}"
+
+    row = con.execute(
+        f"SELECT QUANTILE_CONT(LN(1 + frame_pickups), {qlist}) FROM ("
+        f"  SELECT exact_bin_local_ts, SUM(COALESCE(pickups_now, 0)) AS frame_pickups"
+        f"  FROM exact_shadow_rows"
+        f"  WHERE PULocationID NOT IN (1, 132, 138)"
+        f"  GROUP BY exact_bin_local_ts"
+        f")"
+    ).fetchone()
+    if row and row[0]:
+        return sorted(float(x) for x in row[0])
+    return []
+
+
+def _frame_demand_sidecar_path(exact_store_path: Path) -> Path:
+    return Path(exact_store_path).parent / MONTH_FRAME_DEMAND_SIDECAR
+
+
+def month_frame_demand_breakpoints_for_store(exact_store_path: Path) -> List[float]:
+    """Frame-demand breakpoints for a store: memory cache -> sidecar -> compute.
+
+    Mirrors month_demand_breakpoints_for_store's resolution order so a month built
+    before this existed self-heals on first serve. Empty list => caller no-ops and
+    the frame keeps its per-zone-anchored ratings (no regression).
+    """
+    exact_store_path = Path(exact_store_path)
+    try:
+        cache_key = f"{exact_store_path}:{exact_store_path.stat().st_mtime_ns}"
+    except Exception:
+        cache_key = str(exact_store_path)
+    cached = _MONTH_FRAME_DEMAND_BP_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    sidecar = _frame_demand_sidecar_path(exact_store_path)
+    try:
+        if sidecar.exists() and sidecar.stat().st_size > 0:
+            payload = json.loads(sidecar.read_text(encoding="utf-8"))
+            if str((payload or {}).get("version") or "") == MONTH_FRAME_DEMAND_VERSION:
+                raw = (payload or {}).get("breakpoints")
+                if isinstance(raw, list) and len(raw) >= 2:
+                    bps = sorted(float(x) for x in raw)
+                    _MONTH_FRAME_DEMAND_BP_CACHE[cache_key] = bps
+                    return bps
+    except Exception as exc:
+        _MONTH_DEMAND_BP_LAST_ERROR["frame_read_sidecar"] = f"{type(exc).__name__}: {exc}"
+
+    try:
+        if not exact_store_path.exists() or exact_store_path.stat().st_size <= 0:
+            _MONTH_DEMAND_BP_LAST_ERROR["frame_open"] = "store_missing_or_empty"
+            _MONTH_FRAME_DEMAND_BP_CACHE[cache_key] = []
+            return []
+        con = duckdb.connect(database=str(exact_store_path), read_only=True)
+        try:
+            bps = _compute_frame_demand_breakpoints_from_store(con)
+        finally:
+            con.close()
+        if bps:
+            _write_frame_demand_sidecar(exact_store_path, bps)
+        _MONTH_FRAME_DEMAND_BP_CACHE[cache_key] = bps
+        return bps
+    except Exception as exc:
+        _MONTH_DEMAND_BP_LAST_ERROR["frame_open"] = f"{type(exc).__name__}: {exc}"
+        return []
+
+
+def _write_frame_demand_sidecar(exact_store_path: Path, breakpoints: List[float]) -> bool:
+    if not breakpoints or len(breakpoints) < 2:
+        return False
+    sidecar = _frame_demand_sidecar_path(exact_store_path)
+    tmp = sidecar.with_suffix(sidecar.suffix + ".tmp")
+    try:
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": MONTH_FRAME_DEMAND_VERSION,
+            "signal": "ln1p_citywide_pickups_per_frame",
+            "airport_excluded_zone_ids": [1, 132, 138],
+            "breakpoints": [float(x) for x in breakpoints],
+        }
+        with tmp.open("w", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, separators=(",", ":")))
+            handle.flush()
+            try:
+                os.fsync(handle.fileno())
+            except Exception:
+                pass
+        os.replace(tmp, sidecar)
+        return True
+    except Exception as exc:
+        _MONTH_DEMAND_BP_LAST_ERROR["frame_write_sidecar"] = f"{type(exc).__name__}: {exc}"
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+        return False
+
+
+def frame_demand_ceiling_rating(features: List[Dict[str, Any]], frame_breakpoints: List[float]) -> Optional[float]:
+    """Highest rating this frame's citywide demand entitles its BEST zone to.
+
+    Returns None when the signal is unavailable so callers no-op. The percentile
+    is mapped into [FRAME_DEMAND_CEILING_FLOOR, 100]: the month's busiest frames
+    allow the full scale, its quietest allow mid-blue at best.
+    """
+    if not frame_breakpoints or len(frame_breakpoints) < 2:
+        return None
+    total = 0.0
+    seen = False
+    for feature in features or []:
+        props = feature.get("properties") or {}
+        if props.get("airport_excluded"):
+            continue
+        pickups = props.get("pickups_now")
+        if isinstance(pickups, (int, float)):
+            total += float(pickups)
+            seen = True
+    if not seen:
+        return None
+    from month_color_benchmark import score_on_breakpoints
+
+    # Pass the RAW total: score_on_breakpoints applies the LN(1+x) transform
+    # itself, matching the LN-space breakpoints. Pre-logging here would double
+    # the transform and pin every frame to the floor.
+    pct = score_on_breakpoints(total, frame_breakpoints)
+    if pct is None:
+        return None
+    frac = _clamp01(float(pct) / 100.0)
+    return FRAME_DEMAND_CEILING_FLOOR + (100.0 - FRAME_DEMAND_CEILING_FLOOR) * frac
+
+
+def apply_frame_demand_ceiling(
+    features: List[Dict[str, Any]],
+    frame_breakpoints: List[float],
+) -> Optional[float]:
+    """Scale a quiet frame's ratings so its best zone cannot exceed what the
+    frame's real citywide demand earns. Returns the applied ceiling (or None).
+
+    SCALES rather than clamps: every rating is multiplied by ceiling/frame_max,
+    so ordering and relative spacing survive and a night driver can still tell
+    the best zone from the worst -- they just stop reading as green. Never raises
+    a rating (no-op when the frame's max is already under the ceiling).
+    """
+    ceiling = frame_demand_ceiling_rating(features, frame_breakpoints)
+    if ceiling is None:
+        return None
+    rating_fields = ["earnings_shadow_rating_citywide_v3"] + [
+        f"earnings_shadow_rating_{name}" for name in V3_PROFILE_CONFIG if name != "citywide_v3"
+    ] + ["earnings_shadow_rating_trips_45plus_v3"]
+    for rating_field in rating_fields:
+        frame_max = 0.0
+        for feature in features or []:
+            props = feature.get("properties") or {}
+            if props.get("airport_excluded"):
+                continue
+            value = props.get(rating_field)
+            if isinstance(value, (int, float)):
+                frame_max = max(frame_max, float(value))
+        if frame_max <= ceiling or frame_max <= 0:
+            continue
+        scale = ceiling / frame_max
+        bucket_field = rating_field.replace("_rating_", "_bucket_")
+        color_field = rating_field.replace("_rating_", "_color_")
+        # The "_next" companion drives the map's demand-trend label ("about to
+        # heat up / cool off"). It MUST move with its base rating: scaling the
+        # now-value while leaving next untouched would invent a large fake climb
+        # on every zone in a quiet frame. Adjacent 20-min bins have near-identical
+        # citywide demand, so the same factor is the right first-order correction.
+        next_field = f"{rating_field}_next"
+        for feature in features or []:
+            props = feature.get("properties") or {}
+            if props.get("airport_excluded"):
+                continue
+            value = props.get(rating_field)
+            if not isinstance(value, (int, float)):
+                continue
+            scaled = int(round(max(1.0, float(value) * scale)))
+            bucket, color = bucket_and_color_from_rating(scaled)
+            props[rating_field] = scaled
+            if bucket_field in props:
+                props[bucket_field] = bucket
+            if color_field in props:
+                props[color_field] = color
+            next_value = props.get(next_field)
+            if isinstance(next_value, (int, float)):
+                props[next_field] = int(round(max(1.0, float(next_value) * scale)))
+    return ceiling
 
 
 def _compute_demand_breakpoints_from_store(con: Any) -> List[float]:
@@ -1837,6 +2103,33 @@ def _month_anchored_ceiling_rating(pct: float, anchor_input: float, conf: float)
     return rating
 
 
+def _apply_same_ratio_to_next(
+    props: Dict[str, Any],
+    rating_field: str,
+    before: Any,
+    after: Any,
+) -> None:
+    """Move a rating's "_next" companion by the same factor its base moved.
+
+    The "_next" value is the same zone's rating one 20-min bin later and drives
+    the map's demand-trend label. Any adjustment applied to the now-value has to
+    reach it as well, or a capped zone reads as "about to heat up" purely because
+    its now-value was pulled down and its next-value was not.
+    """
+    next_field = f"{rating_field}_next"
+    next_value = props.get(next_field)
+    if not isinstance(next_value, (int, float)):
+        return
+    try:
+        before_f = float(before)
+        after_f = float(after)
+    except (TypeError, ValueError):
+        return
+    if before_f <= 0 or after_f >= before_f:
+        return
+    props[next_field] = int(round(max(1.0, float(next_value) * (after_f / before_f))))
+
+
 def _apply_month_anchored_colors(
     features: List[Dict[str, Any]],
     breakpoints: List[float],
@@ -1896,6 +2189,10 @@ def _apply_month_anchored_colors(
         props["earnings_shadow_rating_citywide_v3"] = final_rating
         props["earnings_shadow_bucket_citywide_v3"] = bucket
         props["earnings_shadow_color_citywide_v3"] = color
+        # Keep the "_next" companion in step. It feeds the map's demand-trend
+        # label, so capping only the now-value would manufacture a climb that
+        # isn't there ("about to heat up" on every capped zone).
+        _apply_same_ratio_to_next(props, "earnings_shadow_rating_citywide_v3", existing, final_rating)
 
     # Borough-mode passes: same CEILING idea, each mode capped by the month-wide
     # distribution of its OWN earnings score, using that mode's blend so its ceiling
@@ -1934,6 +2231,7 @@ def _apply_month_anchored_colors(
             props[rating_field] = final_rating
             props[bucket_field] = bucket
             props[color_field] = color
+            _apply_same_ratio_to_next(props, rating_field, existing, final_rating)
 
 
 def build_single_frame_from_exact_store(

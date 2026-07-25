@@ -124,6 +124,18 @@ def extract_assistant_feature_payload(feature: Dict[str, Any]) -> Dict[str, Any]
                 "downstream_value_shadow",
             ),
         ),
+        # NORMALIZED (0-1) continuation. The raw field above is an unbounded
+        # downstream value (0-12 in production), so every consumer comparing it
+        # against a 0-1 threshold silently passed ~96% of zones. The map's own
+        # assistant reads `downstream_value_n`, so this keeps backend and
+        # frontend on the same scale.
+        "downstream_value_n_shadow": _first_present(
+            props,
+            (
+                "downstream_value_n_shadow",
+                "downstream_value_n",
+            ),
+        ),
     }
     balanced_trip_share = _first_present(
         raw,
@@ -147,7 +159,16 @@ def extract_assistant_feature_payload(feature: Dict[str, Any]) -> Dict[str, Any]
         "churn_pressure": raw.get("churn_pressure_n_shadow"),
         "market_saturation_penalty": raw.get("market_saturation_penalty_n_shadow"),
         "manhattan_core_saturation_penalty": raw.get("manhattan_core_saturation_penalty_n_shadow"),
-        "continuation_raw": raw.get("downstream_next_value_raw"),
+        # 0-1 continuation strength. Falls back to the unbounded raw value only
+        # when the normalized column is absent (very old frame artifacts); the
+        # guidance gate treats out-of-range values as "unknown" rather than
+        # auto-passing, so a stale frame can no longer fake a supportive read.
+        "continuation_raw": (
+            raw.get("downstream_value_n_shadow")
+            if raw.get("downstream_value_n_shadow") is not None
+            else raw.get("downstream_next_value_raw")
+        ),
+        "continuation_n": raw.get("downstream_value_n_shadow"),
     }
 
 
@@ -214,6 +235,7 @@ def build_zone_outlook_for_frame(
                     "market_saturation_penalty": payload.get("market_saturation_penalty"),
                     "manhattan_core_saturation_penalty": payload.get("manhattan_core_saturation_penalty"),
                     "continuation_raw": payload.get("continuation_raw"),
+                    "continuation_n": payload.get("continuation_n"),
                 }
             )
 
@@ -271,6 +293,7 @@ def build_zone_outlook_for_frame_loader(
                     "market_saturation_penalty": payload.get("market_saturation_penalty"),
                     "manhattan_core_saturation_penalty": payload.get("manhattan_core_saturation_penalty"),
                     "continuation_raw": payload.get("continuation_raw"),
+                    "continuation_n": payload.get("continuation_n"),
                 }
             )
 

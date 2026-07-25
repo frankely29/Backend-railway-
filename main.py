@@ -877,16 +877,61 @@ def _ensure_month_live_bootstrap(month_key: str, *, force_timeline_bootstrap: bo
     }
 
 
+def _apply_month_benchmark_to_features(month_key: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Apply the month benchmark (per-zone ceiling + frame demand ceiling).
+
+    Shared by BOTH frame paths on purpose. Attestation compares the parquet path
+    against the exact-store path field-by-field over exactly these rating/bucket/
+    colour keys, and a mismatch RETIRES the month's store -- so any colour
+    post-processing applied to one path must be applied to the other or the
+    benchmark quietly deletes the data it depends on. (The store path previously
+    skipped the benchmark entirely.)
+
+    No-op when the flag is off or the benchmark is unavailable.
+    """
+    if str(os.environ.get("MONTH_ANCHORED_COLORS", "0")).strip() != "1":
+        return payload
+    try:
+        from build_hotspot import (
+            month_demand_breakpoints_for_store,
+            month_mode_breakpoints_for_store,
+            month_frame_demand_breakpoints_for_store,
+            apply_frame_demand_ceiling,
+            _apply_month_anchored_colors,
+        )
+        # Cross-month benchmark: anchor to the strong-normal REFERENCE month so a
+        # slow active month isn't graded on its own deflated bar. Falls back to
+        # the active month's own store until the reference month is built.
+        _store = _benchmark_reference_store_path() or _month_store_path(month_key)
+        _feats = ((payload or {}).get("polygons") or {}).get("features") or []
+        if not _feats:
+            return payload
+        _bps = month_demand_breakpoints_for_store(_store)
+        if _bps:
+            _apply_month_anchored_colors(_feats, _bps, month_mode_breakpoints_for_store(_store))
+        # Frame-level ceiling. The per-zone ceiling above cannot cap a quiet hour
+        # (its score nets saturation out of demand, so 2am scores like noon);
+        # this caps what the frame's BEST zone may read from how much work the
+        # whole city actually has. Covers every colour track.
+        _frame_bps = month_frame_demand_breakpoints_for_store(_store)
+        if _frame_bps:
+            apply_frame_demand_ceiling(_feats, _frame_bps)
+    except Exception:
+        pass
+    return payload
+
+
 def _build_single_frame_from_exact_store(month_key: str, frame_time: str) -> Dict[str, Any]:
     from build_hotspot import build_single_frame_from_exact_store, ensure_zones_geojson
 
     zones_path = ensure_zones_geojson(DATA_DIR, force=False)
-    return build_single_frame_from_exact_store(
+    payload = build_single_frame_from_exact_store(
         exact_store_path=_month_store_path(month_key),
         zones_geojson_path=zones_path,
         frame_time=str(frame_time),
         bin_minutes=int(DEFAULT_BIN_MINUTES),
     )
+    return _apply_month_benchmark_to_features(month_key, payload)
 
 
 def _attestation_state_snapshot(month_key: str) -> Dict[str, Any]:
@@ -2291,31 +2336,9 @@ def _build_single_frame_for_month(month_key: str, frame_time: str) -> Dict[str, 
         bin_minutes=int(DEFAULT_BIN_MINUTES),
         min_trips_per_window=int(DEFAULT_MIN_TRIPS_PER_WINDOW),
     )
-    # Month-anchored colors (flag-gated): this parquet path is what actually
-    # serves the map, and its visible rating is a PER-FRAME rank. Override the
-    # citywide rating/bucket/color with each zone's month-wide demand percentile
-    # (breakpoints from the month store), so a color means the same busy-ness
-    # every day. No-op when the flag is off or the store/benchmark is unavailable.
-    if str(os.environ.get("MONTH_ANCHORED_COLORS", "0")).strip() == "1":
-        try:
-            from build_hotspot import (
-                month_demand_breakpoints_for_store,
-                month_mode_breakpoints_for_store,
-                _apply_month_anchored_colors,
-            )
-            # Cross-month benchmark: anchor colors to the strong-normal REFERENCE
-            # month (e.g. October) so a slow active month isn't graded on its own
-            # deflated bar. Falls back to the active month's own store until the
-            # reference month is built (no regression).
-            _store = _benchmark_reference_store_path() or _month_store_path(month_key)
-            _bps = month_demand_breakpoints_for_store(_store)
-            _mode_bps = month_mode_breakpoints_for_store(_store)
-            _feats = ((payload or {}).get("polygons") or {}).get("features") or []
-            if _bps and _feats:
-                _apply_month_anchored_colors(_feats, _bps, _mode_bps)
-        except Exception:
-            pass
-    return payload
+    # Month benchmark (flag-gated). Shared with the exact-store path so the two
+    # cannot drift -- see _apply_month_benchmark_to_features.
+    return _apply_month_benchmark_to_features(month_key, payload)
 
 
 def _frame_build_worker(month_key: str, idx: int, frame_time: str, run_token: str) -> None:
@@ -7507,6 +7530,33 @@ def debug_month_anchor(month_key: Optional[str] = None):
                 rating = None if pct is None else int(round(1 + 0.99 * pct))
                 samples[str(sc)] = {"pct": None if pct is None else round(pct, 1), "rating": rating}
             out["sample_earnings_score_to_rating"] = samples
+        # Frame-level demand ceiling: the part that actually makes a colour mean
+        # the same at 2am as at 7pm. Reported in real pickup counts (not LN
+        # space) and alongside the ceiling each level earns, so the behaviour can
+        # be checked against live frames instead of inferred.
+        from build_hotspot import (
+            month_frame_demand_breakpoints_for_store,
+            FRAME_DEMAND_CEILING_FLOOR,
+        )
+        fbps = month_frame_demand_breakpoints_for_store(store_path) if store_path else []
+        out["frame_demand_breakpoints_count"] = len(fbps)
+        if fbps:
+            out["frame_demand_floor_rating"] = FRAME_DEMAND_CEILING_FLOOR
+            out["frame_demand_pickups_min"] = int(round(math.expm1(float(fbps[0]))))
+            out["frame_demand_pickups_median"] = int(round(math.expm1(float(fbps[len(fbps) // 2]))))
+            out["frame_demand_pickups_max"] = int(round(math.expm1(float(fbps[-1]))))
+            fsamples = {}
+            for tot in (3000, 5000, 7500, 10000, 13000, 16000):
+                pct = score_on_breakpoints(float(tot), fbps)
+                ceil_r = None if pct is None else round(
+                    FRAME_DEMAND_CEILING_FLOOR
+                    + (100.0 - FRAME_DEMAND_CEILING_FLOOR) * (float(pct) / 100.0), 1
+                )
+                fsamples[str(tot)] = {
+                    "pct": None if pct is None else round(pct, 1),
+                    "best_zone_may_read": ceil_r,
+                }
+            out["sample_frame_pickups_to_ceiling"] = fsamples
         out["last_error"] = dict(_MONTH_DEMAND_BP_LAST_ERROR)
     except Exception as exc:
         out["error"] = f"{type(exc).__name__}: {exc}"
@@ -8837,7 +8887,18 @@ def _build_guidance_zone_context(
             "rating_60": round(float(current_rating_60), 2),
             "stay_hour_value": round(float(current_stay_hour_value), 2),
             "market_saturation_penalty": _safe_float_value(current_now.get("market_saturation_penalty"), 0.0),
+            # Manhattan-core crowding is tracked separately from citywide market
+            # saturation, and the map's own assistant already consults it for
+            # Manhattan zones. The server ignored it entirely, so the two engines
+            # could disagree about whether a crowded core zone was a trap.
+            "manhattan_core_saturation_penalty": _safe_float_value(
+                current_now.get("manhattan_core_saturation_penalty"), 0.0
+            ),
             "continuation_raw": _safe_float_value(current_now.get("continuation_raw"), 0.0),
+            # Normalized 0-1 continuation. Passed through explicitly (None stays
+            # None) so the engine can tell "weak continuation" apart from "this
+            # frame didn't carry the column" instead of defaulting to a pass.
+            "continuation_n": current_now.get("continuation_n"),
             "short_trip_penalty": _safe_float_value(current_now.get("short_trip_penalty"), 0.0),
         },
         "nearby_candidates": nearby_candidates[:8],
@@ -8992,6 +9053,25 @@ _REVERSE_GEOCODE_OK_TTL = 7 * 24 * 3600
 _REVERSE_GEOCODE_MISS_TTL = 20 * 60
 
 
+def _frame_instant_unix(frame_time: str, fallback_ts: int) -> int:
+    """Unix instant for a frame's NYC-local timestamp.
+
+    The pickup-anchor matcher derives a weekday + time-of-day bin from this and
+    compares it against each logged pickup's own instant, so it has to be a real
+    instant on the same clock -- interpreting the local string as UTC would shift
+    every comparison by the NYC offset. Falls back to the caller's timestamp when
+    the frame string can't be parsed.
+    """
+    try:
+        naive = datetime.fromisoformat(str(frame_time).strip()[:19])
+    except Exception:
+        return int(fallback_ts)
+    try:
+        return int(naive.replace(tzinfo=NYC_TZ).timestamp())
+    except Exception:
+        return int(fallback_ts)
+
+
 def _reverse_geocode_anchor_label(lat: float, lng: float) -> Optional[str]:
     """Short street/landmark label for a pickup anchor, or None on failure.
 
@@ -8999,7 +9079,12 @@ def _reverse_geocode_anchor_label(lat: float, lng: float) -> Optional[str]:
     failure or empty result returns None and the caller keeps generic wording.
     """
     try:
-        key = f"{round(float(lat), 3)},{round(float(lng), 3)}"
+        # 4 decimals ~= 11m. At 3 decimals the key covered ~110m of latitude, so
+        # anchors several blocks apart collided in the cache and the second one
+        # was labelled with the first one's street -- naming a corner the driver
+        # was not being sent to. Anchors sit on a 135m grid, so 4dp keeps them
+        # distinct while still collapsing repeat lookups of the same anchor.
+        key = f"{round(float(lat), 4)},{round(float(lng), 4)}"
     except Exception:
         return None
     now = time.time()
@@ -9314,7 +9399,15 @@ def assistant_guidance(
                         zone_id=int(_rec_zone),
                         zone_geom=_zg,
                         pickup_rows=_pickup_zone_long_run_points(int(_rec_zone), limit=2400),
-                        frame_time=now_ts,
+                        # The anchor is chosen by matching each past pickup's
+                        # weekday+time-of-day against a reference instant, so that
+                        # instant must be the FRAME the driver is being advised
+                        # about -- not the server's wall clock. Passing now_ts
+                        # named the corner that is busiest at the moment the
+                        # request happened to land, which is a different corner
+                        # whenever the displayed frame isn't the current hour.
+                        # Everything else in this block already keys off frame_key.
+                        frame_time=_frame_instant_unix(frame_key, now_ts),
                     )
                 if pickup_anchor:
                     _anchor_label = _reverse_geocode_anchor_label(
