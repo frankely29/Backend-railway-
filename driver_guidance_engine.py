@@ -59,6 +59,22 @@ STRONG_HOLD_OVERRIDE_MARGIN = 8.0
 # of sitting on a flat "strong hold".
 CLOSE_HOP_MAX_MILES = 1.0
 CLOSE_HOP_OVERRIDE_MARGIN = 5.0
+# How much the next hour has to climb before a sub-blue zone counts as "coming
+# up" rather than flat. Below this the zone is STAGNANT: the driver is being
+# asked to wait for something the forecast says isn't arriving.
+STAGNANT_RISE_EPSILON = 2.0
+# Arrival-rating edge a target needs to pull a driver out of a STAGNANT sub-blue
+# zone. Lower than MOVE_NEARBY_MIN_IMPROVEMENT because the thing it is being
+# compared against is going nowhere: holding is not a neutral option that costs
+# nothing, it is a decision to keep earning sub-blue money for another bin. Still
+# has to beat staying over the hour AFTER the deadhead, so this never sends a
+# driver on a losing drive.
+STAGNANT_MOVE_MIN_IMPROVEMENT = 6.0
+# Extra margin a STAGNANT zone must win by before "staying out-earns moving"
+# blocks a move. Added on top of HOUR_STAY_PREFERENCE, which is the amount
+# STAYING has to beat the move by -- so a larger total means the flat zone has to
+# prove more, and a driver stuck in it is freed sooner.
+STAGNANT_STAY_EXTRA_MARGIN = 4.0
 
 
 # Elevated-risk TLC zones — the highest violent-crime areas per NYPD CompStat
@@ -639,6 +655,19 @@ def build_driver_guidance(
         and current_next_rating >= BLUE_RATING
         and min(_improve_r40, _improve_r60) >= BLUE_RATING - 4.0
     )
+    # STAGNANT: below blue, and the forecast says it STAYS below blue with no
+    # meaningful rise in the next 20/40/60 minutes. This is the case where a hold
+    # costs the driver real money -- the stay-preference margin below exists to
+    # protect a zone that MIGHT come up, and it must not shelter one that
+    # demonstrably won't. Waiting out a flat sub-blue zone just banks another bin
+    # of sub-blue earnings, so a reachable better zone wins on a smaller edge.
+    _best_ahead = max(current_next_rating, _improve_r40, _improve_r60)
+    current_is_stagnant = (
+        below_blue
+        and not current_will_improve
+        and _best_ahead < BLUE_RATING
+        and _best_ahead <= current_rating + STAGNANT_RISE_EPSILON
+    )
     best_nearby_arrival = _safe_float(best_nearby.get("rating"), 0.0) if best_nearby else 0.0
     best_nearby_dist = _safe_float(best_nearby.get("distance_miles"), 999.0) if best_nearby else 999.0
     best_nearby_name = (best_nearby or {}).get("zone_name") or "the nearby zone"
@@ -708,7 +737,18 @@ def build_driver_guidance(
     # flat nearby zone; it never forces a move (escapes/fades keep their own
     # logic) and a big value gap (a real escape) sails past it untouched.
     best_move_value = max((_net_after_drive(c) for c in nearby_candidates), default=float("-inf"))
-    stay_beats_moving = stay_hour_value >= best_move_value + HOUR_STAY_PREFERENCE
+    # NOTE the direction: this margin is what STAYING must win BY before it
+    # blocks a move, so a BIGGER number means staying has to prove more and moves
+    # get easier. A stagnant sub-blue zone is exactly the case where staying
+    # should have to prove more -- it is asking the driver to wait out an hour
+    # the forecast says stays flat -- so it must clear a wider margin, not the
+    # ordinary one.
+    _stay_preference = (
+        HOUR_STAY_PREFERENCE + STAGNANT_STAY_EXTRA_MARGIN
+        if current_is_stagnant
+        else HOUR_STAY_PREFERENCE
+    )
+    stay_beats_moving = stay_hour_value >= best_move_value + _stay_preference
     # The zone we'd actually send the driver to on ANY nearby move: the highest
     # worth-the-move value (which folds in distance/ETA), NOT merely the highest-
     # rated best_nearby. This is the fix for "sends me far when a closer, just-as-
@@ -811,6 +851,30 @@ def build_driver_guidance(
                 improvement_note = (
                     "This area's about to get busier in a few minutes — sit tight."
                 )
+            blue_rule_applied = True
+        elif (
+            current_is_stagnant
+            and can_move
+            and best_move_target is not None
+            and best_move_target_dist <= 3.0
+            and best_move_target_arrival >= current_rating + STAGNANT_MOVE_MIN_IMPROVEMENT
+            and move_beats_staying
+            and (not overriding_antichurn or clear_escape_margin)
+        ):
+            # Nothing here is coming. The old ladder held in this exact spot --
+            # "X's busier, but not worth the drive yet" -- which is only true if
+            # waiting is free. It isn't: the forecast says this zone is still
+            # sub-blue in an hour, so the driver is being asked to bank another
+            # hour of sub-blue earnings for a rise that never arrives. A clearly
+            # better reachable zone that also out-earns staying wins on a smaller
+            # edge than usual.
+            _t = best_move_target
+            action = "move_nearby"
+            confidence = 0.68
+            target_zone = dict(_t)
+            hold_until_unix = None
+            reason_codes = ["below_blue_stagnant", "no_rise_coming", "waiting_costs_money"]
+            message = f"Move to {_t.get('zone_name')} — this area isn't picking up."
             blue_rule_applied = True
         elif (
             can_move
@@ -1131,6 +1195,9 @@ def build_driver_guidance(
         "is_airport": bool(is_airport),
         "below_blue": bool(below_blue),
         "current_will_improve": bool(current_will_improve),
+        # Sub-blue with no rise in the forecast. Surfaced so the card can stop
+        # implying a wait pays off when the numbers say it doesn't.
+        "current_is_stagnant": bool(current_is_stagnant),
         "improvement_note": improvement_note,
         "far_reposition": bool(far_reposition),
         # Holding a sub-blue zone even though a blue+ zone is in reach -> we're

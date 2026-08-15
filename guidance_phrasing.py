@@ -128,6 +128,7 @@ def compose_guidance_directive(
     held_for_antichurn: bool = False,
     busier_zone_name: Optional[str] = None,
     current_hour_trend_rating: Optional[float] = None,
+    current_is_stagnant: bool = False,
 ) -> str:
     czone = current_zone_name or "this area"
     sp = spot_phrase(spot)
@@ -207,6 +208,16 @@ def compose_guidance_directive(
     # "nothing nearby beats it"; name it and say why we're not chasing. --------
     if busier_zone_name:
         tail = f" Work {sp_here} meanwhile." if sp_here else ""
+        # "not worth the drive YET" promises a turn that the forecast may not be
+        # predicting. When the zone is stagnant we are holding only because the
+        # drive still loses on the hour's math -- not because this area is about
+        # to come up -- so say that plainly and tell the driver what to watch.
+        if current_is_stagnant:
+            return (
+                f"Stay in {czone} for now — {busier_zone_name}'s busier but the drive "
+                f"still costs more than it adds. This area isn't picking up, so go if "
+                f"it gets any closer.{tail}"
+            )
         return (
             f"Stay in {czone} for now — {busier_zone_name}'s busier, but not worth "
             f"the drive yet.{tail}"
