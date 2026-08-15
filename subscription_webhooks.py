@@ -253,12 +253,7 @@ def process_paddle_event_by_id(event_id: str) -> None:
             return
 
         last_updated = user_row["subscription_updated_at"] if "subscription_updated_at" in user_row.keys() else None
-        # Use >= so that a replay of the *same* event (which set
-        # subscription_updated_at = occurred_at on the first pass) is skipped
-        # idempotently. This is the recovery path for a processor that crashed
-        # between _dispatch_event and _mark_processed — the event re-surfaces
-        # via replay_unprocessed_events_on_startup but is not double-applied.
-        if last_updated is not None and int(last_updated) >= occurred_at:
+        if _is_stale_event(last_updated, occurred_at):
             _mark_processed(event_id, user_id=user_id, outcome="skipped_older_than_current")
             logger.info("Paddle event older or equal to stored update, skipping: %s", event_id)
             return
@@ -271,6 +266,30 @@ def process_paddle_event_by_id(event_id: str) -> None:
             _mark_processed(event_id, user_id=None, outcome=f"processing_error:{exc}")
         except Exception:
             pass
+
+
+def _is_stale_event(last_updated: Any, occurred_at: int) -> bool:
+    """True when this event predates the state already stored for the user.
+
+    STRICTLY older. It used to be >=, to make a crash-recovery replay of the SAME
+    event a no-op -- but Paddle routinely emits several events for one checkout
+    sharing an identical occurred_at (transaction.completed and
+    subscription.activated land together). Under >=, whichever arrived first
+    stamped subscription_updated_at and every sibling was discarded as "older",
+    so a driver could pay and never be marked active.
+
+    Replay safety does not need this guard: process_paddle_event_by_id already
+    returns early on processed_at, and every handler writes absolute values
+    (status=X, period_end=Y) rather than increments, so re-applying one is a
+    no-op. The single non-idempotent side effect, the first-paid welcome email,
+    has its own atomic claim.
+    """
+    if last_updated is None:
+        return False
+    try:
+        return int(last_updated) > int(occurred_at)
+    except (TypeError, ValueError):
+        return False
 
 
 def _dispatch_event(event_type: str, user_id: int, data: Dict[str, Any], occurred_at: int) -> str:

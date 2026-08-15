@@ -367,36 +367,27 @@ def _enforce_access_or_admin(user: sqlite3.Row) -> None:
 
     now = int(time.time())
 
-    def _normalize_subscription_status(raw_status: Any) -> str:
-        if raw_status is None:
-            return ""
-        return str(raw_status).strip().lower()
-
-    def _status_allows_paid_window_access(raw_status: Any) -> bool:
-        return _normalize_subscription_status(raw_status) in {"active", "past_due"}
+    # The access rules live in subscription_state so this gate and the /me
+    # payload that drives the paywall UI cannot drift apart. Imported here rather
+    # than at module scope because subscription_state imports from core.
+    from subscription_state import (
+        COMP_STATUS,
+        has_paid_window_access as _has_paid_window_access_shared,
+        normalize_status,
+    )
 
     def _has_paid_window_access(row: sqlite3.Row, now_unix: int) -> bool:
-        try:
-            raw_status = row["subscription_status"] if "subscription_status" in row.keys() else None
-        except Exception:
-            raw_status = None
-        if not _status_allows_paid_window_access(raw_status):
-            return False
-        try:
-            period_end = row["subscription_current_period_end"] if "subscription_current_period_end" in row.keys() else None
-            period_end_int = int(period_end) if period_end is not None else None
-        except Exception:
-            period_end_int = None
-        if period_end_int is None:
-            return False
-        return now_unix < period_end_int
+        return _has_paid_window_access_shared(row, now_unix)
 
     try:
         sub_status = user["subscription_status"] if "subscription_status" in user.keys() else None
     except Exception:
         sub_status = None
 
-    if sub_status == "comp":
+    # Normalised, like every other status comparison. This check used to be a raw
+    # equality test while the paid-window check normalised, so a comp stored as
+    # "Comp" granted nothing.
+    if normalize_status(sub_status) == COMP_STATUS:
         try:
             comp_expires = user["subscription_comp_expires_at"] if "subscription_comp_expires_at" in user.keys() else None
             comp_expires_int = int(comp_expires) if comp_expires is not None else None
