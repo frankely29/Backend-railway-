@@ -52,10 +52,23 @@ def _row_get(user_row, key: str) -> Any:
 def has_paid_window_access(user_row, now_unix: Optional[int] = None) -> bool:
     """True while the driver is inside a subscription window they paid for."""
     status = normalize_status(_row_get(user_row, "subscription_status"))
-    if status not in PAID_WINDOW_STATUSES:
-        return False
     now = int(time.time()) if now_unix is None else int(now_unix)
     period_end = _row_get(user_row, "subscription_current_period_end")
+
+    if status not in PAID_WINDOW_STATUSES:
+        # A comp grant OVERWRITES subscription_status, so an expired comp can be
+        # hiding a paid subscription that is still running underneath it. Nothing
+        # restores the real status when a comp lapses (revoke_comp does, expiry
+        # does not), so an admin comping a paying subscriber would lock them out
+        # the moment the comp ran out. If there is a real subscription id and the
+        # paid period has not elapsed, that window is still theirs.
+        if status == COMP_STATUS and _row_get(user_row, "subscription_id"):
+            try:
+                return period_end is not None and now < int(period_end)
+            except (TypeError, ValueError):
+                return False
+        return False
+
     if period_end is None:
         return status in OPEN_ENDED_OK_STATUSES
     try:

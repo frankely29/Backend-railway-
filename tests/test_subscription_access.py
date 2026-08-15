@@ -217,3 +217,36 @@ def test_response_payload_shape_is_stable():
                 "comp_reason", "is_comp_forever"):
         assert key in payload, f"/me payload lost {key}"
     assert payload["has_access"] is True
+
+
+# --- a comp must not destroy a paid subscription ---------------------------
+
+def test_expired_comp_does_not_strand_a_still_paid_subscriber():
+    """grant_comp overwrites subscription_status with 'comp'. Nothing restores
+    the real status when the comp lapses (revoke_comp does; expiry does not), so
+    an admin comping a PAYING subscriber locked them out the moment the comp ran
+    out -- while their paid period was still running."""
+    u = _user(subscription_status="comp", subscription_comp_expires_at=PAST(),
+              subscription_id="sub_live_123", subscription_current_period_end=FUTURE())
+    assert subscription_state.is_comp_active(u) is False, "comp really has expired"
+    assert _server_allows(u) is True, "the paid period underneath is still theirs"
+    assert subscription_state.has_access(u) is True
+
+
+def test_expired_comp_with_no_subscription_underneath_is_denied():
+    """The fallback is evidence-based: no subscription id, nothing to honour."""
+    u = _user(subscription_status="comp", subscription_comp_expires_at=PAST(),
+              subscription_id=None, subscription_current_period_end=FUTURE())
+    assert _server_allows(u) is False
+
+
+def test_expired_comp_with_an_elapsed_paid_period_is_denied():
+    u = _user(subscription_status="comp", subscription_comp_expires_at=PAST(),
+              subscription_id="sub_old", subscription_current_period_end=PAST())
+    assert _server_allows(u) is False
+
+
+def test_active_comp_still_wins_regardless_of_subscription_state():
+    u = _user(subscription_status="comp", subscription_comp_expires_at=FUTURE(),
+              subscription_id="sub_x", subscription_current_period_end=PAST())
+    assert _server_allows(u) is True

@@ -25,6 +25,11 @@ PADDLE_ENVIRONMENT = os.environ.get("PADDLE_ENVIRONMENT", "sandbox").strip().low
 PADDLE_API_BASE_SANDBOX = "https://sandbox-api.paddle.com"
 PADDLE_API_BASE_LIVE = "https://api.paddle.com"
 
+# How far a webhook's signed timestamp may sit from our clock. See the note in
+# verify_webhook_signature: this is a delivery-latency and clock-skew allowance,
+# not the replay defence (event_id dedupe is).
+WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS = 300
+
 
 def _api_base() -> str:
     return PADDLE_API_BASE_LIVE if PADDLE_ENVIRONMENT == "production" else PADDLE_API_BASE_SANDBOX
@@ -137,10 +142,18 @@ def verify_webhook_signature(raw_body: bytes, signature_header: str) -> bool:
 
         try:
             ts_int = int(ts)
-            # Tight skew window (60s) limits the replay attempt surface if a
-            # signed payload is ever captured. Real duplicates are caught by
-            # event_id dedupe in subscription_webhooks.paddle_webhook.
-            if abs(int(time.time()) - ts_int) > 60:
+            # 60s was too tight to be safe. A rejected webhook is not a cosmetic
+            # failure: it is a driver who paid and never got activated. Anything
+            # that puts a minute between Paddle signing and us verifying trips
+            # it -- a cold container start, a queued request, ordinary clock
+            # skew between Paddle's host and ours.
+            #
+            # Widening the window does not weaken replay protection, which is
+            # not what this check provides: duplicates are caught by the
+            # event_id claim in subscription_webhooks.paddle_webhook, and every
+            # handler writes absolute values, so a replayed event is a no-op.
+            # 300s matches the tolerance other billing providers default to.
+            if abs(int(time.time()) - ts_int) > WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS:
                 logger.warning("Paddle webhook timestamp too old or too new: %s", ts)
                 return False
         except ValueError:
