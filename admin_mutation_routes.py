@@ -22,6 +22,7 @@ from admin_mutation_service import (
     extend_comp,
     get_admin_user_detail,
     grant_comp,
+    access_preflight,
     list_active_comps,
     revoke_comp,
     set_user_admin,
@@ -118,7 +119,17 @@ def admin_list_comps(
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     search: str | None = Query(default=None, max_length=200),
+    include_expired: bool = Query(default=False),
     admin: sqlite3.Row = Depends(require_admin_user),
 ):
     _ = admin
-    return list_active_comps(limit=limit, offset=offset, search=search)
+    return list_active_comps(
+        limit=limit, offset=offset, search=search, include_expired=include_expired
+    )
+
+
+@router.get("/access_preflight")
+def admin_access_preflight(admin: sqlite3.Row = Depends(require_admin_user)):
+    """Who keeps access if the paywall is switched on right now. Read-only."""
+    _ = admin
+    return access_preflight()
