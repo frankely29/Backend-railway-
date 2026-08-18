@@ -34,7 +34,15 @@ JWT_SECRET = os.environ.get("JWT_SECRET", "")
 POSTGRES_URL = os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL")
 DB_BACKEND = "postgres" if POSTGRES_URL else "sqlite"
 TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "7"))
-ENFORCE_TRIAL = str(os.environ.get("ENFORCE_TRIAL", "0")).strip().lower() in ("1", "true", "yes", "on")
+# The subscription gate FAILS CLOSED. It used to default to "0", so the paywall
+# was disabled unless someone remembered to enable it -- and a revenue gate that
+# defaults to off gives the whole product away on any deploy where the variable
+# is missing, renamed, or typo'd, with no error and no signal. Production has
+# been serving every gated endpoint to unpaid accounts for exactly this reason.
+#
+# Disabling it is now a deliberate act (ENFORCE_TRIAL=0) rather than the default,
+# and _log_access_enforcement_state() shouts on boot whenever it is off.
+ENFORCE_TRIAL = str(os.environ.get("ENFORCE_TRIAL", "1")).strip().lower() in ("1", "true", "yes", "on")
 POSTGRES_POOL_MIN = max(1, int(os.environ.get("POSTGRES_POOL_MIN", "2")))
 POSTGRES_POOL_MAX = max(POSTGRES_POOL_MIN, int(os.environ.get("POSTGRES_POOL_MAX", "24")))
 LIVE_TOKEN_TTL_SECONDS = min(90, max(30, int(os.environ.get("LIVE_TOKEN_TTL_SECONDS", "60"))))
@@ -42,6 +50,24 @@ LIVE_TOKEN_TTL_SECONDS = min(90, max(30, int(os.environ.get("LIVE_TOKEN_TTL_SECO
 # Duplicated read is intentional: admin_mutation_service imports from core, not main,
 # and core cannot import from main without a circular import.
 ADMIN_EMAIL = (os.environ.get("ADMIN_EMAIL") or "").strip().lower()
+
+
+def _log_access_enforcement_state() -> None:
+    """Make a disabled paywall loud instead of silent.
+
+    With enforcement off, every gated endpoint serves unpaid accounts and nothing
+    anywhere says so -- the app simply works for everyone, which looks identical
+    to the app working correctly. That is how it stayed off unnoticed. Called on
+    startup so the state is in the logs of every boot.
+    """
+    if ENFORCE_TRIAL:
+        print("access_enforcement=ON subscription gate active")
+        return
+    print(
+        "access_enforcement=OFF  *** PAYWALL DISABLED *** "
+        "ENFORCE_TRIAL is set to a falsey value, so every gated endpoint is being "
+        "served to unpaid accounts. Unset ENFORCE_TRIAL (or set it to 1) to enforce."
+    )
 
 
 def is_account_owner(user_row) -> bool:
@@ -367,36 +393,27 @@ def _enforce_access_or_admin(user: sqlite3.Row) -> None:
 
     now = int(time.time())
 
-    def _normalize_subscription_status(raw_status: Any) -> str:
-        if raw_status is None:
-            return ""
-        return str(raw_status).strip().lower()
-
-    def _status_allows_paid_window_access(raw_status: Any) -> bool:
-        return _normalize_subscription_status(raw_status) in {"active", "past_due"}
+    # The access rules live in subscription_state so this gate and the /me
+    # payload that drives the paywall UI cannot drift apart. Imported here rather
+    # than at module scope because subscription_state imports from core.
+    from subscription_state import (
+        COMP_STATUS,
+        has_paid_window_access as _has_paid_window_access_shared,
+        normalize_status,
+    )
 
     def _has_paid_window_access(row: sqlite3.Row, now_unix: int) -> bool:
-        try:
-            raw_status = row["subscription_status"] if "subscription_status" in row.keys() else None
-        except Exception:
-            raw_status = None
-        if not _status_allows_paid_window_access(raw_status):
-            return False
-        try:
-            period_end = row["subscription_current_period_end"] if "subscription_current_period_end" in row.keys() else None
-            period_end_int = int(period_end) if period_end is not None else None
-        except Exception:
-            period_end_int = None
-        if period_end_int is None:
-            return False
-        return now_unix < period_end_int
+        return _has_paid_window_access_shared(row, now_unix)
 
     try:
         sub_status = user["subscription_status"] if "subscription_status" in user.keys() else None
     except Exception:
         sub_status = None
 
-    if sub_status == "comp":
+    # Normalised, like every other status comparison. This check used to be a raw
+    # equality test while the paid-window check normalised, so a comp stored as
+    # "Comp" granted nothing.
+    if normalize_status(sub_status) == COMP_STATUS:
         try:
             comp_expires = user["subscription_comp_expires_at"] if "subscription_comp_expires_at" in user.keys() else None
             comp_expires_int = int(comp_expires) if comp_expires is not None else None
