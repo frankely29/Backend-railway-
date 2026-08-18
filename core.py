@@ -34,7 +34,15 @@ JWT_SECRET = os.environ.get("JWT_SECRET", "")
 POSTGRES_URL = os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL")
 DB_BACKEND = "postgres" if POSTGRES_URL else "sqlite"
 TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "7"))
-ENFORCE_TRIAL = str(os.environ.get("ENFORCE_TRIAL", "0")).strip().lower() in ("1", "true", "yes", "on")
+# The subscription gate FAILS CLOSED. It used to default to "0", so the paywall
+# was disabled unless someone remembered to enable it -- and a revenue gate that
+# defaults to off gives the whole product away on any deploy where the variable
+# is missing, renamed, or typo'd, with no error and no signal. Production has
+# been serving every gated endpoint to unpaid accounts for exactly this reason.
+#
+# Disabling it is now a deliberate act (ENFORCE_TRIAL=0) rather than the default,
+# and _log_access_enforcement_state() shouts on boot whenever it is off.
+ENFORCE_TRIAL = str(os.environ.get("ENFORCE_TRIAL", "1")).strip().lower() in ("1", "true", "yes", "on")
 POSTGRES_POOL_MIN = max(1, int(os.environ.get("POSTGRES_POOL_MIN", "2")))
 POSTGRES_POOL_MAX = max(POSTGRES_POOL_MIN, int(os.environ.get("POSTGRES_POOL_MAX", "24")))
 LIVE_TOKEN_TTL_SECONDS = min(90, max(30, int(os.environ.get("LIVE_TOKEN_TTL_SECONDS", "60"))))
@@ -42,6 +50,24 @@ LIVE_TOKEN_TTL_SECONDS = min(90, max(30, int(os.environ.get("LIVE_TOKEN_TTL_SECO
 # Duplicated read is intentional: admin_mutation_service imports from core, not main,
 # and core cannot import from main without a circular import.
 ADMIN_EMAIL = (os.environ.get("ADMIN_EMAIL") or "").strip().lower()
+
+
+def _log_access_enforcement_state() -> None:
+    """Make a disabled paywall loud instead of silent.
+
+    With enforcement off, every gated endpoint serves unpaid accounts and nothing
+    anywhere says so -- the app simply works for everyone, which looks identical
+    to the app working correctly. That is how it stayed off unnoticed. Called on
+    startup so the state is in the logs of every boot.
+    """
+    if ENFORCE_TRIAL:
+        print("access_enforcement=ON subscription gate active")
+        return
+    print(
+        "access_enforcement=OFF  *** PAYWALL DISABLED *** "
+        "ENFORCE_TRIAL is set to a falsey value, so every gated endpoint is being "
+        "served to unpaid accounts. Unset ENFORCE_TRIAL (or set it to 1) to enforce."
+    )
 
 
 def is_account_owner(user_row) -> bool:
