@@ -6914,6 +6914,14 @@ app.include_router(subscription_webhook_router)
 # =========================================================
 @app.on_event("startup")
 def startup():
+    # First thing in the log: whether the paywall is actually enforcing. A
+    # disabled gate is otherwise indistinguishable from a working app.
+    try:
+        from core import _log_access_enforcement_state
+        _log_access_enforcement_state()
+    except Exception:
+        traceback.print_exc()
+
     def _log_runtime_integrity_summary() -> None:
         try:
             integrity_report = _artifact_runtime_integrity_report()

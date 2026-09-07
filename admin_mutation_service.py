@@ -379,7 +379,21 @@ def revoke_comp(actor_user_id: int, user_id: int) -> Dict[str, Any]:
     }
 
 
-def list_active_comps(limit: int = 100, offset: int = 0, search: Optional[str] = None) -> Dict[str, Any]:
+def list_active_comps(
+    limit: int = 100,
+    offset: int = 0,
+    search: Optional[str] = None,
+    include_expired: bool = False,
+) -> Dict[str, Any]:
+    """Comped users. Active only by default; include_expired also returns lapsed ones.
+
+    A comp that expires leaves subscription_status='comp' behind forever -- nothing
+    transitions it. This listing filtered those rows out, so an admin saw an empty
+    comps screen and would reasonably conclude nobody had ever been comped, while
+    users sat in a status that grants nothing and no admin surface showed them.
+    Lapsed comps are the ones an operator most needs to find, so they have to be
+    reachable.
+    """
     now = int(time.time())
 
     search_clause = ""
@@ -389,15 +403,22 @@ def list_active_comps(limit: int = 100, offset: int = 0, search: Optional[str] =
         pattern = f"%{search}%"
         search_params = [pattern, pattern, pattern]
 
+    if include_expired:
+        expiry_clause = ""
+        expiry_params: list = []
+    else:
+        expiry_clause = " AND (subscription_comp_expires_at IS NULL OR subscription_comp_expires_at > ?)"
+        expiry_params = [now]
+
     base_where = f"""
         subscription_status = 'comp'
-        AND (subscription_comp_expires_at IS NULL OR subscription_comp_expires_at > ?)
+        {expiry_clause}
         {search_clause}
     """
 
     count_row = _db_query_one(
         f"SELECT COUNT(*) AS c FROM users WHERE {base_where}",
-        (now, *search_params),
+        (*expiry_params, *search_params),
     )
     total = int(count_row["c"]) if count_row else 0
 
@@ -411,7 +432,7 @@ def list_active_comps(limit: int = 100, offset: int = 0, search: Optional[str] =
         ORDER BY subscription_comp_granted_at DESC
         LIMIT ? OFFSET ?
         """,
-        (now, *search_params, int(limit), int(offset)),
+        (*expiry_params, *search_params, int(limit), int(offset)),
     )
 
     items = []
@@ -439,3 +460,79 @@ def list_active_comps(limit: int = 100, offset: int = 0, search: Optional[str] =
         )
 
     return {"items": items, "total": total}
+
+
+def access_preflight() -> Dict[str, Any]:
+    """Who would keep access if the paywall were switched on right now.
+
+    ENFORCE_TRIAL is currently off in production, so every authenticated user is
+    ungated regardless of subscription state -- which hides the fact that comps
+    and signup trials have quietly lapsed. Flipping the flag applies the whole
+    ladder at once, to everyone, with no warning and no staged rollout.
+
+    This answers the question that has to be asked BEFORE that flip: how many
+    people lose access the moment it happens, and why. Read-only.
+    """
+    from core import ENFORCE_TRIAL
+    from subscription_state import is_comp_active, is_subscription_active, is_trial_active
+
+    rows = _db_query_all(
+        """
+        SELECT id, email, display_name, is_admin, trial_expires_at,
+               subscription_status, subscription_id,
+               subscription_current_period_end, subscription_comp_expires_at
+        FROM users
+        """
+    ) or []
+
+    buckets = {"admin": 0, "comp": 0, "subscription": 0, "trial": 0, "would_lose_access": 0}
+    losing = []
+    for row in rows:
+        if _flag_to_bool(row["is_admin"]):
+            buckets["admin"] += 1
+            continue
+        if is_comp_active(row):
+            buckets["comp"] += 1
+        elif is_subscription_active(row):
+            buckets["subscription"] += 1
+        elif is_trial_active(row):
+            buckets["trial"] += 1
+        else:
+            buckets["would_lose_access"] += 1
+            if len(losing) < 200:
+                losing.append({
+                    "id": int(row["id"]),
+                    "email": row["email"],
+                    "display_name": row["display_name"],
+                    "subscription_status": row["subscription_status"],
+                    "comp_expires_at": row["subscription_comp_expires_at"],
+                    "trial_expires_at": row["trial_expires_at"],
+                    "reason": _preflight_reason(row),
+                })
+
+    return {
+        "ok": True,
+        "enforcement_currently_on": bool(ENFORCE_TRIAL),
+        "total_users": len(rows),
+        "counts": buckets,
+        "would_lose_access": losing,
+    }
+
+
+def _preflight_reason(row) -> str:
+    now = int(time.time())
+    status = str(row["subscription_status"] or "none").strip().lower()
+    comp_exp = row["subscription_comp_expires_at"]
+    trial_exp = row["trial_expires_at"]
+    period_end = row["subscription_current_period_end"]
+    if status == "comp" and comp_exp is not None and int(comp_exp) <= now:
+        return "comp_expired"
+    if status in {"active", "past_due", "trialing", "cancelled"}:
+        if period_end is not None and int(period_end) <= now:
+            return "subscription_period_ended"
+        return f"subscription_status_{status}_without_period"
+    if trial_exp is not None and int(trial_exp) <= now:
+        return "trial_expired"
+    if trial_exp is None and status == "none":
+        return "never_had_trial_or_subscription"
+    return f"no_access_status_{status}"

@@ -6,6 +6,77 @@ from typing import Any, Dict, Optional
 
 from core import ENFORCE_TRIAL
 
+# --- Access rules. SINGLE SOURCE OF TRUTH ------------------------------------
+# core._enforce_access_or_admin (the API gate) and build_subscription_response
+# (what /me tells the paywall UI) both read these. They used to implement the
+# ladder separately, which is how they drifted: the gate normalised status case
+# for paid statuses but not for comp, and each had its own status list. When the
+# two disagree the driver gets either a paywall over a working app, or an app
+# that 402s behind a paywall that never appears.
+
+# Statuses that represent a window the driver has ALREADY PAID FOR. Access then
+# depends on whether that window has elapsed, not on the label:
+#   active    -- billing healthy
+#   past_due  -- charge failed; dunning grace, do not cut off mid-shift
+#   trialing  -- Paddle plan that opens with a trial; a real subscription
+#   cancelled -- cancelled mid-cycle; the time already bought is still theirs,
+#                and Paddle sets the period end to when it actually lapses
+# 'paused' is deliberately absent: paused billing is not a paid window.
+PAID_WINDOW_STATUSES = frozenset({"active", "past_due", "trialing", "cancelled"})
+
+# Statuses where a MISSING period end should still grant access. A null period is
+# our own parsing gap (transaction.completed can arrive with no billing period),
+# not something the driver did, and refusing someone who just paid is the worse
+# error. past_due/cancelled are excluded: those only mean anything relative to a
+# period, so with no period there is nothing to honour.
+OPEN_ENDED_OK_STATUSES = frozenset({"active", "trialing"})
+
+COMP_STATUS = "comp"
+
+
+def normalize_status(raw: Any) -> str:
+    """Lowercase/trimmed status, with the canonical spelling of 'cancelled'."""
+    if raw is None:
+        return ""
+    text = str(raw).strip().lower()
+    return "cancelled" if text == "canceled" else text
+
+
+def _row_get(user_row, key: str) -> Any:
+    try:
+        return user_row[key] if key in user_row.keys() else None
+    except Exception:
+        return None
+
+
+def has_paid_window_access(user_row, now_unix: Optional[int] = None) -> bool:
+    """True while the driver is inside a subscription window they paid for."""
+    status = normalize_status(_row_get(user_row, "subscription_status"))
+    now = int(time.time()) if now_unix is None else int(now_unix)
+    period_end = _row_get(user_row, "subscription_current_period_end")
+
+    if status not in PAID_WINDOW_STATUSES:
+        # A comp grant OVERWRITES subscription_status, so an expired comp can be
+        # hiding a paid subscription that is still running underneath it. Nothing
+        # restores the real status when a comp lapses (revoke_comp does, expiry
+        # does not), so an admin comping a paying subscriber would lock them out
+        # the moment the comp ran out. If there is a real subscription id and the
+        # paid period has not elapsed, that window is still theirs.
+        if status == COMP_STATUS and _row_get(user_row, "subscription_id"):
+            try:
+                return period_end is not None and now < int(period_end)
+            except (TypeError, ValueError):
+                return False
+        return False
+
+    if period_end is None:
+        return status in OPEN_ENDED_OK_STATUSES
+    try:
+        return now < int(period_end)
+    except (TypeError, ValueError):
+        return status in OPEN_ENDED_OK_STATUSES
+
+
 
 def get_subscription_fields(user_row) -> Dict[str, Any]:
     """Extract all subscription_* columns from a user row into a plain dict."""
@@ -31,18 +102,8 @@ def get_subscription_fields(user_row) -> Dict[str, Any]:
 
 
 def is_subscription_active(user_row) -> bool:
-    """True if user still has paid-period access based on status + future period end."""
-    fields = get_subscription_fields(user_row)
-    status = str(fields["status"] or "").strip().lower()
-    if status not in {"active", "past_due"}:
-        return False
-    period_end = fields["current_period_end"]
-    if period_end is None:
-        return False
-    try:
-        return int(time.time()) < int(period_end)
-    except Exception:
-        return False
+    """True if user still has paid-period access based on status + period end."""
+    return has_paid_window_access(user_row)
 
 
 def is_comp_active(user_row) -> bool:
@@ -54,7 +115,7 @@ def is_comp_active(user_row) -> bool:
     server is still granting access.
     """
     fields = get_subscription_fields(user_row)
-    if fields["status"] != "comp":
+    if normalize_status(fields["status"]) != COMP_STATUS:
         return False
     comp_expires = fields["comp_expires_at"]
     if comp_expires is None:
@@ -71,7 +132,7 @@ def is_comp_active(user_row) -> bool:
 def is_comp_forever(user_row) -> bool:
     """True if user has comp with no expiration (NULL or non-positive comp_expires_at)."""
     fields = get_subscription_fields(user_row)
-    if fields["status"] != "comp":
+    if normalize_status(fields["status"]) != COMP_STATUS:
         return False
     comp_expires = fields["comp_expires_at"]
     if comp_expires is None:
