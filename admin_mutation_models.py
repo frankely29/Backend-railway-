@@ -95,3 +95,20 @@ class CompListItem(BaseModel):
 class CompListResponse(BaseModel):
     items: list[CompListItem]
     total: int
+
+
+class AccessTokenCreateRequest(BaseModel):
+    """Mint a free-access code.
+
+    Both durations are optional and mean different things:
+      access_days    -- how long the ACCESS lasts once redeemed (omit = forever)
+      redeem_by_days -- how long the CODE stays usable  (omit = never expires)
+    """
+    access_days: Optional[int] = Field(default=None, ge=1, le=3650)
+    redeem_by_days: Optional[int] = Field(default=None, ge=1, le=3650)
+    max_uses: int = Field(default=1, ge=1, le=10000)
+    note: Optional[str] = Field(default=None, max_length=200)
+
+
+class RedeemAccessTokenRequest(BaseModel):
+    code: str = Field(min_length=1, max_length=64)
