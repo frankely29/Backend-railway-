@@ -5473,6 +5473,13 @@ def _db_init() -> None:
             WHERE map_identity_mode IS NULL OR btrim(map_identity_mode) = '';
             """
         )
+        # Admin-issued free-access codes (see access_tokens.py).
+        try:
+            from access_tokens import create_access_token_tables_sql
+            for _ddl in create_access_token_tables_sql("postgres"):
+                _db_exec(_ddl)
+        except Exception:
+            traceback.print_exc()
         _db_exec(
             """
             CREATE TABLE IF NOT EXISTS paddle_webhook_events (
@@ -6024,6 +6031,13 @@ def _db_init() -> None:
         WHERE map_identity_mode IS NULL OR trim(map_identity_mode) = '';
         """
     )
+    # Admin-issued free-access codes (see access_tokens.py).
+    try:
+        from access_tokens import create_access_token_tables_sql
+        for _ddl in create_access_token_tables_sql("sqlite"):
+            _db_exec(_ddl)
+    except Exception:
+        traceback.print_exc()
     _db_exec(
         """
         CREATE TABLE IF NOT EXISTS paddle_webhook_events (

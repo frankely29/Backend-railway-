@@ -5,6 +5,7 @@ import sqlite3
 from fastapi import APIRouter, Depends, Query
 
 from admin_mutation_models import (
+    AccessTokenCreateRequest,
     AdminActionUserResponse,
     AdminUserDetailResponse,
     ClearReportResponse,
@@ -15,6 +16,11 @@ from admin_mutation_models import (
     CompRevokeResponse,
     SetAdminRequest,
     SetSuspendedRequest,
+)
+from access_tokens import (
+    create_access_token,
+    list_access_tokens,
+    revoke_access_token,
 )
 from admin_mutation_service import (
     clear_pickup_report,
@@ -126,6 +132,41 @@ def admin_list_comps(
     return list_active_comps(
         limit=limit, offset=offset, search=search, include_expired=include_expired
     )
+
+
+@router.post("/access_tokens")
+def admin_create_access_token(
+    payload: AccessTokenCreateRequest,
+    admin: sqlite3.Row = Depends(require_admin_user),
+):
+    """Mint a free-access code. Omit access_days for permanent access."""
+    return create_access_token(
+        actor_user_id=int(admin["id"]),
+        access_days=payload.access_days,
+        redeem_by_days=payload.redeem_by_days,
+        max_uses=payload.max_uses,
+        note=payload.note or "",
+    )
+
+
+@router.get("/access_tokens")
+def admin_list_access_tokens(
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    include_inactive: bool = Query(default=True),
+    admin: sqlite3.Row = Depends(require_admin_user),
+):
+    _ = admin
+    return list_access_tokens(limit=limit, offset=offset, include_inactive=include_inactive)
+
+
+@router.post("/access_tokens/{code}/revoke")
+def admin_revoke_access_token(
+    code: str,
+    admin: sqlite3.Row = Depends(require_admin_user),
+):
+    """Stop a code being redeemed. Does not withdraw access already granted."""
+    return revoke_access_token(actor_user_id=int(admin["id"]), code=code)
 
 
 @router.get("/access_preflight")

@@ -11,12 +11,14 @@ import sqlite3
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from core import require_user_basic
+from core import _db_query_one, require_user_basic
 from paddle_client import (
     create_checkout_transaction,
     create_customer_portal_session,
     paddle_is_configured,
 )
+from access_tokens import redeem_access_token
+from admin_mutation_models import RedeemAccessTokenRequest
 from subscription_state import build_subscription_response
 
 logger = logging.getLogger(__name__)
@@ -96,3 +98,21 @@ def subscription_portal(user: sqlite3.Row = Depends(require_user_basic)):
         "ok": True,
         "portal_url": portal_url,
     }
+
+
+@router.post("/redeem")
+def subscription_redeem(
+    payload: RedeemAccessTokenRequest,
+    user: sqlite3.Row = Depends(require_user_basic),
+):
+    """Redeem an admin-issued free-access code.
+
+    require_user_basic, like every other route in this file: the people who need
+    to redeem a code are precisely the ones the access gate is currently turning
+    away. Behind require_user this would 402 before it could ever grant anything.
+    """
+    result = redeem_access_token(user_id=int(user["id"]), code=payload.code)
+    refreshed = _db_query_one("SELECT * FROM users WHERE id=?", (int(user["id"]),))
+    if refreshed is not None:
+        result["subscription"] = build_subscription_response(refreshed)
+    return result
