@@ -37,6 +37,7 @@ from core import (
     _verify_live_token,
     require_user,
 )
+from media_store import THUMB_MIME_TYPE, build_thumbnail, derive_thumb_key
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
@@ -404,6 +405,17 @@ def _safe_unlink_chat_image(relative_path: str | None) -> None:
     except HTTPException:
         _LOGGER.warning("Skipping unsafe chat image purge path", extra={"image_path": relative_path})
         return
+    # The thumbnail is derived from the original's key and is never referenced by
+    # a row of its own, so purging the image is the only chance to remove it.
+    # Missing that leaks a file per expired image, forever.
+    try:
+        _resolve_image_path(derive_thumb_key(str(relative_path))).unlink(missing_ok=True)
+    except (HTTPException, OSError, ValueError):
+        _LOGGER.warning(
+            "Failed to unlink expired chat image thumbnail",
+            exc_info=True,
+            extra={"image_path": relative_path},
+        )
     try:
         target.unlink(missing_ok=True)
     except OSError:
@@ -628,6 +640,14 @@ def _private_image_url(message_id: int) -> str:
     return f"/chat/image/private/{int(message_id)}"
 
 
+def _public_image_thumb_url(message_id: int) -> str:
+    return f"/chat/image/public/{int(message_id)}/thumb"
+
+
+def _private_image_thumb_url(message_id: int) -> str:
+    return f"/chat/image/private/{int(message_id)}/thumb"
+
+
 def _voice_fields(audio_url: str, row: dict) -> dict[str, Any]:
     return {
         "audio_url": audio_url,
@@ -649,12 +669,14 @@ def _serialize_public_message(row: dict) -> dict:
         "audio_duration_ms": None,
         "audio_mime_type": None,
         "image_url": None,
+        "image_thumb_url": None,
         "image_mime_type": row.get("image_mime_type"),
     }
     if payload["message_type"] == "voice" and row.get("audio_path"):
         payload.update(_voice_fields(_public_audio_url(payload["id"]), row))
     if payload["message_type"] == "image" and row.get("image_path"):
         payload["image_url"] = _public_image_url(payload["id"])
+        payload["image_thumb_url"] = _public_image_thumb_url(payload["id"])
     return payload
 
 
@@ -670,12 +692,14 @@ def _serialize_private_message(row: dict, include_legacy_aliases: bool = False) 
         "audio_duration_ms": None,
         "audio_mime_type": None,
         "image_url": None,
+        "image_thumb_url": None,
         "image_mime_type": row.get("image_mime_type"),
     }
     if payload["message_type"] == "voice" and row.get("audio_path"):
         payload.update(_voice_fields(_private_audio_url(payload["id"]), row))
     if payload["message_type"] == "image" and row.get("image_path"):
         payload["image_url"] = _private_image_url(payload["id"])
+        payload["image_thumb_url"] = _private_image_thumb_url(payload["id"])
     if include_legacy_aliases:
         payload["user_id"] = payload["sender_user_id"]
         payload["room"] = _dm_room_for_users(payload["sender_user_id"], payload["recipient_user_id"])
@@ -1631,9 +1655,12 @@ def _resolve_image_path(relative_path: str) -> Path:
     return target
 
 
-def _store_audio_file(relative_dir: str, message_id: int, user_id: int, extension: str, payload: bytes) -> str:
-    relative_path = f"{relative_dir}/user-{int(user_id)}-message-{int(message_id)}{extension}"
-    target = _resolve_audio_path(relative_path)
+def _write_file_atomically(target: Path, payload: bytes) -> None:
+    """Write via a temp file and rename, fsyncing both file and directory.
+
+    A half-written photo that survives a crash is worse than no photo: the row
+    points at it and every read serves a broken image.
+    """
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.with_suffix(target.suffix + ".tmp")
     with tmp.open("wb") as fh:
@@ -1649,31 +1676,58 @@ def _store_audio_file(relative_dir: str, message_id: int, user_id: int, extensio
             os.close(dir_fd)
     except OSError:
         pass
+
+
+def _store_audio_file(relative_dir: str, message_id: int, user_id: int, extension: str, payload: bytes) -> str:
+    relative_path = f"{relative_dir}/user-{int(user_id)}-message-{int(message_id)}{extension}"
+    target = _resolve_audio_path(relative_path)
+    _write_file_atomically(target, payload)
     if not target.exists() or not target.is_file():
         raise RuntimeError("Audio file was not persisted")
     return relative_path
 
 
+def _unlink_image_and_thumb(target: Path | None) -> None:
+    """Undo a stored image, thumbnail included.
+
+    Used when the surrounding transaction fails after the file is on disk. The
+    thumbnail has no row of its own, so anything that forgets it leaks a file.
+    """
+    if target is None:
+        return
+    for path in (target, Path(derive_thumb_key(str(target)))):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            _LOGGER.warning("Failed to roll back stored image", exc_info=True, extra={"path": str(path)})
+
+
+def _store_image_thumbnail(relative_path: str, payload: bytes) -> bool:
+    """Best-effort companion thumbnail. Never raises.
+
+    Called inside the upload's transaction, so a failure here must not cost the
+    user their photo -- a missing thumbnail degrades to serving the original.
+    """
+    try:
+        thumb = build_thumbnail(payload)
+        if thumb is None:
+            return False
+        _write_file_atomically(_resolve_image_path(derive_thumb_key(relative_path)), thumb)
+        return True
+    except Exception:
+        _LOGGER.warning(
+            "Could not store image thumbnail", exc_info=True, extra={"image_path": relative_path}
+        )
+        return False
+
+
 def _store_image_file(relative_dir: str, message_id: int, user_id: int, extension: str, payload: bytes) -> str:
     relative_path = f"{relative_dir}/user-{int(user_id)}-message-{int(message_id)}{extension}"
     target = _resolve_image_path(relative_path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_suffix(target.suffix + ".tmp")
-    with tmp.open("wb") as fh:
-        fh.write(payload)
-        fh.flush()
-        os.fsync(fh.fileno())
-    tmp.replace(target)
-    try:
-        dir_fd = os.open(str(target.parent), os.O_RDONLY)
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
-    except OSError:
-        pass
+    _write_file_atomically(target, payload)
     if not target.exists() or not target.is_file():
         raise RuntimeError("Image file was not persisted")
+    _store_image_thumbnail(relative_path, payload)
     return relative_path
 
 
@@ -1992,8 +2046,7 @@ def _persist_public_image_message(room: str, user, upload: UploadFile, text: str
             conn.rollback()
             conn.close()
             conn = None
-        if target and target.exists():
-            target.unlink(missing_ok=True)
+        _unlink_image_and_thumb(target)
         raise
     finally:
         if conn is not None:
@@ -2090,8 +2143,7 @@ def _persist_private_image_message(
             conn.rollback()
             conn.close()
             conn = None
-        if target and target.exists():
-            target.unlink(missing_ok=True)
+        _unlink_image_and_thumb(target)
         raise
     finally:
         if conn is not None:
@@ -2273,6 +2325,44 @@ def _serve_image(route: str, message_id: int, row: dict, request: Request) -> Re
         raise HTTPException(status_code=404, detail="Image file missing")
     return Response(
         content=b"" if request.method.upper() == "HEAD" else target.read_bytes(),
+        media_type=row.get("image_mime_type") or "application/octet-stream",
+        headers={"Cache-Control": "private, max-age=300"},
+    )
+
+
+def _serve_image_thumb(message_id: int, row: dict, request: Request) -> Response:
+    """Serve the small version, generating it on first request if absent.
+
+    Images stored before thumbnails existed have none on disk, and so do any
+    whose generation failed at upload time. Building it here on the first read
+    means no backfill job and no permanently-slow rows -- and if it still cannot
+    be built, the original is returned so the grid renders something.
+    """
+    _ = message_id
+    if request.method.upper() not in {"GET", "HEAD"}:
+        raise HTTPException(status_code=405, detail="Method not allowed")
+    if row.get("message_type") != "image" or not row.get("image_path"):
+        raise HTTPException(status_code=404, detail="Image not found")
+
+    image_key = str(row["image_path"])
+    original = _resolve_image_path(image_key)
+    if not original.exists() or not original.is_file():
+        raise HTTPException(status_code=404, detail="Image file missing")
+
+    thumb_target = _resolve_image_path(derive_thumb_key(image_key))
+    if not thumb_target.exists() or not thumb_target.is_file():
+        _store_image_thumbnail(image_key, original.read_bytes())
+
+    is_head = request.method.upper() == "HEAD"
+    if thumb_target.exists() and thumb_target.is_file():
+        return Response(
+            content=b"" if is_head else thumb_target.read_bytes(),
+            media_type=THUMB_MIME_TYPE,
+            headers={"Cache-Control": "private, max-age=86400"},
+        )
+
+    return Response(
+        content=b"" if is_head else original.read_bytes(),
         media_type=row.get("image_mime_type") or "application/octet-stream",
         headers={"Cache-Control": "private, max-age=300"},
     )
@@ -2912,6 +3002,13 @@ def get_public_image(message_id: int, request: Request, user=Depends(require_use
     return _serve_image("/chat/image/public/{message_id}", int(message_id), row, request)
 
 
+@router.api_route("/image/public/{message_id}/thumb", methods=["GET", "HEAD"])
+def get_public_image_thumb(message_id: int, request: Request, user=Depends(require_user)):
+    _ = user
+    row = _fetch_public_image_row(message_id)
+    return _serve_image_thumb(int(message_id), row, request)
+
+
 @router.api_route("/image/private/{message_id}", methods=["GET", "HEAD"])
 def get_private_image(message_id: int, request: Request, user=Depends(require_user)):
     my_user_id = int(user["id"])
@@ -2919,3 +3016,13 @@ def get_private_image(message_id: int, request: Request, user=Depends(require_us
     if my_user_id not in {int(row["sender_user_id"]), int(row["recipient_user_id"])}:
         raise HTTPException(status_code=403, detail="Not allowed")
     return _serve_image("/chat/image/private/{message_id}", int(message_id), row, request)
+
+
+@router.api_route("/image/private/{message_id}/thumb", methods=["GET", "HEAD"])
+def get_private_image_thumb(message_id: int, request: Request, user=Depends(require_user)):
+    my_user_id = int(user["id"])
+    row = _fetch_private_image_row(message_id)
+    # Same authorisation as the full image. A thumbnail is still the photo.
+    if my_user_id not in {int(row["sender_user_id"]), int(row["recipient_user_id"])}:
+        raise HTTPException(status_code=403, detail="Not allowed")
+    return _serve_image_thumb(int(message_id), row, request)
