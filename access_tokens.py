@@ -77,6 +77,16 @@ def _now() -> int:
     return int(time.time())
 
 
+def comp_reason_for(code: str) -> str:
+    """The comp reason a redemption of `code` writes.
+
+    Withdrawal matches on this string, so it has to be produced in exactly one
+    place. If the grant and the withdrawal ever disagree about the wording,
+    revoking a code silently stops removing the access it granted.
+    """
+    return f"access code {code}"
+
+
 def _days_to_seconds(days: Optional[int]) -> Optional[int]:
     if days is None:
         return None
@@ -180,22 +190,273 @@ def list_access_tokens(limit: int = 100, offset: int = 0, include_inactive: bool
     return {"ok": True, "items": items, "total": int(total_row["c"]) if total_row else 0}
 
 
-def revoke_access_token(*, actor_user_id: int, code: str) -> Dict[str, Any]:
-    """Stop a code being redeemed from now on.
-
-    Deliberately does NOT withdraw access from anyone who already redeemed it.
-    Revoking a leaked code should not silently cut off the people it was meant
-    for; removing an individual's access is grant/revoke_comp's job.
-    """
+def _require_token_row(code: str):
     normalized = normalize_code(code)
-    row = _db_query_one("SELECT code, revoked_at FROM access_tokens WHERE code=? LIMIT 1", (normalized,))
+    if not normalized:
+        raise HTTPException(status_code=400, detail="Enter a code")
+    row = _db_query_one(
+        "SELECT code, created_at, access_days, redeem_by, max_uses, uses, revoked_at, note"
+        " FROM access_tokens WHERE code=? LIMIT 1",
+        (normalized,),
+    )
     if not row:
         raise HTTPException(status_code=404, detail="Code not found")
-    if row["revoked_at"] is not None:
-        return {"ok": True, "code": normalized, "already_revoked": True}
-    _db_exec("UPDATE access_tokens SET revoked_at=? WHERE code=?", (_now(), normalized))
-    logger.info("access_token_revoked code=%s by=%s", normalized, actor_user_id)
-    return {"ok": True, "code": normalized, "already_revoked": False}
+    return normalized, row
+
+
+def list_token_redemptions(code: str) -> Dict[str, Any]:
+    """Who redeemed this code, and whether their access still comes from it.
+
+    Needed for revocation to be a decision rather than a guess: `traces_to_code`
+    is exactly the condition a withdrawal acts on, so the admin can see who
+    would lose access before choosing to remove it.
+    """
+    normalized, _row = _require_token_row(code)
+    reason = comp_reason_for(normalized)
+    rows = _db_query_all(
+        """
+        SELECT r.user_id            AS user_id,
+               r.redeemed_at        AS redeemed_at,
+               u.email              AS email,
+               u.display_name       AS display_name,
+               u.subscription_status            AS subscription_status,
+               u.subscription_comp_reason       AS comp_reason,
+               u.subscription_comp_expires_at   AS comp_expires_at
+        FROM access_token_redemptions r
+        LEFT JOIN users u ON u.id = r.user_id
+        WHERE r.code = ?
+        ORDER BY r.redeemed_at DESC
+        """,
+        (normalized,),
+    ) or []
+
+    from subscription_state import COMP_STATUS, normalize_status
+
+    now = _now()
+    items = []
+    for row in rows:
+        status = normalize_status(row["subscription_status"])
+        expires = row["comp_expires_at"]
+        comp_live = status == COMP_STATUS and (expires is None or int(expires) > now)
+        items.append({
+            "user_id": row["user_id"],
+            "email": row["email"],
+            "display_name": row["display_name"],
+            "redeemed_at": row["redeemed_at"],
+            "subscription_status": row["subscription_status"],
+            "comp_reason": row["comp_reason"],
+            "comp_expires_at": expires,
+            "comp_is_forever": comp_live and expires is None,
+            "comp_active": comp_live,
+            # True == a withdrawal on this code would take this person's access.
+            "traces_to_code": comp_live and str(row["comp_reason"] or "") == reason,
+        })
+    return {"ok": True, "code": normalized, "items": items, "total": len(items)}
+
+
+def _withdraw_comp_for_code(*, actor_user_id: int, code: str) -> Dict[str, Any]:
+    """Pull the comp from everyone whose access still traces to `code`.
+
+    Routed through revoke_comp so a redeemer who ALSO pays keeps their paid
+    subscription -- that function already drops them back to "active" rather
+    than "none" when their billing period is still open. Reimplementing the
+    UPDATE here would quietly cut off a paying customer.
+    """
+    from admin_mutation_service import revoke_comp
+
+    listing = list_token_redemptions(code)
+    withdrawn: List[Dict[str, Any]] = []
+    kept: List[Dict[str, Any]] = []
+    for item in listing["items"]:
+        if not item["traces_to_code"]:
+            kept.append({
+                "user_id": item["user_id"],
+                "email": item["email"],
+                "reason": "access does not come from this code" if item["comp_active"] else "no active comp",
+            })
+            continue
+        try:
+            result = revoke_comp(actor_user_id=int(actor_user_id), user_id=int(item["user_id"]))
+        except HTTPException as exc:
+            # A deleted account should not abort withdrawal for everyone else.
+            kept.append({"user_id": item["user_id"], "email": item["email"], "reason": str(exc.detail)})
+            continue
+        withdrawn.append({
+            "user_id": item["user_id"],
+            "email": item["email"],
+            "status_after": result.get("status"),
+        })
+    logger.info(
+        "access_token_access_withdrawn code=%s by=%s withdrawn=%d kept=%d",
+        listing["code"], actor_user_id, len(withdrawn), len(kept),
+    )
+    return {"withdrawn": withdrawn, "kept": kept}
+
+
+def revoke_access_token(
+    *,
+    actor_user_id: int,
+    code: str,
+    withdraw_access: bool = False,
+) -> Dict[str, Any]:
+    """Stop a code being redeemed, and optionally take back what it granted.
+
+    The two halves are separate on purpose, because they answer different
+    questions. Revoking a leaked code should not by default cut off the people
+    it was legitimately given to -- but an admin who wants that must be able to
+    say so, which is what withdraw_access is for.
+
+    Revocation works from any state. A used-up or expired code cannot be
+    redeemed anyway, but revoking it is still the handle for withdrawing the
+    access it already handed out.
+    """
+    normalized, row = _require_token_row(code)
+    already_revoked = row["revoked_at"] is not None
+    if not already_revoked:
+        _db_exec("UPDATE access_tokens SET revoked_at=? WHERE code=?", (_now(), normalized))
+        logger.info("access_token_revoked code=%s by=%s", normalized, actor_user_id)
+
+    result: Dict[str, Any] = {
+        "ok": True,
+        "code": normalized,
+        "already_revoked": already_revoked,
+        "access_withdrawn": bool(withdraw_access),
+        "withdrawn": [],
+        "kept": [],
+    }
+    if withdraw_access:
+        result.update(_withdraw_comp_for_code(actor_user_id=actor_user_id, code=normalized))
+    result["withdrawn_count"] = len(result["withdrawn"])
+    result["kept_count"] = len(result["kept"])
+    return result
+
+
+def restore_access_token(*, actor_user_id: int, code: str) -> Dict[str, Any]:
+    """Un-revoke a code, so a revoke made in error is not a one-way door.
+
+    Clearing revoked_at does not necessarily make the code usable again -- it
+    may still be used up or past its redeem-by -- so the resulting state is
+    returned rather than assumed.
+    """
+    normalized, row = _require_token_row(code)
+    if row["revoked_at"] is None:
+        return {"ok": True, "code": normalized, "was_revoked": False, "state": _token_state(row)}
+    _db_exec("UPDATE access_tokens SET revoked_at=NULL WHERE code=?", (normalized,))
+    logger.info("access_token_restored code=%s by=%s", normalized, actor_user_id)
+    refreshed = _db_query_one(
+        "SELECT redeem_by, max_uses, uses, revoked_at FROM access_tokens WHERE code=? LIMIT 1",
+        (normalized,),
+    )
+    return {
+        "ok": True,
+        "code": normalized,
+        "was_revoked": True,
+        "state": _token_state(refreshed) if refreshed else "active",
+    }
+
+
+def revoke_redemption(*, actor_user_id: int, code: str, user_id: int) -> Dict[str, Any]:
+    """Take one person's access back without touching the code itself.
+
+    The case this exists for: a multi-use code handed to a group, one of whom
+    should no longer have access. Revoking the code would punish everyone.
+    """
+    from admin_mutation_service import revoke_comp
+
+    normalized, _row = _require_token_row(code)
+    listing = list_token_redemptions(normalized)
+    match = next((i for i in listing["items"] if int(i["user_id"]) == int(user_id)), None)
+    if match is None:
+        raise HTTPException(status_code=404, detail="That user has not redeemed this code")
+    if not match["traces_to_code"]:
+        # Refusing beats silently doing nothing, and beats removing a comp this
+        # code did not grant.
+        raise HTTPException(
+            status_code=409,
+            detail="That user's access does not come from this code — remove it from Comps instead",
+        )
+    result = revoke_comp(actor_user_id=int(actor_user_id), user_id=int(user_id))
+    logger.info("access_token_redemption_revoked code=%s user=%s by=%s", normalized, user_id, actor_user_id)
+    return {"ok": True, "code": normalized, "user_id": int(user_id), "status_after": result.get("status")}
+
+
+BULK_SCAN_PAGE = 500
+
+
+def _active_codes() -> List[str]:
+    """Every code currently in the `active` state, oldest first.
+
+    Pages over raw rows and reuses _token_state rather than re-expressing
+    "active" as SQL: two definitions of the same thing would eventually
+    disagree, and the SQL copy is the one nothing would notice was wrong.
+    """
+    codes: List[str] = []
+    offset = 0
+    while True:
+        rows = _db_query_all(
+            """
+            SELECT code, redeem_by, max_uses, uses, revoked_at
+            FROM access_tokens
+            ORDER BY created_at ASC
+            LIMIT ? OFFSET ?
+            """,
+            (BULK_SCAN_PAGE, offset),
+        ) or []
+        if not rows:
+            return codes
+        now = _now()
+        codes.extend(row["code"] for row in rows if _token_state(row, now) == "active")
+        if len(rows) < BULK_SCAN_PAGE:
+            return codes
+        offset += BULK_SCAN_PAGE
+
+
+def _codes_with_redemptions() -> List[str]:
+    rows = _db_query_all(
+        "SELECT DISTINCT code FROM access_token_redemptions ORDER BY code ASC"
+    ) or []
+    return [row["code"] for row in rows]
+
+
+def revoke_all_active_tokens(*, actor_user_id: int, withdraw_access: bool = False) -> Dict[str, Any]:
+    """Kill every code that can still be redeemed. The leaked-everywhere button.
+
+    The two halves deliberately cover different sets:
+
+      * revocation touches only `active` codes. Revoking a used-up or expired
+        code changes nothing about whether it can be redeemed, and counting it
+        would overstate what happened.
+      * withdrawal covers every code that has EVER been redeemed. Spent codes
+        are precisely the ones whose access is already out in the wild, so a
+        "take it all back" that skipped them would take back almost nothing.
+    """
+    revoked: List[Dict[str, Any]] = []
+    for code in _active_codes():
+        revoke_access_token(actor_user_id=actor_user_id, code=code, withdraw_access=False)
+        revoked.append({"code": code})
+
+    withdrawn_total = 0
+    withdrawn_codes: List[Dict[str, Any]] = []
+    if withdraw_access:
+        for code in _codes_with_redemptions():
+            outcome = _withdraw_comp_for_code(actor_user_id=actor_user_id, code=code)
+            count = len(outcome["withdrawn"])
+            withdrawn_total += count
+            if count:
+                withdrawn_codes.append({"code": code, "withdrawn_count": count})
+
+    logger.info(
+        "access_tokens_bulk_revoked revoked=%d withdraw_access=%s withdrawn=%d by=%s",
+        len(revoked), withdraw_access, withdrawn_total, actor_user_id,
+    )
+    return {
+        "ok": True,
+        "revoked_count": len(revoked),
+        "withdrawn_count": withdrawn_total,
+        "access_withdrawn": bool(withdraw_access),
+        "codes": revoked,
+        "withdrawn_codes": withdrawn_codes,
+    }
 
 
 def redeem_access_token(*, user_id: int, code: str) -> Dict[str, Any]:
@@ -270,9 +531,15 @@ def _apply_comp_from_token(*, user_id: int, new_expiry: Optional[int], code: str
     A code is a gift. If someone redeems a 7-day code while holding a 30-day comp
     -- or a forever comp -- naively writing the new expiry would take 23 days off
     them. So the longer window wins, and None (forever) beats every date.
+
+    The reason field follows the same rule: it names the code only when the code
+    is what is actually providing the access. Overwriting it unconditionally
+    would mis-attribute a stronger pre-existing comp to this code, and revoking
+    the code with withdrawal would then strip a grant it never made.
     """
     existing = _db_query_one(
-        "SELECT subscription_status, subscription_comp_expires_at FROM users WHERE id=? LIMIT 1",
+        "SELECT subscription_status, subscription_comp_expires_at, subscription_comp_reason"
+        " FROM users WHERE id=? LIMIT 1",
         (int(user_id),),
     )
     if not existing:
@@ -281,12 +548,17 @@ def _apply_comp_from_token(*, user_id: int, new_expiry: Optional[int], code: str
     from subscription_state import COMP_STATUS, normalize_status
 
     effective_expiry = new_expiry
+    reason = comp_reason_for(code)
     if normalize_status(existing["subscription_status"]) == COMP_STATUS:
         current = existing["subscription_comp_expires_at"]
         if current is None:
             effective_expiry = None          # already forever; keep it
         elif new_expiry is not None:
             effective_expiry = max(int(current), int(new_expiry))
+        # The existing comp already covers this window, so the code added
+        # nothing -- leave the credit (and the withdrawal handle) where it was.
+        if effective_expiry == current and existing["subscription_comp_reason"]:
+            reason = str(existing["subscription_comp_reason"])
 
     _db_exec(
         """
@@ -298,9 +570,9 @@ def _apply_comp_from_token(*, user_id: int, new_expiry: Optional[int], code: str
             subscription_updated_at=?
         WHERE id=?
         """,
-        ("comp", f"access code {code}", now, effective_expiry, now, int(user_id)),
+        ("comp", reason, now, effective_expiry, now, int(user_id)),
     )
-    return {"comp_expires_at": effective_expiry}
+    return {"comp_expires_at": effective_expiry, "comp_reason": reason}
 
 
 def create_access_token_tables_sql(backend: str) -> List[str]:
