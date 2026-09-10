@@ -110,5 +110,27 @@ class AccessTokenCreateRequest(BaseModel):
     note: Optional[str] = Field(default=None, max_length=200)
 
 
+class AccessTokenRevokeRequest(BaseModel):
+    """Revoking a code always stops further redemptions.
+
+    withdraw_access additionally takes back the access it already granted, from
+    everyone whose comp still traces to this code. It defaults to False because
+    the two are genuinely different intents and the destructive one should be
+    asked for explicitly.
+    """
+    withdraw_access: bool = False
+
+
+class AccessTokenBulkRevokeRequest(BaseModel):
+    """Revoke every still-redeemable code at once.
+
+    confirm must be the literal string "REVOKE ALL". This is the one action here
+    that cannot be aimed at a single code, so a mis-sent request should fail
+    rather than empty out every code the admin has issued.
+    """
+    confirm: str = Field(min_length=1, max_length=32)
+    withdraw_access: bool = False
+
+
 class RedeemAccessTokenRequest(BaseModel):
     code: str = Field(min_length=1, max_length=64)

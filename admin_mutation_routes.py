@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import sqlite3
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from admin_mutation_models import (
+    AccessTokenBulkRevokeRequest,
     AccessTokenCreateRequest,
+    AccessTokenRevokeRequest,
     AdminActionUserResponse,
     AdminUserDetailResponse,
     ClearReportResponse,
@@ -20,7 +22,11 @@ from admin_mutation_models import (
 from access_tokens import (
     create_access_token,
     list_access_tokens,
+    list_token_redemptions,
+    restore_access_token,
     revoke_access_token,
+    revoke_all_active_tokens,
+    revoke_redemption,
 )
 from admin_mutation_service import (
     clear_pickup_report,
@@ -160,13 +166,68 @@ def admin_list_access_tokens(
     return list_access_tokens(limit=limit, offset=offset, include_inactive=include_inactive)
 
 
+# Bulk revoke is declared before /access_tokens/{code}/revoke so "revoke_all"
+# cannot be captured as a {code} by the path matcher.
+@router.post("/access_tokens/revoke_all")
+def admin_revoke_all_access_tokens(
+    payload: AccessTokenBulkRevokeRequest,
+    admin: sqlite3.Row = Depends(require_admin_user),
+):
+    """Revoke every still-redeemable code. Requires confirm == "REVOKE ALL"."""
+    if payload.confirm.strip().upper() != "REVOKE ALL":
+        raise HTTPException(status_code=400, detail='Send confirm="REVOKE ALL" to revoke every active code')
+    return revoke_all_active_tokens(
+        actor_user_id=int(admin["id"]),
+        withdraw_access=payload.withdraw_access,
+    )
+
+
 @router.post("/access_tokens/{code}/revoke")
 def admin_revoke_access_token(
     code: str,
+    payload: AccessTokenRevokeRequest | None = None,
     admin: sqlite3.Row = Depends(require_admin_user),
 ):
-    """Stop a code being redeemed. Does not withdraw access already granted."""
-    return revoke_access_token(actor_user_id=int(admin["id"]), code=code)
+    """Stop a code being redeemed, and optionally take back what it granted.
+
+    The body is optional so the original no-body call still means "block future
+    redemptions only" -- that was the shipped behaviour and silently making it
+    destructive would be the worst possible upgrade.
+    """
+    return revoke_access_token(
+        actor_user_id=int(admin["id"]),
+        code=code,
+        withdraw_access=bool(payload.withdraw_access) if payload else False,
+    )
+
+
+@router.post("/access_tokens/{code}/restore")
+def admin_restore_access_token(
+    code: str,
+    admin: sqlite3.Row = Depends(require_admin_user),
+):
+    """Un-revoke a code, for a revoke made in error."""
+    return restore_access_token(actor_user_id=int(admin["id"]), code=code)
+
+
+@router.get("/access_tokens/{code}/redemptions")
+def admin_list_access_token_redemptions(
+    code: str,
+    admin: sqlite3.Row = Depends(require_admin_user),
+):
+    """Who redeemed this code, and whose access a withdrawal would remove."""
+    _ = admin
+    return list_token_redemptions(code)
+
+
+@router.post("/access_tokens/{code}/redemptions/{user_id}/revoke")
+def admin_revoke_access_token_redemption(
+    code: str,
+    user_id: int,
+    admin: sqlite3.Row = Depends(require_admin_user),
+):
+    """Take one redeemer's access back, leaving the code usable for others."""
+    return revoke_redemption(actor_user_id=int(admin["id"]), code=code, user_id=user_id)
 
 
 @router.get("/access_preflight")
