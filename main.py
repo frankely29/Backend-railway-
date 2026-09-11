@@ -6891,6 +6891,9 @@ from games_service import (
     get_battle_stats_for_user,
     get_viewer_game_relationship,
 )
+from social_db import init_social_schema
+from social_routes import router as social_router
+from social_service import set_user_city
 from work_battles_routes import router as work_battles_router
 from subscription_routes import router as subscription_router
 from subscription_webhooks import (
@@ -6920,6 +6923,7 @@ app.include_router(pickup_recording_router)
 app.include_router(city_events_router)
 app.include_router(games_router)
 app.include_router(work_battles_router)
+app.include_router(social_router)
 app.include_router(subscription_router)
 app.include_router(subscription_webhook_router)
 
@@ -6970,6 +6974,7 @@ def startup():
     ensure_pickup_recording_schema()
     ensure_games_schema()
     ensure_work_battles_schema()
+    init_social_schema()
     try:
         ensure_city_events_schema()
     except Exception:
@@ -9884,6 +9889,9 @@ class SignupPayload(BaseModel):
     email: str
     password: str
     display_name: Optional[str] = None
+    # Where the driver works. Optional so existing clients keep working; it is
+    # what routes them into a city feed instead of only the national one.
+    city: Optional[str] = None
     bootstrap_token: Optional[str] = None
 
 
@@ -9955,6 +9963,13 @@ def auth_signup(payload: SignupPayload):
     row = _db_query_one("SELECT * FROM users WHERE lower(email)=lower(?) LIMIT 1", (email,))
     if not row:
         raise HTTPException(status_code=500, detail="Signup created user but cannot load it")
+
+    # Best effort: a city that fails to save must not cost someone their signup.
+    if payload.city:
+        try:
+            set_user_city(int(row["id"]), payload.city)
+        except Exception:
+            print(f"[warn] could not set signup city for {email}")
 
     exp = now + TOKEN_TTL_SECONDS
     token = _make_token({"uid": int(row["id"]), "email": email, "exp": exp})
