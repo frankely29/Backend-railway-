@@ -6892,6 +6892,7 @@ from games_service import (
     get_viewer_game_relationship,
 )
 from social_db import init_social_schema
+from social_identity import backfill_handles, ensure_handle, ensure_identity_schema
 from social_routes import router as social_router
 from social_service import set_user_city
 from work_battles_routes import router as work_battles_router
@@ -6975,6 +6976,15 @@ def startup():
     ensure_games_schema()
     ensure_work_battles_schema()
     init_social_schema()
+    ensure_identity_schema()
+    try:
+        # Accounts that predate handles get one without having to log in and
+        # pick; a profile nobody can link to is what Phase 1 exists to fix.
+        granted = backfill_handles()
+        if granted:
+            print(f"[startup] assigned {granted} driver handles")
+    except Exception:
+        print("[warn] handle backfill failed (non-fatal)")
     try:
         ensure_city_events_schema()
     except Exception:
@@ -9964,7 +9974,13 @@ def auth_signup(payload: SignupPayload):
     if not row:
         raise HTTPException(status_code=500, detail="Signup created user but cannot load it")
 
-    # Best effort: a city that fails to save must not cost someone their signup.
+    # Best effort, both of them: neither a city nor a handle may cost someone
+    # their signup if it fails.
+    try:
+        ensure_handle(int(row["id"]), payload.display_name, email)
+    except Exception:
+        print(f"[warn] could not assign a handle at signup for {email}")
+
     if payload.city:
         try:
             set_user_city(int(row["id"]), payload.city)

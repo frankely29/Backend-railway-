@@ -16,11 +16,24 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Resp
 
 from core import require_user
 from media_store import THUMB_MIME_TYPE, derive_thumb_key
+from social_identity import (
+    PLATFORM_CHOICES,
+    VEHICLE_CHOICES,
+    handle_is_free,
+    set_handle,
+    suggest_handle,
+    update_identity,
+    validate_handle,
+)
 from social_models import (
     CreatePostPayload,
     FeedResponse,
     FeedScope,
     FollowResponse,
+    HandleAvailability,
+    IdentityOptionsResponse,
+    SetHandlePayload,
+    UpdateIdentityPayload,
     LikeResponse,
     OkResponse,
     PostResponse,
@@ -36,6 +49,7 @@ from social_service import (
     get_feed,
     get_post,
     get_profile,
+    get_profile_by_handle,
     get_user_posts,
     like_post,
     post_media_row,
@@ -219,3 +233,73 @@ def social_my_profile(user: sqlite3.Row = Depends(require_user)):
 def social_set_city(payload: SetCityPayload, user: sqlite3.Row = Depends(require_user)):
     set_user_city(int(user["id"]), payload.city)
     return {"ok": True}
+
+
+# --------------------------------------------------------------------------
+# identity
+# --------------------------------------------------------------------------
+
+@router.get("/social/users/by-handle/{handle}/profile", response_model=ProfileResponse)
+def social_profile_by_handle(handle: str, user: sqlite3.Row = Depends(require_user)):
+    """A handle is the name people link to, so it has to resolve to a profile."""
+    return {"ok": True, "profile": get_profile_by_handle(int(user["id"]), handle)}
+
+
+@router.get("/social/handles/{handle}/available", response_model=HandleAvailability)
+def social_handle_available(handle: str, user: sqlite3.Row = Depends(require_user)):
+    """Checked live while typing, so it answers rather than raising.
+
+    The validation rules return a 400 from validate_handle when a handle is
+    malformed; here that is not an error, it is the answer -- and the reason is
+    what the field shows underneath.
+    """
+    try:
+        display = validate_handle(handle)
+    except HTTPException as exc:
+        return {"ok": True, "handle": str(handle), "available": False,
+                "reason": str(exc.detail)}
+    free = handle_is_free(display, for_user_id=int(user["id"]))
+    return {"ok": True, "handle": display, "available": free,
+            "reason": None if free else "That handle is taken"}
+
+
+@router.post("/social/me/handle", response_model=ProfileResponse)
+def social_set_handle(payload: SetHandlePayload, user: sqlite3.Row = Depends(require_user)):
+    me = int(user["id"])
+    set_handle(me, payload.handle)
+    return {"ok": True, "profile": get_profile(me, me)}
+
+
+@router.get("/social/me/handle/suggest", response_model=HandleAvailability)
+def social_suggest_handle(user: sqlite3.Row = Depends(require_user)):
+    display_name = user["display_name"] if "display_name" in user.keys() else None
+    email = user["email"] if "email" in user.keys() else None
+    candidate = suggest_handle(display_name, email)
+    return {"ok": True, "handle": candidate, "available": True, "reason": None}
+
+
+@router.post("/social/me/identity", response_model=ProfileResponse)
+def social_update_identity(payload: UpdateIdentityPayload,
+                           user: sqlite3.Row = Depends(require_user)):
+    """Patch, not replace.
+
+    Reading `model_fields_set` is what separates "the client did not send a bio"
+    from "the client is clearing the bio" -- both arrive as None otherwise, and
+    conflating them means every partial save wipes the fields it did not touch.
+    """
+    sent = payload.model_fields_set
+    update_identity(
+        int(user["id"]),
+        bio=payload.bio if "bio" in sent else ...,
+        platforms=payload.platforms if "platforms" in sent else ...,
+        vehicle_type=payload.vehicle_type if "vehicle_type" in sent else ...,
+        driving_since_year=payload.driving_since_year if "driving_since_year" in sent else ...,
+    )
+    me = int(user["id"])
+    return {"ok": True, "profile": get_profile(me, me)}
+
+
+@router.get("/social/identity/options", response_model=IdentityOptionsResponse)
+def social_identity_options(user: sqlite3.Row = Depends(require_user)):
+    """The closed sets the client should render, rather than hard-coding them."""
+    return {"ok": True, "platforms": PLATFORM_CHOICES, "vehicle_types": VEHICLE_CHOICES}

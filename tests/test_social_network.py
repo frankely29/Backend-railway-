@@ -45,7 +45,10 @@ def app_env(monkeypatch):
         "core", "chat", "media_store",
         "leaderboard_db", "leaderboard_routes", "leaderboard_service", "leaderboard_tracker",
         "pickup_recording_feature", "games_models", "games_service", "games_routes",
-        "social_db", "social_models", "social_service", "social_routes",
+        # social_identity must be reloaded with the rest: it holds its own
+        # reference to core's _db_exec, so leaving it cached points this test at
+        # the previous test's torn-down database.
+        "social_db", "social_models", "social_service", "social_routes", "social_identity",
         "main",
     ]:
         sys.modules.pop(name, None)

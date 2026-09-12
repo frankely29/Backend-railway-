@@ -24,6 +24,7 @@ from fastapi import HTTPException, UploadFile
 
 from core import DB_BACKEND, _db_exec, _db_query_all, _db_query_one, _db_run_in_transaction, _sql
 from media_store import derive_thumb_key
+from social_identity import split_platforms
 from social_models import MAX_BODY_CHARS, MAX_CITY_CHARS, FeedScope
 
 # chat.py owns the vetted upload path; see the module docstring.
@@ -154,7 +155,8 @@ _POST_COLUMNS = """
     p.id AS id, p.user_id AS user_id, p.body AS body, p.image_path AS image_path,
     p.has_thumb AS has_thumb, p.lat AS lat, p.lng AS lng, p.zone_name AS zone_name,
     p.zone_rating AS zone_rating, p.created_at AS created_at,
-    u.display_name AS display_name, u.city AS author_city, u.avatar_url AS avatar_url
+    u.display_name AS display_name, u.handle AS handle, u.city AS author_city,
+    u.avatar_url AS avatar_url
 """
 
 
@@ -192,6 +194,7 @@ def _serialize(row: Any, viewer_id: int, counts: Dict[int, int], mine: set) -> D
         "author": {
             "user_id": author_id,
             "display_name": str(_row_value(row, "display_name", "Driver")),
+            "handle": _row_value(row, "handle"),
             "city": _row_value(row, "author_city"),
             "avatar_url": f"/avatars/thumb/{author_id}" if avatar else None,
         },
@@ -471,7 +474,8 @@ def _following_count(user_id: int) -> int:
 
 def _user_or_404(user_id: int) -> Any:
     row = _db_query_one(
-        "SELECT id, display_name, city, avatar_url FROM users WHERE id=? LIMIT 1",
+        "SELECT id, display_name, handle, city, avatar_url, bio, platforms, "
+        "vehicle_type, driving_since_year FROM users WHERE id=? LIMIT 1",
         (int(user_id),),
     )
     if not row:
@@ -512,6 +516,40 @@ def unfollow_user(follower_id: int, followee_id: int) -> Dict[str, Any]:
     }
 
 
+def _reputation_for(user_id: int) -> Dict[str, Any]:
+    """Level, rank, badge and lifetime totals, from the leaderboard service.
+
+    Imported lazily and wrapped: this is decoration on a profile, and a profile
+    that 500s because a badge cache is cold is a worse outcome than one that
+    renders without a badge. Every field is optional to the client.
+    """
+    out: Dict[str, Any] = {
+        "level": None, "rank_name": None, "title": None, "badge_code": None,
+        "lifetime_miles": None, "lifetime_hours": None, "trips_logged": None,
+    }
+    try:
+        from leaderboard_service import (
+            get_best_current_badge_for_user,
+            get_progression_for_user,
+        )
+        progression = get_progression_for_user(int(user_id)) or {}
+        out["level"] = progression.get("level")
+        out["rank_name"] = progression.get("rank_name")
+        out["title"] = progression.get("title")
+        out["lifetime_miles"] = progression.get("lifetime_miles")
+        out["lifetime_hours"] = progression.get("lifetime_hours")
+        out["trips_logged"] = progression.get("lifetime_pickups_recorded")
+    except Exception:
+        _LOGGER.warning("Could not read progression for profile", exc_info=True)
+    try:
+        from leaderboard_service import get_best_current_badge_for_user
+        out["badge_code"] = (get_best_current_badge_for_user(int(user_id)) or {}).get(
+            "leaderboard_badge_code")
+    except Exception:
+        _LOGGER.warning("Could not read badge for profile", exc_info=True)
+    return out
+
+
 def get_profile(viewer_id: int, user_id: int) -> Dict[str, Any]:
     row = _user_or_404(user_id)
     is_me = int(viewer_id) == int(user_id)
@@ -527,15 +565,31 @@ def get_profile(viewer_id: int, user_id: int) -> Dict[str, Any]:
     return {
         "user_id": int(user_id),
         "display_name": str(_row_value(row, "display_name", "Driver")),
+        "handle": _row_value(row, "handle"),
         "city": _row_value(row, "city"),
         "avatar_url": f"/avatars/thumb/{int(user_id)}" if avatar else None,
+        "bio": _row_value(row, "bio"),
+        "platforms": split_platforms(_row_value(row, "platforms")),
+        "vehicle_type": _row_value(row, "vehicle_type"),
+        "driving_since_year": _row_value(row, "driving_since_year"),
         "post_count": int(_row_value(posts, "n", 0)),
         "follower_count": _follower_count(user_id),
         # Private by product decision: how many people you follow is yours.
         "following_count": _following_count(user_id) if is_me else None,
         "followed_by_me": bool(followed),
         "is_me": is_me,
+        "reputation": _reputation_for(user_id),
     }
+
+
+def get_profile_by_handle(viewer_id: int, handle: str) -> Dict[str, Any]:
+    """A handle is the linkable name, so it has to resolve to a profile."""
+    from social_identity import handle_key as _key
+    row = _db_query_one(
+        "SELECT id FROM users WHERE handle_key=? LIMIT 1", (_key(handle),))
+    if not row:
+        raise HTTPException(status_code=404, detail="Driver not found")
+    return get_profile(int(viewer_id), int(_row_value(row, "id", 0)))
 
 
 def post_media_row(post_id: int) -> Any:
