@@ -6894,6 +6894,8 @@ from games_service import (
 from social_db import init_social_schema
 from social_identity import backfill_handles, ensure_handle, ensure_identity_schema
 from social_routes import router as social_router
+from social_admin_routes import router as social_admin_router
+from social_moderation import ensure_moderation_schema
 from social_service import set_user_city
 from work_battles_routes import router as work_battles_router
 from subscription_routes import router as subscription_router
@@ -6925,6 +6927,7 @@ app.include_router(city_events_router)
 app.include_router(games_router)
 app.include_router(work_battles_router)
 app.include_router(social_router)
+app.include_router(social_admin_router)
 app.include_router(subscription_router)
 app.include_router(subscription_webhook_router)
 
@@ -6977,6 +6980,7 @@ def startup():
     ensure_work_battles_schema()
     init_social_schema()
     ensure_identity_schema()
+    ensure_moderation_schema()
     try:
         # Accounts that predate handles get one without having to log in and
         # pick; a profile nobody can link to is what Phase 1 exists to fix.

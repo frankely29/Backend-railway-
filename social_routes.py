@@ -16,6 +16,17 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Resp
 
 from core import require_user
 from media_store import THUMB_MIME_TYPE, derive_thumb_key
+from social_moderation import (
+    REPORT_REASONS,
+    REPORT_TARGETS,
+    block_user,
+    create_report,
+    list_blocked,
+    list_muted,
+    mute_user,
+    unblock_user,
+    unmute_user,
+)
 from social_identity import (
     PLATFORM_CHOICES,
     VEHICLE_CHOICES,
@@ -32,6 +43,11 @@ from social_models import (
     FollowResponse,
     HandleAvailability,
     IdentityOptionsResponse,
+    RelationshipListResponse,
+    RelationshipResponse,
+    ReportCreated,
+    ReportOptionsResponse,
+    ReportPayload,
     SetHandlePayload,
     UpdateIdentityPayload,
     LikeResponse,
@@ -162,7 +178,7 @@ def _serve(target, media_type: str, request: Request) -> Response:
 
 @router.api_route("/social/posts/{post_id}/image", methods=["GET", "HEAD"])
 def social_post_image(post_id: int, request: Request, user: sqlite3.Row = Depends(require_user)):
-    row = post_media_row(post_id)
+    row = post_media_row(post_id, int(user["id"]))
     return _serve(
         _resolve_image_path(str(_row_value(row, "image_path"))),
         str(_row_value(row, "image_mime_type", "") or ""),
@@ -178,7 +194,7 @@ def social_post_image_thumb(post_id: int, request: Request, user: sqlite3.Row = 
     serving the full image is slower but correct, and 404 here would leave a
     hole in the feed for something that is only a size optimisation.
     """
-    row = post_media_row(post_id)
+    row = post_media_row(post_id, int(user["id"]))
     image_path = str(_row_value(row, "image_path"))
     thumb = _resolve_image_path(derive_thumb_key(image_path))
     if thumb.exists() and thumb.is_file():
@@ -303,3 +319,51 @@ def social_update_identity(payload: UpdateIdentityPayload,
 def social_identity_options(user: sqlite3.Row = Depends(require_user)):
     """The closed sets the client should render, rather than hard-coding them."""
     return {"ok": True, "platforms": PLATFORM_CHOICES, "vehicle_types": VEHICLE_CHOICES}
+
+
+# --------------------------------------------------------------------------
+# block, mute, report
+# --------------------------------------------------------------------------
+
+@router.post("/social/users/{user_id}/block", response_model=RelationshipResponse)
+def social_block(user_id: int, user: sqlite3.Row = Depends(require_user)):
+    """Mutual and structural: it also severs the follows in both directions."""
+    return {"ok": True, **block_user(int(user["id"]), user_id)}
+
+
+@router.delete("/social/users/{user_id}/block", response_model=RelationshipResponse)
+def social_unblock(user_id: int, user: sqlite3.Row = Depends(require_user)):
+    return {"ok": True, **unblock_user(int(user["id"]), user_id)}
+
+
+@router.post("/social/users/{user_id}/mute", response_model=RelationshipResponse)
+def social_mute(user_id: int, user: sqlite3.Row = Depends(require_user)):
+    """One-way and silent. Their posts leave your feed; nothing else changes."""
+    return {"ok": True, **mute_user(int(user["id"]), user_id)}
+
+
+@router.delete("/social/users/{user_id}/mute", response_model=RelationshipResponse)
+def social_unmute(user_id: int, user: sqlite3.Row = Depends(require_user)):
+    return {"ok": True, **unmute_user(int(user["id"]), user_id)}
+
+
+@router.get("/social/me/blocked", response_model=RelationshipListResponse)
+def social_list_blocked(user: sqlite3.Row = Depends(require_user)):
+    return {"ok": True, "items": list_blocked(int(user["id"]))}
+
+
+@router.get("/social/me/muted", response_model=RelationshipListResponse)
+def social_list_muted(user: sqlite3.Row = Depends(require_user)):
+    return {"ok": True, "items": list_muted(int(user["id"]))}
+
+
+@router.post("/social/reports", response_model=ReportCreated)
+def social_report(payload: ReportPayload, user: sqlite3.Row = Depends(require_user)):
+    return {"ok": True, **create_report(
+        int(user["id"]), payload.target_type, payload.target_id,
+        payload.reason, payload.note)}
+
+
+@router.get("/social/reports/options", response_model=ReportOptionsResponse)
+def social_report_options(user: sqlite3.Row = Depends(require_user)):
+    return {"ok": True, "reasons": REPORT_REASONS, "targets": REPORT_TARGETS}

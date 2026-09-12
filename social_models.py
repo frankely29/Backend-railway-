@@ -159,5 +159,97 @@ class IdentityOptionsResponse(BaseModel):
     vehicle_types: List[str] = []
 
 
+class ReportPayload(BaseModel):
+    target_type: str
+    target_id: int
+    reason: str
+    note: Optional[str] = Field(default=None, max_length=500)
+
+
+class ReportCreated(BaseModel):
+    ok: bool = True
+    report_id: int
+    # True when this person already had an open report on this thing. Reported
+    # as success, not as an error: tapping Report twice is not a mistake worth
+    # showing someone an error for.
+    duplicate: bool = False
+
+
+class RelationshipResponse(BaseModel):
+    ok: bool = True
+    user_id: int
+    blocked: Optional[bool] = None
+    muted: Optional[bool] = None
+
+
+class MutedOrBlockedUser(BaseModel):
+    user_id: int
+    display_name: str
+    handle: Optional[str] = None
+    created_at: int
+
+
+class RelationshipListResponse(BaseModel):
+    ok: bool = True
+    items: List[MutedOrBlockedUser] = []
+
+
+class ReportOptionsResponse(BaseModel):
+    ok: bool = True
+    reasons: List[str] = []
+    targets: List[str] = []
+
+
+class ReportItem(BaseModel):
+    id: int
+    reporter_id: int
+    reporter_name: Optional[str] = None
+    target_type: str
+    target_id: int
+    target_user_id: Optional[int] = None
+    target_name: Optional[str] = None
+    target_handle: Optional[str] = None
+    reason: str
+    note: Optional[str] = None
+    status: str
+    created_at: int
+    resolved_at: Optional[int] = None
+    resolved_by: Optional[int] = None
+    resolution: Optional[str] = None
+
+
+class ReportQueueResponse(BaseModel):
+    ok: bool = True
+    items: List[ReportItem] = []
+    next_before_id: Optional[int] = None
+    open_count: int = 0
+
+
+class ResolveReportPayload(BaseModel):
+    status: str
+    resolution: Optional[str] = Field(default=None, max_length=500)
+
+
+class HidePostPayload(BaseModel):
+    reason: Optional[str] = Field(default=None, max_length=500)
+
+
+class ReportCountResponse(BaseModel):
+    ok: bool = True
+    open_count: int = 0
+
+
+class ResolveReportResponse(BaseModel):
+    ok: bool = True
+    report_id: int
+    status: str
+
+
+class HidePostResponse(BaseModel):
+    ok: bool = True
+    post_id: int
+    hidden: bool
+
+
 class OkResponse(BaseModel):
     ok: bool = True

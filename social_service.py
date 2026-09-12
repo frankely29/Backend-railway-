@@ -25,6 +25,7 @@ from fastapi import HTTPException, UploadFile
 from core import DB_BACKEND, _db_exec, _db_query_all, _db_query_one, _db_run_in_transaction, _sql
 from media_store import derive_thumb_key
 from social_identity import split_platforms
+from social_moderation import hidden_author_ids, is_blocked_either_way
 from social_models import MAX_BODY_CHARS, MAX_CITY_CHARS, FeedScope
 
 # chat.py owns the vetted upload path; see the module docstring.
@@ -160,6 +161,25 @@ _POST_COLUMNS = """
 """
 
 
+
+def _visibility_clause(viewer_id: int) -> Tuple[str, List[Any]]:
+    """SQL that removes what this viewer must not see: moderator-hidden posts,
+    plus anyone they blocked, anyone who blocked them, and anyone they muted.
+
+    Returned as a fragment rather than applied inside one query, because the
+    same rule has to hold for the feed, a profile's posts and a single post --
+    and a rule enforced in only two of three places is not enforced.
+    """
+    parts = ["p.hidden_at IS NULL"]
+    params: List[Any] = []
+    hidden = hidden_author_ids(int(viewer_id))
+    if hidden:
+        placeholders = ",".join("?" for _ in hidden)
+        parts.append(f"p.user_id NOT IN ({placeholders})")
+        params.extend(int(uid) for uid in hidden)
+    return " AND ".join(parts), params
+
+
 def _like_state(post_ids: Sequence[int], viewer_id: int) -> Tuple[Dict[int, int], set]:
     """Two queries for the whole page: how many likes, and which ones are mine."""
     if not post_ids:
@@ -237,8 +257,9 @@ def get_feed(viewer_id: int, scope: FeedScope, limit: Optional[int] = None,
     limit = _clamp_limit(limit)
     fetch = limit + 1
     viewer_id = int(viewer_id)
-    where = ["p.deleted_at IS NULL"]
-    params: List[Any] = []
+    visibility, visibility_params = _visibility_clause(viewer_id)
+    where = ["p.deleted_at IS NULL", visibility]
+    params: List[Any] = list(visibility_params)
 
     if scope == FeedScope.following:
         # Your own posts belong in your timeline. A feed that hides what you
@@ -272,8 +293,9 @@ def get_feed(viewer_id: int, scope: FeedScope, limit: Optional[int] = None,
 def get_user_posts(viewer_id: int, author_id: int, limit: Optional[int] = None,
                    before_id: Optional[int] = None) -> Dict[str, Any]:
     limit = _clamp_limit(limit)
-    where = ["p.deleted_at IS NULL", "p.user_id = ?"]
-    params: List[Any] = [int(author_id)]
+    visibility, visibility_params = _visibility_clause(viewer_id)
+    where = ["p.deleted_at IS NULL", visibility, "p.user_id = ?"]
+    params: List[Any] = list(visibility_params) + [int(author_id)]
     if before_id:
         where.append("p.id < ?")
         params.append(int(before_id))
@@ -286,10 +308,11 @@ def get_user_posts(viewer_id: int, author_id: int, limit: Optional[int] = None,
 
 
 def get_post(viewer_id: int, post_id: int) -> Dict[str, Any]:
+    visibility, visibility_params = _visibility_clause(viewer_id)
     row = _db_query_one(
         f"SELECT {_POST_COLUMNS} FROM posts p JOIN users u ON u.id = p.user_id "
-        f"WHERE p.id=? AND p.deleted_at IS NULL LIMIT 1",
-        (int(post_id),),
+        f"WHERE p.id=? AND p.deleted_at IS NULL AND {visibility} LIMIT 1",
+        (int(post_id),) + tuple(visibility_params),
     )
     if not row:
         raise HTTPException(status_code=404, detail="Post not found")
@@ -487,6 +510,10 @@ def follow_user(follower_id: int, followee_id: int) -> Dict[str, Any]:
     if int(follower_id) == int(followee_id):
         raise HTTPException(status_code=400, detail="You can't follow yourself")
     _user_or_404(followee_id)
+    if is_blocked_either_way(int(follower_id), int(followee_id)):
+        # Symmetric on purpose: it must not be possible to work out that someone
+        # blocked you by watching which follows succeed.
+        raise HTTPException(status_code=403, detail="You can't follow this driver")
     existing = _db_query_one(
         "SELECT follower_id FROM follows WHERE follower_id=? AND followee_id=? LIMIT 1",
         (int(follower_id), int(followee_id)),
@@ -553,6 +580,10 @@ def _reputation_for(user_id: int) -> Dict[str, Any]:
 def get_profile(viewer_id: int, user_id: int) -> Dict[str, Any]:
     row = _user_or_404(user_id)
     is_me = int(viewer_id) == int(user_id)
+    if not is_me and is_blocked_either_way(int(viewer_id), int(user_id)):
+        # 404 rather than 403: "this person blocked you" is itself information,
+        # and handing it over turns a block into a notification.
+        raise HTTPException(status_code=404, detail="Driver not found")
     posts = _db_query_one(
         "SELECT COUNT(*) AS n FROM posts WHERE user_id=? AND deleted_at IS NULL",
         (int(user_id),),
@@ -592,13 +623,22 @@ def get_profile_by_handle(viewer_id: int, handle: str) -> Dict[str, Any]:
     return get_profile(int(viewer_id), int(_row_value(row, "id", 0)))
 
 
-def post_media_row(post_id: int) -> Any:
-    """For the image routes: the media columns of a post that still exists."""
+def post_media_row(post_id: int, viewer_id: Optional[int] = None) -> Any:
+    """The media columns of a post this viewer is allowed to see.
+
+    The visibility rule has to reach the bytes too. Filtering a blocked author
+    out of the feed while still serving their photo to anyone holding the URL
+    is not a block, it is a hidden link.
+    """
     row = _db_query_one(
-        "SELECT id, image_path, image_mime_type, has_thumb FROM posts "
-        "WHERE id=? AND deleted_at IS NULL LIMIT 1",
+        "SELECT id, user_id, image_path, image_mime_type, has_thumb FROM posts "
+        "WHERE id=? AND deleted_at IS NULL AND hidden_at IS NULL LIMIT 1",
         (int(post_id),),
     )
     if not row or not _row_value(row, "image_path"):
         raise HTTPException(status_code=404, detail="Image not found")
+    if viewer_id is not None:
+        author_id = int(_row_value(row, "user_id", 0))
+        if author_id != int(viewer_id) and is_blocked_either_way(int(viewer_id), author_id):
+            raise HTTPException(status_code=404, detail="Image not found")
     return row
