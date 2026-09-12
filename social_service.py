@@ -100,6 +100,24 @@ def clean_body(body: Optional[str]) -> str:
     return str(body).strip()[:MAX_BODY_CHARS]
 
 
+def _returned_id(cur: Any) -> int:
+    """The id from a Postgres `RETURNING id`, whatever shape the row comes in.
+
+    The connection pool is built with cursor_factory=RealDictCursor, so rows are
+    dict-like and `cur.fetchone()[0]` raises KeyError. That is not a subtle
+    failure -- it is a 500 on every write that uses RETURNING -- but it is an
+    INVISIBLE one, because SQLite hands back tuples and every test runs on
+    SQLite. Both shapes are handled here so one helper covers every call site.
+    """
+    row = cur.fetchone()
+    if row is None:
+        raise HTTPException(status_code=500, detail="Row could not be saved")
+    try:
+        return int(row["id"])
+    except (TypeError, KeyError, IndexError):
+        return int(list(dict(row).values())[0] if hasattr(row, "keys") else row[0])
+
+
 def _clamp_limit(limit: Optional[int]) -> int:
     try:
         value = int(limit) if limit is not None else DEFAULT_PAGE
@@ -425,7 +443,12 @@ def create_post(user: Any, body: Optional[str], lat: Optional[float] = None,
                 _sql(f"INSERT INTO posts({columns}) VALUES(?,?,?,?,?,?,?,?,?,?) RETURNING id"),
                 values,
             )
-            return int(cur.fetchone()[0])
+            # dict(...)["id"], NOT [0]. The pool is built with
+            # cursor_factory=RealDictCursor, so every Postgres row is dict-like
+            # and [0] raises KeyError -- which is a 500 on every post. SQLite
+            # returns tuples, so the whole test suite passed while production
+            # could not create a single post. chat.py does it this way already.
+            return int(_returned_id(cur))
         cur.execute(_sql(f"INSERT INTO posts({columns}) VALUES(?,?,?,?,?,?,?,?,?,?)"), values)
         return int(cur.lastrowid)
 
@@ -846,7 +869,7 @@ def create_comment(user: Any, post_id: int, body: str) -> Dict[str, Any]:
         # the same second.
         if DB_BACKEND == "postgres":
             cur.execute(_sql(f"INSERT INTO post_comments({columns}) VALUES(?,?,?,?) RETURNING id"), values)
-            return int(cur.fetchone()[0])
+            return int(_returned_id(cur))
         cur.execute(_sql(f"INSERT INTO post_comments({columns}) VALUES(?,?,?,?)"), values)
         return int(cur.lastrowid)
 
