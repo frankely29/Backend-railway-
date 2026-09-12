@@ -157,7 +157,7 @@ _POST_COLUMNS = """
     p.has_thumb AS has_thumb, p.lat AS lat, p.lng AS lng, p.zone_name AS zone_name,
     p.zone_rating AS zone_rating, p.created_at AS created_at,
     u.display_name AS display_name, u.handle AS handle, u.city AS author_city,
-    u.avatar_url AS avatar_url
+    u.avatar_url AS avatar_url, u.platforms AS author_platforms
 """
 
 
@@ -204,7 +204,36 @@ def _like_state(post_ids: Sequence[int], viewer_id: int) -> Tuple[Dict[int, int]
     return counts, mine
 
 
-def _serialize(row: Any, viewer_id: int, counts: Dict[int, int], mine: set) -> Dict[str, Any]:
+def _author_levels(author_ids: Sequence[int]) -> Dict[int, Optional[int]]:
+    """Driving level for each author on the page, in one query.
+
+    This is what makes a driver network different from a photo app: you can see
+    that the person telling you the lot is moving has actually driven. But it is
+    still decoration -- a cold or broken progression cache must degrade to a card
+    without a badge, never to a feed that 500s. Hence the blanket except.
+
+    Batched deliberately. _reputation_for() is per-user, and calling it inside
+    the serializer would be one leaderboard round trip per post.
+    """
+    ids = sorted({int(uid) for uid in author_ids})
+    if not ids:
+        return {}
+    try:
+        from leaderboard_service import get_progression_for_users
+        progression = get_progression_for_users(ids) or {}
+    except Exception:
+        _LOGGER.warning("Could not read progression for a feed page", exc_info=True)
+        return {}
+    out: Dict[int, Optional[int]] = {}
+    for uid in ids:
+        entry = progression.get(uid) or progression.get(str(uid)) or {}
+        level = entry.get("level")
+        out[uid] = int(level) if isinstance(level, (int, float)) else None
+    return out
+
+
+def _serialize(row: Any, viewer_id: int, counts: Dict[int, int], mine: set,
+               levels: Optional[Dict[int, Optional[int]]] = None) -> Dict[str, Any]:
     post_id = int(_row_value(row, "id", 0))
     author_id = int(_row_value(row, "user_id", 0))
     image_url, thumb_url = _image_urls(post_id, _row_value(row, "image_path"), _row_value(row, "has_thumb"))
@@ -217,6 +246,10 @@ def _serialize(row: Any, viewer_id: int, counts: Dict[int, int], mine: set) -> D
             "handle": _row_value(row, "handle"),
             "city": _row_value(row, "author_city"),
             "avatar_url": f"/avatars/thumb/{author_id}" if avatar else None,
+            # Who is talking, not just what they said. Both optional: a driver
+            # with no trips logged and no platform set still posts.
+            "level": (levels or {}).get(author_id),
+            "platforms": split_platforms(_row_value(row, "author_platforms")),
         },
         "body": str(_row_value(row, "body", "")),
         "image_url": image_url,
@@ -241,7 +274,8 @@ def _page(rows: Iterable[Any], viewer_id: int, limit: int) -> Dict[str, Any]:
     rows = rows[:limit]
     post_ids = [int(_row_value(r, "id", 0)) for r in rows]
     counts, mine = _like_state(post_ids, viewer_id)
-    items = [_serialize(r, viewer_id, counts, mine) for r in rows]
+    levels = _author_levels([int(_row_value(r, "user_id", 0)) for r in rows])
+    items = [_serialize(r, viewer_id, counts, mine, levels) for r in rows]
     return {
         "items": items,
         "next_before_id": post_ids[-1] if (has_more and post_ids) else None,
@@ -317,7 +351,11 @@ def get_post(viewer_id: int, post_id: int) -> Dict[str, Any]:
     if not row:
         raise HTTPException(status_code=404, detail="Post not found")
     counts, mine = _like_state([int(post_id)], int(viewer_id))
-    return _serialize(row, int(viewer_id), counts, mine)
+    # The same post has to look the same however it was fetched. Skipping the
+    # level here would drop the badge the moment a driver opened a post from
+    # the feed that had one.
+    author_id = int(_row_value(row, "user_id", 0))
+    return _serialize(row, int(viewer_id), counts, mine, _author_levels([author_id]))
 
 
 # --------------------------------------------------------------------------
