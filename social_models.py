@@ -9,6 +9,8 @@ from pydantic import BaseModel, Field
 MAX_BODY_CHARS = 2000
 MAX_CITY_CHARS = 80
 MAX_ZONE_NAME_CHARS = 120
+MAX_HANDLE_CHARS = 20
+MAX_BIO_CHARS = 200
 
 
 class FeedScope(str, Enum):
@@ -38,6 +40,7 @@ class SetCityPayload(BaseModel):
 class PostAuthor(BaseModel):
     user_id: int
     display_name: str
+    handle: Optional[str] = None
     city: Optional[str] = None
     avatar_url: Optional[str] = None
 
@@ -85,11 +88,52 @@ class FollowResponse(BaseModel):
     follower_count: int
 
 
+class Reputation(BaseModel):
+    """Driving history as social proof — the thing a generic photo app cannot
+    show. Every field is optional: a cold badge cache must not break a profile."""
+
+    level: Optional[int] = None
+    rank_name: Optional[str] = None
+    title: Optional[str] = None
+    badge_code: Optional[str] = None
+    lifetime_miles: Optional[float] = None
+    lifetime_hours: Optional[float] = None
+    trips_logged: Optional[int] = None
+
+
+class SetHandlePayload(BaseModel):
+    handle: str = Field(min_length=1, max_length=MAX_HANDLE_CHARS + 1)
+
+
+class UpdateIdentityPayload(BaseModel):
+    """Patch semantics — an omitted field is left alone, an explicit null clears
+    it. That distinction is why every field defaults to None AND the route reads
+    `model_fields_set` rather than the values."""
+
+    bio: Optional[str] = Field(default=None, max_length=MAX_BIO_CHARS)
+    platforms: Optional[List[str]] = None
+    vehicle_type: Optional[str] = None
+    driving_since_year: Optional[int] = None
+
+
+class HandleAvailability(BaseModel):
+    ok: bool = True
+    handle: str
+    available: bool
+    reason: Optional[str] = None
+
+
 class Profile(BaseModel):
     user_id: int
     display_name: str
+    handle: Optional[str] = None
     city: Optional[str] = None
     avatar_url: Optional[str] = None
+    bio: Optional[str] = None
+    platforms: List[str] = []
+    vehicle_type: Optional[str] = None
+    driving_since_year: Optional[int] = None
+    reputation: Optional[Reputation] = None
     post_count: int = 0
     follower_count: int = 0
     # Only ever populated for the profile's owner. The product decision is that
@@ -104,6 +148,15 @@ class Profile(BaseModel):
 class ProfileResponse(BaseModel):
     ok: bool = True
     profile: Profile
+
+
+class IdentityOptionsResponse(BaseModel):
+    """The closed sets, served rather than hard-coded in the client -- otherwise
+    adding a platform means shipping a frontend release."""
+
+    ok: bool = True
+    platforms: List[str] = []
+    vehicle_types: List[str] = []
 
 
 class OkResponse(BaseModel):
