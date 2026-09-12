@@ -37,6 +37,11 @@ from social_identity import (
     validate_handle,
 )
 from social_models import (
+    Comment,
+    CommentCountResponse,
+    CommentResponse,
+    CommentsResponse,
+    CreateCommentPayload,
     CreatePostPayload,
     FeedResponse,
     FeedScope,
@@ -59,8 +64,11 @@ from social_models import (
 from social_service import (
     _resolve_image_path,
     _row_value,
+    create_comment,
     create_post,
+    delete_comment,
     delete_post,
+    get_comments,
     follow_user,
     get_feed,
     get_post,
@@ -209,6 +217,38 @@ def social_post_image_thumb(post_id: int, request: Request, user: sqlite3.Row = 
 # --------------------------------------------------------------------------
 # likes
 # --------------------------------------------------------------------------
+
+# --------------------------------------------------------------------------
+# comments
+# --------------------------------------------------------------------------
+
+@router.get("/social/posts/{post_id}/comments", response_model=CommentsResponse)
+def social_comments(
+    post_id: int,
+    limit: Optional[int] = None,
+    after_id: Optional[int] = None,
+    user: sqlite3.Row = Depends(require_user),
+):
+    """Oldest first, paging forwards.
+
+    A conversation is read in the order it happened, and paging forwards means
+    a new reply lands at the end where the reader already is, rather than
+    shifting everything above it.
+    """
+    return {"ok": True, **get_comments(int(user["id"]), post_id, limit=limit, after_id=after_id)}
+
+
+@router.post("/social/posts/{post_id}/comments", response_model=CommentResponse)
+def social_create_comment(post_id: int, payload: CreateCommentPayload,
+                          user: sqlite3.Row = Depends(require_user)):
+    return {"ok": True, **create_comment(user, post_id, payload.body)}
+
+
+@router.delete("/social/comments/{comment_id}", response_model=CommentCountResponse)
+def social_delete_comment(comment_id: int, user: sqlite3.Row = Depends(require_user)):
+    """Your own comment, or anything under your own post."""
+    return {"ok": True, **delete_comment(int(user["id"]), comment_id)}
+
 
 @router.post("/social/posts/{post_id}/like", response_model=LikeResponse)
 def social_like(post_id: int, user: sqlite3.Row = Depends(require_user)):

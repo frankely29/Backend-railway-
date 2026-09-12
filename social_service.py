@@ -26,7 +26,7 @@ from core import DB_BACKEND, _db_exec, _db_query_all, _db_query_one, _db_run_in_
 from media_store import derive_thumb_key
 from social_identity import split_platforms
 from social_moderation import hidden_author_ids, is_blocked_either_way
-from social_models import MAX_BODY_CHARS, MAX_CITY_CHARS, FeedScope
+from social_models import MAX_BODY_CHARS, MAX_CITY_CHARS, MAX_COMMENT_CHARS, FeedScope
 
 # chat.py owns the vetted upload path; see the module docstring.
 from chat import (  # noqa: F401  (re-exported for tests)
@@ -233,7 +233,8 @@ def _author_levels(author_ids: Sequence[int]) -> Dict[int, Optional[int]]:
 
 
 def _serialize(row: Any, viewer_id: int, counts: Dict[int, int], mine: set,
-               levels: Optional[Dict[int, Optional[int]]] = None) -> Dict[str, Any]:
+               levels: Optional[Dict[int, Optional[int]]] = None,
+               comments: Optional[Dict[int, int]] = None) -> Dict[str, Any]:
     post_id = int(_row_value(row, "id", 0))
     author_id = int(_row_value(row, "user_id", 0))
     image_url, thumb_url = _image_urls(post_id, _row_value(row, "image_path"), _row_value(row, "has_thumb"))
@@ -261,6 +262,9 @@ def _serialize(row: Any, viewer_id: int, counts: Dict[int, int], mine: set,
         "zone_rating": _row_value(row, "zone_rating"),
         "like_count": counts.get(post_id, 0),
         "liked_by_me": post_id in mine,
+        # From this viewer's point of view: comments by people they blocked are
+        # excluded, so the number under a post matches what opening it shows.
+        "comment_count": (comments or {}).get(post_id, 0),
         "mine": author_id == int(viewer_id),
         "created_at": int(_row_value(row, "created_at", 0)),
     }
@@ -275,7 +279,8 @@ def _page(rows: Iterable[Any], viewer_id: int, limit: int) -> Dict[str, Any]:
     post_ids = [int(_row_value(r, "id", 0)) for r in rows]
     counts, mine = _like_state(post_ids, viewer_id)
     levels = _author_levels([int(_row_value(r, "user_id", 0)) for r in rows])
-    items = [_serialize(r, viewer_id, counts, mine, levels) for r in rows]
+    comments = comment_counts(post_ids, viewer_id)
+    items = [_serialize(r, viewer_id, counts, mine, levels, comments) for r in rows]
     return {
         "items": items,
         "next_before_id": post_ids[-1] if (has_more and post_ids) else None,
@@ -355,7 +360,8 @@ def get_post(viewer_id: int, post_id: int) -> Dict[str, Any]:
     # level here would drop the badge the moment a driver opened a post from
     # the feed that had one.
     author_id = int(_row_value(row, "user_id", 0))
-    return _serialize(row, int(viewer_id), counts, mine, _author_levels([author_id]))
+    return _serialize(row, int(viewer_id), counts, mine, _author_levels([author_id]),
+                      comment_counts([int(post_id)], int(viewer_id)))
 
 
 # --------------------------------------------------------------------------
@@ -680,3 +686,212 @@ def post_media_row(post_id: int, viewer_id: Optional[int] = None) -> Any:
         if author_id != int(viewer_id) and is_blocked_either_way(int(viewer_id), author_id):
             raise HTTPException(status_code=404, detail="Image not found")
     return row
+
+
+# --------------------------------------------------------------------------
+# comments
+# --------------------------------------------------------------------------
+
+_COMMENT_COLUMNS = """
+    c.id AS id, c.post_id AS post_id, c.user_id AS user_id, c.body AS body,
+    c.created_at AS created_at,
+    u.display_name AS display_name, u.handle AS handle, u.city AS author_city,
+    u.avatar_url AS avatar_url, u.platforms AS author_platforms
+"""
+
+
+def _comment_visibility(viewer_id: int) -> Tuple[str, List[Any]]:
+    """The same rule the feed uses, on comments.
+
+    A block that hides someone's posts but still shows their replies under
+    yours is not a block. Written as a fragment for the same reason
+    _visibility_clause is: a rule enforced in some of the places is not
+    enforced.
+    """
+    parts = ["c.deleted_at IS NULL", "c.hidden_at IS NULL"]
+    params: List[Any] = []
+    hidden = hidden_author_ids(int(viewer_id))
+    if hidden:
+        placeholders = ",".join("?" for _ in hidden)
+        parts.append(f"c.user_id NOT IN ({placeholders})")
+        params.extend(int(uid) for uid in hidden)
+    return " AND ".join(parts), params
+
+
+def comment_counts(post_ids: Sequence[int], viewer_id: int) -> Dict[int, int]:
+    """How many comments each post has, from this viewer's point of view.
+
+    Blocked and muted authors are excluded here too, so the number under a post
+    matches the number of comments that actually appear when it is opened. A
+    count of 3 that opens to 1 reads as a bug.
+
+    One grouped query for the whole page, like the like counts -- and no
+    denormalised column, for the same reason: counters drift, joins do not.
+    """
+    ids = [int(pid) for pid in post_ids]
+    if not ids:
+        return {}
+    visibility, visibility_params = _comment_visibility(int(viewer_id))
+    placeholders = ",".join("?" for _ in ids)
+    rows = _db_query_all(
+        f"SELECT c.post_id AS post_id, COUNT(*) AS n FROM post_comments c "
+        f"WHERE c.post_id IN ({placeholders}) AND {visibility} GROUP BY c.post_id",
+        tuple(ids) + tuple(visibility_params),
+    )
+    out: Dict[int, int] = {}
+    for row in rows:
+        out[int(_row_value(row, "post_id", 0))] = int(_row_value(row, "n", 0))
+    return out
+
+
+def _serialize_comment(row: Any, viewer_id: int, post_author_id: int,
+                       levels: Optional[Dict[int, Optional[int]]] = None) -> Dict[str, Any]:
+    author_id = int(_row_value(row, "user_id", 0))
+    avatar = _row_value(row, "avatar_url")
+    mine = author_id == int(viewer_id)
+    return {
+        "id": int(_row_value(row, "id", 0)),
+        "post_id": int(_row_value(row, "post_id", 0)),
+        "author": {
+            "user_id": author_id,
+            "display_name": str(_row_value(row, "display_name", "Driver")),
+            "handle": _row_value(row, "handle"),
+            "city": _row_value(row, "author_city"),
+            "avatar_url": f"/avatars/thumb/{author_id}" if avatar else None,
+            "level": (levels or {}).get(author_id),
+            "platforms": split_platforms(_row_value(row, "author_platforms")),
+        },
+        "body": str(_row_value(row, "body", "")),
+        "mine": mine,
+        # Your own comment, or anything under your own post. Sent rather than
+        # left to the client to work out, so it cannot offer a delete that 403s.
+        "can_delete": mine or int(post_author_id) == int(viewer_id),
+        "created_at": int(_row_value(row, "created_at", 0)),
+    }
+
+
+def get_comments(viewer_id: int, post_id: int, limit: Optional[int] = None,
+                 after_id: Optional[int] = None) -> Dict[str, Any]:
+    """A page of comments, oldest first.
+
+    Forwards, unlike the feed: a conversation is read in the order it happened,
+    and paging forwards means new replies land at the end where a reader is
+    already looking, instead of shifting everything they have read.
+    """
+    post = _live_post_or_404(post_id)
+    # A post you cannot see has no comments you can see. Without this, a blocked
+    # author's post is invisible in the feed but readable by id.
+    post_visibility, post_params = _visibility_clause(int(viewer_id))
+    visible = _db_query_one(
+        f"SELECT p.id FROM posts p WHERE p.id=? AND p.deleted_at IS NULL AND {post_visibility} LIMIT 1",
+        (int(post_id),) + tuple(post_params),
+    )
+    if not visible:
+        raise HTTPException(status_code=404, detail="Post not found")
+
+    limit = _clamp_limit(limit)
+    fetch = limit + 1
+    visibility, visibility_params = _comment_visibility(int(viewer_id))
+    where = [f"c.post_id = ?", visibility]
+    params: List[Any] = [int(post_id)] + list(visibility_params)
+    if after_id:
+        where.append("c.id > ?")
+        params.append(int(after_id))
+
+    rows = list(_db_query_all(
+        f"SELECT {_COMMENT_COLUMNS} FROM post_comments c JOIN users u ON u.id = c.user_id "
+        f"WHERE {' AND '.join(where)} ORDER BY c.id ASC LIMIT ?",
+        tuple(params) + (fetch,),
+    ))
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    post_author_id = int(_row_value(post, "user_id", 0))
+    levels = _author_levels([int(_row_value(r, "user_id", 0)) for r in rows])
+    items = [_serialize_comment(r, viewer_id, post_author_id, levels) for r in rows]
+    return {
+        "post_id": int(post_id),
+        "items": items,
+        "next_after_id": items[-1]["id"] if (has_more and items) else None,
+        "comment_count": comment_counts([int(post_id)], int(viewer_id)).get(int(post_id), 0),
+    }
+
+
+def create_comment(user: Any, post_id: int, body: str) -> Dict[str, Any]:
+    post = _live_post_or_404(post_id)
+    viewer_id = int(_row_value(user, "id", 0))
+
+    # You cannot reply to a post you are not allowed to see, and the check has
+    # to be here rather than only on the read path: otherwise a blocked driver
+    # can still put words under someone's photo.
+    post_visibility, post_params = _visibility_clause(viewer_id)
+    visible = _db_query_one(
+        f"SELECT p.id FROM posts p WHERE p.id=? AND p.deleted_at IS NULL AND {post_visibility} LIMIT 1",
+        (int(post_id),) + tuple(post_params),
+    )
+    if not visible:
+        raise HTTPException(status_code=404, detail="Post not found")
+
+    text = " ".join(str(body or "").split()).strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Say something first")
+    text = text[:MAX_COMMENT_CHARS]
+
+    now = _now()
+    columns = "post_id, user_id, body, created_at"
+    values = (int(post_id), viewer_id, text, now)
+
+    def _insert(_conn, cur) -> int:
+        # RETURNING on Postgres, lastrowid on SQLite -- reading back "the newest
+        # row for this user" would attach the wrong id when two comments land in
+        # the same second.
+        if DB_BACKEND == "postgres":
+            cur.execute(_sql(f"INSERT INTO post_comments({columns}) VALUES(?,?,?,?) RETURNING id"), values)
+            return int(cur.fetchone()[0])
+        cur.execute(_sql(f"INSERT INTO post_comments({columns}) VALUES(?,?,?,?)"), values)
+        return int(cur.lastrowid)
+
+    comment_id = int(_db_run_in_transaction(_insert) or 0)
+
+    row = _db_query_one(
+        f"SELECT {_COMMENT_COLUMNS} FROM post_comments c JOIN users u ON u.id = c.user_id "
+        f"WHERE c.id=? LIMIT 1",
+        (comment_id,),
+    )
+    if not row:
+        raise HTTPException(status_code=500, detail="Comment could not be read back")
+    post_author_id = int(_row_value(post, "user_id", 0))
+    levels = _author_levels([viewer_id])
+    return {
+        "comment": _serialize_comment(row, viewer_id, post_author_id, levels),
+        "comment_count": comment_counts([int(post_id)], viewer_id).get(int(post_id), 0),
+    }
+
+
+def delete_comment(user_id: int, comment_id: int) -> Dict[str, Any]:
+    """Your own comment, or anything under your own post.
+
+    The post owner can remove replies because they are the one living with what
+    appears under their photo -- the same reason a comment is soft deleted:
+    a reply that vanishes takes the reply below it out of context, and the row
+    staying keeps the thread readable to a moderator afterwards.
+    """
+    row = _db_query_one(
+        "SELECT c.id AS id, c.post_id AS post_id, c.user_id AS user_id, "
+        "p.user_id AS post_author_id "
+        "FROM post_comments c JOIN posts p ON p.id = c.post_id "
+        "WHERE c.id=? AND c.deleted_at IS NULL LIMIT 1",
+        (int(comment_id),),
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Comment not found")
+    author_id = int(_row_value(row, "user_id", 0))
+    post_author_id = int(_row_value(row, "post_author_id", 0))
+    if int(user_id) not in (author_id, post_author_id):
+        raise HTTPException(status_code=403, detail="That isn't yours to delete")
+
+    post_id = int(_row_value(row, "post_id", 0))
+    _db_exec("UPDATE post_comments SET deleted_at=? WHERE id=?", (_now(), int(comment_id)))
+    return {
+        "post_id": post_id,
+        "comment_count": comment_counts([post_id], int(user_id)).get(post_id, 0),
+    }

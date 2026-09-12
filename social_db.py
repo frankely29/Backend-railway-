@@ -17,6 +17,11 @@ to change once there are rows:
    from Houston to Phoenix does not retroactively move a year of posts with
    them, and the Houston feed stays what Houston actually saw.
 
+4. Comments are ONE level deep. No parent_comment_id, because a thread tree is
+   a different product: it needs collapsing, "load more replies", and an order
+   that is not just time. A driver reading at a light wants the replies, in
+   order, and this shape cannot grow a nesting bug it does not have.
+
 Unlike chat, nothing here expires. chat.py sweeps messages after 7 or 30 days
 because a chat room is a conversation; a feed is a record, and a social network
 whose posts evaporate is not a social network.
@@ -75,6 +80,23 @@ def init_social_schema() -> None:
         )
         _db_exec(
             """
+            CREATE TABLE IF NOT EXISTS post_comments (
+              id BIGSERIAL PRIMARY KEY,
+              post_id BIGINT NOT NULL,
+              user_id BIGINT NOT NULL,
+              body TEXT NOT NULL,
+              created_at BIGINT NOT NULL,
+              deleted_at BIGINT,
+              hidden_at BIGINT,
+              hidden_by BIGINT,
+              hidden_reason TEXT,
+              FOREIGN KEY(post_id) REFERENCES posts(id),
+              FOREIGN KEY(user_id) REFERENCES users(id)
+            );
+            """
+        )
+        _db_exec(
+            """
             CREATE TABLE IF NOT EXISTS follows (
               follower_id BIGINT NOT NULL,
               followee_id BIGINT NOT NULL,
@@ -120,6 +142,23 @@ def init_social_schema() -> None:
         )
         _db_exec(
             """
+            CREATE TABLE IF NOT EXISTS post_comments (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              post_id INTEGER NOT NULL,
+              user_id INTEGER NOT NULL,
+              body TEXT NOT NULL,
+              created_at INTEGER NOT NULL,
+              deleted_at INTEGER,
+              hidden_at INTEGER,
+              hidden_by INTEGER,
+              hidden_reason TEXT,
+              FOREIGN KEY(post_id) REFERENCES posts(id),
+              FOREIGN KEY(user_id) REFERENCES users(id)
+            );
+            """
+        )
+        _db_exec(
+            """
             CREATE TABLE IF NOT EXISTS follows (
               follower_id INTEGER NOT NULL,
               followee_id INTEGER NOT NULL,
@@ -149,6 +188,12 @@ def init_social_schema() -> None:
     _try_exec("CREATE INDEX IF NOT EXISTS idx_posts_live ON posts(deleted_at, id DESC);")
     _try_exec("CREATE INDEX IF NOT EXISTS idx_posts_author ON posts(user_id, deleted_at, id DESC);")
     _try_exec("CREATE INDEX IF NOT EXISTS idx_posts_city ON posts(city_key, deleted_at, id DESC);")
+    # Comments read oldest-first within one post (a conversation runs forwards,
+    # unlike a feed), so this index ends with id ASC rather than DESC.
+    _try_exec("CREATE INDEX IF NOT EXISTS idx_post_comments_post "
+              "ON post_comments(post_id, deleted_at, id);")
+    _try_exec("CREATE INDEX IF NOT EXISTS idx_post_comments_author "
+              "ON post_comments(user_id, deleted_at);")
     _try_exec("CREATE INDEX IF NOT EXISTS idx_follows_followee ON follows(followee_id);")
     _try_exec("CREATE INDEX IF NOT EXISTS idx_post_likes_post ON post_likes(post_id);")
     _try_exec("CREATE INDEX IF NOT EXISTS idx_post_likes_user ON post_likes(user_id, post_id);")
