@@ -7,6 +7,9 @@ from typing import List, Optional
 from pydantic import BaseModel, Field
 
 MAX_BODY_CHARS = 2000
+# Shorter than a post on purpose. A reply is a reply; anything longer is a post
+# of its own, and a wall of text under someone else's photo buries the thread.
+MAX_COMMENT_CHARS = 600
 MAX_CITY_CHARS = 80
 MAX_ZONE_NAME_CHARS = 120
 MAX_HANDLE_CHARS = 20
@@ -64,8 +67,53 @@ class Post(BaseModel):
     zone_rating: Optional[int] = None
     like_count: int = 0
     liked_by_me: bool = False
+    comment_count: int = 0
     mine: bool = False
     created_at: int
+
+
+class CreateCommentPayload(BaseModel):
+    body: str = Field(min_length=1, max_length=MAX_COMMENT_CHARS)
+
+
+class Comment(BaseModel):
+    id: int
+    post_id: int
+    author: PostAuthor
+    body: str
+    mine: bool = False
+    # True when the viewer can remove it: their own comment, or any comment on
+    # a post they own. Sent rather than derived, so the client cannot get the
+    # rule subtly wrong and offer a delete that 403s.
+    can_delete: bool = False
+    created_at: int
+
+
+class CommentsResponse(BaseModel):
+    ok: bool = True
+    post_id: int
+    items: List[Comment] = []
+    next_after_id: Optional[int] = None
+    comment_count: int = 0
+
+
+class CommentResponse(BaseModel):
+    ok: bool = True
+    comment: Comment
+    comment_count: int = 0
+
+
+class CommentCountResponse(BaseModel):
+    """What a delete returns: the post, and what its count is now.
+
+    The count comes back so the client repaints from the server rather than
+    decrementing its own copy -- two people deleting at once makes local
+    arithmetic wrong.
+    """
+
+    ok: bool = True
+    post_id: int
+    comment_count: int = 0
 
 
 class FeedResponse(BaseModel):
@@ -253,6 +301,15 @@ class ResolveReportResponse(BaseModel):
 
 class HidePostResponse(BaseModel):
     ok: bool = True
+    post_id: int
+    hidden: bool
+
+
+class HideCommentResponse(BaseModel):
+    ok: bool = True
+    comment_id: int
+    # The post too, so an admin acting from the queue can jump straight to the
+    # thread the reply is in rather than looking it up.
     post_id: int
     hidden: bool
 

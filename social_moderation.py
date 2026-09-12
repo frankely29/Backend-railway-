@@ -45,7 +45,7 @@ REPORT_REASONS = [
     "other",
 ]
 
-REPORT_TARGETS = ["post", "user", "chat_message"]
+REPORT_TARGETS = ["post", "user", "chat_message", "comment"]
 
 REPORT_OPEN = "open"
 REPORT_ACTIONED = "actioned"
@@ -343,6 +343,12 @@ def _resolve_target_owner(target_type: str, target_id: int) -> Optional[int]:
         if not row:
             raise HTTPException(status_code=404, detail="Post not found")
         return int(_row_value(row, "user_id", 0))
+    if target_type == "comment":
+        row = _db_query_one(
+            "SELECT user_id FROM post_comments WHERE id=? LIMIT 1", (int(target_id),))
+        if not row:
+            raise HTTPException(status_code=404, detail="Comment not found")
+        return int(_row_value(row, "user_id", 0))
     if target_type == "user":
         if not _user_exists(int(target_id)):
             raise HTTPException(status_code=404, detail="Driver not found")
@@ -498,6 +504,44 @@ def hide_post(admin_id: int, post_id: int, reason: Optional[str] = None) -> Dict
         (REPORT_ACTIONED, _now(), int(admin_id), "post hidden", "post", int(post_id), REPORT_OPEN),
     )
     return {"post_id": int(post_id), "hidden": True}
+
+
+def hide_comment(admin_id: int, comment_id: int, reason: Optional[str] = None) -> Dict[str, Any]:
+    """The same lever as hide_post, on a reply.
+
+    Somewhere for people to write is somewhere people can be harassed, so a
+    reply has to be reportable and removable by a moderator -- not only by the
+    post's owner, who may be the person being harassed.
+    """
+    row = _db_query_one("SELECT id, post_id FROM post_comments WHERE id=? LIMIT 1",
+                        (int(comment_id),))
+    if not row:
+        raise HTTPException(status_code=404, detail="Comment not found")
+    _db_exec(
+        "UPDATE post_comments SET hidden_at=?, hidden_by=?, hidden_reason=? WHERE id=?",
+        (_now(), int(admin_id), _clean_note(reason), int(comment_id)),
+    )
+    _db_exec(
+        "UPDATE content_reports SET status=?, resolved_at=?, resolved_by=?, resolution=? "
+        "WHERE target_type=? AND target_id=? AND status=?",
+        (REPORT_ACTIONED, _now(), int(admin_id), "comment hidden", "comment",
+         int(comment_id), REPORT_OPEN),
+    )
+    return {"comment_id": int(comment_id),
+            "post_id": int(_row_value(row, "post_id", 0)), "hidden": True}
+
+
+def unhide_comment(admin_id: int, comment_id: int) -> Dict[str, Any]:
+    row = _db_query_one("SELECT id, post_id FROM post_comments WHERE id=? LIMIT 1",
+                        (int(comment_id),))
+    if not row:
+        raise HTTPException(status_code=404, detail="Comment not found")
+    _db_exec(
+        "UPDATE post_comments SET hidden_at=NULL, hidden_by=NULL, hidden_reason=NULL WHERE id=?",
+        (int(comment_id),),
+    )
+    return {"comment_id": int(comment_id),
+            "post_id": int(_row_value(row, "post_id", 0)), "hidden": False}
 
 
 def unhide_post(admin_id: int, post_id: int) -> Dict[str, Any]:

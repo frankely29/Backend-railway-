@@ -362,7 +362,9 @@ def test_report_options_are_served(app_env):
     ana = _signup(client, "a@example.com", "Ana")
     res = client.get("/social/reports/options", headers=_h(ana)).json()
     assert "harassment" in res["reasons"] and "personal_info" in res["reasons"]
-    assert set(res["targets"]) == {"post", "user", "chat_message"}
+    # "comment" arrived with replies: somewhere for people to write is
+    # somewhere people can be harassed, so it has to be reportable.
+    assert set(res["targets"]) == {"post", "user", "chat_message", "comment"}
 
 
 # --------------------------------------------------------------------------

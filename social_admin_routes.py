@@ -17,6 +17,7 @@ from fastapi import APIRouter, Depends
 from admin_security import require_admin_user
 from social_models import (
     HidePostPayload,
+    HideCommentResponse,
     HidePostResponse,
     ReportCountResponse,
     ReportQueueResponse,
@@ -25,10 +26,12 @@ from social_models import (
 )
 from social_moderation import (
     REPORT_OPEN,
+    hide_comment,
     hide_post,
     list_reports,
     open_report_count,
     resolve_report,
+    unhide_comment,
     unhide_post,
 )
 
@@ -83,3 +86,22 @@ def admin_hide_post(
 @router.post("/posts/{post_id}/unhide", response_model=HidePostResponse)
 def admin_unhide_post(post_id: int, admin: sqlite3.Row = Depends(require_admin_user)):
     return {"ok": True, **unhide_post(int(admin["id"]), post_id)}
+
+
+@router.post("/comments/{comment_id}/hide", response_model=HideCommentResponse)
+def admin_hide_comment(
+    comment_id: int,
+    payload: HidePostPayload,
+    admin: sqlite3.Row = Depends(require_admin_user),
+):
+    """The same lever as hiding a post, on a reply.
+
+    The post's owner can already delete replies under their own post, but the
+    person being harassed should not be the only line of defence.
+    """
+    return {"ok": True, **hide_comment(int(admin["id"]), comment_id, payload.reason)}
+
+
+@router.post("/comments/{comment_id}/unhide", response_model=HideCommentResponse)
+def admin_unhide_comment(comment_id: int, admin: sqlite3.Row = Depends(require_admin_user)):
+    return {"ok": True, **unhide_comment(int(admin["id"]), comment_id)}
