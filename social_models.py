@@ -43,6 +43,12 @@ class PostAuthor(BaseModel):
     handle: Optional[str] = None
     city: Optional[str] = None
     avatar_url: Optional[str] = None
+    # Who is talking. A driver weighing "the lot is moving" wants to know the
+    # person saying it has actually driven, and on what. Both stay optional:
+    # a new driver with no trips logged and no platform set still posts, and a
+    # cold progression cache must cost a badge, never the feed.
+    level: Optional[int] = None
+    platforms: List[str] = []
 
 
 class Post(BaseModel):

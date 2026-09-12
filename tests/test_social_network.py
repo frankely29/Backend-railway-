@@ -543,3 +543,112 @@ def test_two_posts_in_the_same_second_keep_their_own_photos(app_env):
     assert len(set(paths)) == len(paths), "no two posts share one image file"
     for pid in ids:
         assert client.get(f"/social/posts/{pid}/image", headers=_h(ana)).status_code == 200
+
+
+# --------------------------------------------------------------------------
+# who is talking: level and platforms on the author
+# --------------------------------------------------------------------------
+
+def test_feed_author_carries_level_and_platforms(app_env):
+    """The card says who is talking, not just what they said.
+
+    A driver weighing "the lot is moving" wants to know the person saying it
+    has actually driven, and on what. Both fields are optional, but the keys
+    must always be present -- a client that has to test for a missing key on
+    every card ends up not testing for it.
+    """
+    _main, client = app_env
+    author = _signup(client, "author-level@example.com", "Marcus R.")
+    client.post("/social/me/identity", json={"platforms": ["uber", "lyft"]},
+                headers=_h(author))
+    _post(client, author, "Lot's actually moving tonight.")
+
+    item = _feed(client, author)["items"][0]
+    assert set(item["author"]) >= {"user_id", "display_name", "handle", "city",
+                                   "avatar_url", "level", "platforms"}
+    assert item["author"]["platforms"] == ["uber", "lyft"]
+    # level is whatever the progression service says, including None for a
+    # driver with no logged trips. The contract is the key, not the number.
+    assert "level" in item["author"]
+
+
+def test_a_driver_with_no_platforms_still_posts(app_env):
+    """Empty list, not null and not a missing key: the card renders no tags."""
+    _main, client = app_env
+    author = _signup(client, "no-platform@example.com", "Quiet Driver")
+    _post(client, author, "First post.")
+    item = _feed(client, author)["items"][0]
+    assert item["author"]["platforms"] == []
+    assert item["author"]["level"] is None or isinstance(item["author"]["level"], int)
+
+
+def test_the_same_post_looks_the_same_fetched_alone(app_env):
+    """A post opened from the feed must not lose the badge the feed showed.
+
+    The feed batches the level lookup and the single-post route does not, so
+    these are two code paths that can silently disagree.
+    """
+    _main, client = app_env
+    author = _signup(client, "same-post@example.com", "Aisha D.")
+    client.post("/social/me/identity", json={"platforms": ["fhv"]}, headers=_h(author))
+    created = _post(client, author, "Congestion surcharge ate a third of a $19 fare.")
+
+    from_feed = _feed(client, author)["items"][0]
+    res = client.get(f"/social/posts/{created['id']}", headers=_h(author))
+    assert res.status_code == 200, res.text
+    alone = res.json()["post"]
+    assert alone["author"] == from_feed["author"]
+
+
+def test_a_broken_progression_service_costs_a_badge_not_the_feed(app_env, monkeypatch):
+    """Decoration must degrade to nothing, never to a 500.
+
+    The level comes from the leaderboard service. A cold cache, a migration in
+    flight or a bad row there must not take the timeline down with it.
+    """
+    _main, client = app_env
+    import leaderboard_service
+
+    def _boom(_user_ids):
+        raise RuntimeError("progression cache is cold")
+
+    monkeypatch.setattr(leaderboard_service, "get_progression_for_users", _boom)
+
+    author = _signup(client, "cold-cache@example.com", "Still Posting")
+    _post(client, author, "The feed should still load.")
+    feed = _feed(client, author)
+    assert len(feed["items"]) == 1
+    assert feed["items"][0]["author"]["level"] is None
+
+
+def test_the_level_lookup_is_batched_over_the_page(app_env, monkeypatch):
+    """One query for the page, not one per post.
+
+    A per-post lookup is invisible until a feed of twenty posts costs twenty
+    round trips, at which point it is a rewrite rather than a fix.
+    """
+    _main, client = app_env
+    import leaderboard_service
+
+    calls = []
+    original = leaderboard_service.get_progression_for_users
+
+    def _counting(user_ids):
+        calls.append(list(user_ids))
+        return original(user_ids)
+
+    monkeypatch.setattr(leaderboard_service, "get_progression_for_users", _counting)
+
+    a = _signup(client, "batch-a@example.com", "A")
+    b = _signup(client, "batch-b@example.com", "B")
+    client.post(f"/social/users/{b['id']}/follow", headers=_h(a))
+    for i in range(4):
+        _post(client, a, f"a{i}")
+        _post(client, b, f"b{i}")
+
+    calls.clear()
+    feed = _feed(client, a)
+    assert len(feed["items"]) == 8
+    assert len(calls) == 1, f"expected one batched lookup, got {len(calls)}"
+    # Deduplicated: eight posts, two authors.
+    assert sorted(calls[0]) == sorted({a["id"], b["id"]})
