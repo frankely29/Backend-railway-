@@ -36,6 +36,7 @@ def app_env(monkeypatch):
         "leaderboard_db", "leaderboard_routes", "leaderboard_service", "leaderboard_tracker",
         "pickup_recording_feature", "games_models", "games_service", "games_routes",
         "social_db", "social_models", "social_service", "social_routes", "social_identity",
+        "social_moderation", "social_admin_routes",
         "main",
     ]:
         sys.modules.pop(name, None)

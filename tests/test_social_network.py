@@ -49,6 +49,7 @@ def app_env(monkeypatch):
         # reference to core's _db_exec, so leaving it cached points this test at
         # the previous test's torn-down database.
         "social_db", "social_models", "social_service", "social_routes", "social_identity",
+        "social_moderation", "social_admin_routes",
         "main",
     ]:
         sys.modules.pop(name, None)
