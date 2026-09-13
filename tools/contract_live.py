@@ -17,9 +17,10 @@ RUNNING IT
     JOSEO_CONTRACT_URL=https://staging.example.com python3 tools/contract_live.py
 
 Point it at staging if there is one. Pointing it at production is legitimate
-after a deploy -- that is what it was written for -- but it leaves a throwaway
-account behind, which it prints. The post and comment it creates are deleted
-before it exits.
+after a deploy -- that is what it was written for. It cleans up after itself:
+the last thing it does is delete its own account, which is also a check, since
+that endpoint was returning 500 for every driver who had ever posted. If the
+deletion fails the script says so loudly and names what it left behind.
 
 WHAT IT CHECKS
 
@@ -221,9 +222,40 @@ status, out = call("DELETE", f"/social/comments/{comment_id}", None, token)
 check("DELETE comment", status == 200 and out.get("comment_count") == 0,
       f"{status} {json.dumps(out)[:200]}")
 
-# ---- cleanup ------------------------------------------------------------
+# ---- deleting one post ----------------------------------------------------
 status, _ = call("DELETE", f"/social/posts/{post_id}", None, token)
 check("the contract-test post was deleted", status == 200, f"status {status}")
+
+# A second post, left standing on purpose: the account deletion below has to
+# take a live post with it, not just the soft-deleted row above.
+status, out = call("POST", "/social/posts", {
+    "body": "Automated contract test - left for the account delete."}, token)
+check("a second post for the deletion check", status == 200, f"status {status}")
+live_post_id = (out.get("post") or {}).get("id")
+
+# ---- leaving --------------------------------------------------------------
+# Account deletion is the one check that has to come last, and it is the reason
+# this script no longer leaves anything behind. It also caught a real one:
+# `DELETE FROM users` hits eight foreign keys the cleanup did not clear, so on
+# Postgres a driver who had posted once got a 500 and stayed signed up forever.
+# SQLite does not enforce foreign keys, so the whole unit suite was blind to it.
+status, out = call("POST", "/me/delete_account", None, token)
+check("POST /me/delete_account, for a driver who has actually used the app",
+      status == 200, f"{status} {json.dumps(out)[:300]}")
+deleted_ok = status == 200
+if deleted_ok:
+    cleanup = out.get("cleanup") or {}
+    check("the deletion says what it removed", bool(cleanup.get("deleted")),
+          json.dumps(cleanup)[:300])
+    check("both posts went with the account",
+          int((cleanup.get("deleted") or {}).get("posts") or 0) >= 2,
+          json.dumps(cleanup.get("deleted"))[:300])
+    status, out = call("GET", "/me", None, token)
+    check("the token stops working once the account is gone",
+          status in (401, 403, 404), f"status {status}")
+    status, out = call("GET", f"/social/posts/{live_post_id}", token=token)
+    check("the deleted driver's post is unreachable", status in (401, 403, 404),
+          f"status {status}")
 
 failed = [n for n, ok in results if not ok]
 print(f"\n{len(results) - len(failed)}/{len(results)} contract checks passed")
@@ -231,5 +263,8 @@ if failed:
     print("failed:")
     for f in failed:
         print("  -", f)
-print(f"\nthrowaway account left behind: {EMAIL} (id {me_id})")
+if deleted_ok:
+    print(f"\nnothing left behind: {EMAIL} (id {me_id}) deleted itself")
+else:
+    print(f"\nCOULD NOT CLEAN UP -- account still on the deployment: {EMAIL} (id {me_id})")
 sys.exit(1 if failed else 0)
