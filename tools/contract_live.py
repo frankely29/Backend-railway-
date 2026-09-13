@@ -133,6 +133,23 @@ status, out = call("GET", f"/social/handles/contracttest{STAMP}/available", toke
 check("GET /social/handles/{h}/available", status == 200 and "available" in out,
       f"{status} {json.dumps(out)[:200]}")
 
+# ---- avatar ------------------------------------------------------------
+# /avatars/thumb/{id} is served `immutable` for 30 days, so the URL MUST carry
+# the ?v= or a driver who changes their picture shows the old one for a month.
+# The social surfaces shipped without it once; this is the live guard.
+import base64
+_PNG = bytes.fromhex(
+    "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
+    "0000000a49444154789c6300010000050001"
+    "0d0a2db40000000049454e44ae426082")
+status, _ = call("POST", "/me/update", {
+    "avatar_url": "data:image/png;base64," + base64.b64encode(_PNG).decode()}, token)
+check("POST /me/update with an avatar", status == 200, str(status))
+status, out = call("GET", "/social/me/profile", token=token)
+avatar = out.get("profile", {}).get("avatar_url")
+check("the profile avatar url carries its version",
+      bool(avatar) and "?v=" in str(avatar), f"avatar_url={avatar!r}")
+
 # ---- post ---------------------------------------------------------------
 status, out = call("POST", "/social/posts", {
     "body": "Automated contract test - please ignore.",
@@ -152,6 +169,9 @@ check("compose's zone tag round-trips",
 check("the author's platforms reach the card",
       post.get("author", {}).get("platforms") == ["uber", "lyft"],
       json.dumps(post.get("author", {}).get("platforms")))
+post_avatar = post.get("author", {}).get("avatar_url")
+check("the card's avatar url carries its version",
+      bool(post_avatar) and "?v=" in str(post_avatar), f"avatar_url={post_avatar!r}")
 
 # ---- feed ---------------------------------------------------------------
 for scope in ("following", "city", "everyone"):
