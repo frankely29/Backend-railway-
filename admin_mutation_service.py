@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import time
 from typing import Any, Dict, Optional
 
@@ -399,8 +400,20 @@ def list_active_comps(
     search_clause = ""
     search_params: list = []
     if search:
-        search_clause = " AND (email LIKE ? OR display_name LIKE ? OR subscription_comp_reason LIKE ?)"
-        pattern = f"%{search}%"
+        # LIKE is case-sensitive on Postgres and case-insensitive on SQLite, so
+        # searching "frank" found "Frankely" in every test here and nobody at
+        # all on production. Lower both sides, the way the chat and games
+        # searches already do.
+        #
+        # The ESCAPE is the other half: % and _ are wildcards, so an admin
+        # searching for a comp reason like "beta_tester" was matching
+        # "betaXtester" too. Search for what was typed.
+        search_clause = (
+            " AND (LOWER(email) LIKE ? ESCAPE '!'"
+            " OR LOWER(display_name) LIKE ? ESCAPE '!'"
+            " OR LOWER(subscription_comp_reason) LIKE ? ESCAPE '!')"
+        )
+        pattern = "%" + re.sub(r"([!%_])", r"!\1", search.strip().lower()) + "%"
         search_params = [pattern, pattern, pattern]
 
     if include_expired:

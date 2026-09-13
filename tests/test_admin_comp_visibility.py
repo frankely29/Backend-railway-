@@ -68,3 +68,88 @@ def test_preflight_uses_the_same_ladder_as_the_gate():
     rollout the real gate then handles differently."""
     src = inspect.getsource(svc.access_preflight)
     assert "is_comp_active" in src and "is_subscription_active" in src and "is_trial_active" in src
+
+
+# --------------------------------------------------------------------------
+# searching the comps list
+# --------------------------------------------------------------------------
+
+def _capture(monkeypatch):
+    """Run list_active_comps without a database and hand back the SQL it built."""
+    seen = {}
+
+    def count(sql, params):
+        seen["count"] = (sql, list(params))
+        return {"c": 0}
+
+    def rows(sql, params):
+        seen["rows"] = (sql, list(params))
+        return []
+
+    monkeypatch.setattr(svc, "_db_query_one", count)
+    monkeypatch.setattr(svc, "_db_query_all", rows)
+    return seen
+
+
+def test_comp_search_lowers_both_sides(monkeypatch):
+    """This one cannot be proved by querying the test database.
+
+    SQLite's LIKE is case-insensitive and Postgres's is case-sensitive, so a
+    search that works here fails on production and no amount of running it
+    locally shows that. The SQL itself is the evidence: both sides lowered.
+    """
+    seen = _capture(monkeypatch)
+    svc.list_active_comps(search="Frankely")
+
+    sql, params = seen["rows"]
+    for column in ("email", "display_name", "subscription_comp_reason"):
+        assert f"LOWER({column}) LIKE" in sql, f"{column} is compared case-sensitively"
+    assert all(p == "%frankely%" for p in params[:-2] if isinstance(p, str)), params
+    assert "%Frankely%" not in params, "the pattern still carries the typed case"
+
+
+def test_comp_search_counts_and_lists_the_same_rows(monkeypatch):
+    """The count and the page are two queries. They have to filter identically
+    or the screen says 40 results and shows 12."""
+    seen = _capture(monkeypatch)
+    svc.list_active_comps(search="Beta")
+
+    count_sql, count_params = seen["count"]
+    rows_sql, rows_params = seen["rows"]
+    assert "LOWER(email) LIKE" in count_sql
+    # the row query adds LIMIT/OFFSET on the end; everything before must match
+    assert rows_params[:len(count_params)] == count_params
+
+
+def test_an_underscore_in_a_search_is_not_a_wildcard(monkeypatch):
+    """% and _ are LIKE wildcards. Searching a comp reason of "beta_tester"
+    was also matching "betaXtester"."""
+    seen = _capture(monkeypatch)
+    svc.list_active_comps(search="beta_tester")
+
+    sql, params = seen["rows"]
+    assert "ESCAPE" in sql
+    assert "%beta!_tester%" in params, params
+
+
+def test_a_percent_in_a_search_is_not_a_wildcard(monkeypatch):
+    seen = _capture(monkeypatch)
+    svc.list_active_comps(search="100%")
+    _sql_text, params = seen["rows"]
+    assert "%100!%%" in params, params
+
+
+def test_the_escape_character_itself_is_escaped(monkeypatch):
+    """Otherwise searching for "!" builds a pattern ending in a dangling
+    escape, which Postgres rejects outright."""
+    seen = _capture(monkeypatch)
+    svc.list_active_comps(search="wow!")
+    _sql_text, params = seen["rows"]
+    assert "%wow!!%" in params, params
+
+
+def test_a_search_is_trimmed_before_it_is_used(monkeypatch):
+    seen = _capture(monkeypatch)
+    svc.list_active_comps(search="  Frankely  ")
+    _sql_text, params = seen["rows"]
+    assert "%frankely%" in params, params
