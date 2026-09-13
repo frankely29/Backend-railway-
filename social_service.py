@@ -24,6 +24,7 @@ from fastapi import HTTPException, UploadFile
 
 from core import DB_BACKEND, _db_exec, _db_query_all, _db_query_one, _db_run_in_transaction, _sql
 from media_store import derive_thumb_key
+from avatar_assets import avatar_thumb_url, avatar_version_for_data_url
 from social_identity import split_platforms
 from social_moderation import hidden_author_ids, is_blocked_either_way
 from social_models import MAX_BODY_CHARS, MAX_CITY_CHARS, MAX_COMMENT_CHARS, FeedScope
@@ -98,6 +99,31 @@ def clean_body(body: Optional[str]) -> str:
     if not body:
         return ""
     return str(body).strip()[:MAX_BODY_CHARS]
+
+
+def _avatar_url(row: Any, user_id: int) -> Optional[str]:
+    """The avatar URL WITH its version, the way every other module builds it.
+
+    /avatars/thumb/{id} is served with `public, max-age=30 days, immutable`.
+    `immutable` means the browser will not revalidate at all, so an unversioned
+    URL shows a driver's OLD picture for a month after they change it -- and
+    the ETag on that route never gets a chance to run.
+
+    main.py, work_battles_service.py and games_service.py all go through
+    avatar_thumb_url(); this module was hand-building the path and dropping the
+    ?v=, so every feed card, comment and profile had the stale-avatar bug while
+    the rest of the app did not.
+
+    The version column can be empty on rows that predate it, so it falls back
+    to hashing the data URL exactly as _avatar_version_for_row does.
+    """
+    stored = _row_value(row, "avatar_url")
+    if not stored:
+        return None
+    version = _row_value(row, "avatar_version")
+    if not version:
+        version = avatar_version_for_data_url(str(stored))
+    return avatar_thumb_url(int(user_id), version)
 
 
 def _returned_id(cur: Any) -> int:
@@ -175,7 +201,8 @@ _POST_COLUMNS = """
     p.has_thumb AS has_thumb, p.lat AS lat, p.lng AS lng, p.zone_name AS zone_name,
     p.zone_rating AS zone_rating, p.created_at AS created_at,
     u.display_name AS display_name, u.handle AS handle, u.city AS author_city,
-    u.avatar_url AS avatar_url, u.platforms AS author_platforms
+    u.avatar_url AS avatar_url, u.avatar_version AS avatar_version,
+    u.platforms AS author_platforms
 """
 
 
@@ -256,7 +283,6 @@ def _serialize(row: Any, viewer_id: int, counts: Dict[int, int], mine: set,
     post_id = int(_row_value(row, "id", 0))
     author_id = int(_row_value(row, "user_id", 0))
     image_url, thumb_url = _image_urls(post_id, _row_value(row, "image_path"), _row_value(row, "has_thumb"))
-    avatar = _row_value(row, "avatar_url")
     return {
         "id": post_id,
         "author": {
@@ -264,7 +290,7 @@ def _serialize(row: Any, viewer_id: int, counts: Dict[int, int], mine: set,
             "display_name": str(_row_value(row, "display_name", "Driver")),
             "handle": _row_value(row, "handle"),
             "city": _row_value(row, "author_city"),
-            "avatar_url": f"/avatars/thumb/{author_id}" if avatar else None,
+            "avatar_url": _avatar_url(row, author_id),
             # Who is talking, not just what they said. Both optional: a driver
             # with no trips logged and no platform set still posts.
             "level": (levels or {}).get(author_id),
@@ -564,7 +590,7 @@ def _following_count(user_id: int) -> int:
 
 def _user_or_404(user_id: int) -> Any:
     row = _db_query_one(
-        "SELECT id, display_name, handle, city, avatar_url, bio, platforms, "
+        "SELECT id, display_name, handle, city, avatar_url, avatar_version, bio, platforms, "
         "vehicle_type, driving_since_year FROM users WHERE id=? LIMIT 1",
         (int(user_id),),
     )
@@ -659,13 +685,12 @@ def get_profile(viewer_id: int, user_id: int) -> Dict[str, Any]:
         "SELECT follower_id FROM follows WHERE follower_id=? AND followee_id=? LIMIT 1",
         (int(viewer_id), int(user_id)),
     )
-    avatar = _row_value(row, "avatar_url")
     return {
         "user_id": int(user_id),
         "display_name": str(_row_value(row, "display_name", "Driver")),
         "handle": _row_value(row, "handle"),
         "city": _row_value(row, "city"),
-        "avatar_url": f"/avatars/thumb/{int(user_id)}" if avatar else None,
+        "avatar_url": _avatar_url(row, int(user_id)),
         "bio": _row_value(row, "bio"),
         "platforms": split_platforms(_row_value(row, "platforms")),
         "vehicle_type": _row_value(row, "vehicle_type"),
@@ -719,7 +744,8 @@ _COMMENT_COLUMNS = """
     c.id AS id, c.post_id AS post_id, c.user_id AS user_id, c.body AS body,
     c.created_at AS created_at,
     u.display_name AS display_name, u.handle AS handle, u.city AS author_city,
-    u.avatar_url AS avatar_url, u.platforms AS author_platforms
+    u.avatar_url AS avatar_url, u.avatar_version AS avatar_version,
+    u.platforms AS author_platforms
 """
 
 
@@ -770,7 +796,6 @@ def comment_counts(post_ids: Sequence[int], viewer_id: int) -> Dict[int, int]:
 def _serialize_comment(row: Any, viewer_id: int, post_author_id: int,
                        levels: Optional[Dict[int, Optional[int]]] = None) -> Dict[str, Any]:
     author_id = int(_row_value(row, "user_id", 0))
-    avatar = _row_value(row, "avatar_url")
     mine = author_id == int(viewer_id)
     return {
         "id": int(_row_value(row, "id", 0)),
@@ -780,7 +805,7 @@ def _serialize_comment(row: Any, viewer_id: int, post_author_id: int,
             "display_name": str(_row_value(row, "display_name", "Driver")),
             "handle": _row_value(row, "handle"),
             "city": _row_value(row, "author_city"),
-            "avatar_url": f"/avatars/thumb/{author_id}" if avatar else None,
+            "avatar_url": _avatar_url(row, author_id),
             "level": (levels or {}).get(author_id),
             "platforms": split_platforms(_row_value(row, "author_platforms")),
         },

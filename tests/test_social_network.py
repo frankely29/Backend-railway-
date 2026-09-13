@@ -652,3 +652,100 @@ def test_the_level_lookup_is_batched_over_the_page(app_env, monkeypatch):
     assert len(calls) == 1, f"expected one batched lookup, got {len(calls)}"
     # Deduplicated: eight posts, two authors.
     assert sorted(calls[0]) == sorted({a["id"], b["id"]})
+
+
+# --------------------------------------------------------------------------
+# avatar URLs carry their version
+# --------------------------------------------------------------------------
+
+def _tiny_avatar_data_url() -> str:
+    """A 1x1 PNG as a data URL, which is the shape /me/update accepts."""
+    import base64
+    return "data:image/png;base64," + base64.b64encode(_png_bytes(1, 1)).decode()
+
+
+def _set_avatar(client: TestClient, account: dict) -> None:
+    res = client.post("/me/update", json={"avatar_url": _tiny_avatar_data_url()},
+                      headers=_h(account))
+    assert res.status_code == 200, res.text
+
+
+def test_a_feed_avatar_url_carries_its_version(app_env):
+    """/avatars/thumb/{id} is served `immutable` for 30 days.
+
+    Without the ?v= the browser will not revalidate at all, so a driver who
+    changes their picture shows the OLD one everywhere for a month. main.py,
+    work_battles_service.py and games_service.py all build the URL through
+    avatar_thumb_url(); the social surfaces were hand-building the path and
+    dropping the version.
+    """
+    _main, client = app_env
+    author = _signup(client, "avatar-feed@example.com", "Marcus R.")
+    _set_avatar(client, author)
+    _post(client, author, "with an avatar")
+
+    url = _feed(client, author)["items"][0]["author"]["avatar_url"]
+    assert url, "no avatar url at all"
+    assert url.startswith(f"/avatars/thumb/{author['id']}?v="), url
+
+
+def test_a_profile_avatar_url_carries_its_version(app_env):
+    _main, client = app_env
+    author = _signup(client, "avatar-profile@example.com", "Marcus R.")
+    _set_avatar(client, author)
+    url = client.get("/social/me/profile", headers=_h(author)).json()["profile"]["avatar_url"]
+    assert url and "?v=" in url, url
+
+
+def test_a_comment_avatar_url_carries_its_version(app_env):
+    _main, client = app_env
+    author = _signup(client, "avatar-comment@example.com", "Marcus R.")
+    _set_avatar(client, author)
+    post = _post(client, author, "a post")
+    res = client.post(f"/social/posts/{post['id']}/comments",
+                      json={"body": "a reply"}, headers=_h(author))
+    assert res.status_code == 200, res.text
+    url = res.json()["comment"]["author"]["avatar_url"]
+    assert url and "?v=" in url, url
+
+
+def test_changing_an_avatar_changes_the_url(app_env):
+    """The whole point of the version: a new picture is a new URL, so a cache
+    holding the old one is simply not asked for it."""
+    _main, client = app_env
+    import base64
+    author = _signup(client, "avatar-change@example.com", "Marcus R.")
+    _set_avatar(client, author)
+    _post(client, author, "a post")
+    first = _feed(client, author)["items"][0]["author"]["avatar_url"]
+
+    # A visibly different image, so the version hash has to move.
+    other = "data:image/png;base64," + base64.b64encode(_png_bytes(2, 2)).decode()
+    assert client.post("/me/update", json={"avatar_url": other},
+                       headers=_h(author)).status_code == 200
+    second = _feed(client, author)["items"][0]["author"]["avatar_url"]
+    assert first != second, f"the URL did not change: {first}"
+
+
+def test_a_driver_with_no_avatar_gets_null_not_a_broken_url(app_env):
+    _main, client = app_env
+    author = _signup(client, "avatar-none@example.com", "No Picture")
+    _post(client, author, "a post")
+    item = _feed(client, author)["items"][0]
+    assert item["author"]["avatar_url"] is None
+    profile = client.get("/social/me/profile", headers=_h(author)).json()["profile"]
+    assert profile["avatar_url"] is None
+
+
+def test_the_social_surfaces_do_not_hand_build_avatar_paths(app_env):
+    """The guard. An f-string path here is a stale avatar nobody will notice."""
+    import re
+    from pathlib import Path
+    import social_service
+    source = Path(social_service.__file__).read_text(encoding="utf-8")
+    code = re.sub(r'"""[\s\S]*?"""', "", source)
+    code = "\n".join(l for l in code.split("\n") if not l.strip().startswith("#"))
+    assert "avatars/thumb" not in code, (
+        "social_service.py builds an avatar path by hand again -- use "
+        "avatar_thumb_url() so the ?v= cache buster is not dropped"
+    )
