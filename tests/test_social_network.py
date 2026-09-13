@@ -749,3 +749,106 @@ def test_the_social_surfaces_do_not_hand_build_avatar_paths(app_env):
         "social_service.py builds an avatar path by hand again -- use "
         "avatar_thumb_url() so the ?v= cache buster is not dropped"
     )
+
+
+# --------------------------------------------------------------------------
+# post images revalidate instead of being re-downloaded
+# --------------------------------------------------------------------------
+
+def _photo_post(client: TestClient, account: dict) -> dict:
+    res = client.post(
+        "/social/posts/photo",
+        files={"file": ("shot.png", _png_bytes(24, 24), "image/png")},
+        data={"body": "a photo"},
+        headers=_h(account),
+    )
+    assert res.status_code == 200, res.text
+    return res.json()["post"]
+
+
+def test_a_post_image_is_served_with_an_etag(app_env):
+    """Without one, the only lever is max-age: when it expires the whole file
+    comes off the disk again even though it cannot have changed."""
+    _main, client = app_env
+    author = _signup(client, "img-etag@example.com", "Shooter")
+    post = _photo_post(client, author)
+    res = client.get(f"/social/posts/{post['id']}/image", headers=_h(author))
+    assert res.status_code == 200, res.text
+    assert res.headers.get("etag"), res.headers
+    assert "max-age" in (res.headers.get("cache-control") or ""), res.headers
+
+
+def test_an_unchanged_post_image_answers_304(app_env):
+    _main, client = app_env
+    author = _signup(client, "img-304@example.com", "Shooter")
+    post = _photo_post(client, author)
+    first = client.get(f"/social/posts/{post['id']}/image", headers=_h(author))
+    etag = first.headers["etag"]
+
+    again = client.get(f"/social/posts/{post['id']}/image",
+                       headers={**_h(author), "If-None-Match": etag})
+    assert again.status_code == 304, again.status_code
+    assert not again.content, "a 304 sent the bytes anyway"
+
+
+def test_a_mismatched_etag_still_gets_the_image(app_env):
+    _main, client = app_env
+    author = _signup(client, "img-mismatch@example.com", "Shooter")
+    post = _photo_post(client, author)
+    res = client.get(f"/social/posts/{post['id']}/image",
+                     headers={**_h(author), "If-None-Match": '"something-else"'})
+    assert res.status_code == 200
+    assert res.content
+
+
+def test_the_thumb_route_revalidates_too(app_env):
+    _main, client = app_env
+    author = _signup(client, "img-thumb@example.com", "Shooter")
+    post = _photo_post(client, author)
+    first = client.get(f"/social/posts/{post['id']}/image/thumb", headers=_h(author))
+    assert first.status_code == 200, first.text
+    etag = first.headers.get("etag")
+    assert etag, first.headers
+    again = client.get(f"/social/posts/{post['id']}/image/thumb",
+                       headers={**_h(author), "If-None-Match": etag})
+    assert again.status_code == 304
+
+
+def test_a_post_image_is_never_cached_by_a_shared_cache(app_env):
+    """These need a token. `public` would let a proxy hand one driver's photo
+    to whoever asked next."""
+    _main, client = app_env
+    author = _signup(client, "img-private@example.com", "Shooter")
+    post = _photo_post(client, author)
+    res = client.get(f"/social/posts/{post['id']}/image", headers=_h(author))
+    cache_control = res.headers.get("cache-control") or ""
+    assert "private" in cache_control, cache_control
+    assert "public" not in cache_control, cache_control
+
+
+def test_a_304_still_needs_a_token(app_env):
+    """The revalidation path must not become a way around the auth gate."""
+    _main, client = app_env
+    author = _signup(client, "img-auth@example.com", "Shooter")
+    post = _photo_post(client, author)
+    etag = client.get(f"/social/posts/{post['id']}/image",
+                      headers=_h(author)).headers["etag"]
+    res = client.get(f"/social/posts/{post['id']}/image",
+                     headers={"If-None-Match": etag})
+    assert res.status_code in (401, 403), res.status_code
+
+
+def test_a_blocked_driver_cannot_revalidate_their_way_to_a_photo(app_env):
+    """The visibility rule has to hold on the 304 path as well as the 200 one."""
+    _main, client = app_env
+    author = _signup(client, "img-block-a@example.com", "Author")
+    other = _signup(client, "img-block-b@example.com", "Other")
+    post = _photo_post(client, author)
+    etag = client.get(f"/social/posts/{post['id']}/image",
+                      headers=_h(author)).headers["etag"]
+
+    assert client.post(f"/social/users/{other['id']}/block",
+                       headers=_h(author)).status_code == 200
+    res = client.get(f"/social/posts/{post['id']}/image",
+                     headers={**_h(other), "If-None-Match": etag})
+    assert res.status_code == 404, res.status_code

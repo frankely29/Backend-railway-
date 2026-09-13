@@ -172,15 +172,60 @@ def social_delete_post(post_id: int, user: sqlite3.Row = Depends(require_user)):
 # post media
 # --------------------------------------------------------------------------
 
+# A week. A post's photo is written once inside create_post and never touched
+# again -- there is no edit route, ids are never reused, and thumbnails are made
+# at write time rather than backfilled -- so the bytes behind one of these URLs
+# are fixed for the life of the post.
+#
+# Not `immutable`, though. That removes the browser's ability to ever correct
+# itself, and with an ETag the gain over a 304 is one round trip on a reload.
+# The avatar route can afford `immutable` because its URL carries a version;
+# these URLs do not, so revalidation stays available.
+POST_IMAGE_CACHE_SECONDS = 7 * 24 * 3600
+
+
+def _file_etag(target) -> str:
+    """Size and mtime, the way a static file server does it.
+
+    Cheap -- one stat, no read -- and it changes if the bytes ever do, which
+    matters more than being a true content hash for files this size.
+    """
+    stat = target.stat()
+    return f'"post-{int(stat.st_size)}-{int(stat.st_mtime)}"'
+
+
+def _if_none_match(request: Request, etag: str) -> bool:
+    # Deliberately a local copy of main.py's matcher rather than an import:
+    # main imports this module, so reaching back for eight lines would make the
+    # import circular.
+    raw = request.headers.get("if-none-match", "")
+    if not raw or not etag:
+        return False
+    return any(candidate.strip() == etag for candidate in raw.split(","))
+
+
 def _serve(target, media_type: str, request: Request) -> Response:
     if request.method.upper() not in {"GET", "HEAD"}:
         raise HTTPException(status_code=405, detail="Method not allowed")
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="Image file missing")
+
+    etag = _file_etag(target)
+    headers = {
+        # `private`, because these need a token. A shared cache holding them
+        # would serve one driver's photo to whoever asked next.
+        "Cache-Control": f"private, max-age={POST_IMAGE_CACHE_SECONDS}",
+        "ETag": etag,
+    }
+    # A 304 costs a stat and a header. The old five-minute window with no ETag
+    # meant a driver scrolling the same feed pulled every photo off the disk
+    # again every five minutes, in full.
+    if _if_none_match(request, etag):
+        return Response(status_code=304, headers=headers)
     return Response(
         content=b"" if request.method.upper() == "HEAD" else target.read_bytes(),
         media_type=media_type or "application/octet-stream",
-        headers={"Cache-Control": "private, max-age=300"},
+        headers=headers,
     )
 
 
