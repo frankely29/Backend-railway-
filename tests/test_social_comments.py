@@ -480,3 +480,169 @@ def test_hiding_a_reply_needs_an_admin(app_env):
     res = client.post(f"/admin/comments/{mine['comment']['id']}/hide",
                       json={"reason": "because"}, headers=_h(author))
     assert res.status_code in (401, 403)
+
+
+# --------------------------------------------------------------------------
+# replying to a reply
+# --------------------------------------------------------------------------
+
+def _reply(client, account, post_id, parent_id, body):
+    res = client.post(f"/social/posts/{post_id}/comments",
+                      json={"body": body, "parent_id": parent_id}, headers=_h(account))
+    assert res.status_code == 200, res.text
+    return res.json()
+
+
+def test_a_reply_can_answer_another_reply(app_env):
+    _main, client = app_env
+    author = _signup(client, "a@example.com", "Author")
+    reader = _signup(client, "b@example.com", "Reader")
+    post = _post(client, author)
+
+    top = _comment(client, reader, post["id"], "Which gate?")
+    nested = _reply(client, author, post["id"], top["comment"]["id"], "Terminal 4.")
+
+    assert nested["comment"]["parent_id"] == top["comment"]["id"]
+    assert nested["comment"]["reply_to"]["display_name"] == "Reader"
+    # Every reply counts, nested or not: the number under the post is how many
+    # replies there are, not how many top-level ones.
+    assert nested["comment_count"] == 2
+
+
+def test_a_comment_with_no_parent_is_a_reply_to_the_post(app_env):
+    """Which is every comment written before parent_id existed."""
+    _main, client = app_env
+    author = _signup(client, "a@example.com", "Author")
+    post = _post(client, author)
+    out = _comment(client, author, post["id"], "plain")
+    assert out["comment"]["parent_id"] is None
+    assert out["comment"]["reply_to"] is None
+
+
+def test_the_thread_carries_the_shape_back(app_env):
+    _main, client = app_env
+    author = _signup(client, "a@example.com", "Author")
+    reader = _signup(client, "b@example.com", "Reader")
+    post = _post(client, author)
+    top = _comment(client, reader, post["id"], "Which gate?")
+    _reply(client, author, post["id"], top["comment"]["id"], "Terminal 4.")
+
+    items = _comments(client, author, post["id"])["items"]
+    assert [c["parent_id"] for c in items] == [None, top["comment"]["id"]]
+    assert items[1]["reply_to"]["user_id"] == items[0]["author"]["user_id"]
+    assert items[1]["reply_to"]["display_name"] == "Reader"
+    # Oldest first, still: a nested reply does not jump the queue.
+    assert [c["body"] for c in items] == ["Which gate?", "Terminal 4."]
+
+
+def test_a_reply_to_a_reply_to_a_reply_keeps_who_it_answered(app_env):
+    """Depth is not clamped in the database -- the client draws two levels.
+
+    Flattening here would lose which of the two a third-level reply answered,
+    and that is the whole point of the @name on it.
+    """
+    _main, client = app_env
+    author = _signup(client, "a@example.com", "Author")
+    reader = _signup(client, "b@example.com", "Reader")
+    post = _post(client, author)
+    top = _comment(client, reader, post["id"], "Which gate?")
+    second = _reply(client, author, post["id"], top["comment"]["id"], "Terminal 4.")
+    third = _reply(client, reader, post["id"], second["comment"]["id"], "Thanks.")
+
+    assert third["comment"]["parent_id"] == second["comment"]["id"]
+    assert third["comment"]["reply_to"]["display_name"] == "Author"
+
+
+def test_a_parent_on_another_post_is_refused(app_env):
+    """Otherwise a reply lands in a thread whose author cannot see where it came from."""
+    _main, client = app_env
+    author = _signup(client, "a@example.com", "Author")
+    one = _post(client, author, "one")
+    two = _post(client, author, "two")
+    elsewhere = _comment(client, author, one["id"], "over here")
+
+    res = client.post(f"/social/posts/{two['id']}/comments",
+                      json={"body": "no", "parent_id": elsewhere["comment"]["id"]},
+                      headers=_h(author))
+    assert res.status_code == 404, res.text
+
+
+def test_a_parent_that_does_not_exist_is_refused(app_env):
+    _main, client = app_env
+    author = _signup(client, "a@example.com", "Author")
+    post = _post(client, author)
+    res = client.post(f"/social/posts/{post['id']}/comments",
+                      json={"body": "no", "parent_id": 999999}, headers=_h(author))
+    assert res.status_code == 404, res.text
+
+
+def test_a_deleted_parent_cannot_be_replied_to(app_env):
+    _main, client = app_env
+    author = _signup(client, "a@example.com", "Author")
+    post = _post(client, author)
+    top = _comment(client, author, post["id"], "gone in a moment")
+    assert client.delete(f"/social/comments/{top['comment']['id']}",
+                         headers=_h(author)).status_code == 200
+
+    res = client.post(f"/social/posts/{post['id']}/comments",
+                      json={"body": "no", "parent_id": top["comment"]["id"]},
+                      headers=_h(author))
+    assert res.status_code == 404, res.text
+
+
+def test_deleting_a_parent_leaves_its_replies_readable(app_env):
+    """A reply whose parent went away still has to say who it answered.
+
+    The name comes from the comment row, which is soft deleted, so it survives
+    -- without that the @name on an orphan would silently vanish.
+    """
+    _main, client = app_env
+    author = _signup(client, "a@example.com", "Author")
+    reader = _signup(client, "b@example.com", "Reader")
+    post = _post(client, author)
+    top = _comment(client, reader, post["id"], "Which gate?")
+    _reply(client, author, post["id"], top["comment"]["id"], "Terminal 4.")
+    assert client.delete(f"/social/comments/{top['comment']['id']}",
+                         headers=_h(reader)).status_code == 200
+
+    items = _comments(client, author, post["id"])["items"]
+    assert [c["body"] for c in items] == ["Terminal 4."]
+    assert items[0]["reply_to"]["display_name"] == "Reader"
+
+
+# --------------------------------------------------------------------------
+# deleting a post
+# --------------------------------------------------------------------------
+
+def test_an_author_can_delete_their_own_post(app_env):
+    _main, client = app_env
+    author = _signup(client, "a@example.com", "Author")
+    post = _post(client, author, "gone")
+
+    assert client.delete(f"/social/posts/{post['id']}", headers=_h(author)).status_code == 200
+    assert client.get(f"/social/posts/{post['id']}", headers=_h(author)).status_code == 404
+    feed = client.get("/social/feed", params={"scope": "everyone"}, headers=_h(author))
+    assert [p["id"] for p in feed.json()["items"]] == []
+
+
+def test_somebody_else_s_post_is_not_yours_to_delete(app_env):
+    _main, client = app_env
+    author = _signup(client, "a@example.com", "Author")
+    reader = _signup(client, "b@example.com", "Reader")
+    post = _post(client, author, "mine")
+
+    assert client.delete(f"/social/posts/{post['id']}", headers=_h(reader)).status_code == 403
+    assert client.get(f"/social/posts/{post['id']}", headers=_h(reader)).status_code == 200
+
+
+def test_a_post_says_whether_it_is_yours(app_env):
+    """The delete control is drawn from this, so it has to be right for both."""
+    _main, client = app_env
+    author = _signup(client, "a@example.com", "Author")
+    reader = _signup(client, "b@example.com", "Reader")
+    post = _post(client, author, "mine")
+
+    assert client.get(f"/social/posts/{post['id']}",
+                      headers=_h(author)).json()["post"]["mine"] is True
+    assert client.get(f"/social/posts/{post['id']}",
+                      headers=_h(reader)).json()["post"]["mine"] is False

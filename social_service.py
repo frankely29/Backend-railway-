@@ -742,11 +742,65 @@ def post_media_row(post_id: int, viewer_id: Optional[int] = None) -> Any:
 
 _COMMENT_COLUMNS = """
     c.id AS id, c.post_id AS post_id, c.user_id AS user_id, c.body AS body,
-    c.created_at AS created_at,
+    c.parent_id AS parent_id, c.created_at AS created_at,
     u.display_name AS display_name, u.handle AS handle, u.city AS author_city,
     u.avatar_url AS avatar_url, u.avatar_version AS avatar_version,
     u.platforms AS author_platforms
 """
+
+
+def _comment_parents(rows: Iterable[Any]) -> Dict[int, Dict[str, Any]]:
+    """Who wrote each comment that something in this page replied to.
+
+    One query for the whole page rather than one per reply. Parents are almost
+    always already in the page -- ids ascend and a thread is paged forwards, so
+    a reply cannot arrive before what it answers -- but a deleted or
+    blocked-away parent is not, and a reply whose "@name" silently vanishes is
+    worse than one that keeps it.
+    """
+    ids = sorted({
+        int(_row_value(r, "parent_id"))
+        for r in rows
+        if _row_value(r, "parent_id") is not None
+    })
+    if not ids:
+        return {}
+    placeholders = ",".join("?" for _ in ids)
+    found = _db_query_all(
+        f"SELECT c.id AS id, c.user_id AS user_id, u.display_name AS display_name, "
+        f"u.handle AS handle FROM post_comments c JOIN users u ON u.id = c.user_id "
+        f"WHERE c.id IN ({placeholders})",
+        tuple(ids),
+    )
+    out: Dict[int, Dict[str, Any]] = {}
+    for row in found:
+        out[int(_row_value(row, "id", 0))] = {
+            "user_id": int(_row_value(row, "user_id", 0)),
+            "display_name": str(_row_value(row, "display_name", "Driver")),
+            "handle": _row_value(row, "handle"),
+        }
+    return out
+
+
+def _resolve_parent(post_id: int, parent_id: Optional[int]) -> Optional[int]:
+    """A parent has to be a live comment on this same post, or it is not one.
+
+    Without the post check a driver could hang a reply off a comment on
+    somebody else's post and have it appear in a thread they cannot even see.
+    """
+    if parent_id in (None, 0, ""):
+        return None
+    try:
+        wanted = int(parent_id)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="That reply does not exist")
+    row = _db_query_one(
+        "SELECT id FROM post_comments WHERE id=? AND post_id=? AND deleted_at IS NULL LIMIT 1",
+        (wanted, int(post_id)),
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="That reply does not exist")
+    return wanted
 
 
 def _comment_visibility(viewer_id: int) -> Tuple[str, List[Any]]:
@@ -794,12 +848,23 @@ def comment_counts(post_ids: Sequence[int], viewer_id: int) -> Dict[int, int]:
 
 
 def _serialize_comment(row: Any, viewer_id: int, post_author_id: int,
-                       levels: Optional[Dict[int, Optional[int]]] = None) -> Dict[str, Any]:
+                       levels: Optional[Dict[int, Optional[int]]] = None,
+                       parents: Optional[Dict[int, Dict[str, Any]]] = None) -> Dict[str, Any]:
     author_id = int(_row_value(row, "user_id", 0))
     mine = author_id == int(viewer_id)
+    raw_parent = _row_value(row, "parent_id")
+    parent_id = int(raw_parent) if raw_parent is not None else None
     return {
         "id": int(_row_value(row, "id", 0)),
         "post_id": int(_row_value(row, "post_id", 0)),
+        # The comment this one answered, exactly -- null for a reply to the
+        # post. The database keeps the real shape; the two-level render is the
+        # client's, which is why nothing here clamps a depth.
+        "parent_id": parent_id,
+        # Who that was. A reply nested under a reply is drawn at the same
+        # indent as its parent, so without a name on it there is nothing to say
+        # which of the two it answered.
+        "reply_to": (parents or {}).get(parent_id) if parent_id else None,
         "author": {
             "user_id": author_id,
             "display_name": str(_row_value(row, "display_name", "Driver")),
@@ -855,7 +920,8 @@ def get_comments(viewer_id: int, post_id: int, limit: Optional[int] = None,
     rows = rows[:limit]
     post_author_id = int(_row_value(post, "user_id", 0))
     levels = _author_levels([int(_row_value(r, "user_id", 0)) for r in rows])
-    items = [_serialize_comment(r, viewer_id, post_author_id, levels) for r in rows]
+    parents = _comment_parents(rows)
+    items = [_serialize_comment(r, viewer_id, post_author_id, levels, parents) for r in rows]
     return {
         "post_id": int(post_id),
         "items": items,
@@ -864,7 +930,8 @@ def get_comments(viewer_id: int, post_id: int, limit: Optional[int] = None,
     }
 
 
-def create_comment(user: Any, post_id: int, body: str) -> Dict[str, Any]:
+def create_comment(user: Any, post_id: int, body: str,
+                   parent_id: Optional[int] = None) -> Dict[str, Any]:
     post = _live_post_or_404(post_id)
     viewer_id = int(_row_value(user, "id", 0))
 
@@ -884,18 +951,22 @@ def create_comment(user: Any, post_id: int, body: str) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail="Say something first")
     text = text[:MAX_COMMENT_CHARS]
 
+    # Checked before the insert, not after: a reply hung off a comment on
+    # somebody else's post would appear in a thread its author cannot see.
+    parent = _resolve_parent(int(post_id), parent_id)
+
     now = _now()
-    columns = "post_id, user_id, body, created_at"
-    values = (int(post_id), viewer_id, text, now)
+    columns = "post_id, user_id, parent_id, body, created_at"
+    values = (int(post_id), viewer_id, parent, text, now)
 
     def _insert(_conn, cur) -> int:
         # RETURNING on Postgres, lastrowid on SQLite -- reading back "the newest
         # row for this user" would attach the wrong id when two comments land in
         # the same second.
         if DB_BACKEND == "postgres":
-            cur.execute(_sql(f"INSERT INTO post_comments({columns}) VALUES(?,?,?,?) RETURNING id"), values)
+            cur.execute(_sql(f"INSERT INTO post_comments({columns}) VALUES(?,?,?,?,?) RETURNING id"), values)
             return int(_returned_id(cur))
-        cur.execute(_sql(f"INSERT INTO post_comments({columns}) VALUES(?,?,?,?)"), values)
+        cur.execute(_sql(f"INSERT INTO post_comments({columns}) VALUES(?,?,?,?,?)"), values)
         return int(cur.lastrowid)
 
     comment_id = int(_db_run_in_transaction(_insert) or 0)
@@ -910,7 +981,8 @@ def create_comment(user: Any, post_id: int, body: str) -> Dict[str, Any]:
     post_author_id = int(_row_value(post, "user_id", 0))
     levels = _author_levels([viewer_id])
     return {
-        "comment": _serialize_comment(row, viewer_id, post_author_id, levels),
+        "comment": _serialize_comment(row, viewer_id, post_author_id, levels,
+                                      _comment_parents([row])),
         "comment_count": comment_counts([int(post_id)], viewer_id).get(int(post_id), 0),
     }
 

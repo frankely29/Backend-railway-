@@ -297,7 +297,8 @@ def social_comments(
 @router.post("/social/posts/{post_id}/comments", response_model=CommentResponse)
 def social_create_comment(post_id: int, payload: CreateCommentPayload,
                           user: sqlite3.Row = Depends(require_user)):
-    return {"ok": True, **create_comment(user, post_id, payload.body)}
+    return {"ok": True, **create_comment(user, post_id, payload.body,
+                                         parent_id=payload.parent_id)}
 
 
 @router.delete("/social/comments/{comment_id}", response_model=CommentCountResponse)

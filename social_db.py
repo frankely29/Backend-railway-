@@ -17,10 +17,22 @@ to change once there are rows:
    from Houston to Phoenix does not retroactively move a year of posts with
    them, and the Houston feed stays what Houston actually saw.
 
-4. Comments are ONE level deep. No parent_comment_id, because a thread tree is
-   a different product: it needs collapsing, "load more replies", and an order
-   that is not just time. A driver reading at a light wants the replies, in
-   order, and this shape cannot grow a nesting bug it does not have.
+4. Comments store the REAL shape and are DRAWN two levels deep. `parent_id` is
+   exactly the comment that was answered -- null for a reply to the post -- and
+   the client renders a reply to a reply-to-a-reply at the same indent as its
+   parent, with an "@name" saying which of the two it answered.
+
+   This started as one level, and the reasons written here for keeping it that
+   way were that a tree needs collapsing, "load more replies", and an order
+   that is not just time. Drawing two levels needs none of them: the indent
+   cannot grow, so nothing has to collapse; every reply is in the one
+   forward-paged stream ordered by id, so there is no second query to "load
+   more replies"; and the order is still just time.
+
+   Flattening in the database instead would have been less code here and a
+   worse record: it throws away which comment was actually answered, which is
+   precisely what the "@name" needs. Storage keeps the truth, the render
+   decides how much of it fits on a phone.
 
 Unlike chat, nothing here expires. chat.py sweeps messages after 7 or 30 days
 because a chat room is a conversation; a feed is a record, and a social network
@@ -54,6 +66,26 @@ def _ensure_user_city_columns() -> None:
     _try_exec("CREATE INDEX IF NOT EXISTS idx_users_city_key ON users(city_key);")
 
 
+def _ensure_comment_parent_column() -> None:
+    """The CREATE TABLE above only runs on a database that does not exist yet.
+
+    Every database that already has comments in it needs the column added, and
+    this is the only way it gets there. Null everywhere it lands, which is what
+    a reply to the post means -- so every existing comment keeps the shape it
+    already had and nothing has to be backfilled.
+    """
+    if DB_BACKEND == "postgres":
+        _try_exec("ALTER TABLE post_comments ADD COLUMN IF NOT EXISTS parent_id BIGINT;")
+    else:
+        _try_exec("ALTER TABLE post_comments ADD COLUMN parent_id INTEGER;")
+    # Reading a thread groups children by parent; without this that is a scan
+    # of every comment on the post for every parent in it.
+    _try_exec(
+        "CREATE INDEX IF NOT EXISTS idx_post_comments_parent "
+        "ON post_comments(post_id, parent_id);"
+    )
+
+
 def init_social_schema() -> None:
     _ensure_user_city_columns()
 
@@ -84,6 +116,10 @@ def init_social_schema() -> None:
               id BIGSERIAL PRIMARY KEY,
               post_id BIGINT NOT NULL,
               user_id BIGINT NOT NULL,
+              -- The comment this one answered, exactly; null for a reply to
+              -- the post. Not clamped: the client draws two levels, and
+              -- flattening here would lose which comment the "@name" refers to.
+              parent_id BIGINT,
               body TEXT NOT NULL,
               created_at BIGINT NOT NULL,
               deleted_at BIGINT,
@@ -146,6 +182,8 @@ def init_social_schema() -> None:
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               post_id INTEGER NOT NULL,
               user_id INTEGER NOT NULL,
+              -- See the Postgres table above.
+              parent_id INTEGER,
               body TEXT NOT NULL,
               created_at INTEGER NOT NULL,
               deleted_at INTEGER,
@@ -194,6 +232,9 @@ def init_social_schema() -> None:
               "ON post_comments(post_id, deleted_at, id);")
     _try_exec("CREATE INDEX IF NOT EXISTS idx_post_comments_author "
               "ON post_comments(user_id, deleted_at);")
+    # After the CREATE TABLE above, not before it: on a database that does not
+    # exist yet there is nothing to ALTER, and the index would have no column.
+    _ensure_comment_parent_column()
     _try_exec("CREATE INDEX IF NOT EXISTS idx_follows_followee ON follows(followee_id);")
     _try_exec("CREATE INDEX IF NOT EXISTS idx_post_likes_post ON post_likes(post_id);")
     _try_exec("CREATE INDEX IF NOT EXISTS idx_post_likes_user ON post_likes(user_id, post_id);")
