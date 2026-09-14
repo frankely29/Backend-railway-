@@ -83,3 +83,71 @@ def test_paying_routes_stay_reachable_without_access():
     assert "Depends(require_user)" not in src, (
         "subscription routes must not be behind the access gate they exist to resolve"
     )
+
+
+# ---------------------------------------------------------------------------
+# The free tier: read the feed, nothing else
+#
+# Which routes are free is a product decision, so it is pinned here rather than
+# left to whichever dependency someone types next. Reading is free because
+# seeing what other drivers are saying is the reason to subscribe; every write
+# and every other feature is paid.
+# ---------------------------------------------------------------------------
+
+FREE_TO_READ = [
+    "social_feed",              # GET /social/feed
+    "social_user_posts",        # GET /social/users/{id}/posts
+    "social_get_post",          # GET /social/posts/{id}
+    "social_comments",          # GET /social/posts/{id}/comments
+    "social_profile",           # GET /social/users/{id}/profile
+    "social_my_profile",        # GET /social/me/profile
+    "social_profile_by_handle",
+]
+
+PAID_TO_WRITE = [
+    "social_create_post",
+    "social_create_comment",    # "they cant comment if they dont pay"
+    "social_delete_comment",
+    "social_like",
+    "social_unlike",
+    "social_follow",
+    "social_unfollow",
+    "social_set_city",
+]
+
+
+def _signature_of(func_name):
+    import inspect
+    import social_routes
+    src = inspect.getsource(social_routes)
+    start = src.index("def %s(" % func_name)
+    return src[start:src.index("):", start)]
+
+
+@pytest.mark.parametrize("func_name", FREE_TO_READ)
+def test_reading_the_feed_does_not_require_paying(func_name):
+    sig = _signature_of(func_name)
+    assert "Depends(require_user_basic)" in sig, (
+        "%s is behind the paywall; an unpaid driver cannot see the feed, which is "
+        "the one thing meant to sell them the app" % func_name
+    )
+
+
+@pytest.mark.parametrize("func_name", PAID_TO_WRITE)
+def test_joining_in_still_requires_paying(func_name):
+    sig = _signature_of(func_name)
+    assert "Depends(require_user)" in sig and "require_user_basic" not in sig, (
+        "%s became free; reading is the free tier, writing is not" % func_name
+    )
+
+
+def test_account_management_is_never_behind_the_paywall():
+    """A driver whose trial ended could not change their password or delete
+    their account. Whatever the access rules are, those two must work."""
+    import inspect
+    import main
+    for fn in (main.change_password, main.delete_account, main.me_rotate_token):
+        sig = inspect.getsource(fn).split("):", 1)[0]
+        assert "require_user_basic" in sig, (
+            "%s is behind the paywall" % getattr(fn, "__name__", fn)
+        )

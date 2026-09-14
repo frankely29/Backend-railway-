@@ -5439,6 +5439,9 @@ def _db_init() -> None:
         _ensure_column("users", "subscription_comp_expires_at", "INTEGER")
         _ensure_column("users", "subscription_updated_at", "INTEGER")
         _ensure_column("users", "first_paid_welcome_sent_at", "INTEGER")
+        # When this driver last started a map preview. Timed server-side on
+        # purpose -- see core.MAP_PREVIEW_SECONDS.
+        _ensure_column("users", "map_preview_started_at", "INTEGER")
 
         _db_exec(
             """
@@ -6016,6 +6019,7 @@ def _db_init() -> None:
     _ensure_column("users", "subscription_comp_expires_at", "INTEGER")
     _ensure_column("users", "subscription_updated_at", "INTEGER")
     _ensure_column("users", "first_paid_welcome_sent_at", "INTEGER")
+    _ensure_column("users", "map_preview_started_at", "INTEGER")
 
     _db_exec(
         """
@@ -10384,7 +10388,7 @@ def me_update(payload: MeUpdatePayload, user: sqlite3.Row = Depends(require_user
 
 
 @app.post("/me/rotate_token")
-def me_rotate_token(user: sqlite3.Row = Depends(require_user)):
+def me_rotate_token(user: sqlite3.Row = Depends(require_user_basic)):
     # One-click token rotation: bump this user's token_version (invalidating every
     # token previously issued to them -- e.g. one that was shared) and mint a fresh
     # token for the caller to keep using. The old token, including the one in this
@@ -10403,7 +10407,7 @@ def me_rotate_token(user: sqlite3.Row = Depends(require_user)):
 
 
 @app.post("/me/change_password")
-async def change_password(payload: ChangePasswordPayload, user: dict = Depends(require_user)):
+async def change_password(payload: ChangePasswordPayload, user: dict = Depends(require_user_basic)):
     # Enforce the same minimum length signup and admin password-reset use.
     if not payload.new_password or len(payload.new_password) < 6:
         raise HTTPException(status_code=400, detail="Password must be at least 6 chars")
@@ -10424,7 +10428,7 @@ async def change_password(payload: ChangePasswordPayload, user: dict = Depends(r
 
 
 @app.post("/me/delete_account")
-async def delete_account(user: dict = Depends(require_user)):
+async def delete_account(user: dict = Depends(require_user_basic)):
     _presence_remove_runtime_visibility(int(user["id"]), reason="account_deleted")
     cleanup = delete_account_runtime_data(int(user["id"]))
     return {"ok": True, "cleanup": cleanup}

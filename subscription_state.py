@@ -4,7 +4,7 @@ from __future__ import annotations
 import time
 from typing import Any, Dict, Optional
 
-from core import ENFORCE_TRIAL
+from core import ENFORCE_TRIAL, map_preview_remaining
 
 # --- Access rules. SINGLE SOURCE OF TRUTH ------------------------------------
 # core._enforce_access_or_admin (the API gate) and build_subscription_response
@@ -240,4 +240,12 @@ def build_subscription_response(user_row) -> Dict[str, Any]:
         "is_comp_forever": is_comp_forever(user_row),
         "days_remaining": days_remaining,
         "has_access": has_access(user_row),
+        # Seconds of map left on the preview clock. The client counts down from
+        # this and locks when it hits zero, so the moment it blurs and the moment
+        # the server starts refusing are the same number rather than two clocks
+        # drifting apart. Meaningless to anyone who already has access, and read
+        # only -- asking never starts the clock.
+        "map_preview_remaining_seconds": (
+            0 if has_access(user_row) else map_preview_remaining(user_row)
+        ),
     }
