@@ -43,6 +43,35 @@ TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "7"))
 # Disabling it is now a deliberate act (ENFORCE_TRIAL=0) rather than the default,
 # and _log_access_enforcement_state() shouts on boot whenever it is off.
 ENFORCE_TRIAL = str(os.environ.get("ENFORCE_TRIAL", "1")).strip().lower() in ("1", "true", "yes", "on")
+# How long the map stays open to a driver with no access, and how long before
+# they get another look. Timed on the SERVER on purpose: a browser-side timer
+# resets on reinstall, on clearing site data, and in a private window, so the
+# "preview" would be unlimited for anyone who noticed. Zero disables it and the
+# gate behaves exactly as it did before.
+MAP_PREVIEW_SECONDS = max(0, int(os.environ.get("MAP_PREVIEW_SECONDS", "300")))
+# A rolling window rather than a calendar day: a preview at 23:50 should not be
+# refilled ten minutes later, and a night-shift driver should not have the rules
+# change mid-shift because of a timezone.
+MAP_PREVIEW_RESET_SECONDS = max(
+    MAP_PREVIEW_SECONDS, int(os.environ.get("MAP_PREVIEW_RESET_SECONDS", "86400"))
+)
+
+# What the preview actually opens. Everything else an unpaid driver reaches is
+# decided by which dependency the route declares, but the preview has to know a
+# map request from a feed request, and the only thing it can ask is the path.
+_MAP_PREVIEW_PREFIXES = (
+    "/frame",
+    "/timeline",
+    "/day_tendency",
+    "/assistant",
+    "/long_trip_flags",
+    "/long_trip_hotspots",
+    "/nightlife_districts",
+    "/city_events",
+    "/presence",
+    "/events/long_trip_flag",
+)
+
 POSTGRES_POOL_MIN = max(1, int(os.environ.get("POSTGRES_POOL_MIN", "2")))
 POSTGRES_POOL_MAX = max(POSTGRES_POOL_MIN, int(os.environ.get("POSTGRES_POOL_MAX", "24")))
 LIVE_TOKEN_TTL_SECONDS = min(90, max(30, int(os.environ.get("LIVE_TOKEN_TTL_SECONDS", "60"))))
@@ -384,8 +413,70 @@ def _enforce_trial_or_admin(user: sqlite3.Row) -> None:
         raise HTTPException(status_code=402, detail="Trial expired")
 
 
-def _enforce_access_or_admin(user: sqlite3.Row) -> None:
-    """Full access ladder: admin → comp → active subscription → active trial → HTTP 402."""
+def _row_int(user: sqlite3.Row, key: str) -> Optional[int]:
+    """Read an int column that may be absent on older rows, without raising."""
+    try:
+        if key not in user.keys():
+            return None
+        raw = user[key]
+    except Exception:
+        return None
+    try:
+        return int(raw) if raw is not None else None
+    except Exception:
+        return None
+
+
+def _is_map_route(path: str) -> bool:
+    clean = (path or "").split("?", 1)[0]
+    return any(clean.startswith(prefix) for prefix in _MAP_PREVIEW_PREFIXES)
+
+
+def map_preview_remaining(user: sqlite3.Row, now_unix: Optional[int] = None) -> int:
+    """Seconds of map left in this driver's preview. Read-only; starts nothing.
+
+    Shared with the /me payload so the countdown a driver sees and the moment the
+    server starts refusing are the same number, rather than two clocks drifting.
+    """
+    if MAP_PREVIEW_SECONDS <= 0:
+        return 0
+    now = int(now_unix if now_unix is not None else time.time())
+    started = _row_int(user, "map_preview_started_at")
+    if started is None or started <= 0:
+        return MAP_PREVIEW_SECONDS          # untouched: a full preview is waiting
+    elapsed = now - started
+    if elapsed >= MAP_PREVIEW_RESET_SECONDS:
+        return MAP_PREVIEW_SECONDS          # the window rolled over
+    return max(0, MAP_PREVIEW_SECONDS - elapsed)
+
+
+def _map_preview_allows(user: sqlite3.Row, req: Optional[Request], now: int) -> bool:
+    """Let a map request through on the preview clock, starting it if needed."""
+    if MAP_PREVIEW_SECONDS <= 0 or req is None:
+        return False
+    if not _is_map_route(getattr(getattr(req, "url", None), "path", "") or ""):
+        return False
+
+    started = _row_int(user, "map_preview_started_at")
+    fresh = started is None or started <= 0 or (now - started) >= MAP_PREVIEW_RESET_SECONDS
+    if fresh:
+        try:
+            _db_exec("UPDATE users SET map_preview_started_at=? WHERE id=?", (now, int(user["id"])))
+        except Exception:
+            # If the stamp cannot be written the preview would never expire, so
+            # refuse rather than hand out an unlimited map.
+            return False
+        return True
+
+    return (now - started) < MAP_PREVIEW_SECONDS
+
+
+def _enforce_access_or_admin(user: sqlite3.Row, req: Optional[Request] = None) -> None:
+    """Full access ladder: admin → comp → subscription → trial → map preview → 402.
+
+    `req` is optional so existing callers and tests keep working; without it the
+    preview is simply never offered and the ladder is what it always was.
+    """
     if not ENFORCE_TRIAL:
         return
     if int(user["is_admin"]) == 1:
@@ -444,6 +535,12 @@ def _enforce_access_or_admin(user: sqlite3.Row) -> None:
     if trial_expires_at is not None and trial_expires_at > 0 and now < trial_expires_at:
         return
 
+    # Last rung: a short look at the map, timed here rather than in the browser.
+    # Only map routes; the feed and everything else are decided by which
+    # dependency they declare.
+    if _map_preview_allows(user, req, now):
+        return
+
     raise HTTPException(status_code=402, detail="Subscription required")
 
 
@@ -455,7 +552,7 @@ def require_user_basic(req: Request) -> sqlite3.Row:
 
 def require_user(req: Request) -> sqlite3.Row:
     user = require_user_basic(req)
-    _enforce_access_or_admin(user)
+    _enforce_access_or_admin(user, req)
     return user
 
 

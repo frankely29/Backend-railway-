@@ -1,11 +1,17 @@
 """HTTP surface for the driver network.
 
-Everything here sits behind `require_user`, the same gate as the map and chat --
-the network is part of the subscription, not a free tier alongside it.
+Reading is free; joining in is not. The feed, a post, its comments and a profile
+sit behind `require_user_basic` -- signed in, not necessarily paid -- because
+seeing what other drivers are saying is the reason to subscribe, and a wall in
+front of it sells nothing. Posting, commenting, liking, following and every
+identity change sit behind `require_user`, the same gate as the map and chat.
+
+Which of the two a route uses is the whole access policy for this file, so it is
+pinned by tests/test_access_enforcement_default.py rather than left to memory.
 
 The two image routes are the exception in shape rather than in access: they
-still require a signed-in subscriber, but they return bytes instead of JSON and
-they are the only endpoints a browser will hit with an <img> tag.
+return bytes instead of JSON and are the only endpoints a browser will hit with
+an <img> tag.
 """
 from __future__ import annotations
 
@@ -14,7 +20,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Response, UploadFile
 
-from core import require_user
+from core import require_user, require_user_basic
 from media_store import THUMB_MIME_TYPE, derive_thumb_key
 from social_moderation import (
     REPORT_REASONS,
@@ -87,6 +93,11 @@ router = APIRouter(tags=["social"])
 
 # --------------------------------------------------------------------------
 # feed
+#
+# Reading is free; joining in is not. An unpaid driver can see what the
+# community is saying -- that is the reason to subscribe -- but cannot post,
+# comment, like or follow. Which routes are free is decided here, by the
+# dependency each one declares, and pinned by tests/test_access_enforcement_default.py.
 # --------------------------------------------------------------------------
 
 @router.get("/social/feed", response_model=FeedResponse)
@@ -94,7 +105,7 @@ def social_feed(
     scope: FeedScope = FeedScope.following,
     limit: Optional[int] = None,
     before_id: Optional[int] = None,
-    user: sqlite3.Row = Depends(require_user),
+    user: sqlite3.Row = Depends(require_user_basic),
 ):
     data = get_feed(int(user["id"]), scope, limit=limit, before_id=before_id)
     return {"ok": True, "scope": scope, **data}
@@ -105,7 +116,7 @@ def social_user_posts(
     user_id: int,
     limit: Optional[int] = None,
     before_id: Optional[int] = None,
-    user: sqlite3.Row = Depends(require_user),
+    user: sqlite3.Row = Depends(require_user_basic),
 ):
     data = get_user_posts(int(user["id"]), user_id, limit=limit, before_id=before_id)
     return {"ok": True, "scope": FeedScope.everyone, **data}
@@ -158,7 +169,7 @@ async def social_create_photo_post(
 
 
 @router.get("/social/posts/{post_id}", response_model=PostResponse)
-def social_get_post(post_id: int, user: sqlite3.Row = Depends(require_user)):
+def social_get_post(post_id: int, user: sqlite3.Row = Depends(require_user_basic)):
     return {"ok": True, "post": get_post(int(user["id"]), post_id)}
 
 
@@ -272,7 +283,7 @@ def social_comments(
     post_id: int,
     limit: Optional[int] = None,
     after_id: Optional[int] = None,
-    user: sqlite3.Row = Depends(require_user),
+    user: sqlite3.Row = Depends(require_user_basic),
 ):
     """Oldest first, paging forwards.
 
@@ -320,12 +331,12 @@ def social_unfollow(user_id: int, user: sqlite3.Row = Depends(require_user)):
 
 
 @router.get("/social/users/{user_id}/profile", response_model=ProfileResponse)
-def social_profile(user_id: int, user: sqlite3.Row = Depends(require_user)):
+def social_profile(user_id: int, user: sqlite3.Row = Depends(require_user_basic)):
     return {"ok": True, "profile": get_profile(int(user["id"]), user_id)}
 
 
 @router.get("/social/me/profile", response_model=ProfileResponse)
-def social_my_profile(user: sqlite3.Row = Depends(require_user)):
+def social_my_profile(user: sqlite3.Row = Depends(require_user_basic)):
     me = int(user["id"])
     return {"ok": True, "profile": get_profile(me, me)}
 
@@ -341,7 +352,7 @@ def social_set_city(payload: SetCityPayload, user: sqlite3.Row = Depends(require
 # --------------------------------------------------------------------------
 
 @router.get("/social/users/by-handle/{handle}/profile", response_model=ProfileResponse)
-def social_profile_by_handle(handle: str, user: sqlite3.Row = Depends(require_user)):
+def social_profile_by_handle(handle: str, user: sqlite3.Row = Depends(require_user_basic)):
     """A handle is the name people link to, so it has to resolve to a profile."""
     return {"ok": True, "profile": get_profile_by_handle(int(user["id"]), handle)}
 
