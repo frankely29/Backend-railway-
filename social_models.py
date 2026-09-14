@@ -74,6 +74,15 @@ class Post(BaseModel):
 
 class CreateCommentPayload(BaseModel):
     body: str = Field(min_length=1, max_length=MAX_COMMENT_CHARS)
+    # The comment this one answers. Omitted or null is a reply to the post
+    # itself, which is every comment written before this field existed.
+    parent_id: Optional[int] = None
+
+
+class ReplyTo(BaseModel):
+    user_id: int
+    display_name: str
+    handle: Optional[str] = None
 
 
 class Comment(BaseModel):
@@ -81,6 +90,13 @@ class Comment(BaseModel):
     post_id: int
     author: PostAuthor
     body: str
+    # Exactly what was answered; null for a reply to the post. The database
+    # keeps the real shape and the client draws two levels, so a reply to a
+    # reply-to-a-reply sits at the same indent as its parent.
+    parent_id: Optional[int] = None
+    # Who wrote that parent, for the "@name" on a nested reply -- at one indent
+    # there is otherwise nothing to say which of the two it answered.
+    reply_to: Optional[ReplyTo] = None
     mine: bool = False
     # True when the viewer can remove it: their own comment, or any comment on
     # a post they own. Sent rather than derived, so the client cannot get the
