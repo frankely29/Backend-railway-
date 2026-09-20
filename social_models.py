@@ -332,3 +332,61 @@ class HideCommentResponse(BaseModel):
 
 class OkResponse(BaseModel):
     ok: bool = True
+
+
+# ---------------------------------------------------------------- notifications
+
+class NotificationActor(BaseModel):
+    """Deliberately not the full Profile.
+
+    A notification row needs a face, a name and a level, and nothing else.
+    Serving the whole profile here would mean the reputation lookup and the
+    follower counts run once per row on a screen that is mostly one person
+    appearing repeatedly.
+    """
+    user_id: int
+    display_name: str
+    handle: Optional[str] = None
+    avatar_url: Optional[str] = None
+    level: Optional[int] = None
+
+
+class Notification(BaseModel):
+    id: int
+    # like | comment | reply | follow -- see NOTIFICATION_KINDS in the service.
+    # A string rather than an enum so the server can add a kind without every
+    # older client refusing to parse the whole page.
+    kind: str
+    created_at: int
+    read: bool = False
+    actor: NotificationActor
+    # Absent for a follow, which is about a person rather than a post.
+    post_id: Optional[int] = None
+    comment_id: Optional[int] = None
+    # The post's first line, so the row can say WHICH post without the client
+    # fetching every post named on the screen.
+    post_excerpt: Optional[str] = None
+
+
+class NotificationsResponse(BaseModel):
+    ok: bool = True
+    items: List[Notification] = []
+    next_before_id: Optional[int] = None
+    # Sent with the page as well as on its own, so opening the screen and
+    # reading the badge is one request rather than two.
+    unread: int = 0
+
+
+class UnreadResponse(BaseModel):
+    ok: bool = True
+    unread: int = 0
+
+
+class MarkReadPayload(BaseModel):
+    """Inclusive, and optional.
+
+    Marking everything read is the common case. `before_id` exists so opening
+    the screen cannot mark something read that arrived while it was open and
+    was never actually on it.
+    """
+    before_id: Optional[int] = None
