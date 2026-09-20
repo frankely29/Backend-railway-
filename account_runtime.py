@@ -127,6 +127,12 @@ _DELETE_SPECS: List[tuple[str, str]] = [
     # --- the driver's social content, and everything hanging off it -------
     # Deleting someone's post has to take other drivers' likes and comments on
     # it too; those rows point at posts(id).
+    # Before post_likes and posts, because a notification points at both a user
+    # and a post: the driver's own notifications, the ones they caused for other
+    # people, and any left pointing at a post that is about to go.
+    ("social_notifications",
+     "DELETE FROM social_notifications WHERE user_id=? OR actor_id=? "
+     "OR post_id IN (SELECT id FROM posts WHERE user_id=?)"),
     ("post_likes",
      "DELETE FROM post_likes WHERE user_id=? "
      "OR post_id IN (SELECT id FROM posts WHERE user_id=?)"),

@@ -546,7 +546,7 @@ def _like_summary(post_id: int, viewer_id: int) -> Dict[str, Any]:
 
 
 def like_post(user_id: int, post_id: int) -> Dict[str, Any]:
-    _live_post_or_404(post_id)
+    post = _live_post_or_404(post_id)
     existing = _db_query_one(
         "SELECT post_id FROM post_likes WHERE post_id=? AND user_id=? LIMIT 1",
         (int(post_id), int(user_id)),
@@ -558,15 +558,20 @@ def like_post(user_id: int, post_id: int) -> Dict[str, Any]:
             "INSERT INTO post_likes(post_id, user_id, created_at) VALUES(?,?,?)",
             (int(post_id), int(user_id), _now()),
         )
+    _notify(_row_value(post, "user_id", 0), user_id, "like", post_id=post_id)
     return _like_summary(post_id, user_id)
 
 
 def unlike_post(user_id: int, post_id: int) -> Dict[str, Any]:
-    _live_post_or_404(post_id)
+    post = _live_post_or_404(post_id)
     _db_exec(
         "DELETE FROM post_likes WHERE post_id=? AND user_id=?",
         (int(post_id), int(user_id)),
     )
+    # The like is gone, so the notification about it has to go too -- otherwise
+    # the screen keeps saying something that is no longer true, and tapping it
+    # shows a post with no like on it.
+    _unnotify(_row_value(post, "user_id", 0), user_id, "like", post_id=post_id)
     return _like_summary(post_id, user_id)
 
 
@@ -616,6 +621,7 @@ def follow_user(follower_id: int, followee_id: int) -> Dict[str, Any]:
             "INSERT INTO follows(follower_id, followee_id, created_at) VALUES(?,?,?)",
             (int(follower_id), int(followee_id), _now()),
         )
+    _notify(followee_id, follower_id, "follow")
     return {
         "user_id": int(followee_id),
         "following": True,
@@ -629,6 +635,10 @@ def unfollow_user(follower_id: int, followee_id: int) -> Dict[str, Any]:
         "DELETE FROM follows WHERE follower_id=? AND followee_id=?",
         (int(follower_id), int(followee_id)),
     )
+    # Same reason as an unlike: following and unfollowing repeatedly must not
+    # leave a trail, and "started following you" from someone who no longer
+    # does is noise.
+    _unnotify(followee_id, follower_id, "follow")
     return {
         "user_id": int(followee_id),
         "following": False,
@@ -979,6 +989,19 @@ def create_comment(user: Any, post_id: int, body: str,
     if not row:
         raise HTTPException(status_code=500, detail="Comment could not be read back")
     post_author_id = int(_row_value(post, "user_id", 0))
+
+    # Two different people can be owed this one comment: whoever wrote the post,
+    # and whoever wrote the comment being answered. Both are told, and _notify
+    # drops the duplicate when they are the same person -- and drops it again
+    # when either of them is the one typing.
+    _notify(post_author_id, viewer_id, "comment", post_id=post_id, comment_id=comment_id)
+    if parent:
+        parent_row = _db_query_one(
+            "SELECT user_id FROM post_comments WHERE id=? LIMIT 1", (int(parent),)
+        )
+        if parent_row:
+            _notify(_row_value(parent_row, "user_id", 0), viewer_id, "reply",
+                    post_id=post_id, comment_id=comment_id)
     levels = _author_levels([viewer_id])
     return {
         "comment": _serialize_comment(row, viewer_id, post_author_id, levels,
@@ -1015,3 +1038,195 @@ def delete_comment(user_id: int, comment_id: int) -> Dict[str, Any]:
         "post_id": post_id,
         "comment_count": comment_counts([post_id], int(user_id)).get(post_id, 0),
     }
+
+
+# --------------------------------------------------------------------------
+# notifications
+#
+# The return loop. Everything above this point is a driver doing something to
+# somebody else's post; none of it told that somebody. A social network where
+# being liked, answered or followed is silent gives nobody a reason to come
+# back, which is the whole reason this exists.
+#
+# Four rules, and each one is a thing that makes a notifications screen bad:
+#
+#   - You are never notified about yourself. Liking your own post is not news.
+#   - One row per (recipient, actor, kind, subject). Like, unlike, like again
+#     leaves one row, not three -- and an unlike takes its row away, because a
+#     notification about a like that no longer exists is a lie.
+#   - A block silences both directions, for the same reason follow does: it
+#     must not be possible to learn you were blocked by watching what arrives.
+#   - Writing one can never fail the thing that caused it. A like that 500s
+#     because the notification insert raced is a worse bug than a missing
+#     notification, so every write here is best-effort.
+# --------------------------------------------------------------------------
+
+NOTIFICATION_KINDS = ("like", "comment", "reply", "follow")
+
+# What the screen can page through in one go. The same ceiling as the feed:
+# nobody scrolls two hundred notifications, and an unbounded LIMIT is how one
+# account with a popular post takes a page of the database with it.
+_MAX_NOTIFICATIONS = 50
+
+
+def _notify(user_id: Any, actor_id: Any, kind: str,
+            post_id: Any = None, comment_id: Any = None) -> None:
+    """Best effort, by design -- see the note above."""
+    try:
+        recipient = int(user_id or 0)
+        actor = int(actor_id or 0)
+    except (TypeError, ValueError):
+        return
+    if not recipient or not actor or recipient == actor:
+        return
+    if kind not in NOTIFICATION_KINDS:
+        return
+    try:
+        if is_blocked_either_way(recipient, actor):
+            return
+        # 0 rather than NULL, so the unique index can do its job -- see
+        # social_db.py. The INSERT is guarded by a read rather than relying on
+        # the index alone, because a constraint violation on Postgres poisons
+        # the transaction it happens in.
+        subject_post = int(post_id or 0)
+        subject_comment = int(comment_id or 0)
+        existing = _db_query_one(
+            "SELECT id FROM social_notifications WHERE user_id=? AND actor_id=? "
+            "AND kind=? AND post_id=? AND comment_id=? LIMIT 1",
+            (recipient, actor, str(kind), subject_post, subject_comment),
+        )
+        if existing:
+            return
+        _db_exec(
+            "INSERT INTO social_notifications"
+            "(user_id, actor_id, kind, post_id, comment_id, created_at) "
+            "VALUES(?,?,?,?,?,?)",
+            (recipient, actor, str(kind), subject_post, subject_comment, _now()),
+        )
+    except Exception:  # pragma: no cover - never break the caller
+        _LOGGER.warning("notification write failed", exc_info=True)
+
+
+def _unnotify(user_id: Any, actor_id: Any, kind: str,
+              post_id: Any = None, comment_id: Any = None) -> None:
+    """Take a notification back when the thing it describes is undone."""
+    try:
+        _db_exec(
+            "DELETE FROM social_notifications WHERE user_id=? AND actor_id=? "
+            "AND kind=? AND post_id=? AND comment_id=?",
+            (int(user_id or 0), int(actor_id or 0), str(kind),
+             int(post_id or 0), int(comment_id or 0)),
+        )
+    except Exception:  # pragma: no cover
+        _LOGGER.warning("notification delete failed", exc_info=True)
+
+
+def unread_notification_count(user_id: int) -> int:
+    row = _db_query_one(
+        "SELECT COUNT(*) AS n FROM social_notifications "
+        "WHERE user_id=? AND read_at IS NULL",
+        (int(user_id),),
+    )
+    return int(_row_value(row, "n", 0) or 0)
+
+
+def _serialize_notification(row: Any, levels: Dict[int, Optional[int]]) -> Dict[str, Any]:
+    actor_id = int(_row_value(row, "actor_id", 0))
+    post_id = int(_row_value(row, "post_id", 0) or 0)
+    comment_id = int(_row_value(row, "comment_id", 0) or 0)
+    return {
+        "id": int(_row_value(row, "id", 0)),
+        "kind": str(_row_value(row, "kind", "") or ""),
+        "created_at": int(_row_value(row, "created_at", 0) or 0),
+        "read": _row_value(row, "read_at", None) is not None,
+        "actor": {
+            "user_id": actor_id,
+            "display_name": str(_row_value(row, "actor_name", "") or "Driver"),
+            "handle": _row_value(row, "actor_handle", None),
+            "avatar_url": _avatar_url(row, actor_id),
+            "level": levels.get(actor_id),
+        },
+        # 0 means "this kind has no subject"; the client shows nothing to tap.
+        "post_id": post_id or None,
+        "comment_id": comment_id or None,
+        # The post's own words, so a notification says WHICH post without the
+        # client having to fetch every one of them to find out.
+        "post_excerpt": _notification_excerpt(row),
+    }
+
+
+def _notification_excerpt(row: Any) -> Optional[str]:
+    body = _row_value(row, "post_body", None)
+    if body is None:
+        return None
+    text = str(body).strip()
+    if not text:
+        return None
+    return text if len(text) <= 80 else (text[:79].rstrip() + "…")
+
+
+def get_notifications(user_id: int, limit: Optional[int] = None,
+                      before_id: Optional[int] = None) -> Dict[str, Any]:
+    """Newest first, keyset paged on id, exactly like the feed.
+
+    A notification whose post has since been deleted is dropped rather than
+    shown: "Marco liked your post" that opens nothing is worse than silence.
+    The row is left alone -- posts are soft deleted and can come back.
+    """
+    viewer = int(user_id)
+    take = max(1, min(int(limit or 20), _MAX_NOTIFICATIONS))
+    where = ["n.user_id=?"]
+    args: List[Any] = [viewer]
+    if before_id:
+        where.append("n.id < ?")
+        args.append(int(before_id))
+    args.append(take + 1)
+
+    rows = _db_query_all(
+        "SELECT n.id AS id, n.kind AS kind, n.created_at AS created_at, "
+        "n.read_at AS read_at, n.post_id AS post_id, n.comment_id AS comment_id, "
+        "u.id AS actor_id, u.display_name AS actor_name, u.handle AS actor_handle, "
+        "u.avatar_url AS avatar_url, u.avatar_version AS avatar_version, "
+        "p.body AS post_body, p.deleted_at AS post_deleted_at "
+        "FROM social_notifications n "
+        "JOIN users u ON u.id = n.actor_id "
+        "LEFT JOIN posts p ON p.id = n.post_id "
+        f"WHERE {' AND '.join(where)} ORDER BY n.id DESC LIMIT ?",
+        tuple(args),
+    ) or []
+
+    # A blocked or muted actor goes quiet here too, so blocking someone clears
+    # them out of this screen rather than only out of the feed.
+    hidden = hidden_author_ids(viewer)
+    kept = []
+    for row in rows:
+        if int(_row_value(row, "actor_id", 0)) in hidden:
+            continue
+        if int(_row_value(row, "post_id", 0) or 0) and _row_value(row, "post_deleted_at", None):
+            continue
+        kept.append(row)
+
+    has_more = len(kept) > take
+    page = kept[:take]
+    levels = _author_levels([int(_row_value(r, "actor_id", 0)) for r in page])
+    items = [_serialize_notification(row, levels) for row in page]
+    return {
+        "items": items,
+        "next_before_id": items[-1]["id"] if (items and has_more) else None,
+        "unread": unread_notification_count(viewer),
+    }
+
+
+def mark_notifications_read(user_id: int, before_id: Optional[int] = None) -> Dict[str, Any]:
+    """Mark everything read, or everything down to a point.
+
+    `before_id` is inclusive and exists so opening the screen cannot mark
+    something read that arrived while it was open and was never on it.
+    """
+    args: List[Any] = [_now(), int(user_id)]
+    sql = "UPDATE social_notifications SET read_at=? WHERE user_id=? AND read_at IS NULL"
+    if before_id:
+        sql += " AND id <= ?"
+        args.append(int(before_id))
+    _db_exec(sql, tuple(args))
+    return {"unread": unread_notification_count(int(user_id))}

@@ -34,6 +34,15 @@ to change once there are rows:
    precisely what the "@name" needs. Storage keeps the truth, the render
    decides how much of it fits on a phone.
 
+5. Notifications are DERIVED ROWS, not a log. One row per (recipient, actor,
+   kind, subject), so liking, unliking and liking again leaves one notification
+   rather than three, and unliking takes its notification with it. A feed of
+   "Marco liked your post" repeated eleven times is how a notifications screen
+   becomes a thing people turn off.
+
+   They are also the only thing here that is HARD deleted, for that reason and
+   because nothing reads them after they are seen.
+
 Unlike chat, nothing here expires. chat.py sweeps messages after 7 or 30 days
 because a chat room is a conversation; a feed is a record, and a social network
 whose posts evaporate is not a social network.
@@ -155,6 +164,26 @@ def init_social_schema() -> None:
             );
             """
         )
+        _db_exec(
+            """
+            CREATE TABLE IF NOT EXISTS social_notifications (
+              id BIGSERIAL PRIMARY KEY,
+              user_id BIGINT NOT NULL,
+              actor_id BIGINT NOT NULL,
+              kind TEXT NOT NULL,
+              -- 0, not NULL, for "this kind has no subject" -- a follow has
+              -- neither. NULLs compare as distinct in a unique index on both
+              -- engines, so a nullable column here would let the same follow be
+              -- written twice and defeat the whole point of idx_notifications_once.
+              post_id BIGINT NOT NULL DEFAULT 0,
+              comment_id BIGINT NOT NULL DEFAULT 0,
+              created_at BIGINT NOT NULL,
+              read_at BIGINT,
+              FOREIGN KEY(user_id) REFERENCES users(id),
+              FOREIGN KEY(actor_id) REFERENCES users(id)
+            );
+            """
+        )
     else:
         _db_exec(
             """
@@ -219,6 +248,23 @@ def init_social_schema() -> None:
             );
             """
         )
+        _db_exec(
+            """
+            CREATE TABLE IF NOT EXISTS social_notifications (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              user_id INTEGER NOT NULL,
+              actor_id INTEGER NOT NULL,
+              kind TEXT NOT NULL,
+              -- See the Postgres table above: 0 rather than NULL.
+              post_id INTEGER NOT NULL DEFAULT 0,
+              comment_id INTEGER NOT NULL DEFAULT 0,
+              created_at INTEGER NOT NULL,
+              read_at INTEGER,
+              FOREIGN KEY(user_id) REFERENCES users(id),
+              FOREIGN KEY(actor_id) REFERENCES users(id)
+            );
+            """
+        )
 
     # Every feed query is "newest first, not deleted", narrowed by author or by
     # city -- so the indexes lead with the narrowing column and end with id DESC,
@@ -238,3 +284,19 @@ def init_social_schema() -> None:
     _try_exec("CREATE INDEX IF NOT EXISTS idx_follows_followee ON follows(followee_id);")
     _try_exec("CREATE INDEX IF NOT EXISTS idx_post_likes_post ON post_likes(post_id);")
     _try_exec("CREATE INDEX IF NOT EXISTS idx_post_likes_user ON post_likes(user_id, post_id);")
+    # The screen is "mine, newest first"; the badge is "mine, unread". Two reads,
+    # two indexes, and the second is partial on Postgres because unread rows are
+    # a small and shrinking slice of the table.
+    _try_exec("CREATE INDEX IF NOT EXISTS idx_notifications_user "
+              "ON social_notifications(user_id, id DESC);")
+    if DB_BACKEND == "postgres":
+        _try_exec("CREATE INDEX IF NOT EXISTS idx_notifications_unread "
+                  "ON social_notifications(user_id) WHERE read_at IS NULL;")
+    else:
+        _try_exec("CREATE INDEX IF NOT EXISTS idx_notifications_unread "
+                  "ON social_notifications(user_id, read_at);")
+    # One row per (recipient, actor, kind, subject) is what keeps a notification
+    # feed from repeating itself -- see the note at the top. Enforced here rather
+    # than only in the service, so a race between two requests cannot write two.
+    _try_exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_once "
+              "ON social_notifications(user_id, actor_id, kind, post_id, comment_id);")

@@ -62,10 +62,13 @@ from social_models import (
     SetHandlePayload,
     UpdateIdentityPayload,
     LikeResponse,
+    MarkReadPayload,
+    NotificationsResponse,
     OkResponse,
     PostResponse,
     ProfileResponse,
     SetCityPayload,
+    UnreadResponse,
 )
 from social_service import (
     _resolve_image_path,
@@ -80,12 +83,15 @@ from social_service import (
     get_post,
     get_profile,
     get_profile_by_handle,
+    get_notifications,
     get_user_posts,
     like_post,
+    mark_notifications_read,
     post_media_row,
     set_user_city,
     unfollow_user,
     unlike_post,
+    unread_notification_count,
 )
 
 router = APIRouter(tags=["social"])
@@ -464,3 +470,36 @@ def social_report(payload: ReportPayload, user: sqlite3.Row = Depends(require_us
 @router.get("/social/reports/options", response_model=ReportOptionsResponse)
 def social_report_options(user: sqlite3.Row = Depends(require_user)):
     return {"ok": True, "reasons": REPORT_REASONS, "targets": REPORT_TARGETS}
+
+
+# --------------------------------------------------------------------------
+# notifications
+#
+# require_user, not require_user_basic: these are about things other drivers
+# did to your posts, and an unpaid driver has no posts -- reading the feed is
+# free, being part of it is not. Same line every other write-side route draws.
+# --------------------------------------------------------------------------
+
+@router.get("/social/notifications", response_model=NotificationsResponse)
+def social_notifications(limit: Optional[int] = None, before_id: Optional[int] = None,
+                         user: sqlite3.Row = Depends(require_user)):
+    """Newest first, keyset paged on before_id -- the same shape as the feed."""
+    return {"ok": True, **get_notifications(int(user["id"]), limit=limit,
+                                            before_id=before_id)}
+
+
+@router.get("/social/notifications/unread", response_model=UnreadResponse)
+def social_notifications_unread(user: sqlite3.Row = Depends(require_user)):
+    """Just the number, for the badge.
+
+    Its own route because the badge is polled and the page is not: this reads
+    one indexed count, where the page joins users and posts for twenty rows.
+    """
+    return {"ok": True, "unread": unread_notification_count(int(user["id"]))}
+
+
+@router.post("/social/notifications/read", response_model=UnreadResponse)
+def social_notifications_read(payload: MarkReadPayload,
+                              user: sqlite3.Row = Depends(require_user)):
+    return {"ok": True, **mark_notifications_read(int(user["id"]),
+                                                  before_id=payload.before_id)}
