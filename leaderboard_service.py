@@ -58,26 +58,72 @@ def _build_level_xp_thresholds() -> List[int]:
 
 LEVEL_XP_THRESHOLDS = _build_level_xp_thresholds()
 
+# The ladder a driver climbs: ten prestiges of five ranks each, fifty in all.
+#
+# A driver finishing prestige 1 rank 5 moves to prestige 2 rank 1, and so on
+# to the tenth prestige. So band_007 is prestige 2, rank 2 -- the band index
+# is the only thing stored or sent, and the pair is derived from it:
+#
+#     prestige = ((band - 1) // 5) + 1
+#     rank     = ((band - 1) %  5) + 1
+#
+# MAX_LEVEL is untouched at 1000, so each band spans twenty XP levels rather
+# than ten. The XP curve, the thresholds and every level a driver has already
+# earned are unaffected by this; what changed is how many brackets those
+# levels are grouped into.
+PRESTIGE_COUNT = 10
+RANKS_PER_PRESTIGE = 5
+RANK_BAND_COUNT = PRESTIGE_COUNT * RANKS_PER_PRESTIGE
+LEVELS_PER_RANK_BAND = MAX_LEVEL // RANK_BAND_COUNT
+
 RANK_LADDER = [
     (
-        ((band_index - 1) * 10) + 1,
-        band_index * 10,
+        ((band_index - 1) * LEVELS_PER_RANK_BAND) + 1,
+        band_index * LEVELS_PER_RANK_BAND,
         f"Band {band_index:03d}",
         f"band_{band_index:03d}",
     )
-    for band_index in range(1, 101)
+    for band_index in range(1, RANK_BAND_COUNT + 1)
 ]
+
+
+def prestige_and_rank_for_band(band_index: int) -> Dict[str, int]:
+    """The pair a driver actually sees, from the band index that is stored.
+
+    Clamped rather than raising: a band outside the ladder means the ladder
+    changed under stored data, and a driver should see the nearest real rank
+    instead of an error.
+    """
+    band = max(1, min(RANK_BAND_COUNT, int(band_index)))
+    return {
+        "band": band,
+        "prestige": ((band - 1) // RANKS_PER_PRESTIGE) + 1,
+        "rank": ((band - 1) % RANKS_PER_PRESTIGE) + 1,
+    }
+
+
+def band_index_for_prestige_and_rank(prestige: int, rank: int) -> int:
+    p = max(1, min(PRESTIGE_COUNT, int(prestige)))
+    r = max(1, min(RANKS_PER_PRESTIGE, int(rank)))
+    return ((p - 1) * RANKS_PER_PRESTIGE) + r
 
 
 def get_rank_ladder() -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
-    for start, end, rank_name, rank_icon_key in RANK_LADDER:
+    for band_index, (start, end, rank_name, rank_icon_key) in enumerate(RANK_LADDER, start=1):
+        pair = prestige_and_rank_for_band(band_index)
         rows.append(
             {
                 "start_level": start,
                 "end_level": end,
                 "rank_name": rank_name,
                 "rank_icon_key": rank_icon_key,
+                # Sent rather than left to be re-derived. Four clients were
+                # each parsing the key to get back to the pair, and one of
+                # them printed the key itself when it could not.
+                "band": pair["band"],
+                "prestige": pair["prestige"],
+                "rank": pair["rank"],
             }
         )
     return rows

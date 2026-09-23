@@ -190,10 +190,17 @@ def test_progression_reaches_level_1000_and_rank_bands(app_env):
     assert leaderboard_service.get_next_level_xp(101) == leaderboard_service.LEVEL_XP_THRESHOLDS[101]
     assert leaderboard_service.get_next_level_xp(999) == leaderboard_service.LEVEL_XP_THRESHOLDS[999]
     assert leaderboard_service.get_next_level_xp(1000) is None
+    # The XP curve above is untouched by the ladder reshape: a thousand levels,
+    # the same thresholds. What changed is how many brackets they group into --
+    # ten prestiges of five ranks, fifty bands, twenty levels each.
     rows = leaderboard_service.get_rank_ladder()
-    assert len(rows) == 100
+    assert len(rows) == 50
     assert rows[0]["rank_icon_key"] == "band_001"
-    assert rows[-1]["rank_icon_key"] == "band_100"
+    assert rows[-1]["rank_icon_key"] == "band_050"
+    assert rows[0]["start_level"] == 1 and rows[0]["end_level"] == 20
+    assert rows[-1]["end_level"] == leaderboard_service.MAX_LEVEL
+    assert (rows[0]["prestige"], rows[0]["rank"]) == (1, 1)
+    assert (rows[-1]["prestige"], rows[-1]["rank"]) == (10, 5)
 
 
 def test_progression_endpoint_keeps_rank_icon_separate_from_podium_badges(app_env):

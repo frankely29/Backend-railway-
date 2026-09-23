@@ -1,9 +1,13 @@
-"""The hundred rank badges, kept in Postgres.
+"""The fifty rank badges, kept in Postgres.
 
-The ladder is a hundred bands of ten levels (leaderboard_service.RANK_LADDER),
-so a badge is one image per band: band_001 through band_100. They live in the
-database rather than in the frontend repo, which means a new set of artwork
-ships by uploading it, with no deploy of either side and no image files in git.
+The ladder is ten prestiges of five ranks each (leaderboard_service.RANK_LADDER),
+so a badge is one image per band: band_001 through band_050. The band index is
+the only thing stored, and the pair a driver sees is derived from it --
+band_007 is prestige 2, rank 2.
+
+They live in the database rather than in the frontend repo, which means a new
+set of artwork ships by uploading it, with no deploy of either side and no
+image files in git.
 
 The shape follows artifact_db_store: BYTEA on Postgres, BLOB on SQLite, an
 upsert keyed on the row's own identifier, and a sha256 of the bytes stored
@@ -31,10 +35,10 @@ except Exception:  # pragma: no cover - runtime fallback if Pillow is unavailabl
     Image = None
 
 
-# A badge is artwork for a phone, not a poster. The ten painted ones the
-# frontend shipped with were 256px and 15-30KB each; this leaves generous room
-# above that while keeping a hundred of them to a few megabytes in the row
-# store, and it is the backstop against someone uploading a photograph.
+# A badge is artwork for a phone, not a poster. This leaves generous room
+# above the sizes artwork of this kind runs to while keeping the whole set to
+# a few megabytes in the row store, and it is the backstop against someone
+# uploading a photograph.
 MAX_BADGE_BYTES = 512 * 1024
 MIN_BADGE_DIMENSION = 32
 MAX_BADGE_DIMENSION = 1024
@@ -155,7 +159,7 @@ def save_rank_badge(rank_icon_key: str, raw: bytes) -> Dict[str, Any]:
     if not is_valid_rank_icon_key(key):
         raise ValueError(
             f"{key or 'that key'} is not a rank the ladder defines; "
-            "expected band_001 through band_100"
+            "expected band_001 through band_050"
         )
     meta = inspect_badge_bytes(raw)
     updated_at_unix = int(time.time())
@@ -257,15 +261,22 @@ def list_rank_badges() -> List[Dict[str, Any]]:
         FROM rank_badges ORDER BY rank_icon_key ASC
         """
     ) or []
+    from leaderboard_service import prestige_and_rank_for_band
+
+    order = {key: index for index, key in enumerate(valid_rank_icon_keys(), start=1)}
     out: List[Dict[str, Any]] = []
     for row in rows:
         key = _row_value(row, "rank_icon_key", "")
         version = _row_value(row, "content_sha256", "")
+        pair = prestige_and_rank_for_band(order.get(key, 1))
         out.append(
             {
                 "rank_icon_key": key,
                 "version": version,
                 "url": rank_badge_url(key, version),
+                # Sent rather than parsed back out of the key on the client.
+                "prestige": pair["prestige"],
+                "rank": pair["rank"],
                 "content_type": _row_value(row, "content_type", ""),
                 "width": int(_row_value(row, "width", 0) or 0),
                 "height": int(_row_value(row, "height", 0) or 0),

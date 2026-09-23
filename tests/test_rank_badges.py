@@ -1,9 +1,9 @@
-"""The hundred rank badges, stored in the database.
+"""The fifty rank badges, stored in the database.
 
-The ladder is a hundred bands of ten levels, so a badge is one image per band:
-band_001 through band_100. They live in the database rather than in the
-frontend repo, which means new artwork ships by being uploaded rather than
-deployed, and no image files enter git.
+The ladder is ten prestiges of five ranks each, so a badge is one image per
+band: band_001 through band_050, and band_007 is prestige 2 rank 2. They live
+in the database rather than in the frontend repo, which means new artwork
+ships by being uploaded rather than deployed, and no image files enter git.
 
 What is worth testing here is not that an upload round-trips -- it is the
 parts that fail quietly if they are wrong:
@@ -16,7 +16,7 @@ parts that fail quietly if they are wrong:
   * the version is the sha256 of the bytes, which is what makes the
     year-long immutable cache safe -- change the artwork and the URL changes
     with it;
-  * the manifest never carries the bytes, because a hundred badges is
+  * the manifest never carries the bytes, because a full set of artwork is
     megabytes that a list of ranks does not need;
   * uploading is admin-only, and reading is not.
 """
@@ -167,7 +167,8 @@ def test_a_key_the_ladder_does_not_define_is_refused(app_env):
     """A typo must not create a badge nobody will ever be served."""
     _main, client = app_env
     admin = _admin(client)
-    for bad in ["band_101", "band_0", "band_34", "tier-4", "", "band_001; DROP TABLE"]:
+    for bad in ["band_051", "band_100", "band_0", "band_34", "tier-4", "",
+                "band_001; DROP TABLE"]:
         res = _upload(client, admin, bad or "_", _badge_bytes())
         assert res.status_code in (400, 404), f"{bad!r} was accepted: {res.text}"
 
@@ -271,14 +272,14 @@ def test_the_manifest_says_how_much_of_the_ladder_is_dressed(app_env):
     admin = _admin(client)
 
     empty = client.get("/ranks/badges").json()
-    assert empty["expected_count"] == 100
+    assert empty["expected_count"] == 50
     assert empty["count"] == 0
-    assert empty["missing_count"] == 100
+    assert empty["missing_count"] == 50
     assert empty["complete"] is False
 
     _upload(client, admin, "band_001", _badge_bytes())
     one = client.get("/ranks/badges").json()
-    assert one["count"] == 1 and one["missing_count"] == 99
+    assert one["count"] == 1 and one["missing_count"] == 49
 
     coverage = client.get("/admin/ranks/badges/coverage", headers=_h(admin)).json()
     assert "band_002" in coverage["missing"]
@@ -290,11 +291,11 @@ def test_the_manifest_is_ordered_by_rank(app_env):
     zero-padded in the first place."""
     _main, client = app_env
     admin = _admin(client)
-    for key in ["band_010", "band_002", "band_100", "band_001"]:
+    for key in ["band_010", "band_002", "band_050", "band_001"]:
         _upload(client, admin, key, _badge_bytes())
     keys = [i["rank_icon_key"] for i in client.get("/ranks/badges").json()["items"]]
     assert keys == sorted(keys)
-    assert keys == ["band_001", "band_002", "band_010", "band_100"]
+    assert keys == ["band_001", "band_002", "band_010", "band_050"]
 
 
 # ---------------------------------------------------------------- authority
@@ -330,3 +331,78 @@ def test_only_an_admin_can_delete_a_badge(app_env):
     removed = client.delete("/admin/ranks/badge/band_030", headers=_h(admin))
     assert removed.status_code == 200
     assert client.get("/ranks/badge/band_030").status_code == 404
+
+
+# ----------------------------------------------------- ten prestiges of five
+
+def test_the_ladder_is_ten_prestiges_of_five(app_env):
+    _main, _client = app_env
+    from leaderboard_service import (
+        MAX_LEVEL, PRESTIGE_COUNT, RANKS_PER_PRESTIGE, RANK_BAND_COUNT,
+        RANK_LADDER, get_rank_ladder,
+    )
+
+    assert PRESTIGE_COUNT == 10
+    assert RANKS_PER_PRESTIGE == 5
+    assert RANK_BAND_COUNT == 50
+    assert len(RANK_LADDER) == 50
+    assert len(get_rank_ladder()) == 50
+
+    # Every XP level belongs to exactly one band, with no gap and no overlap.
+    rows = get_rank_ladder()
+    assert rows[0]["start_level"] == 1
+    assert rows[-1]["end_level"] == MAX_LEVEL
+    for earlier, later in zip(rows, rows[1:]):
+        assert later["start_level"] == earlier["end_level"] + 1
+
+
+def test_finishing_a_prestige_rolls_into_the_next(app_env):
+    """Prestige 1 rank 5 is followed by prestige 2 rank 1, not prestige 1
+    rank 6. That roll-over is the whole shape of the ladder."""
+    _main, _client = app_env
+    from leaderboard_service import prestige_and_rank_for_band
+
+    assert prestige_and_rank_for_band(1) == {"band": 1, "prestige": 1, "rank": 1}
+    assert prestige_and_rank_for_band(5) == {"band": 5, "prestige": 1, "rank": 5}
+    assert prestige_and_rank_for_band(6) == {"band": 6, "prestige": 2, "rank": 1}
+    assert prestige_and_rank_for_band(7) == {"band": 7, "prestige": 2, "rank": 2}
+    assert prestige_and_rank_for_band(50) == {"band": 50, "prestige": 10, "rank": 5}
+
+
+def test_the_pair_and_the_band_agree_in_both_directions(app_env):
+    _main, _client = app_env
+    from leaderboard_service import (
+        RANK_BAND_COUNT, band_index_for_prestige_and_rank, prestige_and_rank_for_band,
+    )
+
+    for band in range(1, RANK_BAND_COUNT + 1):
+        pair = prestige_and_rank_for_band(band)
+        assert band_index_for_prestige_and_rank(pair["prestige"], pair["rank"]) == band
+
+
+def test_a_band_outside_the_ladder_clamps_to_a_real_rank(app_env):
+    """A band outside the ladder means the ladder changed under stored data.
+    A driver should see the nearest real rank, not an error."""
+    _main, _client = app_env
+    from leaderboard_service import prestige_and_rank_for_band
+
+    assert prestige_and_rank_for_band(0)["band"] == 1
+    assert prestige_and_rank_for_band(-4)["prestige"] == 1
+    assert prestige_and_rank_for_band(51)["band"] == 50
+    assert prestige_and_rank_for_band(9999) == {"band": 50, "prestige": 10, "rank": 5}
+
+
+def test_the_ladder_and_the_manifest_send_the_pair(app_env):
+    """Four clients were each parsing the key to get back to the pair, and one
+    printed the key itself when it could not."""
+    _main, client = app_env
+    from leaderboard_service import get_rank_ladder
+
+    row = next(r for r in get_rank_ladder() if r["rank_icon_key"] == "band_007")
+    assert (row["prestige"], row["rank"]) == (2, 2)
+
+    admin = _admin(client)
+    _upload(client, admin, "band_007", _badge_bytes())
+    item = next(i for i in client.get("/ranks/badges").json()["items"]
+                if i["rank_icon_key"] == "band_007")
+    assert (item["prestige"], item["rank"]) == (2, 2)
