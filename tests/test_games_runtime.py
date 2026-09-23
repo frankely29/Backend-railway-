@@ -191,16 +191,23 @@ def test_progression_reaches_level_1000_and_rank_bands(app_env):
     assert leaderboard_service.get_next_level_xp(999) == leaderboard_service.LEVEL_XP_THRESHOLDS[999]
     assert leaderboard_service.get_next_level_xp(1000) is None
     # The XP curve above is untouched by the ladder reshape: a thousand levels,
-    # the same thresholds. What changed is how many brackets they group into --
-    # ten prestiges of five ranks, fifty bands, twenty levels each.
+    # the same thresholds. What changes is only how many brackets they group
+    # into -- ten prestiges of three ranks, thirty bands. Asserted against the
+    # constants rather than the numbers, because this shape has moved three
+    # times and the curve above has not moved once.
+    count = leaderboard_service.RANK_BAND_COUNT
     rows = leaderboard_service.get_rank_ladder()
-    assert len(rows) == 50
+    assert len(rows) == count == 30
     assert rows[0]["rank_icon_key"] == "band_001"
-    assert rows[-1]["rank_icon_key"] == "band_050"
-    assert rows[0]["start_level"] == 1 and rows[0]["end_level"] == 20
+    assert rows[-1]["rank_icon_key"] == f"band_{count:03d}"
+    assert rows[0]["start_level"] == 1
     assert rows[-1]["end_level"] == leaderboard_service.MAX_LEVEL
+    # 1000 does not divide by 30, so the spare levels must land somewhere:
+    # the top band absorbs them rather than the ladder ending short.
+    assert rows[-1]["end_level"] - rows[-1]["start_level"] + 1 > leaderboard_service.LEVELS_PER_RANK_BAND
     assert (rows[0]["prestige"], rows[0]["rank"]) == (1, 1)
-    assert (rows[-1]["prestige"], rows[-1]["rank"]) == (10, 5)
+    assert (rows[-1]["prestige"], rows[-1]["rank"]) == (
+        leaderboard_service.PRESTIGE_COUNT, leaderboard_service.RANKS_PER_PRESTIGE)
 
 
 def test_progression_endpoint_keeps_rank_icon_separate_from_podium_badges(app_env):

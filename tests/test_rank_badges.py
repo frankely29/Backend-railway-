@@ -1,7 +1,7 @@
 """The fifty rank badges, stored in the database.
 
-The ladder is ten prestiges of five ranks each, so a badge is one image per
-band: band_001 through band_050, and band_007 is prestige 2 rank 2. They live
+The ladder is ten prestiges of three ranks each, so a badge is one image per
+band: band_001 through band_030, and band_005 is prestige 2 rank 2. They live
 in the database rather than in the frontend repo, which means new artwork
 ships by being uploaded rather than deployed, and no image files enter git.
 
@@ -116,14 +116,14 @@ def test_a_badge_round_trips_through_the_database(app_env):
     admin = _admin(client)
     raw = _badge_bytes()
 
-    res = _upload(client, admin, "band_034", raw)
+    res = _upload(client, admin, "band_024", raw)
     assert res.status_code == 200, res.text
     badge = res.json()["badge"]
-    assert badge["rank_icon_key"] == "band_034"
+    assert badge["rank_icon_key"] == "band_024"
     assert badge["width"] == 256 and badge["height"] == 256
     assert badge["byte_size"] == len(raw)
 
-    got = client.get("/ranks/badge/band_034")
+    got = client.get("/ranks/badge/band_024")
     assert got.status_code == 200
     assert got.content == raw, "the bytes served are not the bytes stored"
 
@@ -153,12 +153,12 @@ def test_the_version_is_the_digest_of_the_bytes(app_env):
 def test_re_uploading_replaces_rather_than_duplicates(app_env):
     _main, client = app_env
     admin = _admin(client)
-    _upload(client, admin, "band_007", _badge_bytes())
-    _upload(client, admin, "band_007", _badge_bytes(color=(9, 9, 9, 255)))
+    _upload(client, admin, "band_005", _badge_bytes())
+    _upload(client, admin, "band_005", _badge_bytes(color=(9, 9, 9, 255)))
 
     manifest = client.get("/ranks/badges").json()
     keys = [item["rank_icon_key"] for item in manifest["items"]]
-    assert keys.count("band_007") == 1, "a second upload created a second row"
+    assert keys.count("band_005") == 1, "a second upload created a second row"
 
 
 # ------------------------------------------------------------- refusing bad
@@ -167,8 +167,8 @@ def test_a_key_the_ladder_does_not_define_is_refused(app_env):
     """A typo must not create a badge nobody will ever be served."""
     _main, client = app_env
     admin = _admin(client)
-    for bad in ["band_051", "band_100", "band_0", "band_34", "tier-4", "",
-                "band_001; DROP TABLE"]:
+    for bad in ["band_031", "band_051", "band_100", "band_0", "band_34",
+                "tier-4", "", "band_001; DROP TABLE"]:
         res = _upload(client, admin, bad or "_", _badge_bytes())
         assert res.status_code in (400, 404), f"{bad!r} was accepted: {res.text}"
 
@@ -272,14 +272,14 @@ def test_the_manifest_says_how_much_of_the_ladder_is_dressed(app_env):
     admin = _admin(client)
 
     empty = client.get("/ranks/badges").json()
-    assert empty["expected_count"] == 50
+    assert empty["expected_count"] == 30
     assert empty["count"] == 0
-    assert empty["missing_count"] == 50
+    assert empty["missing_count"] == 30
     assert empty["complete"] is False
 
     _upload(client, admin, "band_001", _badge_bytes())
     one = client.get("/ranks/badges").json()
-    assert one["count"] == 1 and one["missing_count"] == 49
+    assert one["count"] == 1 and one["missing_count"] == 29
 
     coverage = client.get("/admin/ranks/badges/coverage", headers=_h(admin)).json()
     assert "band_002" in coverage["missing"]
@@ -291,11 +291,11 @@ def test_the_manifest_is_ordered_by_rank(app_env):
     zero-padded in the first place."""
     _main, client = app_env
     admin = _admin(client)
-    for key in ["band_010", "band_002", "band_050", "band_001"]:
+    for key in ["band_010", "band_002", "band_030", "band_001"]:
         _upload(client, admin, key, _badge_bytes())
     keys = [i["rank_icon_key"] for i in client.get("/ranks/badges").json()["items"]]
     assert keys == sorted(keys)
-    assert keys == ["band_001", "band_002", "band_010", "band_050"]
+    assert keys == ["band_001", "band_002", "band_010", "band_030"]
 
 
 # ---------------------------------------------------------------- authority
@@ -335,7 +335,7 @@ def test_only_an_admin_can_delete_a_badge(app_env):
 
 # ----------------------------------------------------- ten prestiges of five
 
-def test_the_ladder_is_ten_prestiges_of_five(app_env):
+def test_the_ladder_is_ten_prestiges_of_three(app_env):
     _main, _client = app_env
     from leaderboard_service import (
         MAX_LEVEL, PRESTIGE_COUNT, RANKS_PER_PRESTIGE, RANK_BAND_COUNT,
@@ -343,10 +343,10 @@ def test_the_ladder_is_ten_prestiges_of_five(app_env):
     )
 
     assert PRESTIGE_COUNT == 10
-    assert RANKS_PER_PRESTIGE == 5
-    assert RANK_BAND_COUNT == 50
-    assert len(RANK_LADDER) == 50
-    assert len(get_rank_ladder()) == 50
+    assert RANKS_PER_PRESTIGE == 3
+    assert RANK_BAND_COUNT == PRESTIGE_COUNT * RANKS_PER_PRESTIGE == 30
+    assert len(RANK_LADDER) == RANK_BAND_COUNT
+    assert len(get_rank_ladder()) == RANK_BAND_COUNT
 
     # Every XP level belongs to exactly one band, with no gap and no overlap.
     rows = get_rank_ladder()
@@ -357,16 +357,23 @@ def test_the_ladder_is_ten_prestiges_of_five(app_env):
 
 
 def test_finishing_a_prestige_rolls_into_the_next(app_env):
-    """Prestige 1 rank 5 is followed by prestige 2 rank 1, not prestige 1
-    rank 6. That roll-over is the whole shape of the ladder."""
+    """The last rank of a prestige is followed by the FIRST rank of the next,
+    never an extra rank on the old one. That roll-over is the whole shape of
+    the ladder, and it is derived here rather than written out: this shape has
+    already changed three times."""
     _main, _client = app_env
-    from leaderboard_service import prestige_and_rank_for_band
+    from leaderboard_service import (
+        PRESTIGE_COUNT, RANKS_PER_PRESTIGE, RANK_BAND_COUNT,
+        prestige_and_rank_for_band,
+    )
+    per = RANKS_PER_PRESTIGE
 
     assert prestige_and_rank_for_band(1) == {"band": 1, "prestige": 1, "rank": 1}
-    assert prestige_and_rank_for_band(5) == {"band": 5, "prestige": 1, "rank": 5}
-    assert prestige_and_rank_for_band(6) == {"band": 6, "prestige": 2, "rank": 1}
-    assert prestige_and_rank_for_band(7) == {"band": 7, "prestige": 2, "rank": 2}
-    assert prestige_and_rank_for_band(50) == {"band": 50, "prestige": 10, "rank": 5}
+    assert prestige_and_rank_for_band(per) == {"band": per, "prestige": 1, "rank": per}
+    assert prestige_and_rank_for_band(per + 1) == {
+        "band": per + 1, "prestige": 2, "rank": 1}
+    assert prestige_and_rank_for_band(RANK_BAND_COUNT) == {
+        "band": RANK_BAND_COUNT, "prestige": PRESTIGE_COUNT, "rank": per}
 
 
 def test_the_pair_and_the_band_agree_in_both_directions(app_env):
@@ -384,12 +391,12 @@ def test_a_band_outside_the_ladder_clamps_to_a_real_rank(app_env):
     """A band outside the ladder means the ladder changed under stored data.
     A driver should see the nearest real rank, not an error."""
     _main, _client = app_env
-    from leaderboard_service import prestige_and_rank_for_band
+    from leaderboard_service import RANK_BAND_COUNT, prestige_and_rank_for_band
 
     assert prestige_and_rank_for_band(0)["band"] == 1
     assert prestige_and_rank_for_band(-4)["prestige"] == 1
-    assert prestige_and_rank_for_band(51)["band"] == 50
-    assert prestige_and_rank_for_band(9999) == {"band": 50, "prestige": 10, "rank": 5}
+    assert prestige_and_rank_for_band(RANK_BAND_COUNT + 1)["band"] == RANK_BAND_COUNT
+    assert prestige_and_rank_for_band(9999)["band"] == RANK_BAND_COUNT
 
 
 def test_the_ladder_and_the_manifest_send_the_pair(app_env):
@@ -398,11 +405,11 @@ def test_the_ladder_and_the_manifest_send_the_pair(app_env):
     _main, client = app_env
     from leaderboard_service import get_rank_ladder
 
-    row = next(r for r in get_rank_ladder() if r["rank_icon_key"] == "band_007")
+    row = next(r for r in get_rank_ladder() if r["rank_icon_key"] == "band_005")
     assert (row["prestige"], row["rank"]) == (2, 2)
 
     admin = _admin(client)
-    _upload(client, admin, "band_007", _badge_bytes())
+    _upload(client, admin, "band_005", _badge_bytes())
     item = next(i for i in client.get("/ranks/badges").json()["items"]
-                if i["rank_icon_key"] == "band_007")
+                if i["rank_icon_key"] == "band_005")
     assert (item["prestige"], item["rank"]) == (2, 2)

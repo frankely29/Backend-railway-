@@ -58,33 +58,46 @@ def _build_level_xp_thresholds() -> List[int]:
 
 LEVEL_XP_THRESHOLDS = _build_level_xp_thresholds()
 
-# The ladder a driver climbs: ten prestiges of five ranks each, fifty in all.
+# The ladder a driver climbs: ten prestiges of three ranks each, thirty in all.
 #
-# A driver finishing prestige 1 rank 5 moves to prestige 2 rank 1, and so on
-# to the tenth prestige. So band_007 is prestige 2, rank 2 -- the band index
+# A driver finishing prestige 1 rank 3 moves to prestige 2 rank 1, and so on
+# to the tenth prestige. So band_005 is prestige 2, rank 2 -- the band index
 # is the only thing stored or sent, and the pair is derived from it:
 #
-#     prestige = ((band - 1) // 5) + 1
-#     rank     = ((band - 1) %  5) + 1
+#     prestige = ((band - 1) // RANKS_PER_PRESTIGE) + 1
+#     rank     = ((band - 1) %  RANKS_PER_PRESTIGE) + 1
 #
-# MAX_LEVEL is untouched at 1000, so each band spans twenty XP levels rather
-# than ten. The XP curve, the thresholds and every level a driver has already
-# earned are unaffected by this; what changed is how many brackets those
-# levels are grouped into.
+# Written against the constant rather than a literal 3, because this shape has
+# already changed twice -- a hundred bands of ten, then fifty of five.
+#
+# MAX_LEVEL is untouched at 1000. The XP curve, the thresholds and every level
+# a driver has already earned are unaffected; what changes is only how many
+# brackets those levels are grouped into.
 PRESTIGE_COUNT = 10
-RANKS_PER_PRESTIGE = 5
+RANKS_PER_PRESTIGE = 3
 RANK_BAND_COUNT = PRESTIGE_COUNT * RANKS_PER_PRESTIGE
 LEVELS_PER_RANK_BAND = MAX_LEVEL // RANK_BAND_COUNT
 
-RANK_LADDER = [
-    (
-        ((band_index - 1) * LEVELS_PER_RANK_BAND) + 1,
-        band_index * LEVELS_PER_RANK_BAND,
-        f"Band {band_index:03d}",
-        f"band_{band_index:03d}",
-    )
-    for band_index in range(1, RANK_BAND_COUNT + 1)
-]
+
+def _build_rank_ladder():
+    """The thirty bands, each one covering a slice of the thousand XP levels.
+
+    MAX_LEVEL does not divide evenly by the band count -- 1000 over 30 leaves
+    ten levels spare -- and the obvious `band_index * LEVELS_PER_RANK_BAND`
+    quietly drops them: the ladder would end at 990 and a driver at level 995
+    would have no rank at all. So the last band runs to MAX_LEVEL and absorbs
+    the remainder, which also means the top rank is the longest climb in the
+    game. That is the right place for it.
+    """
+    rows = []
+    for band_index in range(1, RANK_BAND_COUNT + 1):
+        start = ((band_index - 1) * LEVELS_PER_RANK_BAND) + 1
+        end = MAX_LEVEL if band_index == RANK_BAND_COUNT else band_index * LEVELS_PER_RANK_BAND
+        rows.append((start, end, f"Band {band_index:03d}", f"band_{band_index:03d}"))
+    return rows
+
+
+RANK_LADDER = _build_rank_ladder()
 
 
 def prestige_and_rank_for_band(band_index: int) -> Dict[str, int]:
