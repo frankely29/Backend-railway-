@@ -88,6 +88,7 @@ from artifact_db_store import (
 from parquet_inventory import inspect_parquet_inventory
 from rank_badge_store import (
     MAX_BADGE_BYTES,
+    rank_icon_key_range,
     delete_rank_badge,
     ensure_rank_badge_schema,
     get_rank_badge_bytes,
@@ -10300,10 +10301,10 @@ def avatar_thumb_asset(user_id: int, request: Request):
 
 # ----------------------------------------------------------- the rank badges
 #
-# One image per band of the ladder, band_001 through band_050, stored in the
+# One image per band of the ladder, band_001 through band_030, stored in the
 # database rather than shipped in the frontend repo. New artwork goes live by
 # being uploaded; neither side is deployed and no image files enter git.
-# band_007 is prestige 2, rank 2.
+# band_005 is prestige 2, rank 2.
 #
 # The bytes are addressed by their own sha256, handed to the client as ?v= on
 # the URL. That is what makes "cache forever" safe: a badge that changes gets
@@ -10378,7 +10379,7 @@ async def admin_upload_rank_badge(
         raise HTTPException(
             status_code=400,
             detail=f"{rank_icon_key} is not a rank the ladder defines; "
-                   "expected band_001 through band_050",
+                   f"expected {rank_icon_key_range()}",
         )
     raw = await file.read()
     if len(raw) > MAX_BADGE_BYTES:

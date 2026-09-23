@@ -1,9 +1,14 @@
-"""The fifty rank badges, kept in Postgres.
+"""The rank badges, kept in Postgres.
 
-The ladder is ten prestiges of five ranks each (leaderboard_service.RANK_LADDER),
-so a badge is one image per band: band_001 through band_050. The band index is
-the only thing stored, and the pair a driver sees is derived from it --
-band_007 is prestige 2, rank 2.
+One image per band of leaderboard_service.RANK_LADDER, which is currently ten
+prestiges of three ranks: band_001 through band_030. The band index is the only
+thing stored, and the pair a driver sees is derived from it -- band_005 is
+prestige 2, rank 2.
+
+Nothing here hardcodes the count. That shape has changed three times already,
+and the range in the error messages is built from the ladder for the same
+reason: a message that says "band_001 through band_050" when the ladder stops
+at 030 sends whoever is uploading off to look for a bug that is not there.
 
 They live in the database rather than in the frontend repo, which means a new
 set of artwork ships by uploading it, with no deploy of either side and no
@@ -85,6 +90,12 @@ def is_valid_rank_icon_key(rank_icon_key: str) -> bool:
     return str(rank_icon_key or "") in set(valid_rank_icon_keys())
 
 
+def rank_icon_key_range() -> str:
+    """The valid range, spelled out for an error message, read off the ladder."""
+    keys = valid_rank_icon_keys()
+    return f"{keys[0]} through {keys[-1]}" if keys else "(the ladder is empty)"
+
+
 def ensure_rank_badge_schema() -> None:
     _db_exec(
         f"""
@@ -159,7 +170,7 @@ def save_rank_badge(rank_icon_key: str, raw: bytes) -> Dict[str, Any]:
     if not is_valid_rank_icon_key(key):
         raise ValueError(
             f"{key or 'that key'} is not a rank the ladder defines; "
-            "expected band_001 through band_050"
+            f"expected {rank_icon_key_range()}"
         )
     meta = inspect_badge_bytes(raw)
     updated_at_unix = int(time.time())

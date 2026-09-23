@@ -1,4 +1,4 @@
-"""The fifty rank badges, stored in the database.
+"""The rank badges, stored in the database.
 
 The ladder is ten prestiges of three ranks each, so a badge is one image per
 band: band_001 through band_030, and band_005 is prestige 2 rank 2. They live
@@ -18,7 +18,10 @@ parts that fail quietly if they are wrong:
     with it;
   * the manifest never carries the bytes, because a full set of artwork is
     megabytes that a list of ranks does not need;
-  * uploading is admin-only, and reading is not.
+  * uploading is admin-only, and reading is not;
+  * the range named in the refusal message is read off the ladder, because a
+    message that says band_050 when the ladder stops at band_030 sends whoever
+    is uploading looking for a bug that is not there.
 """
 from __future__ import annotations
 
@@ -171,6 +174,10 @@ def test_a_key_the_ladder_does_not_define_is_refused(app_env):
                 "tier-4", "", "band_001; DROP TABLE"]:
         res = _upload(client, admin, bad or "_", _badge_bytes())
         assert res.status_code in (400, 404), f"{bad!r} was accepted: {res.text}"
+        if res.status_code == 400:
+            from leaderboard_service import RANK_BAND_COUNT
+            assert f"band_{RANK_BAND_COUNT:03d}" in res.json()["detail"], (
+                f"the refusal names a range the ladder does not have: {res.json()['detail']}")
 
 
 def test_bytes_that_are_not_an_image_are_refused(app_env):
