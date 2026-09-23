@@ -86,6 +86,16 @@ from artifact_db_store import (
     save_generated_artifact,
 )
 from parquet_inventory import inspect_parquet_inventory
+from rank_badge_store import (
+    MAX_BADGE_BYTES,
+    delete_rank_badge,
+    ensure_rank_badge_schema,
+    get_rank_badge_bytes,
+    is_valid_rank_icon_key,
+    list_rank_badges,
+    rank_badge_coverage,
+    save_rank_badge,
+)
 from avatar_assets import (
     AVATAR_THUMB_MIME,
     avatar_thumb_path,
@@ -6978,6 +6988,7 @@ def startup():
         traceback.print_exc()
     ensure_generated_artifact_store_schema()
     _prune_redundant_db_backed_artifact_files()
+    ensure_rank_badge_schema()
     init_leaderboard_schema()
     ensure_pickup_recording_schema()
     ensure_games_schema()
@@ -10285,6 +10296,120 @@ def avatar_thumb_asset(user_id: int, request: Request):
     if _request_etag_matches(request, headers["ETag"]):
         return Response(status_code=304, headers=headers)
     return Response(content=target.read_bytes(), media_type=AVATAR_THUMB_MIME, headers=headers)
+
+
+# ----------------------------------------------------------- the rank badges
+#
+# One image per band of the ladder, band_001 through band_100, stored in the
+# database rather than shipped in the frontend repo. New artwork goes live by
+# being uploaded; neither side is deployed and no image files enter git.
+#
+# The bytes are addressed by their own sha256, handed to the client as ?v= on
+# the URL. That is what makes "cache forever" safe: a badge that changes gets
+# a different URL, and one that has not changed is never fetched twice.
+
+RANK_BADGE_IMMUTABLE_CACHE_SECONDS = int(
+    os.environ.get("RANK_BADGE_IMMUTABLE_CACHE_SECONDS", str(365 * 24 * 3600))
+)
+
+
+def _rank_badge_headers(rank_icon_key: str, version: str) -> Dict[str, str]:
+    return {
+        "Cache-Control": f"public, max-age={RANK_BADGE_IMMUTABLE_CACHE_SECONDS}, immutable",
+        "ETag": f'"rank-badge-{rank_icon_key}-{version}"',
+        # Same reason as the avatar thumbnails: the map composes badges onto a
+        # canvas with img.crossOrigin = "anonymous", and without these the
+        # browser fails the load silently. A badge is public artwork; there is
+        # nothing here to authorise.
+        "Access-Control-Allow-Origin": "*",
+        "Cross-Origin-Resource-Policy": "cross-origin",
+    }
+
+
+@app.get("/ranks/badges")
+def rank_badges_manifest():
+    """Which badges exist, and where to get them.
+
+    Deliberately without the image bytes -- a hundred rows of artwork is
+    megabytes that a screen listing ranks never needs. Each entry carries the
+    versioned URL, so a client can preload or cache-bust from this alone.
+    """
+    items = list_rank_badges()
+    coverage = rank_badge_coverage()
+    return {
+        "ok": True,
+        "items": items,
+        "count": len(items),
+        "expected_count": coverage["expected_count"],
+        "missing_count": coverage["missing_count"],
+        "complete": coverage["complete"],
+    }
+
+
+@app.get("/ranks/badge/{rank_icon_key}")
+def rank_badge_asset(rank_icon_key: str, request: Request):
+    record = get_rank_badge_bytes(rank_icon_key)
+    if not record or not record.get("image_bytes"):
+        raise HTTPException(status_code=404, detail="Rank badge not found")
+    headers = _rank_badge_headers(record["rank_icon_key"], record["version"])
+    if _request_etag_matches(request, headers["ETag"]):
+        return Response(status_code=304, headers=headers)
+    return Response(
+        content=record["image_bytes"],
+        media_type=record["content_type"],
+        headers=headers,
+    )
+
+
+@app.post("/admin/ranks/badge/{rank_icon_key}")
+async def admin_upload_rank_badge(
+    rank_icon_key: str,
+    file: UploadFile = File(...),
+    admin: sqlite3.Row = Depends(require_admin),
+):
+    """Upload one badge.
+
+    One per request rather than a hundred at once, on purpose: a set that
+    arrives a piece at a time can be corrected a piece at a time, and a single
+    bad file cannot fail the other ninety-nine.
+    """
+    if not is_valid_rank_icon_key(rank_icon_key):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{rank_icon_key} is not a rank the ladder defines; "
+                   "expected band_001 through band_100",
+        )
+    raw = await file.read()
+    if len(raw) > MAX_BADGE_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"the badge image is {len(raw)} bytes; the limit is {MAX_BADGE_BYTES}",
+        )
+    try:
+        saved = save_rank_badge(rank_icon_key, raw)
+    except ValueError as exc:
+        # Every one of these is something the uploader can fix, so the reason
+        # goes back rather than a bare 400.
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"ok": True, "badge": saved, "coverage": rank_badge_coverage()}
+
+
+@app.delete("/admin/ranks/badge/{rank_icon_key}")
+def admin_delete_rank_badge(
+    rank_icon_key: str,
+    admin: sqlite3.Row = Depends(require_admin),
+):
+    removed = delete_rank_badge(rank_icon_key)
+    if not removed:
+        raise HTTPException(status_code=404, detail="Rank badge not found")
+    return {"ok": True, "deleted": rank_icon_key, "coverage": rank_badge_coverage()}
+
+
+@app.get("/admin/ranks/badges/coverage")
+def admin_rank_badge_coverage(admin: sqlite3.Row = Depends(require_admin)):
+    """Which bands are still bare. The useful question while a set is landing,
+    and again later when a band exists that nobody drew for."""
+    return {"ok": True, **rank_badge_coverage()}
 
 
 class MeUpdatePayload(BaseModel):
