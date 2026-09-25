@@ -58,26 +58,117 @@ def _build_level_xp_thresholds() -> List[int]:
 
 LEVEL_XP_THRESHOLDS = _build_level_xp_thresholds()
 
-RANK_LADDER = [
-    (
-        ((band_index - 1) * 10) + 1,
-        band_index * 10,
-        f"Band {band_index:03d}",
-        f"band_{band_index:03d}",
-    )
-    for band_index in range(1, 101)
+# The ladder a driver climbs: ten prestiges of three ranks each, thirty in all.
+#
+# A driver finishing prestige 1 rank 3 moves to prestige 2 rank 1, and so on
+# to the tenth prestige. So band_005 is prestige 2, rank 2 -- the band index
+# is the only thing stored or sent, and the pair is derived from it:
+#
+#     prestige = ((band - 1) // RANKS_PER_PRESTIGE) + 1
+#     rank     = ((band - 1) %  RANKS_PER_PRESTIGE) + 1
+#
+# Written against the constant rather than a literal 3, because this shape has
+# already changed twice -- a hundred bands of ten, then fifty of five.
+#
+# MAX_LEVEL is untouched at 1000. The XP curve, the thresholds and every level
+# a driver has already earned are unaffected; what changes is only how many
+# brackets those levels are grouped into.
+PRESTIGE_COUNT = 10
+RANKS_PER_PRESTIGE = 3
+RANK_BAND_COUNT = PRESTIGE_COUNT * RANKS_PER_PRESTIGE
+LEVELS_PER_RANK_BAND = MAX_LEVEL // RANK_BAND_COUNT
+
+
+# The ten prestiges, in climbing order, each named for the creature on its
+# badge. This table lives here rather than in the clients because the ladder
+# lives here: a rank's name is part of what the rank IS, and a backend that
+# sends only "band_007" forces every client to keep its own copy of this list
+# and hope they agree. They did not -- the frontend printed "Band 034" at
+# drivers for weeks because it had no name to use and fell back to the key.
+PRESTIGE_NAMES = [
+    "Wyvern", "Chimera", "Hydra", "Kraken", "Warlord",
+    "Colossus", "Titan", "Celestial", "Phoenix", "Dragon",
 ]
+
+# Ranks inside a prestige are numbered, not named: Wyvern I, Wyvern II,
+# Wyvern III. Roman because the badge strikes the numeral on its nameplate and
+# a numeral reads as an honour where a digit reads as a count.
+RANK_NUMERALS = ["I", "II", "III", "IV", "V"]
+
+
+def rank_title(prestige: int, rank: int) -> str:
+    """The name a driver is shown: "Wyvern III", not "Band 003"."""
+    p = max(1, min(len(PRESTIGE_NAMES), int(prestige)))
+    r = max(1, min(len(RANK_NUMERALS), int(rank)))
+    return f"{PRESTIGE_NAMES[p - 1]} {RANK_NUMERALS[r - 1]}"
+
+
+def _prestige_and_rank(band_index: int):
+    """The pair, without the clamping -- used while the ladder is being built,
+    before RANK_LADDER exists for prestige_and_rank_for_band to read."""
+    return (((band_index - 1) // RANKS_PER_PRESTIGE) + 1,
+            ((band_index - 1) % RANKS_PER_PRESTIGE) + 1)
+
+
+def _build_rank_ladder():
+    """The thirty bands, each one covering a slice of the thousand XP levels.
+
+    MAX_LEVEL does not divide evenly by the band count -- 1000 over 30 leaves
+    ten levels spare -- and the obvious `band_index * LEVELS_PER_RANK_BAND`
+    quietly drops them: the ladder would end at 990 and a driver at level 995
+    would have no rank at all. So the last band runs to MAX_LEVEL and absorbs
+    the remainder, which also means the top rank is the longest climb in the
+    game. That is the right place for it.
+    """
+    rows = []
+    for band_index in range(1, RANK_BAND_COUNT + 1):
+        start = ((band_index - 1) * LEVELS_PER_RANK_BAND) + 1
+        end = MAX_LEVEL if band_index == RANK_BAND_COUNT else band_index * LEVELS_PER_RANK_BAND
+        pair = _prestige_and_rank(band_index)
+        rows.append((start, end, rank_title(pair[0], pair[1]), f"band_{band_index:03d}"))
+    return rows
+
+
+RANK_LADDER = _build_rank_ladder()
+
+
+def prestige_and_rank_for_band(band_index: int) -> Dict[str, int]:
+    """The pair a driver actually sees, from the band index that is stored.
+
+    Clamped rather than raising: a band outside the ladder means the ladder
+    changed under stored data, and a driver should see the nearest real rank
+    instead of an error.
+    """
+    band = max(1, min(RANK_BAND_COUNT, int(band_index)))
+    return {
+        "band": band,
+        "prestige": ((band - 1) // RANKS_PER_PRESTIGE) + 1,
+        "rank": ((band - 1) % RANKS_PER_PRESTIGE) + 1,
+    }
+
+
+def band_index_for_prestige_and_rank(prestige: int, rank: int) -> int:
+    p = max(1, min(PRESTIGE_COUNT, int(prestige)))
+    r = max(1, min(RANKS_PER_PRESTIGE, int(rank)))
+    return ((p - 1) * RANKS_PER_PRESTIGE) + r
 
 
 def get_rank_ladder() -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
-    for start, end, rank_name, rank_icon_key in RANK_LADDER:
+    for band_index, (start, end, rank_name, rank_icon_key) in enumerate(RANK_LADDER, start=1):
+        pair = prestige_and_rank_for_band(band_index)
         rows.append(
             {
                 "start_level": start,
                 "end_level": end,
                 "rank_name": rank_name,
                 "rank_icon_key": rank_icon_key,
+                # Sent rather than left to be re-derived. Four clients were
+                # each parsing the key to get back to the pair, and one of
+                # them printed the key itself when it could not.
+                "band": pair["band"],
+                "prestige": pair["prestige"],
+                "rank": pair["rank"],
             }
         )
     return rows
@@ -167,7 +258,9 @@ def _rank_for_level(level: int) -> Dict[str, str]:
     for start, end, rank_name, rank_icon_key in RANK_LADDER:
         if start <= clamped <= end:
             return {"rank_name": rank_name, "rank_icon_key": rank_icon_key}
-    return {"rank_name": "Band 001", "rank_icon_key": "band_001"}
+    # Only reachable if the ladder is empty or a level fell outside it, which
+    # the boundary test forbids. The first real rank, not a key spelled out.
+    return {"rank_name": rank_title(1, 1), "rank_icon_key": "band_001"}
 
 
 def get_level_from_lifetime_xp(total_xp: int) -> int:

@@ -1005,7 +1005,9 @@ def admin_pickup_tests_simulate_save(payload: AdminSimulateSavePayload, admin: A
         "reward_contract": {
             "level": int(progression.get("level") or 1),
             "rank_name": str(progression.get("rank_name") or "Recruit"),
-            "rank_icon_key": str(progression.get("rank_icon_key") or "recruit"),
+            # "recruit" was a key from the retired rank vocabulary and no
+            # client understands it any more; the first band is the real floor.
+            "rank_icon_key": str(progression.get("rank_icon_key") or "band_001"),
             "total_xp": int(progression.get("total_xp") or 0),
             "current_level_xp": int(progression.get("current_level_xp") or 0),
             "next_level_xp": progression.get("next_level_xp"),
