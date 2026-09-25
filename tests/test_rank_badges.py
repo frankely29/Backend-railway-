@@ -420,3 +420,56 @@ def test_the_ladder_and_the_manifest_send_the_pair(app_env):
     item = next(i for i in client.get("/ranks/badges").json()["items"]
                 if i["rank_icon_key"] == "band_005")
     assert (item["prestige"], item["rank"]) == (2, 2)
+
+
+# ------------------------------------------------------ the ladder has names
+
+def test_the_ladder_names_every_rank_it_defines(app_env):
+    """The backend owns the ladder, so it owns the names.
+
+    This is the invariant that has broken on every reshape: the name table and
+    the band count are two numbers that must agree, and nothing forced them to.
+    A prestige added without a name, or a fourth rank added with only three
+    numerals, would have sent a driver "None II" or "Wyvern undefined".
+    """
+    _main, _client = app_env
+    from leaderboard_service import (
+        PRESTIGE_COUNT, PRESTIGE_NAMES, RANKS_PER_PRESTIGE, RANK_NUMERALS,
+        get_rank_ladder, rank_title,
+    )
+
+    assert len(PRESTIGE_NAMES) == PRESTIGE_COUNT, (
+        f"{len(PRESTIGE_NAMES)} names for {PRESTIGE_COUNT} prestiges")
+    assert len(RANK_NUMERALS) >= RANKS_PER_PRESTIGE, (
+        f"{len(RANK_NUMERALS)} numerals for {RANKS_PER_PRESTIGE} ranks a prestige")
+    assert len(set(PRESTIGE_NAMES)) == len(PRESTIGE_NAMES), "two prestiges share a name"
+
+    rows = get_rank_ladder()
+    titles = [r["rank_name"] for r in rows]
+    assert len(set(titles)) == len(rows), "two bands share a title"
+    for row in rows:
+        assert row["rank_name"], f"{row['rank_icon_key']} has no name"
+        assert row["rank_name"] == rank_title(row["prestige"], row["rank"])
+        assert "None" not in row["rank_name"]
+        assert "band" not in row["rank_name"].lower(), (
+            f"{row['rank_icon_key']} is named after its own key: {row['rank_name']}")
+
+
+def test_no_rank_is_ever_named_after_its_key(app_env):
+    """"Band 034" on a driver's profile is what this whole ladder exists to
+    stop. Nothing the backend can return may be the key spelled out."""
+    _main, client = app_env
+    import re
+    from leaderboard_service import _rank_for_level, MAX_LEVEL
+
+    key_shaped = re.compile(r"^band[\s_-]*\d+$", re.I)
+    for level in (0, 1, 2, 33, 34, 500, 999, MAX_LEVEL, MAX_LEVEL + 50):
+        name = _rank_for_level(level)["rank_name"]
+        assert not key_shaped.match(name), f"level {level} is named {name!r}"
+
+    driver = _signup(client, "namecheck@example.com", "Namecheck")
+    res = client.get("/leaderboard/progression/me", headers=_h(driver))
+    assert res.status_code == 200, res.text
+    prog = res.json()["progression"]
+    assert not key_shaped.match(prog["rank_name"]), prog["rank_name"]
+    assert prog["rank_icon_key"] == "band_001"

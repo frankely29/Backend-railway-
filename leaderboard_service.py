@@ -79,6 +79,37 @@ RANK_BAND_COUNT = PRESTIGE_COUNT * RANKS_PER_PRESTIGE
 LEVELS_PER_RANK_BAND = MAX_LEVEL // RANK_BAND_COUNT
 
 
+# The ten prestiges, in climbing order, each named for the creature on its
+# badge. This table lives here rather than in the clients because the ladder
+# lives here: a rank's name is part of what the rank IS, and a backend that
+# sends only "band_007" forces every client to keep its own copy of this list
+# and hope they agree. They did not -- the frontend printed "Band 034" at
+# drivers for weeks because it had no name to use and fell back to the key.
+PRESTIGE_NAMES = [
+    "Wyvern", "Chimera", "Hydra", "Kraken", "Warlord",
+    "Colossus", "Titan", "Celestial", "Phoenix", "Dragon",
+]
+
+# Ranks inside a prestige are numbered, not named: Wyvern I, Wyvern II,
+# Wyvern III. Roman because the badge strikes the numeral on its nameplate and
+# a numeral reads as an honour where a digit reads as a count.
+RANK_NUMERALS = ["I", "II", "III", "IV", "V"]
+
+
+def rank_title(prestige: int, rank: int) -> str:
+    """The name a driver is shown: "Wyvern III", not "Band 003"."""
+    p = max(1, min(len(PRESTIGE_NAMES), int(prestige)))
+    r = max(1, min(len(RANK_NUMERALS), int(rank)))
+    return f"{PRESTIGE_NAMES[p - 1]} {RANK_NUMERALS[r - 1]}"
+
+
+def _prestige_and_rank(band_index: int):
+    """The pair, without the clamping -- used while the ladder is being built,
+    before RANK_LADDER exists for prestige_and_rank_for_band to read."""
+    return (((band_index - 1) // RANKS_PER_PRESTIGE) + 1,
+            ((band_index - 1) % RANKS_PER_PRESTIGE) + 1)
+
+
 def _build_rank_ladder():
     """The thirty bands, each one covering a slice of the thousand XP levels.
 
@@ -93,7 +124,8 @@ def _build_rank_ladder():
     for band_index in range(1, RANK_BAND_COUNT + 1):
         start = ((band_index - 1) * LEVELS_PER_RANK_BAND) + 1
         end = MAX_LEVEL if band_index == RANK_BAND_COUNT else band_index * LEVELS_PER_RANK_BAND
-        rows.append((start, end, f"Band {band_index:03d}", f"band_{band_index:03d}"))
+        pair = _prestige_and_rank(band_index)
+        rows.append((start, end, rank_title(pair[0], pair[1]), f"band_{band_index:03d}"))
     return rows
 
 
@@ -226,7 +258,9 @@ def _rank_for_level(level: int) -> Dict[str, str]:
     for start, end, rank_name, rank_icon_key in RANK_LADDER:
         if start <= clamped <= end:
             return {"rank_name": rank_name, "rank_icon_key": rank_icon_key}
-    return {"rank_name": "Band 001", "rank_icon_key": "band_001"}
+    # Only reachable if the ladder is empty or a level fell outside it, which
+    # the boundary test forbids. The first real rank, not a key spelled out.
+    return {"rank_name": rank_title(1, 1), "rank_icon_key": "band_001"}
 
 
 def get_level_from_lifetime_xp(total_xp: int) -> int:
