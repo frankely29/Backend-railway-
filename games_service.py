@@ -39,6 +39,23 @@ def _avatar_thumb_url_for_row(row: Dict[str, Any]) -> Optional[str]:
     return avatar_thumb_url(int(row["id"]), str(version))
 
 
+def _winner_standing(winner_user_id: int) -> dict:
+    """The winner's level and rank key, for the battle feed.
+
+    Wrapped and defaulted because a broadcast is decoration: a cold
+    progression cache must cost the feed its crest, never the match result.
+    """
+    try:
+        entry = get_progression_for_users([int(winner_user_id)]).get(int(winner_user_id), {}) or {}
+    except Exception:
+        entry = {}
+    level = entry.get("level")
+    return {
+        "winner_new_level": int(level) if isinstance(level, (int, float)) else 1,
+        "winner_rank_icon_key": str(entry.get("rank_icon_key") or "").strip() or None,
+    }
+
+
 def _safe_iso(unix_ts: Optional[int]) -> Optional[str]:
     if unix_ts is None:
         return None
@@ -1245,7 +1262,12 @@ def move_match(match_id: int, actor_user_id: int, payload: Dict[str, Any]) -> Di
                     "loser_user_id": int(loser_user_id),
                     "loser_display_name": users.get(int(loser_user_id), {}).get("display_name", "Loser"),
                     "winner_xp_awarded": WINNER_XP,
-                    "winner_new_level": get_progression_for_users([int(winner_user_id)]).get(int(winner_user_id), {}).get("level", 1),
+                    # The rank key alongside the level, because the level here
+                    # is the XP engine's out of a thousand and the rank a
+                    # driver has is one of thirty. The feed draws the crest and
+                    # the ladder position from the key; the level stays for
+                    # clients that already read it and is not for display.
+                    **_winner_standing(int(winner_user_id)),
                     "completed_at": _safe_iso(now),
                 }
             )
