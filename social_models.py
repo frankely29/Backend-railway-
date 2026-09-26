@@ -352,6 +352,36 @@ class OkResponse(BaseModel):
 
 # ---------------------------------------------------------------- notifications
 
+class DriverSearchResult(BaseModel):
+    """One driver in a search result.
+
+    Deliberately not the full Profile: this is a row in a list, and serving
+    the whole profile here would run the reputation lookup and the follower
+    counts once per result. What a row needs is a face, a name, a handle to
+    confirm it is the right person, and the crest.
+
+    rank_icon_key is what the row draws the crest from. Declared here or
+    Pydantic drops it on the way out, the way it dropped the ladder's
+    prestige pair and the feed's rank key.
+    """
+    user_id: int
+    display_name: str
+    handle: Optional[str] = None
+    city: Optional[str] = None
+    avatar_url: Optional[str] = None
+    level: Optional[int] = None
+    rank_icon_key: Optional[str] = None
+    rank_name: Optional[str] = None
+
+
+class DriverSearchResponse(BaseModel):
+    ok: bool = True
+    # Echoed back so a client can drop a response that arrived after the
+    # driver had already typed something else.
+    query: str
+    items: List[DriverSearchResult]
+
+
 class NotificationActor(BaseModel):
     """Deliberately not the full Profile.
 
