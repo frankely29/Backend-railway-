@@ -110,6 +110,18 @@ class RankLadderRow(BaseModel):
     end_level: int
     rank_name: str
     rank_icon_key: str
+    # Declared, or Pydantic drops them on the way out.
+    #
+    # get_rank_ladder() has carried prestige and rank since the ladder was
+    # reshaped, and the service test asserted it did. The response model did
+    # not list them, so the endpoint returned prestige: null regardless, the
+    # app fell back to numbering its rows 1..30, and a driver saw
+    # "Warlord II - Prestige 14" instead of prestige 5, rank 2.
+    #
+    # A test that exercises the function cannot see this. The one that guards
+    # it now goes through the HTTP route.
+    prestige: int
+    rank: int
 
 
 class RankLadderResponse(BaseModel):
