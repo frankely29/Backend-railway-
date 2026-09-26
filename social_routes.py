@@ -45,6 +45,7 @@ from social_identity import (
 from social_models import (
     Comment,
     CommentCountResponse,
+    DriverSearchResponse,
     CommentResponse,
     CommentsResponse,
     CreateCommentPayload,
@@ -83,6 +84,7 @@ from social_service import (
     get_post,
     get_profile,
     get_profile_by_handle,
+    search_drivers,
     get_notifications,
     get_user_posts,
     like_post,
@@ -357,6 +359,24 @@ def social_set_city(payload: SetCityPayload, user: sqlite3.Row = Depends(require
 # --------------------------------------------------------------------------
 # identity
 # --------------------------------------------------------------------------
+
+@router.get("/social/search/drivers", response_model=DriverSearchResponse)
+def social_search_drivers(
+    q: str = "",
+    limit: int = 20,
+    user: sqlite3.Row = Depends(require_user_basic),
+):
+    """Find other drivers by name or handle.
+
+    require_user_basic, not require_user: searching is reading, and a driver
+    whose subscription has lapsed should still be able to find people.
+
+    Blocked drivers are filtered inside the service rather than here, because
+    leaving them out of the RESULTS is the whole point -- a search that still
+    listed someone who blocked you would be a way to find that out.
+    """
+    return {"ok": True, **search_drivers(int(user["id"]), q, limit)}
+
 
 @router.get("/social/users/by-handle/{handle}/profile", response_model=ProfileResponse)
 def social_profile_by_handle(handle: str, user: sqlite3.Row = Depends(require_user_basic)):

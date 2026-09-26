@@ -751,6 +751,98 @@ def get_profile(viewer_id: int, user_id: int) -> Dict[str, Any]:
     }
 
 
+SEARCH_DRIVERS_MAX_LIMIT = 30
+
+
+def search_drivers(viewer_id: int, query: str, limit: int = 20) -> Dict[str, Any]:
+    """Find drivers by name or handle.
+
+    A network you cannot search is a network you can only reach through
+    whoever happens to post. Handles existed and were linkable; there was no
+    way to find one without already knowing it.
+
+    Matching is a prefix-first ranking rather than a plain LIKE, because
+    "mar" should surface Marcus before it surfaces Omar: an exact handle,
+    then a name or handle STARTING with the query, then anything containing
+    it. The sort is stable on display name so the same query gives the same
+    order twice.
+
+    What it will not return, ever:
+      - anyone blocked in either direction. The feed and the profile already
+        hide them; a search that still listed them would be a way to check
+        whether you had been blocked.
+      - disabled or suspended accounts.
+      - the viewer. Searching for people means other people.
+
+    Muted drivers ARE returned. Muting hides someone's posts, it is not a
+    statement that they should become unfindable, and a driver who mutes
+    someone then wants to open their profile should be able to.
+    """
+    from social_identity import handle_key as _handle_key
+    from social_moderation import blocked_either_way
+
+    raw = str(query or "").strip()
+    if len(raw) < 2:
+        # One letter matches most of the network; that is a list, not a
+        # search, and it is the expensive query to serve.
+        return {"items": [], "query": raw}
+    safe_limit = max(1, min(int(limit or 20), SEARCH_DRIVERS_MAX_LIMIT))
+
+    # LIKE metacharacters in a user's own query are literal text to them.
+    escaped = raw.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    starts = f"{escaped}%"
+    contains = f"%{escaped}%"
+    exact_handle = _handle_key(raw) or ""
+
+    rows = _db_query_all(
+        """
+        SELECT id, display_name, handle, city, avatar_url, avatar_version
+        FROM users
+        WHERE (LOWER(display_name) LIKE LOWER(?) ESCAPE '\\'
+               OR LOWER(COALESCE(handle, '')) LIKE LOWER(?) ESCAPE '\\')
+          AND COALESCE(is_disabled, 0) = 0
+          AND COALESCE(is_suspended, 0) = 0
+          AND id <> ?
+        LIMIT ?
+        """,
+        (contains, contains, int(viewer_id), safe_limit * 4),
+    ) or []
+
+    hidden = blocked_either_way(int(viewer_id))
+    lowered = raw.lower()
+
+    def rank(row: Any) -> tuple:
+        name = str(_row_value(row, "display_name", "") or "").lower()
+        handle = str(_row_value(row, "handle", "") or "").lower()
+        if exact_handle and handle == exact_handle:
+            tier = 0
+        elif handle.startswith(lowered) or name.startswith(lowered):
+            tier = 1
+        else:
+            tier = 2
+        return (tier, name, int(_row_value(row, "id", 0)))
+
+    kept = [r for r in rows if int(_row_value(r, "id", 0)) not in hidden]
+    kept.sort(key=rank)
+    kept = kept[:safe_limit]
+
+    standing = _author_levels([int(_row_value(r, "id", 0)) for r in kept])
+    items = []
+    for row in kept:
+        uid = int(_row_value(row, "id", 0))
+        items.append({
+            "user_id": uid,
+            "display_name": str(_row_value(row, "display_name", "Driver")),
+            "handle": _row_value(row, "handle"),
+            "city": _row_value(row, "city"),
+            "avatar_url": _avatar_url(row, uid),
+            # The crest goes beside a driver here for the same reason it does
+            # in the feed: a name alone says who, a crest says who they are.
+            **_author_standing(standing, uid),
+        })
+    return {"items": items, "query": raw}
+
+
 def get_profile_by_handle(viewer_id: int, handle: str) -> Dict[str, Any]:
     """A handle is the linkable name, so it has to resolve to a profile."""
     from social_identity import handle_key as _key
