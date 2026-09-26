@@ -788,20 +788,39 @@ def search_drivers(viewer_id: int, query: str, limit: int = 20) -> Dict[str, Any
         return {"items": [], "query": raw}
     safe_limit = max(1, min(int(limit or 20), SEARCH_DRIVERS_MAX_LIMIT))
 
-    # LIKE metacharacters in a user's own query are literal text to them.
-    escaped = raw.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-    starts = f"{escaped}%"
+    # LIKE metacharacters in a driver's own query are literal text to them:
+    # someone typing % is searching for a percent sign, and unescaped it
+    # matches the whole table.
+    #
+    # The escape character is "!" rather than a backslash on purpose. A
+    # backslash has to survive Python's literal, the driver's SQL literal and
+    # standard_conforming_strings, and it means something different in each;
+    # "!" means nothing to any of them.
+    escaped = (raw.replace("!", "!!")
+                  .replace("%", "!%")
+                  .replace("_", "!_"))
     contains = f"%{escaped}%"
     exact_handle = _handle_key(raw) or ""
 
+    # is_disabled and is_suspended are BOOLEAN on Postgres and INTEGER on
+    # SQLite, so there is no single predicate that works on both -- comparing
+    # a Postgres boolean to 0 is a type error, not a false. This is the same
+    # branch main.py already uses for these two columns; the tests run on
+    # SQLite, so the Postgres side of it is not something they can catch.
+    if DB_BACKEND == "postgres":
+        active = ("COALESCE(is_disabled, FALSE) = FALSE "
+                  "AND COALESCE(is_suspended, FALSE) = FALSE")
+    else:
+        active = ("COALESCE(CAST(is_disabled AS INTEGER), 0) = 0 "
+                  "AND COALESCE(CAST(is_suspended AS INTEGER), 0) = 0")
+
     rows = _db_query_all(
-        """
+        f"""
         SELECT id, display_name, handle, city, avatar_url, avatar_version
         FROM users
-        WHERE (LOWER(display_name) LIKE LOWER(?) ESCAPE '\\'
-               OR LOWER(COALESCE(handle, '')) LIKE LOWER(?) ESCAPE '\\')
-          AND COALESCE(is_disabled, 0) = 0
-          AND COALESCE(is_suspended, 0) = 0
+        WHERE (LOWER(display_name) LIKE LOWER(?) ESCAPE '!'
+               OR LOWER(COALESCE(handle, '')) LIKE LOWER(?) ESCAPE '!')
+          AND {active}
           AND id <> ?
         LIMIT ?
         """,

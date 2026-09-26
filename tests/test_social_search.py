@@ -235,3 +235,80 @@ def test_the_query_comes_back_so_a_stale_response_can_be_dropped(app_env):
     _main, client = app_env
     me = _signup(client, "echo@example.com", "Echo")
     assert _search(client, me, "  marcus  ")["query"] == "marcus"
+
+
+def test_the_active_filter_is_written_for_the_backend_it_runs_on(app_env):
+    """The bug this exists for: a 500 on production and green tests locally.
+
+    is_disabled and is_suspended are BOOLEAN on Postgres and INTEGER on
+    SQLite. `COALESCE(is_disabled, 0) = 0` is a perfectly good predicate on
+    SQLite and a TYPE ERROR on Postgres -- so the endpoint passed every test
+    here, shipped, and returned 500 to every driver who used it.
+
+    The tests run on SQLite, so no amount of black-box testing can catch the
+    Postgres side. This asserts the SQL itself, on both branches, which is
+    the only thing that can.
+    """
+    _main, client = app_env
+    import social_service
+
+    captured = []
+    real = social_service._db_query_all
+
+    def spy(sql, params=None, *a, **kw):
+        captured.append(str(sql))
+        return real(sql, params, *a, **kw) if params is not None else real(sql)
+
+    original_backend = social_service.DB_BACKEND
+    try:
+        for backend in ("postgres", "sqlite"):
+            captured.clear()
+            social_service.DB_BACKEND = backend
+            social_service._db_query_all = spy
+            try:
+                social_service.search_drivers(1, "marcus")
+            except Exception:
+                # A postgres-shaped query cannot execute against the SQLite
+                # test database; the SQL text is what is under test.
+                pass
+            users_sql = next((s for s in captured if "FROM users" in s), "")
+            assert users_sql, f"{backend}: the users query was never built"
+            if backend == "postgres":
+                assert "COALESCE(is_disabled, FALSE) = FALSE" in users_sql, users_sql
+                assert "COALESCE(is_suspended, FALSE) = FALSE" in users_sql, users_sql
+                assert ", 0) = 0" not in users_sql, \
+                    f"a boolean column is compared to 0 on Postgres: {users_sql}"
+            else:
+                assert "CAST(is_disabled AS INTEGER)" in users_sql, users_sql
+                assert "FALSE" not in users_sql.upper().replace("FALSE'", ""), users_sql
+    finally:
+        social_service.DB_BACKEND = original_backend
+        social_service._db_query_all = real
+
+
+def test_the_like_escape_survives_both_dialects(app_env):
+    """A backslash escape has to survive Python's literal, SQL's literal and
+    standard_conforming_strings, and means something different in each. The
+    escape character is one that means nothing to any of them."""
+    _main, client = app_env
+    import social_service
+
+    captured = []
+    real = social_service._db_query_all
+
+    def spy(sql, params=None, *a, **kw):
+        captured.append((str(sql), params))
+        return real(sql, params, *a, **kw) if params is not None else real(sql)
+
+    social_service._db_query_all = spy
+    try:
+        social_service.search_drivers(1, "50%_off")
+    finally:
+        social_service._db_query_all = real
+
+    sql, params = next((c for c in captured if "FROM users" in c[0]), ("", ()))
+    assert sql, "the users query was never built"
+    assert "\\" not in sql, f"a backslash escape is back in the SQL: {sql}"
+    assert "ESCAPE '!'" in sql, sql
+    # Both metacharacters the driver typed are neutralised.
+    assert "!%" in params[0] and "!_" in params[0], params[0]
