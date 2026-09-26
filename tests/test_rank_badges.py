@@ -473,3 +473,51 @@ def test_no_rank_is_ever_named_after_its_key(app_env):
     prog = res.json()["progression"]
     assert not key_shaped.match(prog["rank_name"]), prog["rank_name"]
     assert prog["rank_icon_key"] == "band_001"
+
+
+# ----------------------------------------- what the ENDPOINT actually returns
+
+def test_the_ladder_endpoint_sends_the_prestige_pair(app_env):
+    """Through HTTP, not through the function.
+
+    get_rank_ladder() carried prestige and rank, and a test asserted it did.
+    The response model did not declare them, so Pydantic stripped them and the
+    endpoint returned prestige: null for all thirty rows. The app fell back to
+    numbering its rows 1..30 and showed a driver "Warlord II - Prestige 14"
+    when Warlord II is prestige 5, rank 2.
+
+    The lesson is the test, not the field: a serialiser sits between the
+    service and the client, and only a request can see through it.
+    """
+    _main, client = app_env
+    from leaderboard_service import PRESTIGE_COUNT, RANKS_PER_PRESTIGE, RANK_BAND_COUNT
+
+    driver = _signup(client, "ladder@example.com", "Ladder")
+    res = client.get("/leaderboard/ranks", headers=_h(driver))
+    assert res.status_code == 200, res.text
+    rows = res.json()["rows"]
+    assert len(rows) == RANK_BAND_COUNT
+
+    for i, row in enumerate(rows, start=1):
+        assert row.get("prestige") is not None, f"row {i} lost its prestige in transit"
+        assert row.get("rank") is not None, f"row {i} lost its rank in transit"
+        assert row["prestige"] == ((i - 1) // RANKS_PER_PRESTIGE) + 1
+        assert row["rank"] == ((i - 1) % RANKS_PER_PRESTIGE) + 1
+
+    # The shape a driver is shown: ten prestiges, three ranks each -- never
+    # thirty prestiges.
+    prestiges = {r["prestige"] for r in rows}
+    assert prestiges == set(range(1, PRESTIGE_COUNT + 1)), (
+        f"the endpoint describes {len(prestiges)} prestiges, not {PRESTIGE_COUNT}")
+    assert max(r["rank"] for r in rows) == RANKS_PER_PRESTIGE
+
+
+def test_the_progression_endpoint_sends_the_pair_too(app_env):
+    """Same serialiser, same trap, different route."""
+    _main, client = app_env
+    driver = _signup(client, "prog2@example.com", "Prog Two")
+    res = client.get("/leaderboard/progression/me", headers=_h(driver))
+    assert res.status_code == 200, res.text
+    prog = res.json()["progression"]
+    assert prog["rank_name"] == "Wyvern I"
+    assert prog["rank_icon_key"] == "band_001"
