@@ -174,40 +174,116 @@ def _replace_game_tables_with_old_match_schema(main_module) -> None:
     )
 
 
-def test_progression_reaches_level_1000_and_rank_bands(app_env):
-    _main, _client = app_env
-    leaderboard_service = importlib.import_module("leaderboard_service")
+def test_the_ladder_is_thirty_levels_calibrated_to_four_months(app_env):
+    """One level per rank, and the whole curve solved from one benchmark.
 
-    assert leaderboard_service.MAX_LEVEL == 1000
-    assert len(leaderboard_service.LEVEL_XP_THRESHOLDS) == 1000
-    assert leaderboard_service.get_level_from_lifetime_xp(0) == 1
-    assert leaderboard_service.get_level_from_lifetime_xp(leaderboard_service.LEVEL_XP_THRESHOLDS[99]) == 100
-    assert leaderboard_service.get_level_from_lifetime_xp(leaderboard_service.LEVEL_XP_THRESHOLDS[100]) == 101
-    assert leaderboard_service.get_level_from_lifetime_xp(leaderboard_service.LEVEL_XP_THRESHOLDS[998]) == 999
-    assert leaderboard_service.get_level_from_lifetime_xp(leaderboard_service.LEVEL_XP_THRESHOLDS[999]) == 1000
-    assert leaderboard_service.get_next_level_xp(1) == leaderboard_service.LEVEL_XP_THRESHOLDS[1]
-    assert leaderboard_service.get_next_level_xp(100) == leaderboard_service.LEVEL_XP_THRESHOLDS[100]
-    assert leaderboard_service.get_next_level_xp(101) == leaderboard_service.LEVEL_XP_THRESHOLDS[101]
-    assert leaderboard_service.get_next_level_xp(999) == leaderboard_service.LEVEL_XP_THRESHOLDS[999]
-    assert leaderboard_service.get_next_level_xp(1000) is None
-    # The XP curve above is untouched by the ladder reshape: a thousand levels,
-    # the same thresholds. What changes is only how many brackets they group
-    # into -- ten prestiges of three ranks, thirty bands. Asserted against the
-    # constants rather than the numbers, because this shape has moved three
-    # times and the curve above has not moved once.
-    count = leaderboard_service.RANK_BAND_COUNT
-    rows = leaderboard_service.get_rank_ladder()
-    assert len(rows) == count == 30
+    The old curve wanted 34.3 MILLION XP for the top rank. A driver doing ten
+    hours, a hundred and fifty miles and twenty-five saved trips every single
+    day would have needed forty-seven YEARS. Nobody had ever multiplied it
+    out.
+
+    The benchmark is the input now: a very active daily driver reaches the top
+    rank in four months, and every threshold is derived from that. So these
+    assertions check the SHAPE and the DESTINATION, never a hand-copied
+    number -- the one thing this codebase has got wrong every single time.
+    """
+    _main, _client = app_env
+    svc = importlib.import_module("leaderboard_service")
+
+    # A level is a rank. No second scale.
+    assert svc.MAX_LEVEL == svc.RANK_BAND_COUNT == 30
+    assert svc.LEVELS_PER_RANK_BAND == 1
+    assert len(svc.LEVEL_XP_THRESHOLDS) == svc.MAX_LEVEL
+
+    # Every level costs more than the one before it, and the last threshold is
+    # exactly the benchmark total.
+    steps = [b - a for a, b in zip(svc.LEVEL_XP_THRESHOLDS, svc.LEVEL_XP_THRESHOLDS[1:])]
+    assert all(later > earlier for earlier, later in zip(steps, steps[1:])), \
+        "the climb gets cheaper somewhere"
+    assert svc.LEVEL_XP_THRESHOLDS[0] == 0
+    assert svc.LEVEL_XP_THRESHOLDS[-1] == svc.PROGRESSION_XP_TO_MAX_LEVEL == 405_000
+
+    # THE BENCHMARK ITSELF. A very active day, built from the rates rather
+    # than typed in, must put the top rank four months away.
+    benchmark_day = svc.build_progression_from_daily_stats_rows(
+        [{"miles_worked": 150, "hours_worked": 10, "pickups_recorded": 25}],
+        social_rows=[{"posts": 5, "comments": 20, "likes": 40}],
+    )["total_xp"]
+    days_to_max = svc.PROGRESSION_XP_TO_MAX_LEVEL / benchmark_day
+    assert 110 <= days_to_max <= 130, f"the benchmark driver tops out in {days_to_max:.0f} days"
+
+    # Saving a trip is the largest single source on that day, which is the
+    # whole point: it is the behaviour the product is built on.
+    breakdown = svc.build_progression_from_daily_stats_rows(
+        [{"miles_worked": 150, "hours_worked": 10, "pickups_recorded": 25}],
+        social_rows=[{"posts": 5, "comments": 20, "likes": 40}],
+    )["xp_breakdown"]
+    assert breakdown["report_xp"] == max(breakdown.values())
+    # And the order the rates promise: a trip beats a post beats a reply beats
+    # a like.
+    assert (svc.PROGRESSION_XP_PER_REPORTED_PICKUP > svc.PROGRESSION_XP_PER_POST
+            > svc.PROGRESSION_XP_PER_COMMENT > svc.PROGRESSION_XP_PER_LIKE_GIVEN)
+
+    # Boundaries, read off the table rather than restated.
+    assert svc.get_level_from_lifetime_xp(0) == 1
+    for level in (2, 15, svc.MAX_LEVEL):
+        assert svc.get_level_from_lifetime_xp(svc.LEVEL_XP_THRESHOLDS[level - 1]) == level
+        assert svc.get_level_from_lifetime_xp(svc.LEVEL_XP_THRESHOLDS[level - 1] - 1) == level - 1
+    assert svc.get_next_level_xp(svc.MAX_LEVEL) is None
+    assert svc.get_level_from_lifetime_xp(svc.PROGRESSION_XP_TO_MAX_LEVEL * 10) == svc.MAX_LEVEL
+
+    # The ladder: thirty bands, one level each, first to last.
+    rows = svc.get_rank_ladder()
+    assert len(rows) == svc.RANK_BAND_COUNT == 30
     assert rows[0]["rank_icon_key"] == "band_001"
-    assert rows[-1]["rank_icon_key"] == f"band_{count:03d}"
+    assert rows[-1]["rank_icon_key"] == f"band_{svc.RANK_BAND_COUNT:03d}"
     assert rows[0]["start_level"] == 1
-    assert rows[-1]["end_level"] == leaderboard_service.MAX_LEVEL
-    # 1000 does not divide by 30, so the spare levels must land somewhere:
-    # the top band absorbs them rather than the ladder ending short.
-    assert rows[-1]["end_level"] - rows[-1]["start_level"] + 1 > leaderboard_service.LEVELS_PER_RANK_BAND
+    assert rows[-1]["end_level"] == svc.MAX_LEVEL
+    assert all(r["start_level"] == r["end_level"] for r in rows), "a band spans more than one level"
     assert (rows[0]["prestige"], rows[0]["rank"]) == (1, 1)
-    assert (rows[-1]["prestige"], rows[-1]["rank"]) == (
-        leaderboard_service.PRESTIGE_COUNT, leaderboard_service.RANKS_PER_PRESTIGE)
+    assert (rows[-1]["prestige"], rows[-1]["rank"]) == (svc.PRESTIGE_COUNT, svc.RANKS_PER_PRESTIGE)
+
+
+def test_social_xp_is_capped_per_day_and_never_outruns_driving(app_env):
+    """Posting, replying and liking pay -- and cannot become the fast lane.
+
+    Without per-day caps the cheapest action sets the pace: a driver farming
+    likes from a parked car would out-earn one actually working, which is the
+    opposite of what this ladder is for.
+    """
+    _main, _client = app_env
+    svc = importlib.import_module("leaderboard_service")
+
+    # One absurd day is worth exactly the caps, not what was done.
+    farmed = svc.build_progression_from_daily_stats_rows(
+        [], social_rows=[{"posts": 500, "comments": 500, "likes": 500}])
+    capped = (svc.PROGRESSION_MAX_POSTS_PER_DAY_FOR_XP * svc.PROGRESSION_XP_PER_POST
+              + svc.PROGRESSION_MAX_COMMENTS_PER_DAY_FOR_XP * svc.PROGRESSION_XP_PER_COMMENT
+              + svc.PROGRESSION_MAX_LIKES_PER_DAY_FOR_XP * svc.PROGRESSION_XP_PER_LIKE_GIVEN)
+    assert farmed["total_xp"] == capped
+
+    # The caps are per DAY, so the same activity spread over three days pays
+    # three times -- coming back is the behaviour being rewarded.
+    spread = svc.build_progression_from_daily_stats_rows(
+        [], social_rows=[{"posts": 500, "comments": 500, "likes": 500}] * 3)
+    assert spread["total_xp"] == capped * 3
+
+    # A driver who does nothing but social, flat out, every day for the full
+    # four months still must not reach the top rank. Driving has to matter.
+    assert capped * 120 < svc.PROGRESSION_XP_TO_MAX_LEVEL
+
+    # And a driver who never touches the social side is not locked out: they
+    # reach the top, just later.
+    driving_only = svc.build_progression_from_daily_stats_rows(
+        [{"miles_worked": 150, "hours_worked": 10, "pickups_recorded": 25}])["total_xp"]
+    assert driving_only > 0
+    days = svc.PROGRESSION_XP_TO_MAX_LEVEL / driving_only
+    assert 120 < days < 180, f"a driver who never posts needs {days:.0f} days"
+
+    # Nobody is demoted by the recalibration: more XP can never mean a lower
+    # level, at any point on the curve.
+    levels = [svc.get_level_from_lifetime_xp(xp) for xp in range(0, 420_000, 997)]
+    assert levels == sorted(levels)
 
 
 def test_progression_endpoint_keeps_rank_icon_separate_from_podium_badges(app_env):

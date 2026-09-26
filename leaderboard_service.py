@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import time
 import sqlite3
 import threading
@@ -11,13 +12,66 @@ from zoneinfo import ZoneInfo
 from core import DB_BACKEND, _db_exec, _db_query_all, _db_query_one, _db_run_in_transaction, _sql
 from leaderboard_models import LeaderboardMetric, LeaderboardPeriod
 
+_LOGGER = logging.getLogger(__name__)
+
 NYC_TZ = ZoneInfo("America/New_York")
 
+# ---------------------------------------------------------------- the economy
+#
+# Everything a driver does in the app earns XP, and the whole thing is
+# calibrated against ONE benchmark: a driver who uses the app every day and is
+# very active reaches the top rank in four months. Everything else falls out
+# of that -- someone who drives less, or never posts, simply takes longer.
+#
+# The benchmark day, measured against what a hard NYC FHV shift actually looks
+# like -- 10 hours, 150 miles, 25 saved trips -- plus an active social day:
+#
+#     miles      150 x  8  =  1,200
+#     hours       10 x 30  =    300
+#     trips       25 x 60  =  1,500   <- the largest single source, by design
+#     posts        5 x 25  =    125
+#     comments    20 x  8  =    160
+#     likes       40 x  2  =     80
+#                            -------
+#                              3,365 XP/day  x 120 days = 403,800
+#
+# so the climb to the top rank is 405,000 XP. What that produces:
+#
+#     very active, posts daily      120 days   (the benchmark)
+#     drives hard, never posts      135 days
+#     committed full-time           173 days
+#     steady part-time              349 days
+#
+# Social participation is worth about two weeks off the climb. That is the
+# right weight for a DRIVER network: it is worth doing and it is not a second
+# job, and a driver who only ever drives is never locked out of anything.
+#
+# The order the rates encode, deliberately: saving a trip beats posting, a
+# post beats a reply, a reply beats a like. A saved trip is the thing the
+# whole product is built on, so it pays the most per action.
 PROGRESSION_XP_PER_MILE = 8
 PROGRESSION_XP_PER_HOUR = 30
-PROGRESSION_XP_PER_REPORTED_PICKUP = 20
+PROGRESSION_XP_PER_REPORTED_PICKUP = 60
+PROGRESSION_XP_PER_POST = 25
+PROGRESSION_XP_PER_COMMENT = 8
+PROGRESSION_XP_PER_LIKE_GIVEN = 2
+
+# Daily ceilings, per NYC day. Not anti-cheat theatre: without them the
+# cheapest action sets the pace, and a driver farming likes out-earns one
+# actually working. Every cap is set at "a genuinely heavy day" so nobody
+# real ever touches it.
 PROGRESSION_MAX_PICKUP_REPORTS_PER_DAY_FOR_XP = 25
-MAX_LEVEL = 1000
+PROGRESSION_MAX_POSTS_PER_DAY_FOR_XP = 5
+PROGRESSION_MAX_COMMENTS_PER_DAY_FOR_XP = 20
+PROGRESSION_MAX_LIKES_PER_DAY_FOR_XP = 40
+
+# Thirty levels, one per rank on the ladder: ten prestiges of three. There is
+# no second scale any more. The 1000-level curve this replaces was never
+# calibrated against anything -- it wanted 34.3 MILLION XP for the top rank,
+# which the benchmark driver above would have reached in 47 years -- and it
+# forced every surface to translate between two numbers for the same thing.
+MAX_LEVEL = 30
+PROGRESSION_XP_TO_MAX_LEVEL = 405_000
 _CURRENT_BADGES_REFRESH_LOCK = threading.Lock()
 _CURRENT_BADGES_LAST_REFRESH_TS = 0
 _CURRENT_BADGES_MIN_REFRESH_INTERVAL_SECONDS = 30
@@ -46,13 +100,34 @@ def _prune_user_ttl_cache(cache: Dict[int, Dict[str, Any]], now: int, ttl_second
         cache.pop(uid, None)
 
 
+# How much steeper each level is than the last. 1.25 was chosen by looking at
+# what the pacing does to a benchmark driver rather than because it is a round
+# number: level 2 inside the first session, the first prestige inside a day,
+# the halfway mark around a month, and the last rank a nine-day climb. Flatter
+# and the top ranks arrive too cheaply; steeper and the middle of the ladder
+# stalls.
+PROGRESSION_LEVEL_CURVE_EXPONENT = 1.25
+
+
 def _build_level_xp_thresholds() -> List[int]:
+    """Lifetime XP needed for each level, thresholds[0] = level 1 = 0 XP.
+
+    The shape is chosen, the scale is solved: the steps are weighted L^1.25
+    and then scaled so the total is exactly PROGRESSION_XP_TO_MAX_LEVEL. That
+    way the benchmark -- four months -- is the input, and no step is a magic
+    number somebody has to keep in sync by hand.
+    """
+    weights = [float(level_index) ** PROGRESSION_LEVEL_CURVE_EXPONENT
+               for level_index in range(1, MAX_LEVEL)]
+    scale = float(PROGRESSION_XP_TO_MAX_LEVEL) / sum(weights)
+    steps = [int(round(scale * weight)) for weight in weights]
+    # Rounding drift lands on the last step so the top of the ladder is the
+    # exact number the benchmark produced, not a few XP either side of it.
+    steps[-1] += PROGRESSION_XP_TO_MAX_LEVEL - sum(steps)
+
     thresholds = [0]
-    total_xp = 0
-    for level_index in range(2, MAX_LEVEL + 1):
-        step_xp = round(120 + ((level_index - 1) * 26) + (((level_index - 1) ** 1.28) * 7))
-        total_xp += int(step_xp)
-        thresholds.append(total_xp)
+    for step_xp in steps:
+        thresholds.append(thresholds[-1] + step_xp)
     return thresholds
 
 
@@ -70,9 +145,11 @@ LEVEL_XP_THRESHOLDS = _build_level_xp_thresholds()
 # Written against the constant rather than a literal 3, because this shape has
 # already changed twice -- a hundred bands of ten, then fifty of five.
 #
-# MAX_LEVEL is untouched at 1000. The XP curve, the thresholds and every level
-# a driver has already earned are unaffected; what changes is only how many
-# brackets those levels are grouped into.
+# A level IS a rank now. MAX_LEVEL is 30 and so is the band count, so
+# LEVELS_PER_RANK_BAND is 1 and every level a driver gains is a rank-up worth
+# a ceremony. Under the old 1000-level curve a driver crossed eight levels a
+# day and got eight notifications for it, which is how a promotion came to
+# feel like nothing.
 PRESTIGE_COUNT = 10
 RANKS_PER_PRESTIGE = 3
 RANK_BAND_COUNT = PRESTIGE_COUNT * RANKS_PER_PRESTIGE
@@ -303,7 +380,34 @@ def get_level_progress_from_lifetime_xp(total_xp: int) -> Dict[str, Any]:
     }
 
 
-def build_progression_from_daily_stats_rows(rows: List[Dict[str, Any]], game_xp: int = 0) -> Dict[str, Any]:
+def _social_xp_from_daily_counts(rows: List[Dict[str, Any]]) -> Dict[str, int]:
+    """XP from posting, replying and liking, capped per day.
+
+    Rows are one per (user, NYC day) with the three counts on them. The caps
+    have to be applied per DAY and not to a lifetime total, or a driver who
+    posted forty times in one week would be paid for all of it while one
+    posting twice a day for a month gets less -- which is backwards for a
+    network that wants people to come back.
+    """
+    post_xp = 0
+    comment_xp = 0
+    like_xp = 0
+    for raw_row in rows:
+        row = dict(raw_row)
+        posts = min(max(0, int(row.get("posts") or 0)), PROGRESSION_MAX_POSTS_PER_DAY_FOR_XP)
+        comments = min(max(0, int(row.get("comments") or 0)), PROGRESSION_MAX_COMMENTS_PER_DAY_FOR_XP)
+        likes = min(max(0, int(row.get("likes") or 0)), PROGRESSION_MAX_LIKES_PER_DAY_FOR_XP)
+        post_xp += posts * PROGRESSION_XP_PER_POST
+        comment_xp += comments * PROGRESSION_XP_PER_COMMENT
+        like_xp += likes * PROGRESSION_XP_PER_LIKE_GIVEN
+    return {"post_xp": post_xp, "comment_xp": comment_xp, "like_xp": like_xp}
+
+
+def build_progression_from_daily_stats_rows(
+    rows: List[Dict[str, Any]],
+    game_xp: int = 0,
+    social_rows: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
     lifetime_miles = 0.0
     lifetime_hours = 0.0
     lifetime_pickups_recorded = 0
@@ -311,6 +415,7 @@ def build_progression_from_daily_stats_rows(rows: List[Dict[str, Any]], game_xp:
     hours_xp = 0
     report_xp = 0
     normalized_game_xp = max(0, int(game_xp or 0))
+    social = _social_xp_from_daily_counts(social_rows or [])
 
     for raw_row in rows:
         row = dict(raw_row)
@@ -327,7 +432,8 @@ def build_progression_from_daily_stats_rows(rows: List[Dict[str, Any]], game_xp:
         hours_xp += round(hours * PROGRESSION_XP_PER_HOUR)
         report_xp += pickup_count_for_xp * PROGRESSION_XP_PER_REPORTED_PICKUP
 
-    total_xp = int(miles_xp + hours_xp + report_xp)
+    social_xp = int(social["post_xp"] + social["comment_xp"] + social["like_xp"])
+    total_xp = int(miles_xp + hours_xp + report_xp + social_xp)
     total_xp += normalized_game_xp
     progression = get_level_progress_from_lifetime_xp(total_xp)
     progression["lifetime_miles"] = round(lifetime_miles, 4)
@@ -338,6 +444,9 @@ def build_progression_from_daily_stats_rows(rows: List[Dict[str, Any]], game_xp:
         "hours_xp": int(hours_xp),
         "report_xp": int(report_xp),
         "game_xp": int(normalized_game_xp),
+        "post_xp": int(social["post_xp"]),
+        "comment_xp": int(social["comment_xp"]),
+        "like_xp": int(social["like_xp"]),
     }
     return progression
 
@@ -381,6 +490,66 @@ def get_progression_for_user(user_id: int) -> Dict[str, Any]:
     return progression
 
 
+def _social_rows_for_users(user_ids: List[int]) -> Dict[int, List[Dict[str, Any]]]:
+    """Posts, comments and likes per driver per NYC day, in three queries.
+
+    Three rather than one join: a driver with many posts and many likes would
+    have the counts multiplied by each other in a single joined GROUP BY, and
+    a driver missing from one table would drop out of the others.
+
+    Every row is counted, including content that was later deleted. That
+    reads wrong at first and is deliberate on both sides. Counting only live
+    rows would mean deleting an old post silently takes a rank back -- a
+    driver demoted for tidying up, with nothing on screen to explain it. And
+    it cannot be farmed, because deleting does not free the row: post, delete,
+    post again is two rows and still runs into the same daily cap.
+
+    Wrapped, because XP is decoration on top of a network that has to keep
+    working. A social table that is missing or slow costs the social part of a
+    driver's XP for one request; it must never cost them the whole
+    progression payload.
+    """
+    clean_user_ids = [int(uid) for uid in user_ids]
+    if not clean_user_ids:
+        return {}
+    placeholders = ",".join(["?" for _ in clean_user_ids])
+    # The same NYC day the driving stats are bucketed by, so one calendar day
+    # of work and one of posting land on the same row and share the same caps.
+    if DB_BACKEND == "postgres":
+        day = "to_char(to_timestamp(created_at) AT TIME ZONE 'America/New_York', 'YYYY-MM-DD')"
+    else:
+        day = "date(created_at, 'unixepoch', 'localtime')"
+
+    by_user_day: Dict[int, Dict[str, Dict[str, int]]] = {uid: {} for uid in clean_user_ids}
+    sources = (
+        ("posts", "posts"),
+        ("comments", "post_comments"),
+        ("likes", "post_likes"),
+    )
+    for field, table in sources:
+        try:
+            rows = _db_query_all(
+                f"""
+                SELECT user_id, {day} AS day_key, COUNT(*) AS n
+                FROM {table}
+                WHERE user_id IN ({placeholders})
+                GROUP BY user_id, {day}
+                """,
+                tuple(clean_user_ids),
+            ) or []
+        except Exception:
+            _LOGGER.warning("Could not read %s for progression", table, exc_info=True)
+            continue
+        for row in rows:
+            uid = int(row["user_id"])
+            day_key = str(row["day_key"])
+            bucket = by_user_day.setdefault(uid, {}).setdefault(
+                day_key, {"posts": 0, "comments": 0, "likes": 0})
+            bucket[field] = int(row["n"] or 0)
+
+    return {uid: list(days.values()) for uid, days in by_user_day.items()}
+
+
 def get_progression_for_users(user_ids: List[int]) -> Dict[int, Dict[str, Any]]:
     clean_user_ids = [int(uid) for uid in user_ids]
     if not clean_user_ids:
@@ -415,8 +584,13 @@ def get_progression_for_users(user_ids: List[int]) -> Dict[int, Dict[str, Any]]:
     except sqlite3.OperationalError:
         game_rows = []
     game_xp_by_user = {int(row["user_id"]): int(row["xp_total"] or 0) for row in game_rows}
+    social_by_user = _social_rows_for_users(clean_user_ids)
     progression_by_user = {
-        uid: build_progression_from_daily_stats_rows(rows_by_user.get(uid, []), game_xp=int(game_xp_by_user.get(uid, 0)))
+        uid: build_progression_from_daily_stats_rows(
+            rows_by_user.get(uid, []),
+            game_xp=int(game_xp_by_user.get(uid, 0)),
+            social_rows=social_by_user.get(uid, []),
+        )
         for uid in clean_user_ids
     }
     return progression_by_user
