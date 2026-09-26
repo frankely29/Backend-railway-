@@ -78,10 +78,20 @@ class OverviewResponse(BaseModel):
 
 
 class ProgressionXpBreakdown(BaseModel):
+    """Where a driver's XP came from.
+
+    Declared in full, or Pydantic drops the new sources on the way out and the
+    breakdown silently under-reports -- the same filter that cost the ladder
+    its prestige pair and the feed its rank key. Defaulted to 0 so a client
+    reading a cached payload from before social XP existed still parses.
+    """
     miles_xp: int
     hours_xp: int
     report_xp: int
     game_xp: int
+    post_xp: int = 0
+    comment_xp: int = 0
+    like_xp: int = 0
 
 
 class ProgressionPayload(BaseModel):
