@@ -249,8 +249,8 @@ def _like_state(post_ids: Sequence[int], viewer_id: int) -> Tuple[Dict[int, int]
     return counts, mine
 
 
-def _author_levels(author_ids: Sequence[int]) -> Dict[int, Optional[int]]:
-    """Driving level for each author on the page, in one query.
+def _author_levels(author_ids: Sequence[int]) -> Dict[int, Dict[str, Any]]:
+    """Standing for each author on the page, in one query.
 
     This is what makes a driver network different from a photo app: you can see
     that the person telling you the lot is moving has actually driven. But it is
@@ -259,6 +259,13 @@ def _author_levels(author_ids: Sequence[int]) -> Dict[int, Optional[int]]:
 
     Batched deliberately. _reputation_for() is per-user, and calling it inside
     the serializer would be one leaderboard round trip per post.
+
+    It returns the RANK KEY as well as the level now, because the key is the
+    only thing a client can draw a crest from -- and because the level here is
+    the XP engine's, numbered to a thousand. A driver's rank is one of thirty,
+    and a feed card reading "LVL 445" beside a crest that goes up to thirty is
+    two answers to the same question. The level is still carried for the
+    clients that already take it; nothing should put it on screen.
     """
     ids = sorted({int(uid) for uid in author_ids})
     if not ids:
@@ -269,12 +276,31 @@ def _author_levels(author_ids: Sequence[int]) -> Dict[int, Optional[int]]:
     except Exception:
         _LOGGER.warning("Could not read progression for a feed page", exc_info=True)
         return {}
-    out: Dict[int, Optional[int]] = {}
+    out: Dict[int, Dict[str, Any]] = {}
     for uid in ids:
         entry = progression.get(uid) or progression.get(str(uid)) or {}
         level = entry.get("level")
-        out[uid] = int(level) if isinstance(level, (int, float)) else None
+        key = str(entry.get("rank_icon_key") or "").strip()
+        out[uid] = {
+            "level": int(level) if isinstance(level, (int, float)) else None,
+            "rank_icon_key": key or None,
+            "rank_name": str(entry.get("rank_name") or "").strip() or None,
+        }
     return out
+
+
+def _author_standing(levels: Optional[Dict[int, Dict[str, Any]]], author_id: int) -> Dict[str, Any]:
+    """One author's row out of that batch, with every field present.
+
+    Present-but-null rather than absent: a client that has to test for the key
+    before reading it ends up with three different spellings of "unknown".
+    """
+    entry = (levels or {}).get(int(author_id)) or {}
+    return {
+        "level": entry.get("level"),
+        "rank_icon_key": entry.get("rank_icon_key"),
+        "rank_name": entry.get("rank_name"),
+    }
 
 
 def _serialize(row: Any, viewer_id: int, counts: Dict[int, int], mine: set,
@@ -291,9 +317,14 @@ def _serialize(row: Any, viewer_id: int, counts: Dict[int, int], mine: set,
             "handle": _row_value(row, "handle"),
             "city": _row_value(row, "author_city"),
             "avatar_url": _avatar_url(row, author_id),
-            # Who is talking, not just what they said. Both optional: a driver
+            # Who is talking, not just what they said. All optional: a driver
             # with no trips logged and no platform set still posts.
-            "level": (levels or {}).get(author_id),
+            #
+            # rank_icon_key is what a card draws the crest from. `level` is the
+            # XP engine's, out of a thousand, and is not for display -- the
+            # number a driver knows is their rank out of thirty, which the
+            # client derives from the key.
+            **_author_standing(levels, author_id),
             "platforms": split_platforms(_row_value(row, "author_platforms")),
         },
         "body": str(_row_value(row, "body", "")),
@@ -654,7 +685,8 @@ def _reputation_for(user_id: int) -> Dict[str, Any]:
     renders without a badge. Every field is optional to the client.
     """
     out: Dict[str, Any] = {
-        "level": None, "rank_name": None, "title": None, "badge_code": None,
+        "level": None, "rank_icon_key": None, "rank_name": None,
+        "title": None, "badge_code": None,
         "lifetime_miles": None, "lifetime_hours": None, "trips_logged": None,
     }
     try:
@@ -664,6 +696,10 @@ def _reputation_for(user_id: int) -> Dict[str, Any]:
         )
         progression = get_progression_for_user(int(user_id)) or {}
         out["level"] = progression.get("level")
+        # The key the crest is drawn from, and the only thing that says WHICH
+        # of the thirty ranks this is. The level beside it is the XP engine's,
+        # out of a thousand, and is not what a profile should print.
+        out["rank_icon_key"] = str(progression.get("rank_icon_key") or "").strip() or None
         out["rank_name"] = progression.get("rank_name")
         out["title"] = progression.get("title")
         out["lifetime_miles"] = progression.get("lifetime_miles")
@@ -881,7 +917,7 @@ def _serialize_comment(row: Any, viewer_id: int, post_author_id: int,
             "handle": _row_value(row, "handle"),
             "city": _row_value(row, "author_city"),
             "avatar_url": _avatar_url(row, author_id),
-            "level": (levels or {}).get(author_id),
+            **_author_standing(levels, author_id),
             "platforms": split_platforms(_row_value(row, "author_platforms")),
         },
         "body": str(_row_value(row, "body", "")),
@@ -1130,7 +1166,7 @@ def unread_notification_count(user_id: int) -> int:
     return int(_row_value(row, "n", 0) or 0)
 
 
-def _serialize_notification(row: Any, levels: Dict[int, Optional[int]]) -> Dict[str, Any]:
+def _serialize_notification(row: Any, levels: Dict[int, Dict[str, Any]]) -> Dict[str, Any]:
     actor_id = int(_row_value(row, "actor_id", 0))
     post_id = int(_row_value(row, "post_id", 0) or 0)
     comment_id = int(_row_value(row, "comment_id", 0) or 0)
@@ -1144,7 +1180,7 @@ def _serialize_notification(row: Any, levels: Dict[int, Optional[int]]) -> Dict[
             "display_name": str(_row_value(row, "actor_name", "") or "Driver"),
             "handle": _row_value(row, "actor_handle", None),
             "avatar_url": _avatar_url(row, actor_id),
-            "level": levels.get(actor_id),
+            **_author_standing(levels, actor_id),
         },
         # 0 means "this kind has no subject"; the client shows nothing to tap.
         "post_id": post_id or None,

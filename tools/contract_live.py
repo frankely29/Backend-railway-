@@ -163,7 +163,15 @@ has(post, ["id", "author", "body", "image_url", "image_thumb_url", "city",
            "zone_name", "zone_rating", "like_count", "liked_by_me",
            "comment_count", "mine", "created_at"], "post")
 has(post.get("author") or {}, ["user_id", "display_name", "handle", "city",
-                               "avatar_url", "level", "platforms"], "post author")
+                               "avatar_url", "level", "rank_icon_key",
+                               "rank_name", "platforms"], "post author")
+# rank_icon_key is what a card draws the crest from and derives the ladder
+# position from. `level` beside it is the XP engine's, out of a thousand, and
+# is not for display -- a card that printed it disagreed with the driver's own
+# Ranks tab about the same person.
+check("the author's rank key is one the ladder defines",
+      str(post.get("author", {}).get("rank_icon_key") or "").startswith("band_"),
+      json.dumps(post.get("author", {}).get("rank_icon_key")))
 check("compose's zone tag round-trips",
       post.get("zone_name") == "JFK Airport" and post.get("zone_rating") == 91,
       json.dumps({k: post.get(k) for k in ("zone_name", "zone_rating")}))

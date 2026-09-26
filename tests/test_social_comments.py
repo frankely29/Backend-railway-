@@ -213,8 +213,12 @@ def test_a_comment_carries_the_author_the_feed_shows(app_env):
     _comment(client, author, post["id"], "mine")
     item = _comments(client, author, post["id"])["items"][0]
     assert set(item["author"]) >= {"user_id", "display_name", "handle", "city",
-                                   "avatar_url", "level", "platforms"}
+                                   "avatar_url", "level", "rank_icon_key",
+                                   "rank_name", "platforms"}
     assert item["author"]["platforms"] == ["uber"]
+    # A comment is smaller than a post but it is still someone talking, and
+    # the crest is how a reader knows who is worth listening to.
+    assert item["author"]["rank_icon_key"], "a comment author has no rank to draw"
 
 
 # --------------------------------------------------------------------------

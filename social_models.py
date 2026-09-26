@@ -51,6 +51,19 @@ class PostAuthor(BaseModel):
     # a new driver with no trips logged and no platform set still posts, and a
     # cold progression cache must cost a badge, never the feed.
     level: Optional[int] = None
+    # Declared, or Pydantic drops them on the way out.
+    #
+    # This is the second time: RankLadderRow shipped without its prestige
+    # pair for the same reason, the service computed it correctly the whole
+    # time, and every driver saw "Prestige 14" on a ladder of ten. A response
+    # model is not documentation, it is a filter.
+    #
+    # rank_icon_key is what a client draws the crest from AND derives the
+    # ladder position from -- one of thirty. `level` above is the XP engine's,
+    # out of a thousand, and is not for display; it stays for the clients that
+    # already read it.
+    rank_icon_key: Optional[str] = None
+    rank_name: Optional[str] = None
     platforms: List[str] = []
 
 
@@ -163,6 +176,9 @@ class Reputation(BaseModel):
     show. Every field is optional: a cold badge cache must not break a profile."""
 
     level: Optional[int] = None
+    # The key the crest and the ladder position both come from. Without it a
+    # profile can name a rank but cannot say which of the thirty it is.
+    rank_icon_key: Optional[str] = None
     rank_name: Optional[str] = None
     title: Optional[str] = None
     badge_code: Optional[str] = None
@@ -349,6 +365,19 @@ class NotificationActor(BaseModel):
     handle: Optional[str] = None
     avatar_url: Optional[str] = None
     level: Optional[int] = None
+    # Declared, or Pydantic drops them on the way out.
+    #
+    # This is the second time: RankLadderRow shipped without its prestige
+    # pair for the same reason, the service computed it correctly the whole
+    # time, and every driver saw "Prestige 14" on a ladder of ten. A response
+    # model is not documentation, it is a filter.
+    #
+    # rank_icon_key is what a client draws the crest from AND derives the
+    # ladder position from -- one of thirty. `level` above is the XP engine's,
+    # out of a thousand, and is not for display; it stays for the clients that
+    # already read it.
+    rank_icon_key: Optional[str] = None
+    rank_name: Optional[str] = None
 
 
 class Notification(BaseModel):

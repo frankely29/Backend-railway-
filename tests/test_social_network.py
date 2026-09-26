@@ -565,11 +565,43 @@ def test_feed_author_carries_level_and_platforms(app_env):
 
     item = _feed(client, author)["items"][0]
     assert set(item["author"]) >= {"user_id", "display_name", "handle", "city",
-                                   "avatar_url", "level", "platforms"}
+                                   "avatar_url", "level", "rank_icon_key",
+                                   "rank_name", "platforms"}
     assert item["author"]["platforms"] == ["uber", "lyft"]
     # level is whatever the progression service says, including None for a
     # driver with no logged trips. The contract is the key, not the number.
     assert "level" in item["author"]
+
+
+def test_the_feed_author_carries_the_rank_a_crest_is_drawn_from(app_env):
+    """The key, not just the level.
+
+    A card used to show "LVL 445" and nothing else: the XP engine's number,
+    out of a thousand, while the rank a driver holds is one of thirty. The
+    two disagreed on every card, and the crest -- the point of having painted
+    thirty of them -- was not on the screen drivers look at most.
+
+    rank_icon_key is the only field a client can draw a crest from AND derive
+    the ladder position from, so the picture and the words cannot disagree.
+    """
+    _main, client = app_env
+    author = _signup(client, "author-crest@example.com", "Marcus R.")
+    _post(client, author, "Lot's actually moving tonight.")
+
+    item = _feed(client, author)["items"][0]
+    key = item["author"]["rank_icon_key"]
+    assert key, "the feed author carries no rank key, so no card can show a crest"
+
+    # It must be a rank the ladder actually defines, or the client resolves it
+    # to band 1 and every driver wears the same crest.
+    from rank_badge_store import valid_rank_icon_keys
+    assert key in set(valid_rank_icon_keys()), f"{key} is not a rank on the ladder"
+
+    # And it must agree with the name sent beside it.
+    from leaderboard_service import RANK_LADDER, prestige_and_rank_for_band, rank_title
+    band = [k for _s, _e, _n, k in RANK_LADDER].index(key) + 1
+    pair = prestige_and_rank_for_band(band)
+    assert item["author"]["rank_name"] == rank_title(pair["prestige"], pair["rank"])
 
 
 def test_a_driver_with_no_platforms_still_posts(app_env):
